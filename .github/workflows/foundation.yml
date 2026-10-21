@@ -89,11 +89,14 @@ jobs:
     env:
       COMPOSE_PROJECT_NAME: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
       CP_CI_PROJECT: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
-      CP_DB_PASSWORD_FILE: ${{ runner.temp }}/foundation-ci-private/postgres-password
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Set runner-scoped synthetic secret path
+        shell: bash
+        run: echo "CP_DB_PASSWORD_FILE=$RUNNER_TEMP/foundation-ci-private/postgres-password" >> "$GITHUB_ENV"
 
       - name: Install approved Docker Engine and plugins from signed Ubuntu repository
         shell: bash
