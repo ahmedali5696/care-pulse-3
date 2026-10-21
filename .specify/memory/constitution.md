@@ -55,9 +55,14 @@ changes against authorized scope, dependencies, affected consumers, and acceptan
 run relevant targeted verification; and inspect failures and unintended changes. Required
 task/Wave integration checks remain binding. Documentation-only changes need document checks,
 not unrelated application tests. Report the task ID where applicable, changed files, commands,
-concrete results, and limitations. Distinguish IMPLEMENTED, TESTED, LOCAL VERIFIED, BLOCKED, and
+concrete results, and limitations. Distinguish IMPLEMENTED, TESTED, INTEGRATION VERIFIED, BLOCKED, and
 PRODUCTION READY using the plan's evidence requirements; never infer completion or readiness
 from code presence, delegated claims, or unexecuted checks.
+
+Docker is unavailable on the Product Owner's workstation and MUST NOT be installed or required
+locally. Run available container-free checks locally; required Compose, real-PostgreSQL and other
+container-dependent verification MUST run in Docker-capable CI with recorded evidence. Distinguish
+INTEGRATION VERIFIED from local-only checks; missing CI evidence remains BLOCKED/UNVERIFIED.
 
 ### V. Focused Agent Execution
 
@@ -117,4 +122,4 @@ Task and change reviews MUST check these principles, justified complexity, scope
 before completion; use existing task/PR records rather than creating duplicate governance
 artifacts. Unresolved violations MUST be reported as blockers, not self-approved exceptions.
 
-**Version**: 1.0.0 | **Ratified**: 2026-10-21 | **Last Amended**: 2026-10-21
+**Version**: 1.1.0 | **Ratified**: 2026-10-21 | **Last Amended**: 2026-10-21
