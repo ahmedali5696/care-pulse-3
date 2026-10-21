@@ -14,6 +14,8 @@
 
 This design covers patient identity, one-Doctor/one-branch clinic identity, limited platform provisioning, appointment and Visit lifecycle, independent Emergency/main waiting lanes, Doctor admission capacity and Pause, follow-up entitlement, immutable service-value snapshots, work schedules and booking slots, files/audit/outbox, operational reconciliation and bulk rescheduling. It does **not** implement future SaaS plans, patient payments, patient portal, bulk cancellation, e-prescription authoring, additional Doctors/branches or multi-currency/timezone operation. [B: PRD §§1–4, §§5–7, §11]
 
+**Execution environment note (2026-10-21; non-domain):** The Product Owner's workstation has no Docker and cannot install it. Required database, concurrency, and container integration proofs must therefore run in a Docker-capable CI environment, without reducing the invariants or acceptance tests defined here. No local Compose execution may be assumed or required.
+
 | Level | Owns | Does NOT own |
 |---|---|---|
 | Approved product PRD | Actors, allowed flows, service policies, business rules, acceptance outcomes | SQL tables, queue mechanism, APIs, deployment topology |

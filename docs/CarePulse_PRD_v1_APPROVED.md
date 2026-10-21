@@ -621,6 +621,8 @@ Operational+clinical database and medical attachments must be backed up and reco
 - Post-commit only internal notifications; rollback must emit none. Bulk reschedule all-or-none; bulk cancellation not an MVP endpoint.
 - Defined Metric Dictionary determines all reporting SQL/view semantics, service versus event date and replacement counting.
 
+**Development environment clarification (2026-10-21; non-product):** Docker is unavailable and cannot be installed on the Product Owner's workstation. Docker/Compose and database integration evidence must be produced in a Docker-capable CI environment; workstation checks may run without containers. This changes no product requirement, acceptance outcome, or production gate. A missing integration run is not a passing test.
+
 ## 11. Explicit exclusions and post-MVP features
 
 - **Deferred**: direct clinic/patient payment collection and paid/unpaid, payment gateway for examination, WhatsApp/SMS and patient reminders, bulk cancellation, E-Prescription composition/printing/signing, more than one clinic Doctor or branch, medical cross-Doctor sharing, patient portal, bulk patient exports, merging/deleting medical records, multi-currency and timezone changes, multi-country country-specific clinic operations, patient memberships, laboratory networks, home visits and desktop apps.
