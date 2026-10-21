@@ -252,17 +252,30 @@ jobs:
           cat "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" \
             "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" \
             "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" > "$canaries"
-          chmod 0600 "$canaries"
+          # A nonroot web image must read the read-only bind-mounted pattern
+          # file. The owning runner directory remains 0700 and is disposable.
+          chmod 0444 "$canaries"
           if git grep -I -q -f "$canaries" -- apps tests compose.yaml; then
             echo 'FAIL synthetic key in tracked source'; exit 1
+          else
+            code=$?
+            if [ "$code" -ne 1 ]; then echo 'FAIL tracked-source scan error'; exit 1; fi
           fi
           docker compose logs --no-color web api worker > "$RUNNER_TEMP/foundation-ci-private/runtime-logs"
           if grep -aF -f "$canaries" "$RUNNER_TEMP/foundation-ci-private/runtime-logs" "$RUNNER_TEMP/foundation-ci-private/denials.log" > /dev/null; then
             echo 'FAIL synthetic key in runtime logs'; exit 1
+          else
+            code=$?
+            if [ "$code" -ne 1 ]; then echo 'FAIL runtime-log scan error'; exit 1; fi
           fi
           docker compose run --rm --no-deps \
             -v "$canaries:/tmp/canaries:ro" web sh -c \
-            'if grep -aRF -f /tmp/canaries /workspace/apps/web/.next /workspace/apps/web/app > /dev/null; then exit 1; fi'
+            'if grep -aRF -f /tmp/canaries /workspace/apps/web/.next /workspace/apps/web/app > /dev/null; then
+               exit 1
+             else
+               result=$?
+               test "$result" -eq 1 || exit 2
+             fi'
           images=()
           for service in web api worker; do
             image="$(docker compose images -q "$service")"
@@ -270,6 +283,9 @@ jobs:
             images+=("$image")
             if docker image history --no-trunc "$image" | grep -aF -f "$canaries" > /dev/null; then
               echo "FAIL synthetic key in $service image history"; exit 1
+            else
+              code=$?
+              if [ "$code" -ne 1 ]; then echo "FAIL $service image-history scan error"; exit 1; fi
             fi
           done
           # Uncompressed docker-save layer.tar contents, checked without grep -q
@@ -280,6 +296,9 @@ jobs:
           test "$(find "$image_scan" -type f -name layer.tar | wc -l)" -gt 0
           if grep -aRF -f "$canaries" "$image_scan" > /dev/null; then
             echo 'FAIL synthetic key in image filesystem layers'; exit 1
+          else
+            code=$?
+            if [ "$code" -ne 1 ]; then echo 'FAIL image filesystem layer scan error'; exit 1; fi
           fi
           rm -rf "$image_scan"
           echo 'PASS synthetic secrets absent from source, web bundle, image layers/history and logs'
