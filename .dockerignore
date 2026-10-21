@@ -27,7 +27,10 @@
 **/.env.*
 .env
 .env.*
+.env.example
+**/.env.example
 .secrets
+**/.secrets/**
 **/.secrets
 **/secrets
 **/*.pem

@@ -2,10 +2,11 @@
 
 from threading import Event
 
-import carepulse  # noqa: F401 — confirms the shared package is importable
+from carepulse.config import load_config
 
 
 def main() -> None:
+    load_config("worker")
     Event().wait()
 
 

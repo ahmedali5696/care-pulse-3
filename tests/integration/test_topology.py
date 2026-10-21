@@ -86,13 +86,34 @@ def test_resolved_compose_topology() -> None:
     assert services["mail"]["profiles"] == ["mail"]
     assert services["scan"]["profiles"] == ["scan"]
     assert services["test"]["profiles"] == ["test"]
-    assert {secret["source"] for secret in services["test"]["secrets"]} == {
-        "postgres_password"
+    expected_secrets = {
+        "test": {"postgres_password", "active_policy"},
+        "web": {
+            "active_policy",
+            "runtime_db_password",
+            "service_key",
+            "auth_secret",
+        },
+        "api": {
+            "active_policy",
+            "runtime_db_password",
+            "service_key",
+            "file_encryption_key",
+        },
+        "worker": {"active_policy", "runtime_db_password", "file_encryption_key"},
     }
+    for name, allowed in expected_secrets.items():
+        assert {
+            secret["source"] for secret in services[name].get("secrets", ())
+        } == allowed
     for name in ("web", "api", "worker"):
         assert "postgres_password" not in {
             secret["source"] for secret in services[name].get("secrets", ())
         }
+        assert not any(
+            "operator" in key.lower() or "migration" in key.lower()
+            for key in services[name].get("environment", {})
+        )
 
     assert _volume_targets(services["db"])["/var/lib/postgresql/data"] == "db_data"
     for name in ("api", "worker", "test"):

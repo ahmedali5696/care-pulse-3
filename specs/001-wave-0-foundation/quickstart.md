@@ -109,6 +109,27 @@ Local static verification: the existing approved Node 24.22.1 parsed the workflo
 
 **T010 = [X]; F-02 = CI INTEGRATION VERIFIED / ACCEPTED.** Mandatory later gates remain: F-03 fail-closed configuration/secrets, F-04 migration/role isolation, F-05 health, F-06 consolidated reproducibility and drift/security review, and independent F-07 auth/mail, with production Security/Operations approval still outstanding.
 
+### F-03: fail-closed configuration and synthetic-only verification
+
+F-03 requires an **explicit** environment (`CP_ENV=development` or `test`) together with `CP_SYNTHETIC_TEST_PROFILE=true` and the **complete** tagged JSON in `tests/fixtures/foundation-policy.json`. Its values (session/login/recovery/invitation/Doctor-confirmation/freshness/download limits and file classes/MIME/types/count/storage) are **synthetic test examples only**. They are not production defaults, approved operational security thresholds, or permission to process patient records. `CP_ENV=production` deliberately fails startup while SECURITY-POLICY-NUMERICS and applicable production approval gates remain OPEN.
+
+Only the file **paths** are provided in process environment variables; the actual credentials are generated into ignored private files. `CP_DB_PASSWORD_FILE` is a disposable PostgreSQL **bootstrap** secret for the one-off DB and topology test, never the API/web/worker runtime credential. Compose mounts a distinct `runtime_db_password` to the runtime consumers, `service_key` only to web and API, `auth_secret` only to web and `file_encryption_key` only to API and worker. No operator or migration credential reaches a normal service. The synthetic policy file is mounted read-only. The optional mail transport is web-owned; no worker SMTP grant or network is added. File uploads/scanner activity remain inactive in this Wave.
+
+Reproduce local checks **without Docker** after selecting the approved Python 3.13.16 and Node 24.22.1 toolchains:
+
+```powershell
+$env:PYTHONPATH = "apps/api"
+.\.venv-wave0\Scripts\python.exe -m pytest -q tests/unit/test_config.py
+Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+.\.venv-wave0\Scripts\python.exe -m ruff check apps/api apps/worker tests
+.\.venv-wave0\Scripts\python.exe -m ruff format --check apps/api apps/worker tests
+pnpm typecheck
+pnpm lint
+pnpm build
+```
+
+All consuming-process, secret/canary/image-layer and PostgreSQL-backed checks **must run on the disposable Linux CI runner**, not locally. The single `foundation.yml` renders Compose only after generating distinct private files; it starts normal services with complete synthetic configuration, demands nonzero exits on deliberately removed process inputs, checks the separate runner-host/web/test vantage points and seed→recreate→verify persistent-volume evidence, and scans tracked source, Next build output, image contents/history and captured process logs against generated synthetic credentials. Runtime image preflight validates web policy **before** Next binds port 3000 (instrumentation is a secondary validation guard). Config tests prove error messages and returned object representations do not serialize secret values. Integration must report its exact GitHub run URL/SHA/pass counts before F-03 acceptance; local success or three CI-skipped workstation probes is insufficient.
+
 ## Prerequisites and safety
 
 1. Product Owner **approved the exact R1–R4 inputs and conditional R7 synthetic-development recommendations on 2026-10-21**; obtain separate explicit assignment/authorization for each F task. Keep approved Next.js `15.5.28`; do not substitute a newer version to satisfy an advisory or peer conflict. GHSA-4jqv-mc3x-m676 and GHSA-mcj8-r9mp-w47p are patched from `15.5.27`, so `15.5.28` is outside their affected ranges and those two are not blockers. ESLint 9.39.5 is temporarily authorized **only for synthetic development/CI**, with Security/Operations production disposition deferred until before deployment. Other security/advisory checks and full locked transitive verification remain required during F-01/F-06.

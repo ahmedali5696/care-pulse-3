@@ -19,6 +19,12 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.secrets/
+**/.secrets/
+*.secret
+*.secrets
+*.pem
+*.key
 *.log
 .DS_Store
 Thumbs.db

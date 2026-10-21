@@ -1,0 +1,25 @@
+{
+  "profile": "synthetic",
+  "session_idle_minutes": 30,
+  "session_absolute_minutes": 180,
+  "login_max_attempts": 4,
+  "login_window_minutes": 10,
+  "recovery_max_attempts": 3,
+  "recovery_window_minutes": 15,
+  "invitation_expiry_minutes": 60,
+  "reset_expiry_minutes": 25,
+  "doctor_confirmation_expiry_minutes": 7,
+  "signed_request_freshness_seconds": 90,
+  "signed_request_max_skew_seconds": 15,
+  "download_grant_expiry_seconds": 20,
+  "file_policy": {
+    "allowed_extensions": [".txt"],
+    "allowed_mime_types": ["text/plain"],
+    "allowed_classes": ["synthetic-test-document"],
+    "max_file_bytes": 4096,
+    "max_files_per_record": 1,
+    "max_total_storage_bytes_per_record": 4096,
+    "scanner_required": false,
+    "quarantine_on_failure": true
+  }
+}
