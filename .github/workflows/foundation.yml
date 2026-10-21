@@ -37,6 +37,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Hosted Ubuntu images may include an unrelated Microsoft apt feed.
+          # Its occasional 403 must not block pinned official Ubuntu packages.
+          for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            if [ -f "$source" ] && grep -Fq 'packages.microsoft.com/ubuntu/24.04/prod' "$source"; then
+              sudo mv "$source" "$source.carepulse-ci-disabled"
+              echo 'Excluded unrelated Microsoft apt feed on disposable runner'
+            fi
+          done
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev uuid-dev
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/Python-3.13.16.tar.xz" https://www.python.org/ftp/python/3.13.16/Python-3.13.16.tar.xz
@@ -124,6 +132,12 @@ jobs:
           test "$(uname -m)" = x86_64
           test "$ImageOS" = ubuntu24
           echo "Runner: $ImageOS $ImageVersion, $(uname -sm)"
+          for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            if [ -f "$source" ] && grep -Fq 'packages.microsoft.com/ubuntu/24.04/prod' "$source"; then
+              sudo mv "$source" "$source.carepulse-ci-disabled"
+              echo 'Excluded unrelated Microsoft apt feed on disposable runner'
+            fi
+          done
           sudo install -m 0755 -d /etc/apt/keyrings
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
           sudo chmod a+r /etc/apt/keyrings/docker.gpg
