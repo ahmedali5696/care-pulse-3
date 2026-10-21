@@ -1,0 +1,206 @@
+name: Foundation
+
+on:
+  push:
+    branches: [feature/wave-0-foundation, development]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inputs-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify runner and install pinned PowerShell 7
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$ImageOS" = ubuntu24
+          echo "Runner: $ImageOS $ImageVersion, $(uname -sm)"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/pwsh.tar.gz" https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-linux-x64.tar.gz
+          echo "6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431  $RUNNER_TEMP/pwsh.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/pwsh"
+          tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"
+          chmod +x "$RUNNER_TEMP/pwsh/pwsh"
+          echo "$RUNNER_TEMP/pwsh" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/pwsh/pwsh" -NoProfile -Command 'if ($PSVersionTable.PSVersion.ToString() -ne "7.6.7") { exit 1 }'
+
+      - name: Build exact CPython 3.13.16 from verified official source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev uuid-dev
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/Python-3.13.16.tar.xz" https://www.python.org/ftp/python/3.13.16/Python-3.13.16.tar.xz
+          echo "f4b1bfb3c79b5bb11b8d228a12504163b4c0dab4d679828d8f5f26b6cb6ab35d  $RUNNER_TEMP/Python-3.13.16.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/python-src"
+          tar -xJf "$RUNNER_TEMP/Python-3.13.16.tar.xz" -C "$RUNNER_TEMP/python-src" --strip-components=1
+          cd "$RUNNER_TEMP/python-src"
+          ./configure --prefix="$RUNNER_TEMP/python-3.13.16" --with-ensurepip=install > "$RUNNER_TEMP/python-configure.log" 2>&1
+          make -j 4 > "$RUNNER_TEMP/python-make.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/python-make.log"; exit 1; }
+          make install > "$RUNNER_TEMP/python-install.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/python-install.log"; exit 1; }
+          "$RUNNER_TEMP/python-3.13.16/bin/python3.13" --version
+          "$RUNNER_TEMP/python-3.13.16/bin/python3.13" -m venv "$RUNNER_TEMP/foundation-venv"
+
+      - name: Verify frozen Linux installs, imports and web
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$RUNNER_TEMP/foundation-venv/bin/python"
+          "$PY" -m pip install --no-cache-dir "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+          "$PY" -c 'import pip, sys; assert pip.__version__ == "26.2.2"; assert sys.version_info[:3] == (3, 13, 16)'
+          "$PY" -m pip install --require-hashes --only-binary=:all: -r requirements.lock
+          "$PY" -m pip check
+          PYTHONPATH=apps/api "$PY" -c 'from carepulse.main import app; import apps.worker.main; assert not app.routes'
+          "$PY" -m ruff check apps/api apps/worker tests/integration
+          "$PY" -m ruff format --check apps/api apps/worker tests/integration
+
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/node.tar.xz" https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz
+          echo "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6  $RUNNER_TEMP/node.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/node.tar.xz" -C "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/node-v24.22.1-linux-x64/bin:$PATH"
+          test "$(node --version)" = v24.22.1
+          npm install --global --ignore-scripts --no-audit --no-fund pnpm@10.34.7
+          test "$(pnpm --version)" = 10.34.7
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm lint
+          pnpm build
+          pwsh -NoProfile -Command 'if ($PSVersionTable.PSVersion.ToString() -ne "7.6.7") { exit 1 }; Write-Output "Verified PowerShell 7.6.7"'
+          {
+            echo '### F-01 Linux pinned inputs/build'
+            echo '- CPython 3.13.16, pip 26.2.2, hash-locked Linux wheels: verified'
+            echo '- Node 24.22.1, pnpm 10.34.7, frozen lock, type/lint/Next build: verified'
+            echo '- Python imports, Ruff lint/format and PowerShell 7.6.7: verified'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  compose-integration:
+    needs: inputs-and-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      COMPOSE_PROJECT_NAME: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CP_CI_PROJECT: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CP_DB_PASSWORD_FILE: ${{ runner.temp }}/foundation-ci-private/postgres-password
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install approved Docker Engine and plugins from signed Ubuntu repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$ImageOS" = ubuntu24
+          echo "Runner: $ImageOS $ImageVersion, $(uname -sm)"
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+          sudo chmod a+r /etc/apt/keyrings/docker.gpg
+          echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable' | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y --allow-downgrades \
+            docker-ce=5:29.9.2-1~ubuntu.24.04~noble \
+            docker-ce-cli=5:29.9.2-1~ubuntu.24.04~noble \
+            containerd.io=2.4.2-3~ubuntu.24.04~noble \
+            docker-compose-plugin=5.6.1-1~ubuntu.24.04~noble \
+            docker-buildx-plugin=0.38.1-1~ubuntu.24.04~noble
+          sudo systemctl restart docker
+          test "$(docker version --format '{{.Server.Version}}')" = 29.9.2
+          test "$(docker version --format '{{.Client.Version}}')" = 29.9.2
+          test "$(docker compose version --short)" = 5.6.1
+          docker buildx version | grep -F 'v0.38.1'
+          test "$(dpkg-query -W -f='${Version}' containerd.io)" = '2.4.2-3~ubuntu.24.04~noble'
+
+      - name: Validate disposable topology and exact Linux amd64 image identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 0700 "$RUNNER_TEMP/foundation-ci-private"
+          openssl rand -hex 32 > "$CP_DB_PASSWORD_FILE"
+          # Compose bind-mounted secrets keep host file permissions; test UID 65532
+          # requires read-only world-readability inside a private runner-only directory.
+          chmod 0444 "$CP_DB_PASSWORD_FILE"
+          docker compose --profile mail --profile scan --profile test config --quiet
+          docker compose --profile mail --profile scan --profile test config --format json > "$RUNNER_TEMP/foundation-ci-private/compose.json"
+          chmod 0444 "$RUNNER_TEMP/foundation-ci-private/compose.json"
+          test "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT"
+          for image in \
+            'node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205' \
+            'python:3.13.16-slim-bookworm@sha256:73aa5faee130c60da030e105ec971ccf57473fbd22ce73bd6fc9ba99a40b838d' \
+            'postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27' \
+            'axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387' \
+            'clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'
+          do
+            docker pull --platform linux/amd64 --quiet "$image" > /dev/null
+            test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = linux/amd64
+            echo "Verified pinned Linux amd64 image: ${image%%@*}"
+          done
+
+      - name: Clean build, runner/web/test vantage probes, and persistence after recreation
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose --profile test build --pull
+          docker compose up -d --no-build db api worker web
+          for attempt in $(seq 1 40); do
+            if curl --silent --show-error --fail --max-time 2 http://127.0.0.1:3000/ > /dev/null 2>&1; then break; fi
+            if [ "$attempt" = 40 ]; then echo 'FAIL runner-host web endpoint'; exit 1; fi
+            sleep 2
+          done
+          echo 'PASS runner-host web http://127.0.0.1:3000/'
+          for port in 8000 5432; do
+            if timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+              echo "FAIL runner-host unexpected exposed port $port"; exit 1
+            fi
+            echo "PASS runner-host denied port $port"
+          done
+          docker compose exec -T web node -e 'fetch("http://api:8000/__foundation_network_probe__").then(r => process.exit(r.status === 404 ? 0 : 1)).catch(() => process.exit(1))'
+          echo 'PASS web-container -> private API HTTP 404'
+          docker compose exec -T db postgres --version | grep -F '17.11'
+          docker compose exec -T web node --version | grep -Fx 'v24.22.1'
+          docker compose exec -T api python --version | grep -F '3.13.16'
+          docker compose exec -T api python -m pip --version | grep -F '26.2.2'
+
+          for phase in seed verify; do
+            if [ "$phase" = verify ]; then
+              docker compose up -d --force-recreate --no-deps db api
+            fi
+            docker compose --profile test run --rm --no-deps \
+              -e CP_CI_PROJECT="$CP_CI_PROJECT" \
+              -e CP_PERSIST_PHASE="$phase" \
+              -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+              -v "$RUNNER_TEMP/foundation-ci-private/compose.json:/tmp/foundation-compose.json:ro" \
+              test python -m pytest -q -ra -p no:cacheprovider tests/integration/test_topology.py
+            echo "PASS network-attached test-container topology, API and synthetic DB/file markers: $phase"
+          done
+          docker compose exec -T web node -e 'fetch("http://api:8000/__foundation_network_probe__").then(r => process.exit(r.status === 404 ? 0 : 1)).catch(() => process.exit(1))'
+          {
+            echo '### F-02 disposable Docker Compose integration'
+            echo "- Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT}, SHA ${GITHUB_SHA})"
+            echo '- Linux amd64 image pins, Node/Python/pip/PostgreSQL runtime versions: verified'
+            echo '- Runner-host web response + denied API/DB host ports: verified'
+            echo '- Web-container private API HTTP 404: verified'
+            echo '- Test-container topology and DB/file persistence: 3 passing tests in seed + 3 in verify'
+            echo '- Container recreation: DB/API without named-volume deletion'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up only this disposable Compose project
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" && -s "$CP_DB_PASSWORD_FILE" ]]; then
+            docker compose --profile test down --remove-orphans --volumes
+          fi
+          rm -f "$CP_DB_PASSWORD_FILE" "$RUNNER_TEMP/foundation-ci-private/compose.json"
+          rmdir "$RUNNER_TEMP/foundation-ci-private" 2>/dev/null || true

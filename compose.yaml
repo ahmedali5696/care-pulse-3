@@ -1,0 +1,105 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      target: runtime
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - application
+      - database
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: api
+    networks:
+      - application
+      - database
+    volumes:
+      - private_files:/srv/private-files
+    depends_on:
+      - db
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: worker
+    networks:
+      - database
+    volumes:
+      - private_files:/srv/private-files
+    depends_on:
+      - db
+
+  db:
+    image: postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27
+    environment:
+      POSTGRES_DB: carepulse
+      POSTGRES_USER: carepulse_bootstrap
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - database
+
+  mail:
+    image: axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387
+    profiles:
+      - mail
+    networks:
+      - application
+
+  scan:
+    image: clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c
+    profiles:
+      - scan
+    networks:
+      - application
+      - signature_updates
+
+  test:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: test
+    profiles:
+      - test
+    environment:
+      CI: "true"
+    networks:
+      - application
+      - database
+    secrets:
+      - postgres_password
+    volumes:
+      - private_files:/srv/private-files
+    depends_on:
+      - api
+      - db
+
+networks:
+  application:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+  database:
+    internal: true
+  # Only the optional scanner joins this outbound bridge for signature updates.
+  signature_updates:
+    driver: bridge
+
+volumes:
+  db_data:
+  private_files:
+
+secrets:
+  postgres_password:
+    file: ${CP_DB_PASSWORD_FILE:?Set a synthetic PostgreSQL password file path for CI}

@@ -1,8 +1,105 @@
 # Wave 0 validation guide
 
-**Date:** 2026-10-21 | **Scope:** F-01–F-07 | **State:** prospective run guide; commands require separately authorized implementation
+**Date:** 2026-10-21 | **Scope:** F-01–F-07 | **State:** Wave 0 implementation started; commands not yet validated unless recorded below
 
-No application, lockfiles, Compose configuration or check runner is delivered by planning. The commands below define the intended interface, **not checks run during planning**. No Docker installation or local Docker command is required or permitted on the Product Owner's workstation.
+This guide originated in planning; its prospective commands are not proof of a successful run. No Docker installation or local Docker command is required or permitted on the Product Owner's workstation.
+
+## T001 — approved input baseline (2026-10-22)
+
+The Product Owner approved these exact versions on 2026-10-21. **Input selection** is separate from lock/install/build/CI proof.
+
+| Consumer | Approved direct inputs |
+|---|---|
+| Windows / CI / database | Node `24.22.1`, pnpm `10.34.7`, standard-GIL CPython `3.13.16`, pip `26.2.2`, PostgreSQL `17.11` |
+| Web | Next `15.5.28`, React and React DOM `19.3.1` |
+| Web tooling | TypeScript `5.9.3`, ESLint `9.39.5`, eslint-config-next `15.5.28`, @eslint/eslintrc `3.3.1` |
+| Types | @types/node `24.19.2`, @types/react `19.3.0`, @types/react-dom `19.3.0`, @types/pg `8.23.1` |
+| Browser server/auth/mail | better-auth `1.7.12`, pg `8.23.1`, nodemailer `10.1.7` (bundled types) |
+| API / shared worker | fastapi `0.158.1`, uvicorn `0.54.0`, SQLAlchemy `2.0.55`, psycopg[binary] `3.3.6`, alembic `1.20.0` |
+| Python checks | pytest `9.1.1`, ruff `0.17.1` |
+
+The secured pip bootstrap, **before other dependency downloads in each fresh Python environment**, is the exact wheel `https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl`, SHA-256 `fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70`; verify pip reports `26.2.2` before installing the SHA-256-locked dependencies.
+
+| Image consumer | Approved tag with index digest (Linux amd64 identity still requires CI proof) |
+|---|---|
+| Web | `node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205` |
+| API / worker / tests | `python:3.13.16-slim-bookworm@sha256:73aa5faee130c60da030e105ec971ccf57473fbd22ce73bd6fc9ba99a40b838d` |
+| PostgreSQL | `postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27` |
+| Optional mail | `axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387` |
+| Optional scan | `clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c` |
+
+Version/peer release metadata was reviewed in [research R1–R4](research.md) against upstream release, npm/PyPI and Docker registry records on 2026-10-21; the implementation additionally queried npm exact-version `next@15.5.28`, `react-dom@19.3.1`, `eslint-config-next@15.5.28` and `better-auth@1.7.12` on 2026-10-22. Peer ranges admit the approved React 19/TypeScript 5.9/ESLint 9/Next 15/pg 8 baseline. Actual Node/pnpm installs, Python hash resolution, final transitive graph, Linux platform pulls and PostgreSQL runtime remain independent evidence steps; source metadata is not runtime proof.
+
+**Temporary risk exception:** ESLint `9.39.5` with Next `15.5.28` is approved for synthetic development and CI only. Keep real lint checks; obtain Security/Operations production disposition before deployment and review the installed transitive graph including `sharp` and bundled RSC. No production exception has been granted.
+
+**CI-only input approval:** the Product Owner approved the exact T010 checkout SHA, runner label, PowerShell archive/hash, Docker Engine, Buildx and Compose plugin pins/installation method on 2026-10-22 (full record below). Do not use floating action refs or substitute unapproved CI tools. T010 must still verify the actual runner, Linux amd64 image identities and integration runtime; approval is not execution evidence.
+
+### Local implementation evidence — T002/T004
+
+- The workstation's `py -V:3.13` resolved **Python 3.13.16**. An isolated `.venv-wave0` was created without modifying global runtimes; the exact SHA-256 wheel bootstrap installed **pip 26.2.2** successfully. No other dependencies were downloaded before the secure bootstrap.
+- `requirements.in` has the seven approved direct Python pins; `requirements.lock` contains **29 exact resolved distributions** with SHA-256 wheel hashes from the Windows amd64 and Linux amd64 CPython 3.13 resolutions. `psycopg[binary]` is included and `colorama` is Windows-gated. `pydantic` is a locked transitive dependency only; it has no direct source import yet. Wheel downloads and the Python environment are ignored under `.tools/` and `.venv-wave0/`.
+- `python -m pip install --require-hashes --only-binary=:all: --no-index --find-links .tools/wheels/win -r requirements.lock` completed with exit 0 using the isolated interpreter; `python -m pip check` returned `No broken requirements found.` and the approved runtime imported FastAPI, Uvicorn, SQLAlchemy, psycopg, Alembic and pytest. `python -m ruff check apps/api apps/worker` passed; format check found all 13 Python files formatted. Offline wheels are a local verification aid, not a committed artifact; normal installs must use the same hash lock from the approved index.
+- `PYTHONPATH=apps/api` supplies the shared `carepulse` package to both `uvicorn carepulse.main:app` and `python apps/worker/main.py` without copying it or creating a second installed package. FastAPI has zero API routes prior to the later Wave 0 health/auth owners; the worker has only an idle entrypoint. Linux real-runtime evidence remains T010/F-06 CI-only.
+
+### Local web implementation evidence — T003/T005
+
+- Isolated Node **24.22.1** was downloaded into ignored `.tools/node-v24.22.1-win-x64/` and its archive hash verified against the official `SHASUMS256.txt`: `d2046d28c2c3dcd211ac5145c0bf30e2047ef9dfb306693c8c6e2eccd8b95fa5`. Isolated pnpm **10.34.7** was used; no global Node/pnpm version was changed.
+- `pnpm-lock.yaml` SHA-256 `e81b48c7ab50811e42a3eee46e58071a243d4f4c0ee873e0d91aa089285911a4`. The 14 direct dependency/tool/type pins match the approved exact input table. With strict peer/engine/package-manager rules, `pnpm install --lockfile-only` and `pnpm install --frozen-lockfile` both returned exit 0. The frozen install reported one ignored optional `unrs-resolver@1.12.2` build script; all required checks succeeded.
+- `pnpm typecheck`, `pnpm lint` and `pnpm build` all returned exit 0 on the exact runtime; the build generated the minimal `/` route (4/4 static stages). ESLint's flat config excludes only Next-generated `.next/**`/`next-env.d.ts` files and retains Next core-web-vitals/TypeScript lint rules.
+- Installed transitive `sharp@0.35.5` was confirmed. Production-dependency audit found **0 critical, 2 high, 2 moderate** advisories on transitive `postcss@8.4.31` through Next; the boot page processes no untrusted CSS. Treat these as pending Security/Operations risk evaluation before production, alongside the approved synthetic-only ESLint 9 EOL exception; do not auto-substitute approved pins. Bundled React Server Components require separate security review at F-06.
+
+### F-01 local acceptance — T006 (2026-10-22)
+
+**IMPLEMENTED and LOCALLY TESTED** (six of six F-01 tasks); **INTEGRATION VERIFIED: pending T010/F-06**; **PRODUCTION READY: no**. Clean locked installs were performed into freshly created isolated local environments, with no reliance on existing global Node/pnpm or Python dependency folders. `requirements.lock` SHA-256 `1e0d0bd292857372ba61269de4a76ed6ae20d7129817e4a9ff6b689a840ebafb`. Commands actually executed from the repository root in Windows PowerShell 5.1, with exit 0:
+
+```powershell
+& 'C:\Program Files\PyManager\py.exe' -V:3.13 -m venv .venv-wave0
+& .\.venv-wave0\Scripts\python.exe -m pip install --no-cache-dir 'pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
+& .\.venv-wave0\Scripts\python.exe -m pip install --require-hashes --only-binary=:all: --no-index --find-links .tools/wheels/win -r requirements.lock
+& .\.venv-wave0\Scripts\python.exe -m pip check
+$env:PYTHONPATH = (Join-Path (Get-Location) 'apps/api')
+& .\.venv-wave0\Scripts\python.exe -c "from carepulse.main import app; import apps.worker.main; print(len(app.routes))"
+& .\.venv-wave0\Scripts\python.exe -m ruff check apps/api apps/worker
+& .\.venv-wave0\Scripts\python.exe -m ruff format --check apps/api apps/worker
+$env:PATH = (Join-Path (Get-Location) '.tools/node-v24.22.1-win-x64') + ';' + $env:PATH
+$node = '.\.tools\node-v24.22.1-win-x64\node.exe'
+$pnpm = '.\.tools\pnpm\node_modules\pnpm\bin\pnpm.cjs'
+& $node $pnpm install --frozen-lockfile
+& $node $pnpm typecheck
+& $node $pnpm lint
+& $node $pnpm build
+```
+
+The actual local FastAPI process returned the expected 404 for `/private-probe`, and the separate Python worker process remained alive in idle mode. A fresh independent read-only Python lock/shared-package review found **0 BLOCKER / 0 MAJOR / 0 MINOR**; it checked SHA-256 binary wheel closure for both approved platforms and 29/29 transitive distributions with `pip --dry-run` and metadata. Linux installation, image digest/platform execution, PostgreSQL 17.11 runtime and network/CI evidence remain mandatory at T010/F-06, and none is claimed from the dry-run or published image metadata. No deployment or external CI run occurred during F-01.
+
+### F-02 implementation evidence — T007–T009 (2026-10-22)
+
+**IMPLEMENTED and STATICALLY CHECKED**; container/network/DB/integration verification **BLOCKED/UNVERIFIED** until T010 CI. `apps/web/Dockerfile` and `apps/api/Dockerfile` use the approved image tag+digest pins; the Python build verifies pip 26.2.2's published SHA-256 bootstrap before any dependency download, then installs only hash-checked wheels. The API, worker and CI test target use one Python source and lock; neither application runtime performs DDL or migrations. `.dockerignore` excludes local installations, caches, credentials, images of secrets and other unnecessary context files.
+
+`compose.yaml` defines web, API, worker and PostgreSQL; `mail` and `scan` are optional profiles and `test` is the non-public CI target. Web alone publishes `127.0.0.1:3000:3000`; no database/API/worker/mail/scanner ports are published. `database` is internal; `application` is the private bridge, with IP masquerading disabled; a third, **scanner-only, opt-in** `signature_updates` bridge gives ClamAV update egress without attaching default application consumers to an outbound bridge. Compose does not enforce remote domain allowlists; any mandatory network destination policy still requires host rules. Named `db_data` and `private_files` volumes are mounted only on consumers; a real synthetic CI password file must be provided through `CP_DB_PASSWORD_FILE` for the DB service. The observed topology and host web connectivity are not proven by this static inspection.
+
+The new `tests/integration/test_topology.py` checks the full resolved network/port/volume profile, the network-attached test container's API reachability (expected FastAPI 404), and a synthetic file/database marker across explicit CI database/API **container recreation**. The test service now sets `CI=true`, preventing missing CI inputs from silently skipping every test. It requires a disposable project name `CP_CI_PROJECT=carepulse-ci-<run>-<attempt>` (and matching actual Compose project name), a resolved JSON config available at `CP_COMPOSE_CONFIG_PATH`, and `CP_PERSIST_PHASE=seed` then `verify` in two CI test-container invocations. Its only privileged database credential is the synthetic `postgres_password` Compose secret at `/run/secrets/postgres_password`, mounted solely into disposable DB and test containers, never normal web/API/worker. Generate JSON with all three optional profiles enabled (`--profile mail --profile scan --profile test config --format json`) for structural coverage, and mount that file read-only into both test invocations; normal running services need only the requested profiles. Enforce **zero pytest skips** when running in CI. CI must recreate disposable DB/API containers between `seed` and `verify` without deleting named volumes, then capture the marker result before cleanup. Local check commands with observed outcomes:
+
+```powershell
+.\.venv-wave0\Scripts\python.exe -m ruff check tests/integration/test_topology.py # passed
+.\.venv-wave0\Scripts\python.exe -m ruff format --check tests/integration/test_topology.py # passed
+.\.venv-wave0\Scripts\python.exe -m pytest -q tests/integration/test_topology.py # 3 skipped: no local Docker
+git diff --check # passed
+```
+
+Additional Python/PyYAML static assertions on the compose and Dockerfiles passed, covering approved image digests, pinned installers, valid file paths and build inputs, network/volume/profile boundaries, absent secret build ARGs and no automatic migrations. CI must independently execute: **runner-host vantage** loopback web response on 3000 and denial on API 8000/PostgreSQL 5432; **web-container vantage** ordinary HTTP GET of `http://api:8000/__foundation_network_probe__` returning 404; **test-container vantage** resolved config, private API and marker persistence in `seed` then `verify` after service restart. Unique disposable CI project/DB only; no shared-volume cleanup or privileged-host-isolation claim.
+
+**Negative verification of the CI skip guard:** with `CI=true` locally, and without `CP_CI_PROJECT` and other CI inputs, `python -m pytest -q tests/integration/test_topology.py` reported **3 FAILURES** (each `CI topology probe missing CP_CI_PROJECT`) and a nonzero exit, as required. A normal workstation invocation still reports three intentional skips. CI success must consist of the actual passing cases, and the final T010 run must capture three passes on each `seed`/`verify` invocation, never accept skips as green. The independent T007–T009 review found the pre-correction missing-CI bypass and missing web-vantage evidence; the former is now guarded, while the latter remains a specifically required T010 command/evidence checkpoint. The static topology test additionally asserts restricted application masquerading and only the optional scanner's outbound network.
+
+**T010 inputs — Product Owner approved 2026-10-22:** GitHub-hosted `ubuntu-24.04` Linux x64 runner (record actual rolling ImageOS/ImageVersion); immutable `actions/checkout` v7.0.1 SHA `3d3c42e5aac5ba805825da76410c181273ba90b1` with `persist-credentials:false`; PowerShell 7.6.7 pinned archive SHA-256 `6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431`; signed Docker official Ubuntu Noble amd64 apt packages Docker CE and CLI `5:29.9.2-1~ubuntu.24.04~noble`, containerd.io `2.4.2-3~ubuntu.24.04~noble`, Compose plugin `5.6.1-1~ubuntu.24.04~noble`, Buildx plugin `0.38.1-1~ubuntu.24.04~noble`. The hosted VM image is rolling and cannot be immutable through standard `runs-on`; CI logs its observed identity. Upstream reference URLs: [checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1), [PowerShell v7.6.7](https://github.com/PowerShell/PowerShell/releases/tag/v7.6.7), [Docker official Noble packages](https://download.docker.com/linux/ubuntu/dists/noble/pool/stable/amd64/), [Compose v5.6.1](https://github.com/docker/compose/releases/tag/v5.6.1), [Buildx v0.38.1](https://github.com/docker/buildx/releases/tag/v0.38.1). This is **input approval only**, not evidence that GitHub runners, image digests or CI tests have actually run.
+
+### T010 CI workflow — implementation, not acceptance (2026-10-22)
+
+**IMPLEMENTED / STATICALLY CHECKED; INTEGRATION UNVERIFIED.** Added the single `.github/workflows/foundation.yml` with two dependent jobs (`inputs-and-build`, `compose-integration`) on `ubuntu-24.04`, least-privilege `contents: read`, immutable checkout SHA, approved exact PowerShell/Docker/Compose/Buildx and immutable Python/Node archives. The Linux container-free job builds official CPython 3.13.16 source checked against its published SHA-256 (`f4b1bfb3c79b5bb11b8d228a12504163b4c0dab4d679828d8f5f26b6cb6ab35d`) and verifies the official Node Linux x64 archive SHA-256 (`6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6`); then securely bootstraps pip 26.2.2, verifies frozen Python/Node installs, web build, imports and lint without changing the workstation tools. The second job validates signed Docker apt toolpins and all approved Linux amd64 images, then builds and boots only the nonoptional services.
+
+The CI workflow uses disposable `COMPOSE_PROJECT_NAME=CP_CI_PROJECT=carepulse-ci-<run-id>-<attempt>`, a freshly randomized synthetic PostgreSQL password file outside the Docker build context and a private all-profile rendered Compose JSON. Both are bind-mounted read-only as needed for the nonroot test target; runtime web/API/worker never receive the DB bootstrap password. Evidence from each distinct vantage point is required: runner-host successful loopback web HTTP plus denied API/DB ports; web-container successful private API 404; test-container three positive topology/API/DB-and-file marker checks with `CP_PERSIST_PHASE=seed`, DB/API **container recreation**, and another three passing `verify` checks. The unique disposable Compose project alone is cleaned with its named volumes after tests; no scanner startup or local Docker use. Sanitized step logs and GitHub Step Summary include run URL/attempt/SHA and checks on success; no downloadable uploaded artifact is claimed.
+
+Local static verification: the existing approved Node 24.22.1 parsed the workflow using the already-installed `js-yaml@4.3.2` (three triggers, two jobs, four/five steps), `git diff --check` passed, isolated CPython/Ruff passed, and workstation `python -m pytest -q tests/integration/test_topology.py` reported **three expected skips** because no CI container exists. No CI run, runner image, container platform, network, PostgreSQL or persistence has yet been proven. **T010 remains [ ] and F-02 is not accepted** until an actual GitHub Actions run and review of failure/positive evidence. This local working tree is not yet committed/pushed; obtaining a CI run requires publication to the requested remote/branch.
 
 ## Prerequisites and safety
 
@@ -10,21 +107,21 @@ No application, lockfiles, Compose configuration or check runner is delivered by
 2. Use the approved Python/Node/pnpm versions, not merely the globally installed ones. Current workstation tools are observations, not approved pins. Existing `.venv`/`node_modules` content is not reproducibility evidence; preserve it and use a clean isolated environment for later checks.
 3. Use synthetic data only. Supply separate ignored test secret files and the full, explicitly labeled synthetic security-policy fixture through the F-03 configuration interface. Never copy fixtures to production, print keys/configuration, or use real operator credentials/email addresses.
 4. CI needs a Docker-capable Linux runner, registry access, the recorded Compose tool version, and an isolated checkout/project/database. Do not execute this guide against a shared or production database. CI reports its run URL, Git revision, logs and sanitized evidence artifacts.
-5. Install and configure tools only in the later authorized implementation; this planning session performs documentation checks only. Runtime installs must use approved frozen/hash locks; lock generation and migration execution are not part of planning.
+5. F-01's exact local tools and lockfiles have now been provisioned and tested as recorded above. All later steps must retain approved frozen/hash locks; migrations and CI-only integration are pending and must not be treated as complete.
 
 ## Container-free workstation checks
 
-From repository root in the workstation's existing **Windows PowerShell 5.1**, after implementation supplies the files; do not install or require `pwsh` locally:
+From repository root in the workstation's existing **Windows PowerShell 5.1**; do not install or require `pwsh` locally. Reproduce the full verified local command sequence under **T006** above. For a new workstation, resolve Python 3.13.16 explicitly before creating an isolated environment:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
-.\.venv\Scripts\python.exe -m pip install --require-hashes --only-binary=:all: -r requirements.lock
-.\.venv\Scripts\python.exe -m pip check
-pnpm install --frozen-lockfile
+py -V:3.13 -m venv .venv-wave0
+.\.venv-wave0\Scripts\python.exe -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+.\.venv-wave0\Scripts\python.exe -m pip install --require-hashes --only-binary=:all: -r requirements.lock
+.\.venv-wave0\Scripts\python.exe -m pip check
+pnpm install --frozen-lockfile # after selecting Node 24.22.1 and pnpm 10.34.7
 ```
 
-`requirements.lock` is the proposed single exact direct/transitive development/test lock for Wave 0; API/worker use the same pinned package set, without separate drifting locks. The pinned/hash-verified pip bootstrap follows Python's security instructions and must precede dependency downloads, including in CI/container builds; it is not a floating auto-upgrade. `packageManager` pins pnpm; the environment must provision that exact version before running it. Do not auto-upgrade pip, dependencies or Next.js. Exact installer/tool versions and selected platform artifacts are recorded by F-01/F-06.
+`requirements.lock` is the delivered single exact direct/transitive development/test lock for Wave 0; API/worker use the same pinned package set, without separate drifting locks. The pinned/hash-verified pip bootstrap follows Python's security instructions and must precede dependency downloads, including in CI/container builds; it is not a floating auto-upgrade. `packageManager` pins pnpm; the environment must provision that exact version before running it. Do not auto-upgrade pip, dependencies or Next.js. Exact installer/tool versions and selected platform artifacts are recorded by F-01/F-06.
 
 The later F-06 implementation exposes **one small `ops/check.ps1` entrypoint**, compatible with Windows PowerShell **5.1** locally and PowerShell **7** in Linux CI, with one command per check; do not add duplicate wrapper layers. Keep syntax/cmdlets compatible with 5.1 and check `$LASTEXITCODE` immediately after every native command, terminating nonzero on failure. `$ErrorActionPreference` alone does not propagate native failures in both shells; do not depend on PowerShell 7-only native-error preferences.
 
