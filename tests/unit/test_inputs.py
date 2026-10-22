@@ -125,3 +125,141 @@ def test_peer_validation_cannot_be_disabled(checkout):
     completed = _check(checkout)
     assert completed.returncode != 0
     assert "strict engines/peers" in completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("filename", "original", "replacement", "diagnostic"),
+    [
+        (
+            ".github/workflows/foundation.yml",
+            "docker-compose-plugin=5.6.1-1~ubuntu.24.04~noble",
+            "docker-compose-plugin=5.6.2-1~ubuntu.24.04~noble",
+            "CI Docker/Compose/Buildx/containerd",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "docker-ce=5:29.9.2-1~ubuntu.24.04~noble",
+            "docker-ce",
+            "CI Docker/Compose/Buildx/containerd",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "containerd.io=2.4.2-3~ubuntu.24.04~noble",
+            "containerd.io=latest",
+            "CI Docker/Compose/Buildx/containerd",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "docker-buildx-plugin=0.38.1-1~ubuntu.24.04~noble",
+            "docker-buildx-plugin=latest",
+            "CI Docker/Compose/Buildx/containerd",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "releases/download/v7.6.7/powershell-7.6.7-linux-x64.tar.gz",
+            "releases/download/v7.6.8/powershell-7.6.8-linux-x64.tar.gz",
+            "CI runtime archives and PowerShell",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "f4b1bfb3c79b5bb11b8d228a12504163b4c0dab4d679828d8f5f26b6cb6ab35d",
+            "0" * 64,
+            "CI runtime archives and PowerShell",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "node-v24.22.1-linux-x64.tar.xz",
+            "node-v24.22.2-linux-x64.tar.xz",
+            "CI runtime archives and PowerShell",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            'test "$(docker compose version --short)" = 5.6.1',
+            'test "$(docker compose version --short)" = 5.6.2',
+            "CI Docker/Compose/Buildx/containerd",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "pnpm@10.34.7",
+            "pnpm@latest",
+            "CI pip/pnpm bootstrap",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70",
+            "",
+            "CI pip/pnpm bootstrap",
+        ),
+        (
+            "apps/api/Dockerfile",
+            "#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70",
+            "",
+            "API Docker pip bootstrap",
+        ),
+        (
+            "apps/api/Dockerfile",
+            "assert pip.__version__ == '26.2.2'",
+            "assert pip.__version__ == '26.2.1'",
+            "API Docker pip bootstrap",
+        ),
+        (
+            "apps/web/Dockerfile",
+            "pnpm@10.34.7",
+            "pnpm@latest",
+            "web Docker pnpm bootstrap",
+        ),
+        (
+            "apps/web/Dockerfile",
+            "pnpm install --frozen-lockfile",
+            "pnpm install",
+            "web Docker pnpm bootstrap",
+        ),
+    ],
+)
+def test_ci_tool_and_installer_drift_is_rejected_before_install(
+    checkout, filename, original, replacement, diagnostic
+):
+    target = checkout / filename
+    content = target.read_text()
+    assert original in content
+    target.write_text(content.replace(original, replacement, 1))
+    completed = _check(checkout)
+    assert completed.returncode != 0
+    assert diagnostic + " approved inputs" in completed.stdout + completed.stderr
+
+
+def test_ci_archive_must_be_verified_before_extraction(checkout):
+    workflow = checkout / ".github/workflows/foundation.yml"
+    content = workflow.read_text()
+    hash_line = (
+        'echo "6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431'
+        '  $RUNNER_TEMP/pwsh.tar.gz" | sha256sum -c -'
+    )
+    extract_line = 'tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"'
+    assert hash_line in content and extract_line in content
+    workflow.write_text(
+        content.replace(hash_line, "ARCHIVE_HASH_PLACEHOLDER", 1)
+        .replace(extract_line, hash_line, 1)
+        .replace("ARCHIVE_HASH_PLACEHOLDER", extract_line, 1)
+    )
+    completed = _check(checkout)
+    assert completed.returncode != 0
+    assert "CI runtime archives and PowerShell approved inputs" in (
+        completed.stdout + completed.stderr
+    )
+
+
+def test_commented_checkout_pin_cannot_hide_unapproved_action(checkout):
+    workflow = checkout / ".github/workflows/foundation.yml"
+    content = workflow.read_text()
+    approved = "- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+    assert content.count(approved) == 2
+    workflow.write_text(
+        content.replace(approved, "- uses : actions/checkout@main", 1)
+        + "\n# "
+        + approved
+        + "\n"
+    )
+    completed = _check(checkout)
+    assert completed.returncode != 0
+    assert "immutable action references" in completed.stdout + completed.stderr
