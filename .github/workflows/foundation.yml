@@ -269,6 +269,9 @@ jobs:
           # A nonroot web image must read the read-only bind-mounted pattern
           # file. The owning runner directory remains 0700 and is disposable.
           chmod 0444 "$canaries"
+          awk 'length($0) != 64 || $0 !~ /^[0-9a-f]+$/ { invalid=1 } END { if (NR != 5 || invalid) exit 1 }' "$canaries" || {
+            echo 'FAIL malformed synthetic canary patterns'; exit 1;
+          }
           if git grep -I -q -f "$canaries" -- apps tests compose.yaml; then
             echo 'FAIL synthetic key in tracked source'; exit 1
           else
@@ -284,12 +287,20 @@ jobs:
           fi
           docker compose run --rm --no-deps \
             -v "$canaries:/tmp/canaries:ro" web sh -c \
-            'if grep -aRF -f /tmp/canaries /workspace/apps/web/.next /workspace/apps/web/app > /dev/null; then
-               exit 1
-             else
-               result=$?
-               test "$result" -eq 1 || exit 2
-             fi'
+            'if [ ! -r /tmp/canaries ]; then
+               echo "FAIL nonroot web canary input unreadable"; exit 2
+             fi
+             result=0
+             grep -aRF -f /tmp/canaries /workspace/apps/web/.next /workspace/apps/web/app > /dev/null || result=$?
+             case "$result" in
+               0)
+                 echo "FAIL web source/build canary match"
+                 # Filenames are safe to report; never output matching lines.
+                 grep -aRFl -f /tmp/canaries /workspace/apps/web/.next /workspace/apps/web/app || true
+                 exit 1 ;;
+               1) echo "PASS web source/build canary scan"; exit 0 ;;
+               *) echo "FAIL web source/build scan tool error: $result"; exit 2 ;;
+             esac'
           images=()
           for service in web api worker; do
             image="$(docker compose images -q "$service")"
