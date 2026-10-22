@@ -132,6 +132,40 @@ All consuming-process, secret/canary/image-layer and PostgreSQL-backed checks **
 
 **T011-T016 = [X]; F-03 = SYNTHETIC-DEVELOPMENT CI INTEGRATION VERIFIED / ACCEPTED (2026-10-22).** [GitHub Actions run 39700680578](https://github.com/ahmedali5696/care-pulse-3/actions/runs/39700680578), `push`, attempt **1**, executable SHA `e1df6d721585b890bfac0fc87ea7c0b3ed0202a6`, **completed SUCCESS**: `inputs-and-build` (job `119568862211`) and `compose-integration` (job `119570531079`) both green. The Linux job proved **395/395** deterministic configuration unit cases with approved Python 3.13.16, pinned/hash-locked Python inputs, Ruff and frozen pnpm/TypeScript/ESLint/Next build. Actual Docker Compose Linux amd64 service builds and startup, separate per-consumer file secrets and test-only full active policy, initial web response, closed runner-host API/DB ports, private Web-to-API HTTP 404, and named DB/file marker persistence after DB/API recreation all passed. Network-attached topology tests: **3/3 seed + 3/3 verify**, with no skipped CI cases. Actual API consuming-process configuration integration: **34/34 passed**. Separate negative container starts denied missing `CP_POLICY_FILE`, `CP_DB_PASSWORD_FILE`, `CP_SERVICE_KEY_FILE`, `CP_AUTH_SECRET_FILE` for Web and missing `CP_POLICY_FILE`, `CP_DB_PASSWORD_FILE`, `CP_FILE_ENCRYPTION_KEY_FILE` for Worker (**7/7 nonzero denials**). Nonroot Web source/build canary scan passed, all three service image-history scans passed, and the synthetic-key check reported **PASS** across tracked source, Next output/browser bundle, unpacked Docker-save image archives, and captured service/denial logs. The CI cleanup succeeded for only its disposable Compose project and private runner files. The CI logs/step summary are the evidence, with no separate uploaded artifact and no real operator secret used. Failed predecessor attempts `39693664344`, `39694691796`, `39694893037` and `39699774824` were diagnostic and **not** counted as acceptance; the final fixed executable SHA above is binding. F-03 acceptance is strictly for **synthetic development/testing**, not production policy approval, live authentication, medical uploads, release clearance, or F-04 through F-07 acceptance.
 
+## F-04 local reproduction — T017–T021 (2026-10-22)
+
+The migration/roles/shared transaction implementation and CI wiring are present;
+real PostgreSQL acceptance is still **BLOCKED/UNVERIFIED**. See the T021 execution
+record in [tasks.md](tasks.md) for results and the F-04 prerequisite gate. The
+unchanged F-05 tasks cannot begin before F-04 CI acceptance.
+
+These container-free commands were run from the repository root in Windows
+PowerShell 5.1 using the existing approved CPython 3.13.16 environment:
+
+```powershell
+$env:PYTHONPATH = "apps/api"
+.\.venv-wave0\Scripts\python.exe -m pytest -q tests/unit/test_config.py tests/unit/test_db.py
+.\.venv-wave0\Scripts\python.exe -m ruff check apps/api apps/worker db tests
+.\.venv-wave0\Scripts\python.exe -m ruff format --check apps/api apps/worker db tests
+.\.venv-wave0\Scripts\python.exe -m alembic heads
+.\.venv-wave0\Scripts\python.exe -m pytest --collect-only -q tests/integration/test_database.py
+Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+```
+
+Collection does not execute PostgreSQL tests. The sole revision is
+`0001_foundation`; no auth, clinical or job tables are added. The existing
+workflow contains the proposed CI-only commands, including controlled
+`db/roles.sql` provisioning, explicit `python -m alembic -c alembic.ini upgrade head`
+with `CP_MIGRATION_PASSWORD_FILE` mounted only into the one-shot process, and
+`python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py`.
+Those CI commands have **not** been executed for this candidate. Never run this
+suite against a shared database: reset tests create/drop only their generated
+`carepulse_ci_<run>_<attempt>_f04_<suffix>` database inside the guarded disposable
+Compose project. `db/roles.sql` is a fresh-cluster, explicit bootstrap operation;
+normal application startup/readiness never provisions roles or runs migrations.
+The script deliberately fails if these roles already exist instead of modifying
+an existing cluster's principals.
+
 ## Prerequisites and safety
 
 1. Product Owner **approved the exact R1–R4 inputs and conditional R7 synthetic-development recommendations on 2026-10-21**; obtain separate explicit assignment/authorization for each F task. Keep approved Next.js `15.5.28`; do not substitute a newer version to satisfy an advisory or peer conflict. GHSA-4jqv-mc3x-m676 and GHSA-mcj8-r9mp-w47p are patched from `15.5.27`, so `15.5.28` is outside their affected ranges and those two are not blockers. ESLint 9.39.5 is temporarily authorized **only for synthetic development/CI**, with Security/Operations production disposition deferred until before deployment. Other security/advisory checks and full locked transitive verification remain required during F-01/F-06.
