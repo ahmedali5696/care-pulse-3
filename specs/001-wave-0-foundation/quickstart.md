@@ -1,6 +1,6 @@
 # Wave 0 validation guide
 
-**Date:** 2026-10-21 | **Scope:** F-01–F-07 | **State:** Wave 0 implementation started; commands not yet validated unless recorded below
+**Date:** 2026-10-22 | **Scope:** F-01–F-07 | **State:** Wave 0 implemented, tested and CI integration verified for synthetic development; not production ready
 
 This guide originated in planning; its prospective commands are not proof of a successful run. No Docker installation or local Docker command is required or permitted on the Product Owner's workstation.
 
@@ -269,14 +269,20 @@ lookups still use PostgreSQL and fail closed; no login or fallback is enabled.
 An assert-based native local check against unavailable storage confirmed absent
 and forged cookies return null, while a signed nonexistent candidate fails.
 The original HTTP 401/503 assertions are unchanged; corrected CI passed.
-T038's final combined rerun remains pending; neither acceptance nor readiness
-permits operational login, production deployment or a later Wave.
+**T038 final combined verification passed** on
+`731a26b803ea84879d0aab4900c2005ec2a977e2`,
+[run 39782690550](https://github.com/ahmedali5696/care-pulse-3/actions/runs/39782690550),
+attempt 1. Both jobs and all case counts above passed again with no pytest skips;
+all **38 tasks** are complete and **7/7 owner evidence sets** are accepted.
+Neither acceptance nor readiness permits operational login, production deployment
+or a later Wave. See `tasks.md` for final job/image identities, scope review and
+OPEN release gates. Final record-only edits do not change the verified executable.
 
 1. Product Owner **approved the exact R1–R4 inputs and conditional R7 synthetic-development recommendations on 2026-10-21**; obtain separate explicit assignment/authorization for each F task. Keep approved Next.js `15.5.28`; do not substitute a newer version to satisfy an advisory or peer conflict. GHSA-4jqv-mc3x-m676 and GHSA-mcj8-r9mp-w47p are patched from `15.5.27`, so `15.5.28` is outside their affected ranges and those two are not blockers. ESLint 9.39.5 is temporarily authorized **only for synthetic development/CI**, with Security/Operations production disposition deferred until before deployment. Other security/advisory checks and full locked transitive verification remain required during F-01/F-06.
 2. Use the approved Python/Node/pnpm versions, not merely the globally installed ones. Current workstation tools are observations, not approved pins. Existing `.venv`/`node_modules` content is not reproducibility evidence; preserve it and use a clean isolated environment for later checks.
 3. Use synthetic data only. Supply separate ignored test secret files and the full, explicitly labeled synthetic security-policy fixture through the F-03 configuration interface. Never copy fixtures to production, print keys/configuration, or use real operator credentials/email addresses.
 4. CI needs a Docker-capable Linux runner, registry access, the recorded Compose tool version, and an isolated checkout/project/database. Do not execute this guide against a shared or production database. CI reports its run URL, Git revision, logs and sanitized evidence artifacts.
-5. F-01's exact local tools and lockfiles have now been provisioned and tested as recorded above. All later steps must retain approved frozen/hash locks; migrations and CI-only integration are pending and must not be treated as complete.
+5. Exact local tools, frozen/hash locks, baseline migrations and delivered CI-only integration are verified as recorded above. Retain those approved inputs; production approvals and later-Wave functionality remain separate, unimplemented gates.
 
 ## Container-free workstation checks
 
@@ -292,9 +298,9 @@ pnpm install --frozen-lockfile # after selecting Node 24.22.1 and pnpm 10.34.7
 
 `requirements.lock` is the delivered single exact direct/transitive development/test lock for Wave 0; API/worker use the same pinned package set, without separate drifting locks. The pinned/hash-verified pip bootstrap follows Python's security instructions and must precede dependency downloads, including in CI/container builds; it is not a floating auto-upgrade. `packageManager` pins pnpm; the environment must provision that exact version before running it. Do not auto-upgrade pip, dependencies or Next.js. Exact installer/tool versions and selected platform artifacts are recorded by F-01/F-06.
 
-The later F-06 implementation exposes **one small `ops/check.ps1` entrypoint**, compatible with Windows PowerShell **5.1** locally and PowerShell **7** in Linux CI, with one command per check; do not add duplicate wrapper layers. Keep syntax/cmdlets compatible with 5.1 and check `$LASTEXITCODE` immediately after every native command, terminating nonzero on failure. `$ErrorActionPreference` alone does not propagate native failures in both shells; do not depend on PowerShell 7-only native-error preferences.
+F-06 delivers **one `ops/check.ps1` entrypoint**, verified with Windows PowerShell **5.1** locally and pinned PowerShell **7.6.7** in Linux CI, with one command per check; do not add duplicate wrapper layers. Preserve 5.1-compatible syntax/cmdlets and immediate `$LASTEXITCODE` checks after native commands. `$ErrorActionPreference` alone does not propagate native failures in both shells.
 
-| Command (prospective) | Expected local outcome |
+| Delivered command | Verified local outcome |
 |---|---|
 | `powershell.exe -NoProfile -File .\ops\check.ps1 inputs` | Runtime/tool versions and exact direct pins match the approved input record; lock integrity/peer checks pass; reject floating/unapproved inputs. Does not need Docker locally. |
 | `powershell.exe -NoProfile -File .\ops\check.ps1 python-quality` | Ruff formatting check and lint pass; no redundant formatter/linter stack. |
@@ -312,7 +318,7 @@ In a disposable checkout after the focused tests exist, introduce one known fail
 
 T010 creates the initial workflow using direct commands for delivered F-01/F-02 functionality and supplies the first mandatory Linux/container build and runtime/platform/image evidence. F-01 acceptance uses verified inputs and container-free local checks; this staging preserves every original master acceptance requirement, with Linux/container proof still mandatory at T010 and reverified by F-06. T016/T021/T026/T031 extend the same workflow only with delivered owner checks; no earlier acceptance waits for the future F-06 runner, migration or health endpoint.
 
-Once F-06 supplies the runner, in CI's **PowerShell 7**, use `pwsh -NoProfile -File ops/check.ps1 <check>` for the same local-capable check names above, followed by one integration invocation. `pwsh` is a CI runner tool, not a workstation prerequisite:
+In CI's pinned **PowerShell 7.6.7**, use `pwsh -NoProfile -File ops/check.ps1 <check>` for the same local-capable modes above, followed by one integration invocation. `pwsh` is a CI runner tool, not a workstation prerequisite:
 
 ```powershell
 pwsh -NoProfile -File ops/check.ps1 integration
@@ -320,15 +326,13 @@ pwsh -NoProfile -File ops/check.ps1 integration
 
 F-06's integration mode runs one Compose topology with disposable real PostgreSQL, the approved container pins and a test target containing the existing pytest tooling. It activates `mail` for F-07 checks; `scan` remains optional. Keep one workflow with a container-free job and one dependent Compose integration job; no OS/database/version matrix, parallel database harness, extra frontend test framework or production deployment job.
 
-The integration command must provide these observable stages (standard underlying commands shown for review; **CI only**):
+The delivered integration command performs quiet config, pinned build, controlled
+roles/one-shot migration, private service boot, all delivered suites, failure and
+recovery scenarios, canary scans and scoped cleanup. Invoke it only through the
+same CI entrypoint after the workflow's approved tool/secret-path setup:
 
-```text
-docker compose --profile mail config --quiet
-docker compose --profile mail build
-docker compose up -d db
-docker compose run --rm api alembic upgrade head
-docker compose --profile mail up -d --wait
-docker compose run --rm api python -m pytest tests/integration
+```powershell
+pwsh -NoProfile -File ops/check.ps1 integration
 ```
 
 Migration invocation uses the explicitly scoped migration credential, **not** the API runtime service credential. The check runner supplies a narrowly scoped one-shot test/migration override; normal API/web/worker containers never receive DDL credentials. No migration-on-web-startup hook. Compose commands use a unique CI project name and ignored/CI-mounted secret files. Execute host-published web-port response and localhost API/DB denial checks directly on the CI runner; execute private service connectivity checks from the network-attached test container, using the expected FastAPI 404 before F-05 health exists. Record each probe's vantage point. These checks prove absent host-published API/DB endpoints, not that Docker bridge networking prevents privileged host access. Readiness checks execute from the appropriate private network. Never echo fully interpolated config, environment, connection URLs or secret files.
