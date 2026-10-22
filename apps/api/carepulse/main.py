@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from carepulse.config import load_config
 from carepulse.health import router as health_router
+from carepulse.identity.boundary import ClosedServiceBoundary
 
 
 @asynccontextmanager
@@ -24,3 +25,4 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(health_router)
+app.add_middleware(ClosedServiceBoundary)

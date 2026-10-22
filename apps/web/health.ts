@@ -1,29 +1,12 @@
 // Server-only operational dependencies; no session/schema creation or diagnostics.
 import { createConnection } from "node:net";
-import { Pool, type PoolClient } from "pg";
+import type { PoolClient } from "pg";
 import { loadWebConfig } from "./config";
+import { runtimeDatabase } from "./db";
 
 const DEPENDENCY_TIMEOUT_MS = 1000;
 export const PROBE_DEADLINE_MS = 4000;
-let database: Pool | undefined;
 type WebConfig = ReturnType<typeof loadWebConfig>;
-
-function runtimeDatabase(config: WebConfig): Pool {
-  if (!database) {
-    database = new Pool({
-      host: config.database.host, port: config.database.port,
-      database: config.database.name, user: config.database.user,
-      password: config.database.password, max: 2,
-      connectionTimeoutMillis: DEPENDENCY_TIMEOUT_MS,
-      query_timeout: DEPENDENCY_TIMEOUT_MS,
-      statement_timeout: DEPENDENCY_TIMEOUT_MS,
-      lock_timeout: DEPENDENCY_TIMEOUT_MS,
-    });
-    // pg removes failed idle sockets; the next probe observes dependency state.
-    database.on("error", () => {});
-  }
-  return database;
-}
 
 async function databaseReady(config: WebConfig): Promise<boolean> {
   let client: PoolClient | undefined;

@@ -1,5 +1,10 @@
 .git
 .gitignore
+**/Dockerfile*
+.dockerignore
+coverage
+dist
+build
 .agents
 .dsh
 .opencode

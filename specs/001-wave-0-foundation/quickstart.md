@@ -209,6 +209,51 @@ DB shutdown, baseline mutation or restart against shared services.
 
 ## Prerequisites and safety
 
+### Pending F-07/F-06 candidate (2026-10-22)
+
+Both remaining lanes and T038 are now explicitly assigned, but the uncommitted
+candidate is **not accepted**. Windows virtual-memory exhaustion prevented
+meaningful web/check-runner validation; even Ruff later failed allocating 9,480
+bytes. See the resumption record in `tasks.md` for exact failures and partial
+results. Do not repeat memory workarounds, change approved tools or infer a pass.
+Free workstation commit/virtual-memory capacity before retrying.
+
+The candidate `ops/check.ps1` uses tools on `PATH`; select the existing approved
+isolated tools without changing global installations:
+
+```powershell
+$env:PATH = "$PWD\.venv-wave0\Scripts;$PWD\.tools\node-v24.22.1-win-x64;$PWD\.tools\pnpm\node_modules\.bin;$env:PATH"
+powershell.exe -NoProfile -File .\ops\check.ps1 inputs
+powershell.exe -NoProfile -File .\ops\check.ps1 python-quality
+powershell.exe -NoProfile -File .\ops\check.ps1 unit
+powershell.exe -NoProfile -File .\ops\check.ps1 imports
+powershell.exe -NoProfile -File .\ops\check.ps1 web
+```
+
+These commands are **pending successful reproduction**, not green evidence.
+`integration` refuses workstation invocation before probing Docker; only pinned
+Linux CI with an explicitly matching disposable project may run it. The revised
+single workflow delegates its checks to the common entrypoint and retains the
+accepted bootstrap/tool pins. Candidate HTTP/mail/PG checks have not run.
+Native TypeScript private smoke commands inside CI's web container are
+`node --experimental-strip-types mail/smoke.ts auth` and
+`node --experimental-strip-types mail/smoke.ts mail`; no public auth/mail route,
+working account or D-02 schema is introduced. Both commands are unverified.
+
+The input checker prints raw and canonical-LF lock hashes; LF normalization makes
+reviewed source bytes comparable across Windows checkout conversion and Linux.
+It does not change package artifact SHA-256 verification. A direct import of
+already-locked `starlette==1.9.0` is recorded in `requirements.in`; both complete
+locks and all approved distribution versions remain unchanged.
+
+**Local resumption update:** the five commands above now all pass under approved
+Windows PowerShell 5.1/tool versions: **439 tests**, Ruff format/lint, shared
+imports/sole Alembic head, frozen inputs and Next type/lint/build. An isolated
+post-implementation fault returned runner exit 1 (1 failed/439 passed); removing
+only the fault restored 439 passes/exit 0. See `tasks.md` for exact fault/advisory
+evidence. This supersedes the earlier local-resource block, not pending CI.
+The two private native-TypeScript/HTTP/mail smoke modes remain CI-unverified.
+
 1. Product Owner **approved the exact R1–R4 inputs and conditional R7 synthetic-development recommendations on 2026-10-21**; obtain separate explicit assignment/authorization for each F task. Keep approved Next.js `15.5.28`; do not substitute a newer version to satisfy an advisory or peer conflict. GHSA-4jqv-mc3x-m676 and GHSA-mcj8-r9mp-w47p are patched from `15.5.27`, so `15.5.28` is outside their affected ranges and those two are not blockers. ESLint 9.39.5 is temporarily authorized **only for synthetic development/CI**, with Security/Operations production disposition deferred until before deployment. Other security/advisory checks and full locked transitive verification remain required during F-01/F-06.
 2. Use the approved Python/Node/pnpm versions, not merely the globally installed ones. Current workstation tools are observations, not approved pins. Existing `.venv`/`node_modules` content is not reproducibility evidence; preserve it and use a clean isolated environment for later checks.
 3. Use synthetic data only. Supply separate ignored test secret files and the full, explicitly labeled synthetic security-policy fixture through the F-03 configuration interface. Never copy fixtures to production, print keys/configuration, or use real operator credentials/email addresses.
