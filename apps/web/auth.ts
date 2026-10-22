@@ -10,6 +10,8 @@ function createAuth() {
     baseURL: "http://localhost:3000",
     secret: config.authSecret,
     database: runtimeDatabase(config),
+    // shortcut: no D-02 tables in Wave 0, restore schema preflight with D-02; real lookups still fail closed.
+    advanced: { database: { validateSchema: false } },
     session: { cookieCache: { enabled: false } },
     emailAndPassword: { enabled: false, disableSignUp: true },
     // Adapter failures are translated at the boundary, not logged with SQL.

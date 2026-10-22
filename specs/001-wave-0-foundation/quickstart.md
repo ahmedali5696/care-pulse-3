@@ -209,14 +209,14 @@ DB shutdown, baseline mutation or restart against shared services.
 
 ## Prerequisites and safety
 
-### Pending F-07/F-06 candidate (2026-10-22)
+### F-07/F-06 candidate validation (2026-10-22)
 
-Both remaining lanes and T038 are now explicitly assigned, but the uncommitted
-candidate is **not accepted**. Windows virtual-memory exhaustion prevented
-meaningful web/check-runner validation; even Ruff later failed allocating 9,480
-bytes. See the resumption record in `tasks.md` for exact failures and partial
-results. Do not repeat memory workarounds, change approved tools or infer a pass.
-Free workstation commit/virtual-memory capacity before retrying.
+Both remaining lanes and T038 are explicitly assigned. Candidate
+`41e8e3d207723cfc692dcff2b03904ebebb50097` passes all five local modes; CI
+acceptance is pending [run 39778108715](https://github.com/ahmedali5696/care-pulse-3/actions/runs/39778108715).
+The earlier Windows virtual-memory block cleared without OS/tool changes. See
+the resumption record in `tasks.md` for both the failures and subsequent passes;
+do not infer CI acceptance from local results.
 
 The candidate `ops/check.ps1` uses tools on `PATH`; select the existing approved
 isolated tools without changing global installations:
@@ -230,7 +230,7 @@ powershell.exe -NoProfile -File .\ops\check.ps1 imports
 powershell.exe -NoProfile -File .\ops\check.ps1 web
 ```
 
-These commands are **pending successful reproduction**, not green evidence.
+These five local commands have passed; candidate CI remains unverified.
 `integration` refuses workstation invocation before probing Docker; only pinned
 Linux CI with an explicitly matching disposable project may run it. The revised
 single workflow delegates its checks to the common entrypoint and retains the
@@ -253,6 +253,16 @@ post-implementation fault returned runner exit 1 (1 failed/439 passed); removing
 only the fault restored 439 passes/exit 0. See `tasks.md` for exact fault/advisory
 evidence. This supersedes the earlier local-resource block, not pending CI.
 The two private native-TypeScript/HTTP/mail smoke modes remain CI-unverified.
+
+First combined run `39778108715` failed the anonymous BFF status check (503
+instead of 401), despite passing builds/unit/PG/health and both SMTP deliveries.
+Correction 1 defers Better Auth 1.7.12's eager schema diagnostic using supported
+`advanced.database.validateSchema: false` for the closed Wave 0 adapter. D-02 must
+restore/review that preflight when it provides tables. Real signed session
+lookups still use PostgreSQL and fail closed; no login or fallback is enabled.
+An assert-based native local check against unavailable storage confirmed absent
+and forged cookies return null, while a signed nonexistent candidate fails.
+The original HTTP 401/503 assertions are unchanged; corrected CI is pending.
 
 1. Product Owner **approved the exact R1–R4 inputs and conditional R7 synthetic-development recommendations on 2026-10-21**; obtain separate explicit assignment/authorization for each F task. Keep approved Next.js `15.5.28`; do not substitute a newer version to satisfy an advisory or peer conflict. GHSA-4jqv-mc3x-m676 and GHSA-mcj8-r9mp-w47p are patched from `15.5.27`, so `15.5.28` is outside their affected ranges and those two are not blockers. ESLint 9.39.5 is temporarily authorized **only for synthetic development/CI**, with Security/Operations production disposition deferred until before deployment. Other security/advisory checks and full locked transitive verification remain required during F-01/F-06.
 2. Use the approved Python/Node/pnpm versions, not merely the globally installed ones. Current workstation tools are observations, not approved pins. Existing `.venv`/`node_modules` content is not reproducibility evidence; preserve it and use a clean isolated environment for later checks.

@@ -24,6 +24,9 @@ async function smoke() {
       assert.equal(auth.options.emailAndPassword?.disableSignUp, true);
       assert.equal("socialProviders" in auth.options, false);
       assert.equal("plugins" in auth.options, false);
+      for (const cookie of ["", "better-auth.session_token=forged; better-auth.session_data=forged"]) {
+        assert.equal(await auth.api.getSession({ headers: new Headers({ cookie }) }), null);
+      }
       const context = await auth.$context;
       const token = "synthetic-nonexistent-session";
       const signature = createHmac("sha256", config.authSecret).update(token).digest("base64");
