@@ -211,9 +211,10 @@ DB shutdown, baseline mutation or restart against shared services.
 
 ### F-07/F-06 candidate validation (2026-10-22)
 
-Both remaining lanes and T038 are explicitly assigned. Candidate
-`41e8e3d207723cfc692dcff2b03904ebebb50097` passes all five local modes; CI
-acceptance is pending [run 39778108715](https://github.com/ahmedali5696/care-pulse-3/actions/runs/39778108715).
+Both remaining lanes and T038 are explicitly assigned. F-06/F-07 are **CI
+integration verified/accepted** on corrected executable
+`380e1eeb0d3a66263c92364f350f13ebd872eef0` in
+[run 39780603529](https://github.com/ahmedali5696/care-pulse-3/actions/runs/39780603529).
 The earlier Windows virtual-memory block cleared without OS/tool changes. See
 the resumption record in `tasks.md` for both the failures and subsequent passes;
 do not infer CI acceptance from local results.
@@ -230,7 +231,7 @@ powershell.exe -NoProfile -File .\ops\check.ps1 imports
 powershell.exe -NoProfile -File .\ops\check.ps1 web
 ```
 
-These five local commands have passed; candidate CI remains unverified.
+These five local commands and the corresponding Linux CI modes have passed.
 `integration` refuses workstation invocation before probing Docker; only pinned
 Linux CI with an explicitly matching disposable project may run it. The revised
 single workflow delegates its checks to the common entrypoint and retains the
@@ -252,7 +253,12 @@ imports/sole Alembic head, frozen inputs and Next type/lint/build. An isolated
 post-implementation fault returned runner exit 1 (1 failed/439 passed); removing
 only the fault restored 439 passes/exit 0. See `tasks.md` for exact fault/advisory
 evidence. This supersedes the earlier local-resource block, not pending CI.
-The two private native-TypeScript/HTTP/mail smoke modes remain CI-unverified.
+Both private native-TypeScript/HTTP/mail smoke modes now pass in CI: **14
+auth/mail cases**, exactly two synthetic Mailpit deliveries, no BFF passthrough,
+missing storage 503, missing-mail transport failure and subsequent recovery.
+The same run passed **439 unit**, **30 PostgreSQL**, **3+3 topology/persistence**,
+**34 consuming-process** and **10 health** case invocations, seven startup
+denials and all canary scans. See `tasks.md` for pinned job IDs and evidence.
 
 First combined run `39778108715` failed the anonymous BFF status check (503
 instead of 401), despite passing builds/unit/PG/health and both SMTP deliveries.
@@ -262,7 +268,9 @@ restore/review that preflight when it provides tables. Real signed session
 lookups still use PostgreSQL and fail closed; no login or fallback is enabled.
 An assert-based native local check against unavailable storage confirmed absent
 and forged cookies return null, while a signed nonexistent candidate fails.
-The original HTTP 401/503 assertions are unchanged; corrected CI is pending.
+The original HTTP 401/503 assertions are unchanged; corrected CI passed.
+T038's final combined rerun remains pending; neither acceptance nor readiness
+permits operational login, production deployment or a later Wave.
 
 1. Product Owner **approved the exact R1–R4 inputs and conditional R7 synthetic-development recommendations on 2026-10-21**; obtain separate explicit assignment/authorization for each F task. Keep approved Next.js `15.5.28`; do not substitute a newer version to satisfy an advisory or peer conflict. GHSA-4jqv-mc3x-m676 and GHSA-mcj8-r9mp-w47p are patched from `15.5.27`, so `15.5.28` is outside their affected ranges and those two are not blockers. ESLint 9.39.5 is temporarily authorized **only for synthetic development/CI**, with Security/Operations production disposition deferred until before deployment. Other security/advisory checks and full locked transitive verification remain required during F-01/F-06.
 2. Use the approved Python/Node/pnpm versions, not merely the globally installed ones. Current workstation tools are observations, not approved pins. Existing `.venv`/`node_modules` content is not reproducibility evidence; preserve it and use a clean isolated environment for later checks.
