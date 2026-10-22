@@ -103,13 +103,18 @@ def test_restart_rejects_old_identity_until_fresh_matching_status(heartbeat):
     assert status.probe_status(heartbeat, "ready", os.getpid())
 
 
-def test_dead_process_and_missing_or_malformed_status_fail(heartbeat, monkeypatch):
-    def dead_process(pid):
-        raise FileNotFoundError("Synthetic terminated process")
+@pytest.mark.parametrize("failure", ["dead_process", "malformed", "missing"])
+def test_unusable_process_or_status_fails_independently(
+    heartbeat, monkeypatch, failure
+):
+    if failure == "dead_process":
 
-    monkeypatch.setattr(status, "process_identity", dead_process)
-    assert not status.probe_status(heartbeat, "live", os.getpid())
-    heartbeat.write_text("malformed")
-    assert not status.probe_status(heartbeat, "ready", os.getpid())
-    heartbeat.unlink()
+        def dead_process(pid):
+            raise FileNotFoundError("Synthetic terminated process")
+
+        monkeypatch.setattr(status, "process_identity", dead_process)
+    elif failure == "malformed":
+        heartbeat.write_text("malformed")
+    else:
+        heartbeat.unlink()
     assert not status.probe_status(heartbeat, "live", os.getpid())

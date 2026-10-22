@@ -188,7 +188,7 @@ rtk proxy pnpm lint
 These local checks passed; integration collection is not execution. Local Next
 build was not attempted under observed Windows virtual-memory pressure; clean
 Linux/Next/container builds and all actual service scenarios remain required in
-the existing CI workflow. F-05 acceptance is pending that candidate run.
+the existing CI workflow. F-05 passed on `2f25da0c55d09c4bad5a9611312f04f24da0c85e` in [run 39763868797](https://github.com/ahmedali5696/care-pulse-3/actions/runs/39763868797): 422 CI unit cases, 30 PostgreSQL cases and 9 running-service health cases across seven invocations, with all prior topology/secret checks and cleanup green. Final independent status-case fixtures bring the current local unit total to 424; that count does not replace the pinned run count. See T026 in [tasks.md](tasks.md) for evidence and the Phase 4 stop.
 
 Private HTTP probes: `GET /health/live`, `GET /health/ready` (web and API);
 exact bodies and `Cache-Control: no-store` are defined in the existing contract.
