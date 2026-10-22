@@ -131,6 +131,16 @@ pinned_lines(Path('apps/web/Dockerfile').read_text(), ('RUN npm install', 'RUN p
     'RUN pnpm install --frozen-lockfile',
     'RUN pnpm --filter @carepulse/web build',
 ], 'web Docker pnpm bootstrap')
+# Guard the complete executable inputs too: an inserted downloader or RUN line
+# must not bypass checks by leaving all approved lines intact.
+approved_bootstrap_files = {
+    '.github/workflows/foundation.yml': 'd4a99d322014183cf672d30b3633e00999856a68634d394f9838dc69122001a7',
+    'apps/api/Dockerfile': '293af5bb74f261da9d70fe314241b897b4452e116617758889a9b2dbecfc942a',
+    'apps/web/Dockerfile': '611bacc8415759957ecf813a220303aa7adc6d2f12eade10cb64e9f99b7560b1',
+}
+for filename, approved in approved_bootstrap_files.items():
+    canonical = Path(filename).read_bytes().replace(b'\r\n', b'\n')
+    require(hashlib.sha256(canonical).hexdigest() == approved, filename + ' executable input drift')
 print('PASS approved manifests, complete locks, installed Python closure, private workspace and image inputs')
 '@
             $verify | & python -

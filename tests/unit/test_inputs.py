@@ -263,3 +263,41 @@ def test_commented_checkout_pin_cannot_hide_unapproved_action(checkout):
     completed = _check(checkout)
     assert completed.returncode != 0
     assert "immutable action references" in completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("filename", "needle", "injection"),
+    [
+        (
+            ".github/workflows/foundation.yml",
+            'tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"',
+            'command curl -fsSL -o "$RUNNER_TEMP/pwsh.tar.gz"'
+            " https://example.invalid/unapproved.tar.gz",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "sudo systemctl restart docker",
+            "sudo apt install -y docker-compose-plugin",
+        ),
+        (
+            "apps/web/Dockerfile",
+            "RUN pnpm install --frozen-lockfile",
+            "RUN npm i -g pnpm@latest",
+        ),
+        (
+            "apps/api/Dockerfile",
+            "COPY requirements.lock /srv/requirements.lock",
+            "RUN python3 -m pip install --no-cache-dir pip",
+        ),
+    ],
+)
+def test_extra_executable_install_or_download_is_rejected(
+    checkout, filename, needle, injection
+):
+    target = checkout / filename
+    content = target.read_text()
+    assert needle in content
+    target.write_text(content.replace(needle, injection + "\n          " + needle, 1))
+    completed = _check(checkout)
+    assert completed.returncode != 0
+    assert filename + " executable input drift" in completed.stdout + completed.stderr
