@@ -271,8 +271,7 @@ def test_commented_checkout_pin_cannot_hide_unapproved_action(checkout):
         (
             ".github/workflows/foundation.yml",
             'tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"',
-            'command curl -fsSL -o "$RUNNER_TEMP/pwsh.tar.gz"'
-            " https://example.invalid/unapproved.tar.gz",
+            'command curl -fsSL -o "$RUNNER_TEMP/pwsh.tar.gz" https://example.invalid/bad',
         ),
         (
             ".github/workflows/foundation.yml",
