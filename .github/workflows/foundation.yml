@@ -67,7 +67,7 @@ jobs:
           "$PY" -c 'import pip, sys; assert pip.__version__ == "26.2.2"; assert sys.version_info[:3] == (3, 13, 16)'
           "$PY" -m pip install --require-hashes --only-binary=:all: -r requirements.lock
           "$PY" -m pip check
-          PYTHONPATH=apps/api:. "$PY" -c 'from carepulse.main import app; import apps.worker.main; assert {r.path for r in app.routes} == {"/health/live", "/health/ready"}'
+          PYTHONPATH=apps/api:. "$PY" -c 'from carepulse.main import app; import apps.worker.main; assert set(app.openapi()["paths"]) == {"/health/live", "/health/ready"}; assert app.openapi_url is None'
           "$PY" -m ruff check apps/api apps/worker db tests
           "$PY" -m ruff format --check apps/api apps/worker db tests
           PYTHONPATH=apps/api:. "$PY" -m pytest -q tests/unit/test_config.py tests/unit/test_db.py tests/unit/test_health.py
