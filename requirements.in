@@ -1,0 +1,11 @@
+# F-01 approved Python runtime: standard-GIL CPython 3.13.16, pip 26.2.2.
+# Single exact dependency source for API, worker and tests.
+fastapi==0.158.1
+# Direct ASGI boundary types; exact version already in the reviewed shared lock.
+starlette==1.9.0
+uvicorn==0.54.0
+SQLAlchemy==2.0.55
+psycopg[binary]==3.3.6
+alembic==1.20.0
+pytest==9.1.1
+ruff==0.17.1

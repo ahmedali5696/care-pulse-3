@@ -1,0 +1,161 @@
+name: Foundation
+
+on:
+  push:
+    branches: [feature/wave-0-foundation, development]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inputs-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify runner and install pinned PowerShell 7
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$ImageOS" = ubuntu24
+          echo "Runner: $ImageOS $ImageVersion, $(uname -sm), SHA $GITHUB_SHA"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/pwsh.tar.gz" https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-linux-x64.tar.gz
+          echo "6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431  $RUNNER_TEMP/pwsh.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/pwsh"
+          tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"
+          chmod +x "$RUNNER_TEMP/pwsh/pwsh"
+          echo "$RUNNER_TEMP/pwsh" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/pwsh/pwsh" -NoProfile -Command 'if ($PSVersionTable.PSVersion.ToString() -ne "7.6.7") { exit 1 }'
+
+      - name: Build exact CPython 3.13.16 from verified official source
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Exclude the unrelated hosted Microsoft apt feed, which may return 403.
+          for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            if [ -f "$source" ] && grep -Fq 'packages.microsoft.com/ubuntu/24.04/prod' "$source"; then
+              sudo mv "$source" "$source.carepulse-ci-disabled"
+            fi
+          done
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev uuid-dev
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/Python-3.13.16.tar.xz" https://www.python.org/ftp/python/3.13.16/Python-3.13.16.tar.xz
+          echo "f4b1bfb3c79b5bb11b8d228a12504163b4c0dab4d679828d8f5f26b6cb6ab35d  $RUNNER_TEMP/Python-3.13.16.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/python-src"
+          tar -xJf "$RUNNER_TEMP/Python-3.13.16.tar.xz" -C "$RUNNER_TEMP/python-src" --strip-components=1
+          cd "$RUNNER_TEMP/python-src"
+          ./configure --prefix="$RUNNER_TEMP/python-3.13.16" --with-ensurepip=install > "$RUNNER_TEMP/python-configure.log" 2>&1
+          make -j 4 > "$RUNNER_TEMP/python-make.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/python-make.log"; exit 1; }
+          make install > "$RUNNER_TEMP/python-install.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/python-install.log"; exit 1; }
+          "$RUNNER_TEMP/python-3.13.16/bin/python3.13" -m venv "$RUNNER_TEMP/foundation-venv"
+
+      - name: Secure installer bootstrap and frozen dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$RUNNER_TEMP/foundation-venv/bin/python"
+          "$PY" -m pip install --no-cache-dir "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+          "$PY" -c 'import pip, sys; assert pip.__version__ == "26.2.2"; assert sys.version_info[:3] == (3, 13, 16)'
+          "$PY" -m pip install --require-hashes --only-binary=:all: -r requirements.lock
+          echo "$RUNNER_TEMP/foundation-venv/bin" >> "$GITHUB_PATH"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/node.tar.xz" https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz
+          echo "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6  $RUNNER_TEMP/node.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/node.tar.xz" -C "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/node-v24.22.1-linux-x64/bin:$PATH"
+          test "$(node --version)" = v24.22.1
+          npm install --global --ignore-scripts --no-audit --no-fund pnpm@10.34.7
+          echo "$RUNNER_TEMP/node-v24.22.1-linux-x64/bin" >> "$GITHUB_PATH"
+
+      - name: Common pinned inputs, quality, unit, imports and web gates
+        shell: pwsh
+        run: |
+          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
+          foreach ($check in @('inputs', 'python-quality', 'unit', 'imports', 'web')) {
+            & pwsh -NoProfile -File ops/check.ps1 $check
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+  compose-integration:
+    needs: inputs-and-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      COMPOSE_PROJECT_NAME: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CP_CI_PROJECT: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set runner-scoped synthetic secret paths and environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "CP_DB_PASSWORD_FILE=$RUNNER_TEMP/foundation-ci-private/postgres-password"
+            echo "CP_RUNTIME_DB_PASSWORD_FILE=$RUNNER_TEMP/foundation-ci-private/runtime-db-password"
+            echo "CP_MIGRATION_SECRET_FILE=$RUNNER_TEMP/foundation-ci-private/migration-password"
+            echo "CP_OPERATOR_SECRET_FILE=$RUNNER_TEMP/foundation-ci-private/operator-password"
+            echo "CP_SERVICE_KEY_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/service-key"
+            echo "CP_AUTH_SECRET_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/auth-secret"
+            echo "CP_FILE_ENCRYPTION_KEY_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/file-key"
+            echo "CP_ACTIVE_POLICY_SOURCE_FILE=$GITHUB_WORKSPACE/tests/fixtures/foundation-policy.json"
+            echo "CP_ENV=test"
+            echo "CP_SYNTHETIC_TEST_PROFILE=true"
+            echo "CP_DB_HOST=db"
+            echo "CP_DB_PORT=5432"
+            echo "CP_DB_NAME=carepulse"
+            echo "CP_DB_USER=carepulse_runtime"
+            echo "CP_INTERNAL_API_URL=http://api:8000"
+            echo "CP_MAIL_ENABLED=false"
+            echo "CP_SCAN_ENABLED=false"
+          } >> "$GITHUB_ENV"
+
+      - name: Install approved PowerShell, Docker Engine and plugins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$ImageOS" = ubuntu24
+          echo "Runner: $ImageOS $ImageVersion, $(uname -sm), SHA $GITHUB_SHA"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/pwsh.tar.gz" https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-linux-x64.tar.gz
+          echo "6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431  $RUNNER_TEMP/pwsh.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/pwsh"
+          tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"
+          chmod +x "$RUNNER_TEMP/pwsh/pwsh"
+          echo "$RUNNER_TEMP/pwsh" >> "$GITHUB_PATH"
+          for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            if [ -f "$source" ] && grep -Fq 'packages.microsoft.com/ubuntu/24.04/prod' "$source"; then
+              sudo mv "$source" "$source.carepulse-ci-disabled"
+            fi
+          done
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+          sudo chmod a+r /etc/apt/keyrings/docker.gpg
+          echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable' | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y --allow-downgrades \
+            docker-ce=5:29.9.2-1~ubuntu.24.04~noble \
+            docker-ce-cli=5:29.9.2-1~ubuntu.24.04~noble \
+            containerd.io=2.4.2-3~ubuntu.24.04~noble \
+            docker-compose-plugin=5.6.1-1~ubuntu.24.04~noble \
+            docker-buildx-plugin=0.38.1-1~ubuntu.24.04~noble
+          sudo systemctl restart docker
+          test "$(docker version --format '{{.Server.Version}}')" = 29.9.2
+          test "$(docker version --format '{{.Client.Version}}')" = 29.9.2
+          test "$(docker compose version --short)" = 5.6.1
+          docker buildx version | grep -F 'v0.38.1'
+          test "$(dpkg-query -W -f='${Version}' containerd.io)" = '2.4.2-3~ubuntu.24.04~noble'
+
+      - name: Common disposable integration and scoped cleanup
+        shell: pwsh
+        run: |
+          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
+          & pwsh -NoProfile -File ops/check.ps1 integration
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

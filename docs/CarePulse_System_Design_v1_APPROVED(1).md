@@ -15,7 +15,7 @@
 - **UI Standards:** Responsive desktop/tablet layouts, accessible components, consistent design tokens, and appropriate loading, empty, and error states.
 - **Backend:** Python + FastAPI, serving as the sole owner of business logic and clinical operations.
 - **BFF:** Next.js handles authentication and forwards requests to FastAPI over a secured internal network.
-- **Deployment:** Docker Compose, initially for local development, followed by self-hosted production deployment with an HTTPS reverse proxy.
+- **Deployment:** Docker Compose for the approved containerized development/test topology and later self-hosted production deployment with an HTTPS reverse proxy. Docker/Compose runs in a Docker-capable CI environment for development verification, not on the Product Owner's workstation.
 - **Dependencies:** pnpm with a committed lockfile and reproducible installations. Use verified compatible versions and review security advisories before deployment. No additional state-management or UI frameworks unless required.
 
 ## 2. Authentication & Authorization
@@ -49,7 +49,7 @@
 - **Private Encrypted File Storage** on a protected volume.
 - Files undergo MIME type validation, size validation, malware scanning, and quarantine checks before becoming accessible.
 - File downloads require authorization; public file URLs are prohibited.
-- A free SMTP relay, where a suitable free plan is available, handles staff invitations and account recovery. Mailpit is used for local development.
+- A free SMTP relay, where a suitable free plan is available, handles staff invitations and account recovery. Mailpit is used for development/test email verification in CI (no local Docker required).
 - PDF/CSV exports are restricted to a single patient's data for the clinic owner and include an attachment manifest.
 
 ## 6. Operations & Quality
@@ -58,6 +58,7 @@
 - Database migrations, independently encrypted backups of database records and attachments, and restoration tests are required.
 - Integration tests cover concurrency, RLS, state machines, session revocation, and file security.
 - Development and production environments have separate configurations and secrets. Logging must not expose clinical or other sensitive patient information.
+- **Workstation limitation (2026-10-21):** Docker is unavailable locally and cannot be installed; agents MUST NOT attempt local Docker installation or require local Compose execution. Run available container-free checks locally and prove Compose, PostgreSQL integration/concurrency, network isolation, and container builds in CI. Unexecuted checks remain unverified, and production gates remain unchanged.
 
 ## 7. Scope & Release Gates
 

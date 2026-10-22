@@ -1,0 +1,15 @@
+{
+  "name": "care-pulse-3",
+  "private": true,
+  "packageManager": "pnpm@10.34.7",
+  "engines": {
+    "node": "24.22.1",
+    "pnpm": "10.34.7"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @carepulse/web dev",
+    "typecheck": "pnpm --filter @carepulse/web typecheck",
+    "lint": "pnpm --filter @carepulse/web lint",
+    "build": "pnpm --filter @carepulse/web build"
+  }
+}
