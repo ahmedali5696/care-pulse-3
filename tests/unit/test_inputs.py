@@ -28,6 +28,7 @@ def checkout(tmp_path):
         "apps/api/Dockerfile",
         "compose.yaml",
         ".github/workflows/foundation.yml",
+        "tests/integration/test_auth_mail.py",
     ):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -99,6 +100,20 @@ def _native_stub(checkout, name, body):
             (str(directory), str(Path(sys.executable).parent), os.environ["PATH"])
         ),
     }
+
+
+def test_missing_f07_suite_fails_before_docker(checkout):
+    suite = checkout / "tests/integration/test_auth_mail.py"
+    assert suite.is_file()
+    suite.unlink()
+    marker = checkout / "docker-was-called"
+    env = _native_stub(checkout, "docker", f'echo called > "{marker}"\nexit 1\n')
+    completed = _check(checkout, "integration", env)
+    assert completed.returncode != 0
+    assert (
+        "Missing required F-07 integration test" in completed.stdout + completed.stderr
+    )
+    assert not marker.exists()
 
 
 def test_runtime_version_mismatch_is_rejected(checkout):

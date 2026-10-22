@@ -171,6 +171,9 @@ print('PASS approved manifests, complete locks, installed Python closure, privat
             Invoke-Checked python @('-m', 'alembic', 'heads')
         }
         'integration' {
+            if (-not (Test-Path -LiteralPath 'tests/integration/test_auth_mail.py' -PathType Leaf)) {
+                throw 'Missing required F-07 integration test: tests/integration/test_auth_mail.py'
+            }
             if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Linux' -or $PSVersionTable.PSVersion.Major -lt 7) {
                 throw 'Integration requires Docker-capable Linux CI and PowerShell 7; no local Docker probe performed'
             }
@@ -395,31 +398,29 @@ for service in api web worker; do
   done
 done
 # F-07 is independently executable without D-02 tables or a fake identity.
-if [ -f tests/integration/test_auth_mail.py ]; then
-  docker compose exec -T web node --experimental-strip-types mail/smoke.ts auth
-  docker compose exec -T web node --experimental-strip-types mail/smoke.ts mail
-  docker compose --profile test run --rm --no-deps \
-    -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
-    -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
-    -v "$CP_SERVICE_KEY_SOURCE_FILE:/run/secrets/service_key:ro" \
-    test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_auth_mail.py
-  docker compose logs --no-color api > "$private/auth-logs"
-  if grep -Fq '__foundation_bff_must_not_forward__' "$private/auth-logs"; then
-    echo 'FAIL BFF forwarded a protected request'; exit 1
-  else
-    code=$?; if [ "$code" -ne 1 ]; then echo 'FAIL API no-passthrough log scan'; exit 1; fi
-  fi
-  # Demonstrate that the same real transport fails, rather than selecting a relay.
-  docker compose --profile mail stop mail
-  set +e
-  timeout 15s docker compose exec -T web node --experimental-strip-types mail/smoke.ts mail > "$private/mail-denial.log" 2>&1
-  code=$?
-  set -e
-  cat "$private/mail-denial.log" >> "$private/denials.log"
-  if [ "$code" -eq 0 ] || [ "$code" -eq 124 ]; then echo 'FAIL missing Mailpit did not fail bounded smoke'; exit 1; fi
-  docker compose --profile mail start mail
-  health_case healthy tests/integration/test_health.py::test_running_service_state
+docker compose exec -T web node --experimental-strip-types mail/smoke.ts auth
+docker compose exec -T web node --experimental-strip-types mail/smoke.ts mail
+docker compose --profile test run --rm --no-deps \
+  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$CP_SERVICE_KEY_SOURCE_FILE:/run/secrets/service_key:ro" \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_auth_mail.py
+docker compose logs --no-color api > "$private/auth-logs"
+if grep -Fq '__foundation_bff_must_not_forward__' "$private/auth-logs"; then
+  echo 'FAIL BFF forwarded a protected request'; exit 1
+else
+  code=$?; if [ "$code" -ne 1 ]; then echo 'FAIL API no-passthrough log scan'; exit 1; fi
 fi
+# Demonstrate that the same real transport fails, rather than selecting a relay.
+docker compose --profile mail stop mail
+set +e
+timeout 15s docker compose exec -T web node --experimental-strip-types mail/smoke.ts mail > "$private/mail-denial.log" 2>&1
+code=$?
+set -e
+cat "$private/mail-denial.log" >> "$private/denials.log"
+if [ "$code" -eq 0 ] || [ "$code" -eq 124 ]; then echo 'FAIL missing Mailpit did not fail bounded smoke'; exit 1; fi
+docker compose --profile mail start mail
+health_case healthy tests/integration/test_health.py::test_running_service_state
 docker compose logs --no-color web api worker > "$private/runtime-logs"
 if grep -aF -f "$private/canaries" "$private/runtime-logs" "$private/denials.log" > /dev/null; then
   echo 'FAIL synthetic key in runtime/denial logs'; exit 1
@@ -434,9 +435,7 @@ fi
   echo '- F-03 process denials, source/build/image/history/runtime secret scans: passed'
   echo '- F-04 sole baseline, reset/rollback/privilege and same-connection context cases: passed'
   echo '- F-05 bounded status/failure/recovery/restart and fresh worker identity: passed'
-  if [ -f tests/integration/test_auth_mail.py ]; then
-    echo '- F-07 explicit PostgreSQL/no-cache auth, closed BFF/API, two Mailpit messages and mail-loss denial: passed'
-  fi
+  echo '- F-07 explicit PostgreSQL/no-cache auth, closed BFF/API, two Mailpit messages and mail-loss denial: passed'
   echo '- Synthetic development only; auth persistence, production and later Waves remain closed'
 } >> "$GITHUB_STEP_SUMMARY"
 '@
