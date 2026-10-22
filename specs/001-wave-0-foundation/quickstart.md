@@ -134,10 +134,10 @@ All consuming-process, secret/canary/image-layer and PostgreSQL-backed checks **
 
 ## F-04 local reproduction — T017–T021 (2026-10-22)
 
-The migration/roles/shared transaction implementation and CI wiring are present;
-real PostgreSQL acceptance is still **BLOCKED/UNVERIFIED**. See the T021 execution
-record in [tasks.md](tasks.md) for results and the F-04 prerequisite gate. The
-unchanged F-05 tasks cannot begin before F-04 CI acceptance.
+F-04 is **CI integration verified/accepted** on executable commit
+`bfb3005ffd9290a05b035316bc9fc5a3b946cb19`, [run 39760438154](https://github.com/ahmedali5696/care-pulse-3/actions/runs/39760438154),
+with 401 unit and 30 actual PostgreSQL cases passing. See T021 in
+[tasks.md](tasks.md) for the exact evidence. F-05 started only after this gate.
 
 These container-free commands were run from the repository root in Windows
 PowerShell 5.1 using the existing approved CPython 3.13.16 environment:
@@ -158,13 +158,54 @@ workflow contains the proposed CI-only commands, including controlled
 `db/roles.sql` provisioning, explicit `python -m alembic -c alembic.ini upgrade head`
 with `CP_MIGRATION_PASSWORD_FILE` mounted only into the one-shot process, and
 `python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py`.
-Those CI commands have **not** been executed for this candidate. Never run this
-suite against a shared database: reset tests create/drop only their generated
+Those CI commands passed on the pinned F-04 executable commit above. Never run
+this suite against a shared database: reset tests create/drop only their generated
 `carepulse_ci_<run>_<attempt>_f04_<suffix>` database inside the guarded disposable
 Compose project. `db/roles.sql` is a fresh-cluster, explicit bootstrap operation;
 normal application startup/readiness never provisions roles or runs migrations.
 The script deliberately fails if these roles already exist instead of modifying
 an existing cluster's principals.
+
+## F-05 local reproduction — T022–T026 (2026-10-22)
+
+API/web liveness is process-only; readiness requires the compatible baseline and
+dependencies used by that consumer. Web additionally checks private API liveness
+and SMTP when mail is enabled. Scanner/upload capabilities remain inactive.
+Neither startup nor health creates schema or authenticates a clinic user.
+
+```powershell
+$env:PYTHONPATH = "apps/api;."
+.\.venv-wave0\Scripts\python.exe -m pytest -q tests/unit
+.\.venv-wave0\Scripts\ruff.exe check apps/api apps/worker db tests
+.\.venv-wave0\Scripts\ruff.exe format --check apps/api apps/worker db tests
+.\.venv-wave0\Scripts\python.exe -m pytest --collect-only -q tests/integration/test_health.py
+Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+# Select the approved Node 24.22.1/pnpm 10.34.7 first.
+pnpm typecheck
+rtk proxy pnpm lint
+```
+
+These local checks passed; integration collection is not execution. Local Next
+build was not attempted under observed Windows virtual-memory pressure; clean
+Linux/Next/container builds and all actual service scenarios remain required in
+the existing CI workflow. F-05 acceptance is pending that candidate run.
+
+Private HTTP probes: `GET /health/live`, `GET /health/ready` (web and API);
+exact bodies and `Cache-Control: no-store` are defined in the existing contract.
+The worker writes `/tmp/carepulse-worker-status.json`; inside its container run
+`python apps/worker/status.py live` or `python apps/worker/status.py ready`.
+The probe requires PID 1 plus matching kernel boot/process-start identity and a
+monotonic heartbeat age in `[0, 10]` seconds. A fresh live worker may be unready.
+The 2-second heartbeat interval plus bounded 4-second dependency cycle stays
+below that maximum age; Compose probes have a 6-second timeout. These are fixed
+operational timings, not approved production security-policy values or an SLA.
+
+The CI-only F-05 step in `.github/workflows/foundation.yml` contains the scoped
+Compose stop/start/restart and direct `tests/integration/test_health.py` commands.
+It enables Mailpit without sending messages, verifies mail-required versus
+mail-disabled readiness, and rejects the actual old worker identity after restart.
+Run those commands only in the generated disposable CI project; do not reproduce
+DB shutdown, baseline mutation or restart against shared services.
 
 ## Prerequisites and safety
 

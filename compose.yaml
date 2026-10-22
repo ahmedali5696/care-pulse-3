@@ -32,6 +32,12 @@ services:
       - runtime_db_password
       - service_key
       - auth_secret
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/ready', {signal: AbortSignal.timeout(5000)}).then(r => process.exit(r.status === 200 ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 6s
+      start_period: 15s
+      retries: 2
 
   api:
     build:
@@ -65,6 +71,24 @@ services:
       - runtime_db_password
       - service_key
       - file_encryption_key
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys
+          from urllib.request import urlopen
+          from urllib.error import URLError
+          try:
+              with urlopen('http://127.0.0.1:8000/health/ready', timeout=5):
+                  pass
+          except (URLError, OSError):
+              sys.exit(1)
+      interval: 10s
+      timeout: 6s
+      start_period: 15s
+      retries: 2
 
   worker:
     build:
@@ -93,6 +117,12 @@ services:
       - active_policy
       - runtime_db_password
       - file_encryption_key
+    healthcheck:
+      test: ["CMD", "python", "apps/worker/status.py", "ready"]
+      interval: 10s
+      timeout: 6s
+      start_period: 15s
+      retries: 2
 
   db:
     image: postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27

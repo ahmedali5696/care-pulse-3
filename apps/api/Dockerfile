@@ -11,10 +11,10 @@ RUN python -m pip install --require-hashes --only-binary=:all: -r /srv/requireme
     && python -m pip check
 
 COPY --chown=65532:65532 apps/api/carepulse/ /srv/apps/api/carepulse/
-COPY --chown=65532:65532 apps/worker/main.py /srv/apps/worker/main.py
+COPY --chown=65532:65532 apps/worker/ /srv/apps/worker/
 RUN mkdir -p /srv/private-files && chown 65532:65532 /srv/private-files
 
-ENV PYTHONPATH=/srv/apps/api \
+ENV PYTHONPATH=/srv/apps/api:/srv \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 USER 65532:65532

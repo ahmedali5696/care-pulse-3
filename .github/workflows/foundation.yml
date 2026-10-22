@@ -67,10 +67,10 @@ jobs:
           "$PY" -c 'import pip, sys; assert pip.__version__ == "26.2.2"; assert sys.version_info[:3] == (3, 13, 16)'
           "$PY" -m pip install --require-hashes --only-binary=:all: -r requirements.lock
           "$PY" -m pip check
-          PYTHONPATH=apps/api "$PY" -c 'from carepulse.main import app; import apps.worker.main; assert not app.routes'
+          PYTHONPATH=apps/api:. "$PY" -c 'from carepulse.main import app; import apps.worker.main; assert {r.path for r in app.routes} == {"/health/live", "/health/ready"}'
           "$PY" -m ruff check apps/api apps/worker db tests
           "$PY" -m ruff format --check apps/api apps/worker db tests
-          PYTHONPATH=apps/api "$PY" -m pytest -q tests/unit/test_config.py tests/unit/test_db.py
+          PYTHONPATH=apps/api:. "$PY" -m pytest -q tests/unit/test_config.py tests/unit/test_db.py tests/unit/test_health.py
           PYTHONPATH=apps/api "$PY" -m alembic heads | grep -Fx '0001_foundation (head)'
 
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/node.tar.xz" https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz
@@ -401,6 +401,91 @@ jobs:
             echo '- Container recreation: DB/API without named-volume deletion'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: F-05 health, bounded failures, recovery and process restarts
+        shell: bash
+        run: |
+          set -euo pipefail
+          health_case() {
+            scenario="$1"; shift
+            docker compose --profile test run --rm --no-deps \
+              -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_HEALTH_SCENARIO="$scenario" \
+              -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+              -v "$RUNNER_TEMP/foundation-ci-private/compose.json:/tmp/foundation-compose.json:ro" \
+              test python -m pytest -q -ra --tb=short -p no:cacheprovider "$@"
+          }
+          worker_state() {
+            expected="$1"
+            for attempt in $(seq 1 25); do
+              if docker compose exec -T worker python apps/worker/status.py live; then
+                if docker compose exec -T worker python apps/worker/status.py ready; then actual=0; else actual=$?; fi
+                if [ "$actual" = "$expected" ]; then return 0; fi
+              fi
+              sleep 1
+            done
+            echo 'FAIL worker live/readiness distinction'; return 1
+          }
+          export CP_MAIL_ENABLED=true CP_SMTP_HOST=mail CP_SMTP_PORT=1025
+          docker compose --profile mail up -d --no-build --no-deps --force-recreate mail web
+          health_case healthy tests/integration/test_health.py
+          worker_state 0
+          echo 'PASS healthy, incompatible baseline, bounded locked-query timeout and recovery'
+
+          docker compose stop db
+          health_case database_down tests/integration/test_health.py::test_running_service_state
+          worker_state 1
+          echo 'PASS database unavailable: processes live, readiness denied, worker heartbeat fresh'
+          docker compose start db
+          health_case healthy tests/integration/test_health.py::test_running_service_state
+          worker_state 0
+          echo 'PASS database recovery restores readiness'
+
+          docker compose --profile mail stop mail
+          health_case mail_down tests/integration/test_health.py::test_running_service_state
+          worker_state 0
+          echo 'PASS enabled mail failure affects only its consuming web boundary'
+          export CP_MAIL_ENABLED=false
+          docker compose up -d --no-build --no-deps --force-recreate web
+          health_case mail_disabled tests/integration/test_health.py::test_running_service_state
+          echo 'PASS disabled optional mail/scanner do not block core readiness'
+          export CP_MAIL_ENABLED=true
+          docker compose --profile mail start mail
+          docker compose up -d --no-build --no-deps --force-recreate web
+          health_case healthy tests/integration/test_health.py::test_running_service_state
+
+          docker compose exec -T worker cat /tmp/carepulse-worker-status.json > "$RUNNER_TEMP/foundation-ci-private/old-worker-status.json"
+          docker compose restart api worker
+          health_case healthy tests/integration/test_health.py::test_running_service_state
+          worker_state 0
+          # Make the old heartbeat fresh so only the previous process identity can reject it.
+          docker compose exec -T worker python -c 'import json,sys,time; from pathlib import Path; old=json.load(sys.stdin); old["heartbeat"]=time.monotonic(); p=Path("/tmp/previous-worker-status.json"); p.write_text(json.dumps(old)); p.chmod(0o600)' < "$RUNNER_TEMP/foundation-ci-private/old-worker-status.json"
+          if docker compose exec -T worker python apps/worker/status.py live /tmp/previous-worker-status.json; then
+            echo 'FAIL restarted worker accepted old process identity'; exit 1
+          fi
+          echo 'PASS API/worker restart: old process identity rejected; matching fresh live/ready restored'
+          for service in api web worker; do
+            for attempt in $(seq 1 25); do
+              state="$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q "$service")")"
+              if [ "$state" = healthy ]; then break; fi
+              if [ "$attempt" = 25 ]; then echo "FAIL Compose $service health"; exit 1; fi
+              sleep 1
+            done
+          done
+          docker compose logs --no-color web api worker > "$RUNNER_TEMP/foundation-ci-private/health-logs"
+          if grep -aF -f "$RUNNER_TEMP/foundation-ci-private/canaries" "$RUNNER_TEMP/foundation-ci-private/health-logs" > /dev/null; then
+            echo 'FAIL synthetic secret in health/restart logs'; exit 1
+          else
+            code=$?
+            if [ "$code" -ne 1 ]; then echo 'FAIL health-log canary scan'; exit 1; fi
+          fi
+          {
+            echo '### F-05 truthful service status'
+            echo '- Exact minimal status/body/no-store; DB loss, revision mismatch, timeout, recovery: verified'
+            echo '- Enabled-mail failure and disabled optional dependencies: verified'
+            echo '- API/worker restart, fresh heartbeat and rejection of prior process identity: verified'
+            echo '- Compose healthchecks healthy; service logs free of synthetic secrets'
+            echo '- Foundation readiness conveys no working login or clinical capability'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Clean up only this disposable Compose project
         if: always()
         shell: bash
@@ -410,10 +495,11 @@ jobs:
             && -s "$CP_DB_PASSWORD_FILE" && -s "$CP_RUNTIME_DB_PASSWORD_FILE" \
             && -s "$CP_SERVICE_KEY_SOURCE_FILE" && -s "$CP_AUTH_SECRET_SOURCE_FILE" \
             && -s "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" && -s "$CP_ACTIVE_POLICY_SOURCE_FILE" ]]; then
-            docker compose --profile test down --remove-orphans --volumes
+            docker compose --profile mail --profile test down --remove-orphans --volumes
           fi
           rm -f "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" "$RUNNER_TEMP/foundation-ci-private/compose.json" "$RUNNER_TEMP/foundation-ci-private/web-denial.log" "$RUNNER_TEMP/foundation-ci-private/worker-denial.log" "$RUNNER_TEMP/foundation-ci-private/denials.log" "$RUNNER_TEMP/foundation-ci-private/runtime-logs" "$RUNNER_TEMP/foundation-ci-private/canaries"
           rm -f "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$RUNNER_TEMP/foundation-ci-private/roles.log"
+          rm -f "$RUNNER_TEMP/foundation-ci-private/old-worker-status.json" "$RUNNER_TEMP/foundation-ci-private/health-logs"
           if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ ]]; then
             rm -rf "$RUNNER_TEMP/foundation-ci-private/image-scan"
           fi
