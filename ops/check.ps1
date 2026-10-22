@@ -64,75 +64,9 @@ for line in Path('requirements.lock').read_text().splitlines():
     if '; sys_platform' not in line or sys.platform == 'win32':
         require(metadata.version(match[1]) == match[2], 'installed distribution ' + match[1])
         print(match[1] + '==' + match[2])
-images = {
-    'apps/web/Dockerfile': ['node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205'] * 2,
-    'apps/api/Dockerfile': ['python:3.13.16-slim-bookworm@sha256:73aa5faee130c60da030e105ec971ccf57473fbd22ce73bd6fc9ba99a40b838d', 'python-base', 'python-base', 'python-base'],
-    'compose.yaml': ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'],
-}
-for filename, expected in images.items():
-    actual = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path(filename).read_text(), re.M)
-    require(actual == expected, filename + ' approved image references')
-workflow = Path('.github/workflows/foundation.yml').read_text()
-require(re.findall(r'(?m)^\s*- uses:\s*(\S+)', workflow) == ['actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'] * 2, 'immutable action references')
-def pinned_lines(source, prefixes, approved, label):
-    # Compare complete installer/verification commands, not just version substrings.
-    actual = [line.strip() for line in source.splitlines() if line.strip().startswith(tuple(prefixes))]
-    require(actual == approved, label + ' approved inputs')
-
-pip_wheel = 'pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
-pinned_lines(workflow, ('curl ', 'echo "6896', 'echo "f4b1', 'echo "6c17', 'tar -x', '"$RUNNER_TEMP/pwsh/pwsh" -NoProfile', 'if ($PSVersionTable.PSVersion.ToString()'), [
-    'curl -fsSL --retry 3 -o "$RUNNER_TEMP/pwsh.tar.gz" https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-linux-x64.tar.gz',
-    'echo "6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431  $RUNNER_TEMP/pwsh.tar.gz" | sha256sum -c -',
-    'tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"',
-    '"$RUNNER_TEMP/pwsh/pwsh" -NoProfile -Command \'if ($PSVersionTable.PSVersion.ToString() -ne "7.6.7") { exit 1 }\'',
-    'curl -fsSL --retry 3 -o "$RUNNER_TEMP/Python-3.13.16.tar.xz" https://www.python.org/ftp/python/3.13.16/Python-3.13.16.tar.xz',
-    'echo "f4b1bfb3c79b5bb11b8d228a12504163b4c0dab4d679828d8f5f26b6cb6ab35d  $RUNNER_TEMP/Python-3.13.16.tar.xz" | sha256sum -c -',
-    'tar -xJf "$RUNNER_TEMP/Python-3.13.16.tar.xz" -C "$RUNNER_TEMP/python-src" --strip-components=1',
-    'curl -fsSL --retry 3 -o "$RUNNER_TEMP/node.tar.xz" https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz',
-    'echo "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6  $RUNNER_TEMP/node.tar.xz" | sha256sum -c -',
-    'tar -xJf "$RUNNER_TEMP/node.tar.xz" -C "$RUNNER_TEMP"',
-    'if ($PSVersionTable.PSVersion.ToString() -ne \'7.6.7\') { exit 1 }',
-    'curl -fsSL --retry 3 -o "$RUNNER_TEMP/pwsh.tar.gz" https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-linux-x64.tar.gz',
-    'echo "6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431  $RUNNER_TEMP/pwsh.tar.gz" | sha256sum -c -',
-    'tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"',
-    'curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg',
-    'if ($PSVersionTable.PSVersion.ToString() -ne \'7.6.7\') { exit 1 }',
-], 'CI runtime archives and PowerShell')
-pinned_lines(workflow, ('"$PY" -m pip install', '"$PY" -c', 'npm install --global', 'test "$(node --version)"'), [
-    '"$PY" -m pip install --no-cache-dir "' + pip_wheel + '"',
-    '"$PY" -c \'import pip, sys; assert pip.__version__ == "26.2.2"; assert sys.version_info[:3] == (3, 13, 16)\'',
-    '"$PY" -m pip install --require-hashes --only-binary=:all: -r requirements.lock',
-    'test "$(node --version)" = v24.22.1',
-    'npm install --global --ignore-scripts --no-audit --no-fund pnpm@10.34.7',
-], 'CI pip/pnpm bootstrap')
-pinned_lines(workflow, ('sudo apt-get install ', 'docker-ce', 'containerd.io', 'docker-compose-plugin', 'docker-buildx-plugin', "echo 'deb [arch=amd64", 'test "$(docker version', 'test "$(docker compose version', 'docker buildx version', 'test "$(dpkg-query'), [
-    'sudo apt-get install -y -qq build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev uuid-dev',
-    "echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable' | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null",
-    'sudo apt-get install -y --allow-downgrades \\',
-    'docker-ce=5:29.9.2-1~ubuntu.24.04~noble \\',
-    'docker-ce-cli=5:29.9.2-1~ubuntu.24.04~noble \\',
-    'containerd.io=2.4.2-3~ubuntu.24.04~noble \\',
-    'docker-compose-plugin=5.6.1-1~ubuntu.24.04~noble \\',
-    'docker-buildx-plugin=0.38.1-1~ubuntu.24.04~noble',
-    "test \"$(docker version --format '{{.Server.Version}}')\" = 29.9.2",
-    "test \"$(docker version --format '{{.Client.Version}}')\" = 29.9.2",
-    'test "$(docker compose version --short)" = 5.6.1',
-    "docker buildx version | grep -F 'v0.38.1'",
-    "test \"$(dpkg-query -W -f='${Version}' containerd.io)\" = '2.4.2-3~ubuntu.24.04~noble'",
-], 'CI Docker/Compose/Buildx/containerd')
-pinned_lines(Path('apps/api/Dockerfile').read_text(), ('RUN python -m pip install', '&& python -c', '&& python -m pip check'), [
-    'RUN python -m pip install "' + pip_wheel + '" \\',
-    '&& python -c "import pip; assert pip.__version__ == \'26.2.2\'"',
-    'RUN python -m pip install --require-hashes --only-binary=:all: -r /srv/requirements.lock \\',
-    '&& python -m pip check',
-], 'API Docker pip bootstrap')
-pinned_lines(Path('apps/web/Dockerfile').read_text(), ('RUN npm install', 'RUN pnpm install', 'RUN pnpm --filter'), [
-    'RUN npm install --global --ignore-scripts --no-audit --no-fund pnpm@10.34.7',
-    'RUN pnpm install --frozen-lockfile',
-    'RUN pnpm --filter @carepulse/web build',
-], 'web Docker pnpm bootstrap')
-# Guard the complete executable inputs too: an inserted downloader or RUN line
-# must not bypass checks by leaving all approved lines intact.
+images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_text(), re.M)
+require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
+# Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
     '.github/workflows/foundation.yml': 'd4a99d322014183cf672d30b3633e00999856a68634d394f9838dc69122001a7',
     'apps/api/Dockerfile': '293af5bb74f261da9d70fe314241b897b4452e116617758889a9b2dbecfc942a',

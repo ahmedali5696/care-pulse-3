@@ -33,6 +33,16 @@ type WebPolicy = {
   file_policy: FilePolicy;
 };
 
+const POLICY_NUMBERS = [
+  "session_idle_minutes", "session_absolute_minutes",
+  "login_max_attempts", "login_window_minutes",
+  "recovery_max_attempts", "recovery_window_minutes",
+  "invitation_expiry_minutes", "reset_expiry_minutes",
+  "doctor_confirmation_expiry_minutes",
+  "signed_request_freshness_seconds", "signed_request_max_skew_seconds",
+  "download_grant_expiry_seconds",
+] as const;
+
 function invalid(field: string): never {
   throw new Error(`Invalid ${field}`);
 }
@@ -68,23 +78,40 @@ function hostname(name: string): string {
   return host;
 }
 
-function secretFile(name: string): string {
+function readProtectedFile(name: string, maxBytes: number): string {
   const filename = required(name);
   if (!isAbsolute(filename)) invalid(name);
-  let value: string;
   try {
     const info = lstatSync(filename);
-    if (!info.isFile() || info.size > 8192 ||
+    if (!info.isFile() || info.size > maxBytes ||
         (process.platform !== "win32" && (info.mode & 0o022) !== 0)) invalid(name);
-    value = readFileSync(filename, "utf8").replace(/\r?\n$/, "");
+    return readFileSync(filename, "utf8");
   } catch {
     return invalid(name);
   }
+}
+
+function secretFile(name: string): string {
+  const value = readProtectedFile(name, 8192).replace(/\r?\n$/, "");
   if (
     value.length < 32 || value.length > 4096 ||
     value !== value.trim() || /[\x00-\x1f\x7f]/.test(value)
   ) invalid(name);
   return value;
+}
+
+function quotedStringEnd(json: string, start: number): number {
+  let index = start + 1;
+  while (index < json.length && json[index] !== '"') {
+    if (json[index] === "\\") index++;
+    index++;
+  }
+  return index;
+}
+
+function nextJsonToken(json: string, index: number): string | undefined {
+  while (/\s/.test(json[index] ?? "")) index++;
+  return json[index];
 }
 
 // JSON.parse silently keeps the last duplicate member; policy files must not.
@@ -97,15 +124,9 @@ function rejectDuplicateKeys(json: string): void {
     else if (char === "}" || char === "]") scopes.pop();
     else if (char === '"') {
       const start = index;
-      index++;
-      while (index < json.length && json[index] !== '"') {
-        if (json[index] === "\\") index++;
-        index++;
-      }
-      let next = index + 1;
-      while (/\s/.test(json[next] ?? "")) next++;
+      index = quotedStringEnd(json, start);
       const scope = scopes[scopes.length - 1];
-      if (json[next] === ":" && scope) {
+      if (scope && nextJsonToken(json, index + 1) === ":") {
         const key = JSON.parse(json.slice(start, index + 1)) as string;
         if (scope.has(key)) invalid("CP_POLICY_FILE");
         scope.add(key);
@@ -114,8 +135,10 @@ function rejectDuplicateKeys(json: string): void {
   }
 }
 
-function record(value: unknown, name: string): Record<string, unknown> {
+function record(value: unknown, name: string, fields: readonly string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) invalid(name);
+  if (Object.keys(value).length !== fields.length ||
+      !fields.every((field) => Object.hasOwn(value, field))) invalid(name);
   return value as Record<string, unknown>;
 }
 
@@ -137,83 +160,60 @@ function stringList(value: unknown, name: string, item: RegExp): string[] {
   return value as string[];
 }
 
-function policyFile(): WebPolicy {
-  const filename = required("CP_POLICY_FILE");
-  if (!isAbsolute(filename)) invalid("CP_POLICY_FILE");
-
-  let data: unknown;
+function readPolicy(): unknown {
   try {
-    const info = lstatSync(filename);
-    if (!info.isFile() || info.size > 65536 ||
-        (process.platform !== "win32" && (info.mode & 0o022) !== 0)) invalid("CP_POLICY_FILE");
-    const json = readFileSync(filename, "utf8");
-    data = JSON.parse(json);
+    const json = readProtectedFile("CP_POLICY_FILE", 65536);
+    const policy: unknown = JSON.parse(json);
     rejectDuplicateKeys(json);
+    return policy;
   } catch {
     return invalid("CP_POLICY_FILE");
   }
-  const policy = record(data, "CP_POLICY_FILE");
-  const numericFields = [
-    "session_idle_minutes", "session_absolute_minutes",
-    "login_max_attempts", "login_window_minutes",
-    "recovery_max_attempts", "recovery_window_minutes",
-    "invitation_expiry_minutes", "reset_expiry_minutes",
-    "doctor_confirmation_expiry_minutes",
-    "signed_request_freshness_seconds", "signed_request_max_skew_seconds",
-    "download_grant_expiry_seconds",
-  ];
-  if (
-    Object.keys(policy).length !== numericFields.length + 2 ||
-    !numericFields.every((field) => Object.hasOwn(policy, field)) ||
-    !Object.hasOwn(policy, "profile") || !Object.hasOwn(policy, "file_policy")
-  ) invalid("CP_POLICY_FILE");
-  if (policy.profile !== "synthetic") invalid("CP_POLICY_FILE.profile");
+}
 
-  const session_idle_minutes = integer(policy.session_idle_minutes, "CP_POLICY_FILE.session_idle_minutes");
-  const session_absolute_minutes = integer(policy.session_absolute_minutes, "CP_POLICY_FILE.session_absolute_minutes");
-  const login_max_attempts = integer(policy.login_max_attempts, "CP_POLICY_FILE.login_max_attempts");
-  const login_window_minutes = integer(policy.login_window_minutes, "CP_POLICY_FILE.login_window_minutes");
-  const recovery_max_attempts = integer(policy.recovery_max_attempts, "CP_POLICY_FILE.recovery_max_attempts");
-  const recovery_window_minutes = integer(policy.recovery_window_minutes, "CP_POLICY_FILE.recovery_window_minutes");
-  const invitation_expiry_minutes = integer(policy.invitation_expiry_minutes, "CP_POLICY_FILE.invitation_expiry_minutes");
-  const reset_expiry_minutes = integer(policy.reset_expiry_minutes, "CP_POLICY_FILE.reset_expiry_minutes");
-  const doctor_confirmation_expiry_minutes = integer(policy.doctor_confirmation_expiry_minutes, "CP_POLICY_FILE.doctor_confirmation_expiry_minutes");
-  const signed_request_freshness_seconds = integer(policy.signed_request_freshness_seconds, "CP_POLICY_FILE.signed_request_freshness_seconds");
-  const signed_request_max_skew_seconds = integer(policy.signed_request_max_skew_seconds, "CP_POLICY_FILE.signed_request_max_skew_seconds");
-  const download_grant_expiry_seconds = integer(policy.download_grant_expiry_seconds, "CP_POLICY_FILE.download_grant_expiry_seconds");
-  if (session_absolute_minutes <= session_idle_minutes) invalid("CP_POLICY_FILE.session_absolute_minutes");
+function policyBoolean(policyValue: unknown, name: string): boolean {
+  if (typeof policyValue !== "boolean") invalid(name);
+  return policyValue;
+}
 
-  const files = record(policy.file_policy, "CP_POLICY_FILE.file_policy");
-  const fileFields = [
+function filePolicy(policyValue: unknown): FilePolicy {
+  const files = record(policyValue, "CP_POLICY_FILE.file_policy", [
     "allowed_extensions", "allowed_mime_types", "allowed_classes",
     "max_file_bytes", "max_files_per_record",
     "max_total_storage_bytes_per_record", "scanner_required", "quarantine_on_failure",
-  ];
-  if (Object.keys(files).length !== fileFields.length ||
-      !fileFields.every((field) => Object.hasOwn(files, field))) invalid("CP_POLICY_FILE.file_policy");
-  const file_policy: FilePolicy = {
+  ]);
+  return {
     allowed_extensions: stringList(files.allowed_extensions, "CP_POLICY_FILE.file_policy.allowed_extensions", /^\.[a-z0-9]+(?:[a-z0-9_-]*[a-z0-9])?$/),
     allowed_mime_types: stringList(files.allowed_mime_types, "CP_POLICY_FILE.file_policy.allowed_mime_types", /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/),
     allowed_classes: stringList(files.allowed_classes, "CP_POLICY_FILE.file_policy.allowed_classes", /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/),
     max_file_bytes: integer(files.max_file_bytes, "CP_POLICY_FILE.file_policy.max_file_bytes"),
     max_files_per_record: integer(files.max_files_per_record, "CP_POLICY_FILE.file_policy.max_files_per_record"),
     max_total_storage_bytes_per_record: integer(files.max_total_storage_bytes_per_record, "CP_POLICY_FILE.file_policy.max_total_storage_bytes_per_record"),
-    scanner_required: files.scanner_required as boolean,
-    quarantine_on_failure: files.quarantine_on_failure as boolean,
+    scanner_required: policyBoolean(files.scanner_required, "CP_POLICY_FILE.file_policy.scanner_required"),
+    quarantine_on_failure: policyBoolean(files.quarantine_on_failure, "CP_POLICY_FILE.file_policy.quarantine_on_failure"),
   };
-  if (typeof files.scanner_required !== "boolean") invalid("CP_POLICY_FILE.file_policy.scanner_required");
-  if (typeof files.quarantine_on_failure !== "boolean") invalid("CP_POLICY_FILE.file_policy.quarantine_on_failure");
+}
 
+function policyFile(): WebPolicy {
+  const policy = record(readPolicy(), "CP_POLICY_FILE", ["profile", "file_policy", ...POLICY_NUMBERS]);
+  if (policy.profile !== "synthetic") invalid("CP_POLICY_FILE.profile");
+  const numbers = Object.fromEntries(POLICY_NUMBERS.map(
+    (field) => [field, integer(policy[field], `CP_POLICY_FILE.${field}`)],
+  )) as Record<(typeof POLICY_NUMBERS)[number], number>;
+  if (numbers.session_absolute_minutes <= numbers.session_idle_minutes) invalid("CP_POLICY_FILE.session_absolute_minutes");
   return {
     profile: "synthetic",
-    session_idle_minutes, session_absolute_minutes,
-    login_max_attempts, login_window_minutes,
-    recovery_max_attempts, recovery_window_minutes,
-    invitation_expiry_minutes, reset_expiry_minutes,
-    doctor_confirmation_expiry_minutes,
-    signed_request_freshness_seconds, signed_request_max_skew_seconds,
-    download_grant_expiry_seconds, file_policy,
+    ...numbers,
+    file_policy: filePolicy(policy.file_policy),
   };
+}
+
+function privateIpv4(host: string): boolean {
+  const parts = host.split(".");
+  if (parts.length !== 4 || !parts.every((part) => /^\d+$/.test(part) && Number(part) <= 255)) return false;
+  return ["10", "127"].includes(parts[0]) ||
+    (parts[0] === "172" && Number(parts[1]) >= 16 && Number(parts[1]) <= 31) ||
+    (parts[0] === "192" && parts[1] === "168");
 }
 
 function privateHttpUrl(name: string): string {
@@ -225,16 +225,7 @@ function privateHttpUrl(name: string): string {
   }
 
   const host = url.hostname.toLowerCase();
-  const parts = host.split(".");
-  const ipv4 = parts.length === 4 && parts.every((part) => /^\d+$/.test(part) && Number(part) <= 255);
-  const privateIp = ipv4 && (
-    parts[0] === "10" ||
-    parts[0] === "127" ||
-    (parts[0] === "172" && Number(parts[1]) >= 16 && Number(parts[1]) <= 31) ||
-    (parts[0] === "192" && parts[1] === "168")
-  );
-  const privateHost = host === "api" || host === "localhost" ||
-    host === "[::1]" || privateIp;
+  const privateHost = ["api", "localhost", "[::1]"].includes(host) || privateIpv4(host);
 
   if (
     url.protocol !== "http:" || !privateHost ||

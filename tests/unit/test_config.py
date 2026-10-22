@@ -351,33 +351,38 @@ def test_scanner_is_mandatory_when_api_policy_requires_it(
 
 
 @pytest.mark.parametrize(
-    ("consumer", "flag", "prefix"),
-    [("api", "CP_SCAN_ENABLED", "CP_SCAN")],
+    ("host", "port", "diagnostic"),
+    [
+        (None, None, "CP_SCAN_HOST"),
+        ("service", None, "CP_SCAN_PORT"),
+        ("invalid host", "1025", "CP_SCAN_HOST"),
+        ("service", "65536", "CP_SCAN_PORT"),
+    ],
 )
-def test_enabled_consumer_endpoint_requires_host_and_port(
+def test_enabled_api_scanner_rejects_incomplete_or_invalid_endpoint(
     policy_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    consumer: str,
-    flag: str,
-    prefix: str,
+    host: str | None,
+    port: str | None,
+    diagnostic: str,
 ) -> None:
-    monkeypatch.setenv(flag, "true")
-    with pytest.raises(ConfigError, match=prefix + "_HOST"):
-        load_config(consumer)
-    monkeypatch.setenv(prefix + "_HOST", "service")
-    with pytest.raises(ConfigError, match=prefix + "_PORT"):
-        load_config(consumer)
-    monkeypatch.setenv(prefix + "_HOST", "invalid host")
-    monkeypatch.setenv(prefix + "_PORT", "1025")
-    with pytest.raises(ConfigError, match=prefix + "_HOST"):
-        load_config(consumer)
-    monkeypatch.setenv(prefix + "_HOST", "service")
-    monkeypatch.setenv(prefix + "_PORT", "65536")
-    with pytest.raises(ConfigError, match=prefix + "_PORT"):
-        load_config(consumer)
-    monkeypatch.setenv(prefix + "_PORT", "1025")
-    config = load_config(consumer)
-    endpoint = config.scan if consumer == "api" else config.mail
+    monkeypatch.setenv("CP_SCAN_ENABLED", "true")
+    if host is not None:
+        monkeypatch.setenv("CP_SCAN_HOST", host)
+    if port is not None:
+        monkeypatch.setenv("CP_SCAN_PORT", port)
+    with pytest.raises(ConfigError, match=diagnostic):
+        load_config("api")
+
+
+def test_enabled_api_scanner_loads_valid_endpoint(
+    policy_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CP_SCAN_ENABLED", "true")
+    monkeypatch.setenv("CP_SCAN_HOST", "service")
+    monkeypatch.setenv("CP_SCAN_PORT", "1025")
+    endpoint = load_config("api").scan
     assert endpoint is not None and (endpoint.host, endpoint.port) == ("service", 1025)
 
 

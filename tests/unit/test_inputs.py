@@ -143,96 +143,92 @@ def test_peer_validation_cannot_be_disabled(checkout):
 
 
 @pytest.mark.parametrize(
-    ("filename", "original", "replacement", "diagnostic"),
+    ("filename", "original", "replacement"),
     [
+        (
+            "apps/api/Dockerfile",
+            "python:3.13.16-slim-bookworm@sha256:73aa5faee130c60da030e105ec971ccf57473fbd22ce73bd6fc9ba99a40b838d",
+            "python:latest",
+        ),
+        (
+            "apps/web/Dockerfile",
+            "node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205",
+            "node:latest",
+        ),
         (
             ".github/workflows/foundation.yml",
             "docker-compose-plugin=5.6.1-1~ubuntu.24.04~noble",
             "docker-compose-plugin=5.6.2-1~ubuntu.24.04~noble",
-            "CI Docker/Compose/Buildx/containerd",
         ),
         (
             ".github/workflows/foundation.yml",
             "docker-ce=5:29.9.2-1~ubuntu.24.04~noble",
             "docker-ce",
-            "CI Docker/Compose/Buildx/containerd",
         ),
         (
             ".github/workflows/foundation.yml",
             "containerd.io=2.4.2-3~ubuntu.24.04~noble",
             "containerd.io=latest",
-            "CI Docker/Compose/Buildx/containerd",
         ),
         (
             ".github/workflows/foundation.yml",
             "docker-buildx-plugin=0.38.1-1~ubuntu.24.04~noble",
             "docker-buildx-plugin=latest",
-            "CI Docker/Compose/Buildx/containerd",
         ),
         (
             ".github/workflows/foundation.yml",
             "releases/download/v7.6.7/powershell-7.6.7-linux-x64.tar.gz",
             "releases/download/v7.6.8/powershell-7.6.8-linux-x64.tar.gz",
-            "CI runtime archives and PowerShell",
         ),
         (
             ".github/workflows/foundation.yml",
             "f4b1bfb3c79b5bb11b8d228a12504163b4c0dab4d679828d8f5f26b6cb6ab35d",
             "0" * 64,
-            "CI runtime archives and PowerShell",
         ),
         (
             ".github/workflows/foundation.yml",
             "node-v24.22.1-linux-x64.tar.xz",
             "node-v24.22.2-linux-x64.tar.xz",
-            "CI runtime archives and PowerShell",
         ),
         (
             ".github/workflows/foundation.yml",
             'test "$(docker compose version --short)" = 5.6.1',
             'test "$(docker compose version --short)" = 5.6.2',
-            "CI Docker/Compose/Buildx/containerd",
         ),
         (
             ".github/workflows/foundation.yml",
             "pnpm@10.34.7",
             "pnpm@latest",
-            "CI pip/pnpm bootstrap",
         ),
         (
             ".github/workflows/foundation.yml",
             "#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70",
             "",
-            "CI pip/pnpm bootstrap",
         ),
         (
             "apps/api/Dockerfile",
             "#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70",
             "",
-            "API Docker pip bootstrap",
         ),
         (
             "apps/api/Dockerfile",
             "assert pip.__version__ == '26.2.2'",
             "assert pip.__version__ == '26.2.1'",
-            "API Docker pip bootstrap",
         ),
         (
             "apps/web/Dockerfile",
             "pnpm@10.34.7",
             "pnpm@latest",
-            "web Docker pnpm bootstrap",
         ),
         (
             "apps/web/Dockerfile",
             "pnpm install --frozen-lockfile",
             "pnpm install",
-            "web Docker pnpm bootstrap",
         ),
     ],
 )
 def test_ci_tool_and_installer_drift_is_rejected_before_install(
-    checkout, filename, original, replacement, diagnostic
+    checkout, filename, original, replacement
 ):
     target = checkout / filename
     content = target.read_text()
@@ -240,7 +236,7 @@ def test_ci_tool_and_installer_drift_is_rejected_before_install(
     target.write_text(content.replace(original, replacement, 1))
     completed = _check(checkout)
     assert completed.returncode != 0
-    assert diagnostic + " approved inputs" in completed.stdout + completed.stderr
+    assert filename + " executable input drift" in completed.stdout + completed.stderr
 
 
 def test_ci_archive_must_be_verified_before_extraction(checkout):
@@ -259,7 +255,7 @@ def test_ci_archive_must_be_verified_before_extraction(checkout):
     )
     completed = _check(checkout)
     assert completed.returncode != 0
-    assert "CI runtime archives and PowerShell approved inputs" in (
+    assert ".github/workflows/foundation.yml executable input drift" in (
         completed.stdout + completed.stderr
     )
 
@@ -277,7 +273,9 @@ def test_commented_checkout_pin_cannot_hide_unapproved_action(checkout):
     )
     completed = _check(checkout)
     assert completed.returncode != 0
-    assert "immutable action references" in completed.stdout + completed.stderr
+    assert ".github/workflows/foundation.yml executable input drift" in (
+        completed.stdout + completed.stderr
+    )
 
 
 @pytest.mark.parametrize(
