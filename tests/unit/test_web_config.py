@@ -25,10 +25,13 @@ try {
 def web_env(tmp_path):
     policy_file = tmp_path / "policy.json"
     policy_file.write_text(POLICY, encoding="utf-8")
-    secret_file = tmp_path / "secret.txt"
-    secret_file.write_bytes(b"synthetic-web-config-secret-0123456789\r\n")
-    for protected_file in (policy_file, secret_file):
-        protected_file.chmod(0o600)
+    policy_file.chmod(0o600)
+    secrets = {}
+    for name in ("CP_DB_PASSWORD_FILE", "CP_SERVICE_KEY_FILE", "CP_AUTH_SECRET_FILE"):
+        secret_file = tmp_path / name
+        secret_file.write_bytes(b"synthetic-web-config-secret-0123456789\r\n")
+        secret_file.chmod(0o600)
+        secrets[name] = str(secret_file)
     return {
         **{
             name: setting
@@ -42,10 +45,8 @@ def web_env(tmp_path):
         "CP_DB_PORT": "5432",
         "CP_DB_NAME": "carepulse",
         "CP_DB_USER": "carepulse_runtime",
-        "CP_DB_PASSWORD_FILE": str(secret_file),
         "CP_INTERNAL_API_URL": "http://api:8000",
-        "CP_SERVICE_KEY_FILE": str(secret_file),
-        "CP_AUTH_SECRET_FILE": str(secret_file),
+        **secrets,
         "CP_MAIL_ENABLED": "false",
         "CP_SCAN_ENABLED": "false",
     }
