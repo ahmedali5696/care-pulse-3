@@ -304,7 +304,9 @@ jobs:
           images=()
           for service in web api worker; do
             image="$(docker compose images -q "$service")"
-            test -n "$image"
+            if [ -z "$image" ]; then
+              echo "FAIL missing runtime image for $service"; exit 1
+            fi
             images+=("$image")
             if docker image history --no-trunc "$image" | grep -aF -f "$canaries" > /dev/null; then
               echo "FAIL synthetic key in $service image history"; exit 1
@@ -312,13 +314,20 @@ jobs:
               code=$?
               if [ "$code" -ne 1 ]; then echo "FAIL $service image-history scan error"; exit 1; fi
             fi
+            echo "PASS $service image-history canary scan"
           done
-          # Uncompressed docker-save layer.tar contents, checked without grep -q
-          # (avoids early SIGPIPE false-negative under pipefail).
+          # Docker save may write either legacy layer.tar names or OCI
+          # blobs/sha256/* layer names. Search the complete unpacked archive;
+          # do not silently assume a particular filename layout.
           image_scan="$RUNNER_TEMP/foundation-ci-private/image-scan"
           mkdir -m 0700 "$image_scan"
           docker image save "${images[@]}" | tar -xf - -C "$image_scan"
-          test "$(find "$image_scan" -type f -name layer.tar | wc -l)" -gt 0
+          if [ ! -f "$image_scan/manifest.json" ] && [ ! -f "$image_scan/index.json" ]; then
+            echo 'FAIL missing saved-image archive manifest'; exit 1
+          fi
+          if [ "$(find "$image_scan" -type f | wc -l)" -lt 3 ]; then
+            echo 'FAIL saved-image archive is incomplete'; exit 1
+          fi
           if grep -aRF -f "$canaries" "$image_scan" > /dev/null; then
             echo 'FAIL synthetic key in image filesystem layers'; exit 1
           else
