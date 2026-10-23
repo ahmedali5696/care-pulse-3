@@ -3,10 +3,13 @@
 import json
 import re
 from dataclasses import dataclass
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import IntegrityError
+
+from carepulse.identity.authorization import AuthorizedStaff
 
 
 class ReceiptConflict(Exception):
@@ -186,3 +189,57 @@ def lookup_tenant_receipt(
 def assert_same_request(stored_digest: str, supplied_digest: str) -> None:
     if stored_digest != supplied_digest:
         raise ReceiptConflict("Idempotency key has a different request")
+
+
+@dataclass(frozen=True)
+class TenantReceiptQuery:
+    actor: AuthorizedStaff
+    operation: str
+    idempotency_key: str
+    request_digest: str
+
+
+@dataclass(frozen=True)
+class OperatorReceiptQuery:
+    operator_id: UUID
+    idempotency_key: str
+    request_digest: str
+
+
+def resolve_tenant_receipt(
+    connection: Connection, query: TenantReceiptQuery
+) -> tuple[dict[str, Any], int] | None:
+    """Call after current session, revision and role are checked under T020 locks.
+
+    Recheck resource/field visibility before returning this committed projection.
+    New work, receipt, audit and outbox must use the same domain transaction.
+    """
+    stored = lookup_tenant_receipt(
+        connection,
+        query.actor.organization_id,
+        query.actor.staff_id,
+        query.operation,
+        query.idempotency_key,
+    )
+    if stored is None:
+        return None
+    assert_same_request(stored["request_digest"], query.request_digest)
+    if (
+        not isinstance(stored["result_projection"], dict)
+        or type(stored["result_revision"]) is not int
+    ):
+        raise ValueError("Invalid committed tenant receipt")
+    return stored["result_projection"], stored["result_revision"]
+
+
+def resolve_operator_create_receipt(
+    connection: Connection, query: OperatorReceiptQuery, verified_operator_digest: str
+) -> tuple[UUID, int] | None:
+    """Call only after verifying current operator authority, before clinic allocation."""
+    stored = lookup_operator_create_receipt(
+        connection, query.operator_id, query.idempotency_key, verified_operator_digest
+    )
+    if stored is None:
+        return None
+    assert_same_request(stored["request_digest"], query.request_digest)
+    return stored["result_organization_id"], stored["result_revision"]

@@ -101,7 +101,7 @@ print('PASS approved manifests, complete locks, installed Python closure, privat
         }
         'imports' {
             $env:PYTHONPATH = (Join-Path $PWD 'apps/api') + [IO.Path]::PathSeparator + $PWD
-            Invoke-Checked python @('-c', "from carepulse.main import app; import apps.worker.main; assert set(app.openapi()['paths']) == {'/health/live', '/health/ready'}; assert app.openapi_url is None; print('PASS shared API/worker imports, health-only schema, no jobs')")
+            Invoke-Checked python @('-c', "from carepulse.main import app; from carepulse.identity.boundary import ClosedServiceBoundary; import apps.worker.main; assert set(app.openapi()['paths']) == {'/health/live', '/health/ready'}; assert app.openapi_url is None; assert len(app.user_middleware) == 1 and app.user_middleware[0].cls is ClosedServiceBoundary and app.user_middleware[0].kwargs == {}; print('PASS exact authorized routes, signed private boundary, API/worker imports')")
             Invoke-Checked python @('-m', 'alembic', 'heads')
         }
         'integration' {
@@ -116,6 +116,9 @@ print('PASS approved manifests, complete locks, installed Python closure, privat
             }
             if (-not (Test-Path -LiteralPath 'tests/integration/test_evidence_persistence.py' -PathType Leaf)) {
                 throw 'Missing required D-09 integration test: tests/integration/test_evidence_persistence.py'
+            }
+            if (-not (Test-Path -LiteralPath 'tests/integration/test_request_boundary.py' -PathType Leaf)) {
+                throw 'Missing required B-01 integration test: tests/integration/test_request_boundary.py'
             }
             if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Linux' -or $PSVersionTable.PSVersion.Major -lt 7) {
                 throw 'Integration requires Docker-capable Linux CI and PowerShell 7; no local Docker probe performed'
@@ -189,7 +192,7 @@ docker compose --profile test run --rm --no-deps \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py
 docker compose up -d --no-build db api worker web
 for attempt in $(seq 1 40); do
   if curl --silent --show-error --fail --max-time 2 http://127.0.0.1:3000/ > /dev/null 2>&1; then break; fi
@@ -485,6 +488,7 @@ fi
   echo '- F-07 explicit PostgreSQL/no-cache auth, closed BFF/API, two Mailpit messages and mail-loss denial: passed'
   echo '- D-01 tenant/role isolation and migration rollback/privilege cases: passed'
   echo '- D-02 PostgreSQL identity races, immutable session authority, Better Auth migration compatibility and ephemeral native hashed reset-proof issuance: passed'
+  echo '- B-01 signed request, durable nonce replay, live authority/revocation, RLS and idempotent receipt boundary tests: passed'
   echo '- Synthetic development only; real login, Owner acceptance, recovery protocol, production and later Waves remain closed'
 } >> "$GITHUB_STEP_SUMMARY"
 '@

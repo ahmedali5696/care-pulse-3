@@ -37,3 +37,15 @@ def transaction(
             {"organization_id": str(organization_id) if organization_id else ""},
         )
         yield connection
+
+
+def lock_active_organization(connection: Connection, organization_id: UUID) -> bool:
+    """Lock a live clinic row without giving the runtime role mutation grants."""
+    if not isinstance(organization_id, UUID):
+        raise TypeError("Organization lock requires a validated UUID")
+    return bool(
+        connection.scalar(
+            text("SELECT public.lock_active_organization(:tenant)"),
+            {"tenant": organization_id},
+        )
+    )
