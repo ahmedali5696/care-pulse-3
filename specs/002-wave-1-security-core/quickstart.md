@@ -1,6 +1,6 @@
 # Wave 1 Validation Guide
 
-**Status**: prospective run guide for the planned implementation. Today the repository has the accepted Wave 0 foundation plus design artifacts; operational Wave 1 routes/CLI/tests are not yet implemented. Do not read the commands or expected results below as recorded passing evidence.
+**Status**: D-01 (T001–T006) has a committed implementation and targeted validation; later Wave 1 masters remain prospective. Only the explicitly linked D-01 execution evidence below is recorded as run evidence. Other scenarios remain planned.
 
 ## Prerequisites
 
@@ -73,3 +73,13 @@ For each of the 11 task IDs record changed files, migration revisions, applicabl
 Wave 1 exit requires all master §6 evidence and §13.3 W1 checks, including affected F/D/B regressions, real invited session path, committed invitation/recovery delivery, operator PHI denial, family/archive behavior, nonce forgery/replay and old-session denial. Later D-12/B-27 assurance cannot substitute for focused evidence now.
 
 Use distinct states: IMPLEMENTED, TESTED, INTEGRATION VERIFIED, BLOCKED/UNVERIFIED, PRODUCTION READY. Missing CI execution is BLOCKED/UNVERIFIED. Passing all synthetic checks still does not resolve SECURITY-POLICY-NUMERICS, OPEN-OPS-01/02/03, OPEN-FILES-01 or authorize production. Stop after two unsuccessful corrections to the same failure and report command, expected/actual, evidence and proposed action.
+
+### D-01 — tenant and privileged DB isolation (2026-10-23)
+
+- **Scope/authority**: T001–T006, W1-FR-01, SEC-01 and RACE-01. Migration revision `0002_organizations` follows `0001_foundation`. Cross-table verified enabled Owner enforcement and controlled activation belong to D-02/B-03; the D-01 SQL guard rejects premature activation. Operator identity creation and provisioning remain migration-owned until the approved operator command exists.
+- **Executable changes**: `db/migrations/versions/0002_organizations.py`, `apps/api/carepulse/{db,health}.py`, `apps/web/health.ts`, `ops/check.ps1`, `.github/workflows/foundation.yml`, plus focused PostgreSQL fixtures and affected baseline tests in `tests/`. `db/roles.sql` and pre-existing revisions remain intact.
+- **Executable commits**: `41c94b203e5d77d00074b74a6b822bb48e84710d` (schema and integration suite) and `47546bc7d032ac3260d0b2e8f91f9d0497de16a2` (clear inherited session tenant context in every application transaction).
+- **Local checks**: pinned toolchain; `ops/check.ps1 inputs`, `python-quality`, `imports`, `web` (Next.js build), and `unit` succeeded. Last unit run: **504 passed, 2 skipped**. PostgreSQL suites skip locally by design; no workstation Docker was used.
+- **Initial CI evidence**: [Foundation run 39951366554](https://github.com/ahmedali5696/care-pulse-3/actions/runs/39951366554), at `41c94b2`: both jobs passed with 38 real PostgreSQL baseline and tenant-isolation tests.
+- **Final executable CI evidence**: [Foundation run 39952339350](https://github.com/ahmedali5696/care-pulse-3/actions/runs/39952339350) at `47546bc`: **inputs-and-build SUCCESS**; **compose-integration SUCCESS**, with **39 passed** in real PostgreSQL database/tenant-isolation tests, including poisoned pooled session-context denial. Private topology, startup-denial, readiness, ownership, Mailpit smoke and no-secret scans remained green. D-01 is **INTEGRATION VERIFIED** for synthetic CI. CI logs are the retained execution record; no patient or secret evidence was exported.
+- **Production status**: Not production-ready. SECURITY-POLICY-NUMERICS, OPEN-OPS-01/02/03 and OPEN-FILES-01 remain open under their approved owners.
