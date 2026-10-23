@@ -111,6 +111,9 @@ print('PASS approved manifests, complete locks, installed Python closure, privat
             if (-not (Test-Path -LiteralPath 'tests/integration/test_tenant_isolation.py' -PathType Leaf)) {
                 throw 'Missing required D-01 integration test: tests/integration/test_tenant_isolation.py'
             }
+            if (-not (Test-Path -LiteralPath 'tests/integration/test_identity_persistence.py' -PathType Leaf)) {
+                throw 'Missing required D-02 integration test: tests/integration/test_identity_persistence.py'
+            }
             if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Linux' -or $PSVersionTable.PSVersion.Major -lt 7) {
                 throw 'Integration requires Docker-capable Linux CI and PowerShell 7; no local Docker probe performed'
             }
@@ -183,7 +186,7 @@ docker compose --profile test run --rm --no-deps \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_identity_persistence.py
 docker compose up -d --no-build db api worker web
 for attempt in $(seq 1 40); do
   if curl --silent --show-error --fail --max-time 2 http://127.0.0.1:3000/ > /dev/null 2>&1; then break; fi
@@ -191,6 +194,110 @@ for attempt in $(seq 1 40); do
   sleep 2
 done
 echo 'PASS runner-host web http://127.0.0.1:3000/'
+docker compose exec -T web node --experimental-strip-types --input-type=module <<'NODE'
+import { getSchema } from 'better-auth/db';
+import { getMigrations } from 'better-auth/db/migration';
+import { betterAuth } from 'better-auth';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { getAuth } from './auth.ts';
+import { loadWebConfig } from './config.ts';
+import { runtimeDatabase } from './db.ts';
+
+const auth = getAuth();
+const options = auth.options;
+await auth.$context;
+if (options.verification?.storeIdentifier !== 'hashed' ||
+    options.verification?.storeInDatabase !== true ||
+    options.emailAndPassword?.revokeSessionsOnPasswordReset !== true) {
+  throw new Error('FAIL native auth verification/revocation configuration');
+}
+const models = getSchema(options);
+const expectedTables = ['user', 'session', 'account', 'verification',
+  'recovery_operations', 'auth_recovery_completions'];
+if (expectedTables.some(table => !models[table]) || Object.keys(models).length !== 6) {
+  throw new Error('FAIL supported native auth model set');
+}
+for (const field of ['securityRevision', 'absoluteDeadline', 'lastActivity']) {
+  if (models.session.fields[field]?.input !== false || models.session.fields[field]?.required !== true) {
+    throw new Error('FAIL native session authority fields');
+  }
+}
+const pool = runtimeDatabase(loadWebConfig());
+try {
+  for (const table of expectedTables) {
+    const found = await pool.query(
+      "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1",
+      [table],
+    );
+    const actual = new Set(found.rows.map(row => row.column_name));
+    const expected = new Set(['id', ...Object.keys(models[table].fields)]);
+    if (actual.size !== expected.size || [...expected].some(column => !actual.has(column))) {
+      throw new Error(`FAIL supported native schema drift in ${table}`);
+    }
+  }
+  const plan = await getMigrations(options, { throwOnUnsafe: false });
+  if (plan.schemaProblems.length || plan.unsafeChanges.length ||
+      plan.toBeCreated.length || plan.toBeAdded.length || plan.toBeAddedIndexes.length) {
+    throw new Error('FAIL supported Better Auth migration schema/index compatibility');
+  }
+
+  // A test-only native API instance exercises digest storage; no public route
+  // is enabled and the reset callback makes no SMTP/network call.
+  const nativeUser = `synthetic-native-${randomUUID()}`;
+  const nativeEmail = `synthetic-native-${randomUUID()}@example.invalid`;
+  let proof;
+  await pool.query(
+    'INSERT INTO public."user" (id, name, email, "emailVerified", "createdAt", "updatedAt") VALUES ($1, $2, $3, true, clock_timestamp(), clock_timestamp())',
+    [nativeUser, 'Synthetic native verification', nativeEmail],
+  );
+  try {
+    const testAuth = betterAuth({
+      baseURL: 'http://localhost:3000',
+      secret: randomBytes(32).toString('hex'),
+      database: pool,
+      advanced: { database: { validateSchema: false } },
+      verification: { storeInDatabase: true, storeIdentifier: 'hashed' },
+      emailAndPassword: {
+        enabled: true, disableSignUp: true,
+        sendResetPassword: ({ token }) => { proof = token; },
+      },
+      logger: { disabled: true },
+    });
+    const response = await testAuth.api.requestPasswordReset({
+      body: { email: nativeEmail }, headers: new Headers({ origin: 'http://localhost:3000' }),
+    });
+    if (response.status !== true || !proof) {
+      throw new Error('FAIL native password-reset proof issuance');
+    }
+    const stored = await pool.query(
+      'SELECT identifier FROM public."verification" WHERE value = $1', [nativeUser],
+    );
+    const digest = createHash('sha256').update(`reset-password:${proof}`).digest('base64url');
+    if (stored.rows.length !== 1 || stored.rows[0].identifier !== digest ||
+        stored.rows[0].identifier === `reset-password:${proof}`) {
+      throw new Error('FAIL native proof identifier is not SHA-256 digest stored in database');
+    }
+    const nativeAdapter = (await testAuth.$context).internalAdapter;
+    const consumed = await nativeAdapter.consumeVerificationValue(`reset-password:${proof}`);
+    if (consumed?.value !== nativeUser ||
+        await nativeAdapter.consumeVerificationValue(`reset-password:${proof}`) !== null) {
+      throw new Error('FAIL native reset proof did not consume exactly once');
+    }
+    const remaining = await pool.query(
+      'SELECT count(*)::int AS count FROM public."verification" WHERE value = $1', [nativeUser],
+    );
+    if (remaining.rows[0].count !== 0) {
+      throw new Error('FAIL consumed native proof remained persisted');
+    }
+  } finally {
+    await pool.query('DELETE FROM public."verification" WHERE value = $1', [nativeUser]);
+    await pool.query('DELETE FROM public."user" WHERE id = $1', [nativeUser]);
+  }
+  console.log('PASS supported native Better Auth schema/index compatibility, hashed reset-proof issuance and server-only session fields');
+} finally {
+  await pool.end();
+}
+NODE
 for port in 8000 5432; do
   if timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$port" 2>/dev/null; then
     echo "FAIL runner-host unexpected exposed port $port"; exit 1
@@ -365,7 +472,7 @@ else
   code=$?; if [ "$code" -ne 1 ]; then echo 'FAIL runtime-log scan error'; exit 1; fi
 fi
 {
-  echo '### Wave 0 combined foundation checks'
+  echo '### Wave 0 and Wave 1 D-01/D-02 foundation checks'
   echo "- Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT}, SHA ${GITHUB_SHA})"
   echo '- Pinned Linux amd64 images, builds and runtime versions: verified above'
   echo '- F-02 topology/persistence: 3 seed + 3 verify; runner/web/test vantage probes passed'
@@ -373,7 +480,9 @@ fi
   echo '- F-04 sole baseline, reset/rollback/privilege and same-connection context cases: passed'
   echo '- F-05 bounded status/failure/recovery/restart and fresh worker identity: passed'
   echo '- F-07 explicit PostgreSQL/no-cache auth, closed BFF/API, two Mailpit messages and mail-loss denial: passed'
-  echo '- Synthetic development only; auth persistence, production and later Waves remain closed'
+  echo '- D-01 tenant/role isolation and migration rollback/privilege cases: passed'
+  echo '- D-02 PostgreSQL identity races, immutable session authority, Better Auth migration compatibility and ephemeral native hashed reset-proof issuance: passed'
+  echo '- Synthetic development only; real login, Owner acceptance, recovery protocol, production and later Waves remain closed'
 } >> "$GITHUB_STEP_SUMMARY"
 '@
             & bash -e -c $integration

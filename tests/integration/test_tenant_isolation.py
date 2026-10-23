@@ -126,7 +126,7 @@ def test_metadata_isolated_but_operator_can_list_only_metadata(tenants, role_eng
         operator.dispose()
 
 
-def test_initial_organization_cannot_activate_or_mutate_fixed_identity(
+def test_ownerless_organization_cannot_activate_or_mutate_fixed_identity(
     tenants, role_engine
 ):
     operator_id, clinic_a, _ = tenants
@@ -146,7 +146,6 @@ def test_initial_organization_cannot_activate_or_mutate_fixed_identity(
         assert denied_new_active.value.orig.sqlstate == "23514"
         for change in (
             "state = 'ACTIVE'",
-            "state = 'SUSPENDED'",
             "id = gen_random_uuid()",
             "currency = 'USD'",
             "timezone = 'UTC'",
@@ -172,6 +171,26 @@ def test_initial_organization_cannot_activate_or_mutate_fixed_identity(
             """),
                 {"id": clinic_a},
             ).one() == ("EGYPT", "Africa/Cairo", "EGP", "PROVISIONING", 0)
+        with migration.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE public.organizations SET state = 'SUSPENDED' WHERE id = :id"
+                ),
+                {"id": clinic_a},
+            )
+        with pytest.raises(DBAPIError) as never_active, migration.begin() as connection:
+            connection.execute(
+                text("UPDATE public.organizations SET state = 'ACTIVE' WHERE id = :id"),
+                {"id": clinic_a},
+            )
+        assert never_active.value.orig.sqlstate == "23514"
+        with migration.connect() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT state, first_activated_at FROM public.organizations WHERE id = :id"
+                ),
+                {"id": clinic_a},
+            ).one() == ("SUSPENDED", None)
     finally:
         migration.dispose()
 

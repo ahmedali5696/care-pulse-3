@@ -20,7 +20,7 @@ from sqlalchemy import URL, create_engine, text
 from sqlalchemy.exc import DBAPIError
 
 ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0002_organizations"
+REVISION = "0003_identity"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -135,17 +135,19 @@ def test_organization_schema_owned_by_migration_role():
                 )
                 == REVISION
             )
-            assert set(
+            owned_tables = dict(
                 connection.execute(
                     text(
                         "SELECT tablename, tableowner FROM pg_tables WHERE schemaname = 'public'"
                     )
                 ).all()
-            ) == {
-                ("alembic_version", "carepulse_migration"),
-                ("operator_identities", "carepulse_migration"),
-                ("organizations", "carepulse_migration"),
-            }
+            )
+            assert {
+                "alembic_version",
+                "operator_identities",
+                "organizations",
+            } <= owned_tables.keys()
+            assert set(owned_tables.values()) == {"carepulse_migration"}
             assert (
                 connection.scalar(
                     text(
@@ -182,13 +184,22 @@ def test_empty_database_reset_and_repeated_upgrade(admin, empty_database):
                     )
                     == "0001_foundation"
                 )
-                assert connection.execute(
-                    text("""
+                assert (
+                    connection.execute(
+                        text("""
                     SELECT to_regclass('public.organizations'),
                            to_regclass('public.operator_identities'),
-                           to_regclass('public.runtime_active_tenant_ids')
+                           to_regclass('public.runtime_active_tenant_ids'),
+                           to_regclass('public."user"'),
+                           to_regclass('public."session"'),
+                           to_regclass('public.staff_accounts'),
+                           to_regclass('public.invitations'),
+                           to_regclass('public.recovery_operations'),
+                           to_regclass('public.auth_recovery_completions')
                 """)
-                ).one() == (None, None, None)
+                    ).one()
+                    == (None,) * 9
+                )
             _upgrade(engine)
         finally:
             engine.dispose()
@@ -211,9 +222,9 @@ def test_failed_isolated_migration_rolls_back_objects_and_version(
     _create_empty_database(admin, empty_database)
     scripts = tmp_path / "migrations"
     shutil.copytree(ROOT / "db/migrations", scripts)
-    (scripts / "versions/0003_failure.py").write_text(
-        'from alembic import op\nrevision = "0003_failure"\n'
-        'down_revision = "0002_organizations"\n'
+    (scripts / "versions/0004_failure.py").write_text(
+        'from alembic import op\nrevision = "0004_failure"\n'
+        'down_revision = "0003_identity"\n'
         "def upgrade():\n"
         '    op.execute("CREATE TABLE public.synthetic_partial (value integer)")\n'
         '    op.execute("SELECT 1 / 0")\n'

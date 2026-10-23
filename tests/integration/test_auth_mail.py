@@ -1,4 +1,4 @@
-"""F-07 real deny-only HTTP and isolated Mailpit evidence; no auth schema."""
+"""F-07 deny-only HTTP and isolated Mailpit evidence with D-02 persistence."""
 
 import json
 import os
@@ -135,7 +135,7 @@ def test_both_reserved_templates_arrived_without_tokens():
     }
 
 
-def test_denials_created_no_auth_business_or_outbox_schema():
+def test_denied_routes_do_not_require_business_or_outbox_schema():
     with psycopg.connect(
         host="db",
         dbname="carepulse",
@@ -145,12 +145,19 @@ def test_denials_created_no_auth_business_or_outbox_schema():
         tables = connection.execute(
             "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
         ).fetchall()
-        assert set(tables) <= {
+        assert set(tables) == {
             ("alembic_version",),
             ("organizations",),
             ("operator_identities",),
+            ("user",),
+            ("session",),
+            ("account",),
+            ("verification",),
+            ("staff_accounts",),
+            ("invitations",),
+            ("recovery_operations",),
+            ("auth_recovery_completions",),
         }
-        if tables:
-            assert connection.execute(
-                "SELECT version_num FROM public.alembic_version"
-            ).fetchall() == [("0002_organizations",)]
+        assert connection.execute(
+            "SELECT version_num FROM public.alembic_version"
+        ).fetchall() == [("0003_identity",)]

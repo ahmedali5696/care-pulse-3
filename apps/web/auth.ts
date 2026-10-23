@@ -1,5 +1,6 @@
 // Server-only; initialize at request time, never during a secret-free Next build.
 import { betterAuth } from "better-auth";
+import { lifecycleSchemaPlugin, sessionFields } from "./auth/schema.ts";
 import { loadWebConfig } from "./config.ts";
 import { runtimeDatabase } from "./db.ts";
 
@@ -10,10 +11,13 @@ function createAuth() {
     baseURL: "http://localhost:3000",
     secret: config.authSecret,
     database: runtimeDatabase(config),
-    // shortcut: no D-02 tables in Wave 0, restore schema preflight with D-02; real lookups still fail closed.
-    advanced: { database: { validateSchema: false } },
-    session: { cookieCache: { enabled: false } },
-    emailAndPassword: { enabled: false, disableSignUp: true },
+    plugins: [lifecycleSchemaPlugin],
+    advanced: { database: { validateSchema: true } },
+    session: { cookieCache: { enabled: false }, additionalFields: sessionFields },
+    verification: { storeInDatabase: true, storeIdentifier: "hashed" },
+    emailAndPassword: {
+      enabled: false, disableSignUp: true, revokeSessionsOnPasswordReset: true,
+    },
     // Adapter failures are translated at the boundary, not logged with SQL.
     logger: { disabled: true },
   });
