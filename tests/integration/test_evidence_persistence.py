@@ -508,6 +508,85 @@ def test_job_claim_is_owned_and_material_disposed_on_success(evidence):
         )
 
 
+@pytest.mark.parametrize("spoof_claim", [False, True])
+def test_direct_runtime_update_cannot_fail_another_live_delivery_claim(
+    evidence, role_engine, spoof_claim
+):
+    migration, operator_id, _, _ = evidence
+    with migration.begin() as connection:
+        job_id, _ = _new_delivery(connection, operator_id)
+        claim = claim_delivery_job(
+            connection, ClaimPolicy(timedelta(minutes=4), 3), job_id
+        )
+        tenant_id = connection.scalar(
+            text("SELECT organization_id FROM public.delivery_jobs WHERE id = :id"),
+            {"id": job_id},
+        )
+    runtime = role_engine("carepulse_runtime")
+    try:
+        with pytest.raises(DBAPIError) as denial, runtime.begin() as connection:
+            connection.execute(
+                text("SELECT set_config('app.organization_id', :tenant, true)"),
+                {"tenant": str(tenant_id)},
+            )
+            if spoof_claim:
+                connection.execute(
+                    text("""
+                    SELECT set_config('app.delivery_claim_owner', :wrong_owner, true),
+                           set_config('app.delivery_claim_generation', :generation, true)
+                """),
+                    {"wrong_owner": str(uuid4()), "generation": str(claim.generation)},
+                )
+            # Raw SQL must not bypass the storage helper's owner/lease checks.
+            connection.execute(
+                text("""
+                UPDATE public.delivery_jobs
+                SET state = 'FAILED', claim_owner = NULL,
+                    claimed_at = NULL, lease_expires_at = NULL
+                WHERE id = :job
+            """),
+                {"job": job_id},
+            )
+        assert denial.value.orig.sqlstate == "23514"
+        with migration.connect() as connection:
+            assert connection.execute(
+                text("""
+                SELECT state, claim_owner, claim_generation
+                FROM public.delivery_jobs WHERE id = :job
+            """),
+                {"job": job_id},
+            ).one() == ("CLAIMED", claim.owner, claim.generation)
+        with runtime.begin() as connection:
+            connection.execute(
+                text("SELECT set_config('app.organization_id', :tenant, true)"),
+                {"tenant": str(tenant_id)},
+            )
+            assert finish_delivery_job(connection, claim, JobOutcome("FAILED"))
+    finally:
+        runtime.dispose()
+
+
+def test_lease_expiry_comparisons_at_one_exact_database_instant(evidence):
+    migration, _, _, _ = evidence
+    # PostgreSQL uses one bound instant here: expiry equality is reclaimable,
+    # while an existing owner's lease is already invalid at that same instant.
+    # Full claim/reclaim races use the real clock in separate integration tests.
+    with migration.connect() as connection:
+        assert connection.execute(
+            text("""
+            WITH boundary AS (SELECT clock_timestamp() AS db_now),
+                 samples AS (
+                     SELECT db_now, db_now - interval '1 microsecond' AS before,
+                            db_now AS equal_at, db_now + interval '1 microsecond' AS after
+                     FROM boundary
+                 )
+            SELECT before <= db_now, equal_at <= db_now, after <= db_now,
+                   before > db_now, equal_at > db_now, after > db_now
+            FROM samples
+        """)
+        ).one() == (True, True, False, False, False, True)
+
+
 def test_two_claimers_get_only_one_delivery_lease(evidence):
     migration, operator_id, _, _ = evidence
     with migration.begin() as connection:

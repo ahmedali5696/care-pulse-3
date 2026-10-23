@@ -12,7 +12,7 @@ from carepulse.config import ConfigError, Consumer, load_config
 from carepulse.db import create_db_engine, transaction
 
 PROBE_DEADLINE_SECONDS = 4
-COMPATIBLE_REVISION = "0004_evidence"
+COMPATIBLE_REVISION = "0005_delivery_failed_fence"
 router = APIRouter()
 
 
