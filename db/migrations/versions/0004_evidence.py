@@ -205,7 +205,8 @@ def upgrade() -> None:
             format_version integer NOT NULL DEFAULT 1 CHECK (format_version = 1),
             delivery_key_id text NOT NULL CHECK (btrim(delivery_key_id) <> ''),
             ciphertext_base64url text NOT NULL
-                CHECK (ciphertext_base64url ~ '^[A-Za-z0-9_-]{512}$')
+                CHECK (length(ciphertext_base64url) = 512
+                       AND ciphertext_base64url ~ '^[A-Za-z0-9_-]+$')
         )
     """)
     op.execute("""
