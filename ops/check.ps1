@@ -68,7 +68,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': '771e6f25275b16e95287d98e64afc9f883d77ed493c0cb12c1c3e10acf61a4dd',
+    '.github/workflows/foundation.yml': 'ee3369cc9bd0997d9f4c629b8d3b8acc0498f0dedab5f10105fb4c8642d21d01',
     'apps/api/Dockerfile': '293af5bb74f261da9d70fe314241b897b4452e116617758889a9b2dbecfc942a',
     'apps/web/Dockerfile': '611bacc8415759957ecf813a220303aa7adc6d2f12eade10cb64e9f99b7560b1',
 }
@@ -96,6 +96,7 @@ print('PASS approved manifests, complete locks, installed Python closure, privat
         'unit' { Invoke-Checked python @('-m', 'pytest', '-q', 'tests/unit') }
         'web' {
             Invoke-Checked pnpm @('typecheck')
+            Invoke-Checked node @('--no-warnings', '--experimental-strip-types', '--test', 'apps/web/auth/signing.test.ts')
             Invoke-Checked pnpm @('lint')
             Invoke-Checked pnpm @('build')
         }
@@ -119,6 +120,9 @@ print('PASS approved manifests, complete locks, installed Python closure, privat
             }
             if (-not (Test-Path -LiteralPath 'tests/integration/test_request_boundary.py' -PathType Leaf)) {
                 throw 'Missing required B-01 integration test: tests/integration/test_request_boundary.py'
+            }
+            if (-not (Test-Path -LiteralPath 'tests/integration/test_sessions.py' -PathType Leaf)) {
+                throw 'Missing required B-02 integration test: tests/integration/test_sessions.py'
             }
             if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Linux' -or $PSVersionTable.PSVersion.Major -lt 7) {
                 throw 'Integration requires Docker-capable Linux CI and PowerShell 7; no local Docker probe performed'
@@ -455,6 +459,11 @@ docker compose --profile test run --rm --no-deps \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_SERVICE_KEY_SOURCE_FILE:/run/secrets/service_key:ro" \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_auth_mail.py
+docker compose --profile test run --rm --no-deps \
+  -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" \
+  -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_sessions.py
 docker compose logs --no-color api > "$private/auth-logs"
 if grep -Fq '__foundation_bff_must_not_forward__' "$private/auth-logs"; then
   echo 'FAIL BFF forwarded a protected request'; exit 1

@@ -48,6 +48,7 @@ _EXTENSION = re.compile(r"\.[a-z0-9]+(?:[a-z0-9_-]*[a-z0-9])?\Z")
 _MIME = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*\Z")
 _CLASS = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 _HOST_LABEL = re.compile(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\Z")
+_SIGNING_KEY_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
 class ConfigError(RuntimeError):
@@ -100,6 +101,7 @@ class ServiceConfig:
     db_password: str
     file_encryption_key: str
     service_key: str | None
+    signing_key_id: str | None
     mail_enabled: bool
     scan_enabled: bool
     mail: Endpoint | None
@@ -145,6 +147,13 @@ def _host(name: str) -> str:
         _HOST_LABEL.fullmatch(label) for label in value.split(".")
     ):
         raise ConfigError(f"Invalid {name}")
+    return value
+
+
+def _signing_key_id() -> str:
+    value = _required("CP_SIGNING_KEY_ID")
+    if not _SIGNING_KEY_ID.fullmatch(value):
+        raise ConfigError("Invalid CP_SIGNING_KEY_ID")
     return value
 
 
@@ -330,6 +339,7 @@ def load_config(consumer: Consumer) -> ServiceConfig:
         service_key=_secret("CP_SERVICE_KEY_FILE", minimum=32)
         if consumer == "api"
         else None,
+        signing_key_id=_signing_key_id() if consumer == "api" else None,
         mail_enabled=mail_enabled,
         scan_enabled=scan_enabled,
         # Mail transport is web-owned (F-07); worker has no SMTP network.

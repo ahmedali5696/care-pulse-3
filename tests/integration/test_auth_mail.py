@@ -164,7 +164,8 @@ def test_denied_routes_preserve_current_persistence_boundary():
             ("protected_delivery_material",),
             ("request_nonces",),
             ("idempotency_receipts",),
+            ("auth_login_attempts",),
         }
         assert connection.execute(
             "SELECT version_num FROM public.alembic_version"
-        ).fetchall() == [("0006_authorization_barrier",)]
+        ).fetchall() == [("0007_bff_sessions",)]

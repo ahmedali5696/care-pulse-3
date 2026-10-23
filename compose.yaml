@@ -21,6 +21,7 @@ services:
       CP_DB_USER: ${CP_DB_USER:?Set the runtime DB role}
       CP_DB_PASSWORD_FILE: /run/secrets/runtime_db_password
       CP_INTERNAL_API_URL: ${CP_INTERNAL_API_URL:?Set the private API URL}
+      CP_SIGNING_KEY_ID: ${CP_SIGNING_KEY_ID:?Set the active BFF signing key ID}
       CP_SERVICE_KEY_FILE: /run/secrets/service_key
       CP_AUTH_SECRET_FILE: /run/secrets/auth_secret
       CP_MAIL_ENABLED: ${CP_MAIL_ENABLED:?Set explicit mail enablement}
@@ -61,6 +62,7 @@ services:
       CP_DB_USER: ${CP_DB_USER:?Set the runtime DB role}
       CP_DB_PASSWORD_FILE: /run/secrets/runtime_db_password
       CP_SERVICE_KEY_FILE: /run/secrets/service_key
+      CP_SIGNING_KEY_ID: ${CP_SIGNING_KEY_ID:?Set the active API signing key ID}
       CP_FILE_ENCRYPTION_KEY_FILE: /run/secrets/file_encryption_key
       CP_MAIL_ENABLED: ${CP_MAIL_ENABLED:?Set explicit mail enablement}
       CP_SCAN_ENABLED: ${CP_SCAN_ENABLED:?Set explicit scan enablement}

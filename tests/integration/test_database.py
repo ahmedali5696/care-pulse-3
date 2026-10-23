@@ -20,7 +20,7 @@ from sqlalchemy import URL, create_engine, text
 from sqlalchemy.exc import DBAPIError
 
 ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0006_authorization_barrier"
+REVISION = "0007_bff_sessions"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -224,7 +224,7 @@ def test_failed_isolated_migration_rolls_back_objects_and_version(
     shutil.copytree(ROOT / "db/migrations", scripts)
     (scripts / "versions/0007_failure.py").write_text(
         'from alembic import op\nrevision = "0007_failure"\n'
-        'down_revision = "0006_authorization_barrier"\n'
+        'down_revision = "0007_bff_sessions"\n'
         "def upgrade():\n"
         '    op.execute("CREATE TABLE public.synthetic_partial (value integer)")\n'
         '    op.execute("SELECT 1 / 0")\n'
@@ -342,6 +342,7 @@ def test_reused_runtime_connection_has_no_prior_authority(outcome):
         db_password=_password("carepulse_runtime"),
         file_encryption_key="synthetic-unused-by-database-check",
         service_key=None,
+        signing_key_id=None,
         mail_enabled=False,
         scan_enabled=False,
         mail=None,

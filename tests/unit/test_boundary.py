@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -38,6 +39,7 @@ def api_config(monkeypatch):
         db_password="synthetic-db-password",
         file_encryption_key="synthetic-file-key",
         service_key="synthetic-key",
+        signing_key_id="v1",
         mail_enabled=False,
         scan_enabled=False,
         mail=None,
@@ -237,6 +239,42 @@ def test_verified_request_passes_exact_raw_body_and_consumes_one_nonce(
     routes = {(signed.method, signed.path): signed.purpose}
     status, calls, consumed = _run_signed(scope, body, routes, int(signed.timestamp))
     assert (status, calls, consumed) == (204, [signed], 1)
+
+
+def test_only_configured_signing_key_id_is_accepted(signing_vectors, api_config):
+    vector = signing_vectors["vectors"][0]
+    configured_id = "rollover_key-2"
+    config = replace(api_config, signing_key_id=configured_id)
+    envelope = replace(
+        CanonicalEnvelope(*vector["canonical_fields"]), key_id=configured_id
+    )
+    scope = _signed_request(
+        vector,
+        config,
+        {
+            "key-id": configured_id.encode(),
+            "signature": hmac.new(
+                config.service_key.encode(), canonical_payload(envelope), hashlib.sha256
+            )
+            .hexdigest()
+            .encode(),
+        },
+    )
+    routes = {(envelope.method, envelope.path): envelope.purpose}
+    assert _run_signed(scope, b"", routes, int(envelope.timestamp)) == (
+        204,
+        [envelope],
+        1,
+    )
+    # Even a correctly signed request is unknown when it names a different active ID.
+    other_config = replace(api_config, signing_key_id="different-active-id")
+    scope["app"].state.service_config = other_config
+    assert _run_signed(scope, b"", routes, int(envelope.timestamp)) == (401, [], 0)
+    scope["app"].state.service_config = config
+    scope["headers"] = [
+        header for header in scope["headers"] if header[0] != b"x-carepulse-key-id"
+    ]
+    assert _run_signed(scope, b"", routes, int(envelope.timestamp)) == (401, [], 0)
 
 
 def test_duplicate_signed_header_and_forwarded_cookie_are_denied(

@@ -113,6 +113,7 @@ jobs:
             echo "CP_DB_NAME=carepulse"
             echo "CP_DB_USER=carepulse_runtime"
             echo "CP_INTERNAL_API_URL=http://api:8000"
+            echo "CP_SIGNING_KEY_ID=synthetic-ci-v1"
             echo "CP_MAIL_ENABLED=false"
             echo "CP_SCAN_ENABLED=false"
           } >> "$GITHUB_ENV"

@@ -67,6 +67,7 @@ def policy_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
         "CP_DB_PORT": "5432",
         "CP_DB_NAME": "carepulse_test",
         "CP_DB_USER": "carepulse_runtime",
+        "CP_SIGNING_KEY_ID": "synthetic-ci-v1",
         "CP_MAIL_ENABLED": "false",
         "CP_SCAN_ENABLED": "false",
     }
@@ -104,6 +105,7 @@ def test_complete_synthetic_profile(
     assert config.service_key == (
         SECRET_CANARIES["CP_SERVICE_KEY_FILE"] if consumer == "api" else None
     )
+    assert config.signing_key_id == ("synthetic-ci-v1" if consumer == "api" else None)
     assert config.mail_enabled is False and config.scan_enabled is False
     assert config.mail is None and config.scan is None
     for name in POLICY_NUMBERS:
@@ -122,7 +124,7 @@ def test_complete_synthetic_profile(
 @pytest.mark.parametrize(
     ("consumer", "missing"),
     [(consumer, name) for consumer in ("api", "worker") for name in SHARED_ENV]
-    + [("api", "CP_SERVICE_KEY_FILE")],
+    + [("api", "CP_SERVICE_KEY_FILE"), ("api", "CP_SIGNING_KEY_ID")],
 )
 def test_each_required_environment_key_is_mandatory(
     policy_path: Path,
@@ -415,6 +417,18 @@ def test_worker_does_not_consume_api_service_key(
     assert load_config("worker").service_key is None
     with pytest.raises(ConfigError, match="CP_SERVICE_KEY_FILE"):
         load_config("api")
+
+
+@pytest.mark.parametrize("key_id", ["", "v1/unknown", " space", "á", "a" * 129])
+def test_api_rejects_invalid_signing_key_id(policy_path, monkeypatch, key_id):
+    monkeypatch.setenv("CP_SIGNING_KEY_ID", key_id)
+    with pytest.raises(ConfigError, match="CP_SIGNING_KEY_ID"):
+        load_config("api")
+
+
+def test_worker_does_not_need_bff_signing_key_id(policy_path, monkeypatch):
+    monkeypatch.delenv("CP_SIGNING_KEY_ID")
+    assert load_config("worker").signing_key_id is None
 
 
 @pytest.mark.parametrize("consumer", ["api", "worker"])

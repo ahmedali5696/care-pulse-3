@@ -34,7 +34,6 @@ _HEADER_FIELDS = (
     "signature",
     "service-key",
 )
-_EXPECTED_KEY_ID = "v1"
 _EXPECTED_SERVICE = "web"
 
 
@@ -43,7 +42,7 @@ class BoundaryDenied(Exception):
         self.status = status
 
 
-def _signed_headers(scope: Scope, secret: str) -> dict[str, str]:
+def _signed_headers(scope: Scope, secret: str, signing_key_id: str) -> dict[str, str]:
     headers: dict[str, str] = {}
     for raw_name, raw_value in scope.get("headers", ()):
         name = raw_name.lower()
@@ -68,7 +67,7 @@ def _signed_headers(scope: Scope, secret: str) -> dict[str, str]:
         raise BoundaryDenied(401)
     if not compare_digest(headers["service-key"], secret):
         raise BoundaryDenied(401)
-    if headers["key-id"] != _EXPECTED_KEY_ID or headers["service"] != _EXPECTED_SERVICE:
+    if headers["key-id"] != signing_key_id or headers["service"] != _EXPECTED_SERVICE:
         raise BoundaryDenied(401)
     return headers
 
@@ -155,7 +154,7 @@ class ClosedServiceBoundary:
         self, scope: Scope, receive: Receive
     ) -> tuple[CanonicalEnvelope, bytes]:
         config = scope["app"].state.service_config
-        headers = _signed_headers(scope, config.service_key)
+        headers = _signed_headers(scope, config.service_key, config.signing_key_id)
         payload = await _read_body(receive)
         envelope = _envelope(scope, headers, payload)
         mac = new(config.service_key.encode(), canonical_payload(envelope), sha256)

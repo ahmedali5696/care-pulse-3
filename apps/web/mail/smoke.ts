@@ -20,7 +20,7 @@ async function smoke() {
       assert(auth.options.database instanceof Pool);
       assert.equal(auth.options.session?.cookieCache?.enabled, false);
       assert.equal("secondaryStorage" in auth.options, false);
-      assert.equal(auth.options.emailAndPassword?.enabled, false);
+      assert.equal(auth.options.emailAndPassword?.enabled, true);
       assert.equal(auth.options.emailAndPassword?.disableSignUp, true);
       assert.equal("socialProviders" in auth.options, false);
       assert.deepEqual(auth.options.plugins?.map((plugin) => plugin.id), ["carepulse-lifecycle"]);
@@ -38,7 +38,7 @@ async function smoke() {
       assert.equal(response.headers.get("cache-control"), "no-store");
       const body = await response.json();
       assert.equal(body.error.code, "UNAUTHENTICATED");
-      console.log("PASS PostgreSQL/no-cache/closed auth and unknown-session HTTP denial");
+      console.log("PASS PostgreSQL/no-cache/guarded auth and unknown-session HTTP denial");
     } finally {
       await runtimeDatabase(config).end();
     }

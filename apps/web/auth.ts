@@ -1,6 +1,7 @@
 // Server-only; initialize at request time, never during a secret-free Next build.
 import { betterAuth } from "better-auth";
 import { lifecycleSchemaPlugin, sessionFields } from "./auth/schema.ts";
+import { bindSessionAuthority } from "./auth/session.ts";
 import { loadWebConfig } from "./config.ts";
 import { runtimeDatabase } from "./db.ts";
 
@@ -12,11 +13,20 @@ function createAuth() {
     secret: config.authSecret,
     database: runtimeDatabase(config),
     plugins: [lifecycleSchemaPlugin],
-    advanced: { database: { validateSchema: true } },
-    session: { cookieCache: { enabled: false }, additionalFields: sessionFields },
+    advanced: {
+      database: { validateSchema: true },
+      useSecureCookies: process.env.CP_ENV === "production",
+      defaultCookieAttributes: { httpOnly: true, sameSite: "lax", path: "/" },
+    },
+    session: {
+      cookieCache: { enabled: false }, disableSessionRefresh: true,
+      additionalFields: sessionFields,
+    },
+    databaseHooks: { session: { create: { before: bindSessionAuthority } } },
     verification: { storeInDatabase: true, storeIdentifier: "hashed" },
     emailAndPassword: {
-      enabled: false, disableSignUp: true, revokeSessionsOnPasswordReset: true,
+      enabled: true, disableSignUp: true, requireEmailVerification: true,
+      revokeSessionsOnPasswordReset: true,
     },
     // Adapter failures are translated at the boundary, not logged with SQL.
     logger: { disabled: true },

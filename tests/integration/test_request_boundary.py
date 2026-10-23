@@ -136,6 +136,7 @@ def boundary_data(role_engine, tenant_factory, monkeypatch):
         db_password="synthetic-never-used",
         file_encryption_key="synthetic-never-used",
         service_key=_SECRET,
+        signing_key_id="v1",
         mail_enabled=False,
         scan_enabled=False,
         mail=None,
