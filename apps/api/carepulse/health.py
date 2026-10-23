@@ -12,7 +12,7 @@ from carepulse.config import ConfigError, Consumer, load_config
 from carepulse.db import create_db_engine, transaction
 
 PROBE_DEADLINE_SECONDS = 4
-BASELINE_REVISION = "0001_foundation"
+COMPATIBLE_REVISION = "0002_organizations"
 router = APIRouter()
 
 
@@ -39,7 +39,7 @@ def _database_ready(consumer: Consumer) -> bool:
             revisions = connection.scalars(
                 text("SELECT version_num FROM public.alembic_version")
             ).all()
-            return revisions == [BASELINE_REVISION]
+            return revisions == [COMPATIBLE_REVISION]
     finally:
         engine.dispose()
 

@@ -85,12 +85,14 @@ def test_incompatible_revision_denies_then_recovers_without_schema_creation():
         finally:
             admin.execute(
                 "UPDATE public.alembic_version SET version_num = %s",
-                ("0001_foundation",),
+                ("0002_organizations",),
             )
         _eventually()
-        assert admin.execute(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-        ).fetchall() == [("alembic_version",)]
+        assert set(
+            admin.execute(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+            ).fetchall()
+        ) == {("alembic_version",), ("organizations",), ("operator_identities",)}
 
 
 def test_blocked_database_query_times_out_while_processes_remain_live():

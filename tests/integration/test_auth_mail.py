@@ -145,8 +145,12 @@ def test_denials_created_no_auth_business_or_outbox_schema():
         tables = connection.execute(
             "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
         ).fetchall()
-        assert set(tables) <= {("alembic_version",)}
+        assert set(tables) <= {
+            ("alembic_version",),
+            ("organizations",),
+            ("operator_identities",),
+        }
         if tables:
             assert connection.execute(
                 "SELECT version_num FROM public.alembic_version"
-            ).fetchall() == [("0001_foundation",)]
+            ).fetchall() == [("0002_organizations",)]

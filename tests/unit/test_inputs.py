@@ -29,6 +29,7 @@ def checkout(tmp_path):
         "compose.yaml",
         ".github/workflows/foundation.yml",
         "tests/integration/test_auth_mail.py",
+        "tests/integration/test_tenant_isolation.py",
     ):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -114,6 +115,16 @@ def test_missing_f07_suite_fails_before_docker(checkout):
         "Missing required F-07 integration test" in completed.stdout + completed.stderr
     )
     assert not marker.exists()
+
+
+def test_missing_d01_suite_fails_before_docker(checkout):
+    suite = checkout / "tests/integration/test_tenant_isolation.py"
+    suite.unlink()
+    completed = _check(checkout, "integration")
+    assert completed.returncode != 0
+    assert (
+        "Missing required D-01 integration test" in completed.stdout + completed.stderr
+    )
 
 
 def test_runtime_version_mismatch_is_rejected(checkout):
