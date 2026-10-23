@@ -441,7 +441,7 @@ for service in api web worker; do
     sleep 1
   done
 done
-# F-07 is independently executable without D-02 tables or a fake identity.
+# F-07 remains closed to unauthenticated callers with D-02 native storage present.
 docker compose exec -T web node --experimental-strip-types mail/smoke.ts auth
 docker compose exec -T web node --experimental-strip-types mail/smoke.ts mail
 docker compose --profile test run --rm --no-deps \
