@@ -9,6 +9,68 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # A D-02 deferred staff/native-user trigger can observe an ACTIVE clinic.
+    # Its prior combined condition accessed OLD.state even for those tables;
+    # PL/pgSQL does not guarantee short-circuit evaluation. Correct it in this
+    # forward migration without rewriting the already deployed D-02 revision.
+    op.execute("""
+        CREATE OR REPLACE FUNCTION public.assert_active_owner() RETURNS trigger
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+        DECLARE
+            org_id uuid;
+            org_state text;
+            first_activation timestamptz;
+            actual_owners integer;
+        BEGIN
+            IF TG_TABLE_NAME = 'organizations' THEN
+                org_id := NEW.id;
+            ELSIF TG_TABLE_NAME = 'staff_accounts' THEN
+                org_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.organization_id
+                               ELSE NEW.organization_id END;
+            ELSE
+                SELECT s.organization_id INTO org_id FROM public.staff_accounts s
+                WHERE s.auth_user_id = CASE WHEN TG_OP = 'DELETE' THEN OLD.id
+                                            ELSE NEW.id END;
+            END IF;
+            IF org_id IS NULL THEN
+                RETURN NULL;
+            END IF;
+            SELECT state, first_activated_at INTO org_state, first_activation
+            FROM public.organizations WHERE id = org_id FOR UPDATE;
+            IF org_state = 'ACTIVE' THEN
+                SELECT count(*) INTO actual_owners
+                FROM public.staff_accounts s
+                JOIN public."user" u ON u.id = s.auth_user_id
+                WHERE s.organization_id = org_id
+                  AND s.role = 'DOCTOR_OWNER' AND s.enabled AND s.verified
+                  AND u."emailVerified" AND u.email = s.verified_email;
+                IF actual_owners <> 1 THEN
+                    RAISE EXCEPTION 'ACTIVE tenant requires one verified enabled Owner'
+                        USING ERRCODE = '23514';
+                END IF;
+                IF TG_TABLE_NAME = 'organizations' THEN
+                    IF OLD.state = 'PROVISIONING' THEN
+                        IF first_activation IS NULL OR NOT EXISTS (
+                            SELECT 1 FROM public.invitations i
+                            JOIN public.staff_accounts s ON s.organization_id = i.organization_id
+                            JOIN public."user" u ON u.id = s.auth_user_id
+                            WHERE i.organization_id = org_id
+                              AND i.purpose = 'FIRST_OWNER' AND i.state = 'ACCEPTED'
+                              AND i.accepted_by_user_id = u.id
+                              AND i.target_email = s.verified_email
+                              AND s.role = 'DOCTOR_OWNER' AND s.enabled AND s.verified
+                              AND i.accepted_at < i.expires_at
+                        ) THEN
+                            RAISE EXCEPTION 'Activation requires accepted first-Owner invitation'
+                                USING ERRCODE = '23514';
+                        END IF;
+                    END IF;
+                END IF;
+            END IF;
+            RETURN NULL;
+        END
+        $$
+    """)
     op.execute("""
         CREATE TABLE public.sensitive_audit (
             id uuid PRIMARY KEY,
