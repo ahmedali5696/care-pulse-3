@@ -182,24 +182,13 @@ def test_empty_database_reset_and_repeated_upgrade(admin, empty_database):
                     )
                     == "0001_foundation"
                 )
-                assert (
-                    connection.scalar(
-                        text("SELECT to_regclass('public.organizations')")
-                    )
-                    is None
-                )
-                assert (
-                    connection.scalar(
-                        text("SELECT to_regclass('public.operator_identities')")
-                    )
-                    is None
-                )
-                assert (
-                    connection.scalar(
-                        text("SELECT to_regclass('public.runtime_active_tenant_ids')")
-                    )
-                    is None
-                )
+                assert connection.execute(
+                    text("""
+                    SELECT to_regclass('public.organizations'),
+                           to_regclass('public.operator_identities'),
+                           to_regclass('public.runtime_active_tenant_ids')
+                """)
+                ).one() == (None, None, None)
             _upgrade(engine)
         finally:
             engine.dispose()

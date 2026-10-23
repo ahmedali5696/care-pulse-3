@@ -1,5 +1,6 @@
 """Container-free transaction lifecycle checks; no PostgreSQL/RLS isolation claim."""
 
+import sqlite3
 from asyncio import CancelledError
 
 import pytest
@@ -11,6 +12,17 @@ from sqlalchemy.exc import DBAPIError
 @pytest.fixture
 def engine(tmp_path):
     database = create_engine(f"sqlite:///{tmp_path / 'lifecycle.db'}")
+
+    @event.listens_for(database, "connect")
+    def sqlite_context_placeholder(connection, _record):
+        # Lifecycle unit tests have no tenant; PostgreSQL RLS is proven in CI.
+        def set_config(_key, organization, _local):
+            if organization:
+                raise sqlite3.OperationalError("SQLite has no tenant context")
+            return ""
+
+        connection.create_function("set_config", 3, set_config)
+
     with database.begin() as connection:
         connection.execute(text("CREATE TABLE lifecycle (value integer)"))
     yield database
@@ -57,7 +69,7 @@ def test_commit_failure_releases_without_persisting_partial_work(engine):
 def test_context_setup_failure_releases_before_yielding(engine):
     from uuid import UUID
 
-    # SQLite deliberately lacks set_config; this proves only the failure lifecycle.
+    # The SQLite lifecycle fixture explicitly refuses tenant context.
     with pytest.raises(DBAPIError), transaction(engine, UUID(int=1)):
         pytest.fail("A failed context setup yielded a connection")
     assert engine.pool.checkedout() == 0

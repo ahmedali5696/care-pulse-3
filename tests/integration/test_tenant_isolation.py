@@ -390,3 +390,40 @@ def test_parallel_metadata_creation_of_same_tenant_has_one_winner(
             )
     finally:
         runtime.dispose()
+
+
+def test_pooled_session_setting_cannot_impersonate_tenant_without_context(
+    tenants, clinical_relation, role_engine
+):
+    _, clinic_a, _ = tenants
+    runtime = role_engine("carepulse_runtime")
+    record_id = uuid4()
+    try:
+        with transaction(runtime, clinic_a) as connection:
+            connection.execute(
+                text("""
+                INSERT INTO public.synthetic_d01_clinical (organization_id, id)
+                VALUES (:organization_id, :id)
+                """),
+                {"organization_id": clinic_a, "id": record_id},
+            )
+        with runtime.begin() as connection:
+            backend_pid = connection.scalar(text("SELECT pg_backend_pid()"))
+            connection.execute(
+                text("SELECT set_config('app.organization_id', :context, false)"),
+                {"context": str(clinic_a)},
+            )
+        with transaction(runtime) as connection:
+            assert connection.scalar(text("SELECT pg_backend_pid()")) == backend_pid
+            assert (
+                connection.scalars(
+                    text("SELECT id FROM public.synthetic_d01_clinical")
+                ).all()
+                == []
+            )
+            assert (
+                connection.scalars(text("SELECT id FROM public.organizations")).all()
+                == []
+            )
+    finally:
+        runtime.dispose()

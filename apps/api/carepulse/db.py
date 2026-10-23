@@ -32,11 +32,8 @@ def transaction(
     if organization_id is not None and not isinstance(organization_id, UUID):
         raise ValueError("Organization context must be a validated UUID")
     with engine.begin() as connection:
-        if organization_id is not None:
-            connection.execute(
-                text(
-                    "SELECT set_config('app.organization_id', :organization_id, true)"
-                ),
-                {"organization_id": str(organization_id)},
-            )
+        connection.execute(
+            text("SELECT set_config('app.organization_id', :organization_id, true)"),
+            {"organization_id": str(organization_id) if organization_id else ""},
+        )
         yield connection
