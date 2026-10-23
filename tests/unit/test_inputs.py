@@ -30,6 +30,8 @@ def checkout(tmp_path):
         ".github/workflows/foundation.yml",
         "tests/integration/test_auth_mail.py",
         "tests/integration/test_tenant_isolation.py",
+        "tests/integration/test_identity_persistence.py",
+        "tests/integration/test_evidence_persistence.py",
     ):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -124,6 +126,16 @@ def test_missing_d01_suite_fails_before_docker(checkout):
     assert completed.returncode != 0
     assert (
         "Missing required D-01 integration test" in completed.stdout + completed.stderr
+    )
+
+
+def test_missing_d09_suite_fails_before_docker(checkout):
+    suite = checkout / "tests/integration/test_evidence_persistence.py"
+    suite.unlink()
+    completed = _check(checkout, "integration")
+    assert completed.returncode != 0
+    assert (
+        "Missing required D-09 integration test" in completed.stdout + completed.stderr
     )
 
 

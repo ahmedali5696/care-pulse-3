@@ -135,7 +135,7 @@ def test_both_reserved_templates_arrived_without_tokens():
     }
 
 
-def test_denied_routes_do_not_require_business_or_outbox_schema():
+def test_denied_routes_preserve_current_persistence_boundary():
     with psycopg.connect(
         host="db",
         dbname="carepulse",
@@ -157,7 +157,14 @@ def test_denied_routes_do_not_require_business_or_outbox_schema():
             ("invitations",),
             ("recovery_operations",),
             ("auth_recovery_completions",),
+            ("sensitive_audit",),
+            ("clinical_audit",),
+            ("outbox_events",),
+            ("delivery_jobs",),
+            ("protected_delivery_material",),
+            ("request_nonces",),
+            ("idempotency_receipts",),
         }
         assert connection.execute(
             "SELECT version_num FROM public.alembic_version"
-        ).fetchall() == [("0003_identity",)]
+        ).fetchall() == [("0004_evidence",)]
