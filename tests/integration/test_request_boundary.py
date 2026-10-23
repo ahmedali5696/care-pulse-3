@@ -18,8 +18,10 @@ from carepulse.identity.authorization import protected_transaction
 from carepulse.identity.boundary import ClosedServiceBoundary
 from carepulse.identity.contracts import (
     ContractError,
+    ResourceFields,
     error_response,
     normalized_request_digest,
+    project_visible_resource,
     success_response,
 )
 from carepulse.identity.receipts import (
@@ -318,6 +320,59 @@ def test_expired_persisted_session_is_denied(boundary_data):
             {"session": data.session},
         )
     assert _dispatch(data, _signed(data), lambda i, b: _read_own(data, i, b))[0] == 401
+
+
+def test_stale_security_revision_is_denied(boundary_data):
+    data = boundary_data
+    with data.migration.begin() as connection:
+        connection.execute(
+            text("""
+                UPDATE public.staff_accounts
+                SET security_revision=security_revision+1
+                WHERE id=:staff
+            """),
+            {"staff": data.staff},
+        )
+    assert _dispatch(data, _signed(data), lambda i, b: _read_own(data, i, b))[0] == 401
+
+
+def test_deleted_native_session_is_denied(boundary_data):
+    data = boundary_data
+    with data.migration.begin() as connection:
+        connection.execute(
+            text('DELETE FROM public."session" WHERE id=:session'),
+            {"session": data.session},
+        )
+    assert _dispatch(data, _signed(data), lambda i, b: _read_own(data, i, b))[0] == 401
+
+
+def test_foreign_record_is_nonvisible_even_with_live_own_session(boundary_data):
+    data = boundary_data
+
+    def foreign_read(identity, _body):
+        with protected_transaction(
+            data.runtime, identity, data.config.policy.session_idle_minutes
+        ) as (connection, actor):
+            foreign = (
+                connection.execute(
+                    text(
+                        "SELECT id, id AS organization_id FROM public.organizations WHERE id=:id"
+                    ),
+                    {"id": data.other},
+                )
+                .mappings()
+                .one_or_none()
+            )
+            return project_visible_resource(
+                foreign,
+                actor.organization_id,
+                actor.role,
+                ResourceFields(
+                    readable={"DOCTOR_OWNER": frozenset({"id"})}, writable={}
+                ),
+            )
+
+    assert _dispatch(data, _signed(data), foreign_read)[0] == 404
 
 
 def test_parallel_same_nonce_has_single_committed_winner(boundary_data):

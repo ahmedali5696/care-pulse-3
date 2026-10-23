@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from sqlalchemy.exc import SQLAlchemyError
 
 from carepulse.config import load_config
 from carepulse.db import create_db_engine
@@ -37,6 +38,7 @@ app = FastAPI(
 )
 app.include_router(health_router)
 app.add_exception_handler(ContractError, contract_exception_handler)
+app.add_exception_handler(SQLAlchemyError, lambda _request, _error: error_response(503))
 app.add_exception_handler(
     ReceiptConflict,
     lambda _request, _error: error_response(409, code="IDEMPOTENCY_CONFLICT"),

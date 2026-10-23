@@ -198,6 +198,14 @@ def _run_signed(scope, body, routes, when_ms):
 
     async def authorized(request_scope, receive, send):
         calls.append(request_scope["carepulse.identity"])
+        assert (
+            request_scope["query_string"]
+            == request_scope["carepulse.identity"].query.encode()
+        )
+        assert (
+            request_scope["raw_path"]
+            == request_scope["carepulse.identity"].path.encode()
+        )
         assert (await receive())["body"] == body
         await send({"type": "http.response.start", "status": 204, "headers": []})
         await send({"type": "http.response.body", "body": b""})
@@ -229,6 +237,39 @@ def test_verified_request_passes_exact_raw_body_and_consumes_one_nonce(
     routes = {(signed.method, signed.path): signed.purpose}
     status, calls, consumed = _run_signed(scope, body, routes, int(signed.timestamp))
     assert (status, calls, consumed) == (204, [signed], 1)
+
+
+def test_duplicate_signed_header_and_forwarded_cookie_are_denied(
+    signing_vectors, api_config
+):
+    vector = signing_vectors["vectors"][0]
+    signed = CanonicalEnvelope(*vector["canonical_fields"])
+    routes = {(signed.method, signed.path): signed.purpose}
+    for extra_header in (
+        (b"x-carepulse-staff-id", signed.staff_id.encode()),
+        (b"cookie", b"synthetic-session-cookie"),
+    ):
+        scope = _signed_request(vector, api_config)
+        scope["headers"].append(extra_header)
+        assert _run_signed(scope, b"", routes, int(signed.timestamp)) == (401, [], 0)
+
+
+def test_signed_request_cannot_change_body_or_resolved_route(
+    signing_vectors, api_config
+):
+    vector = signing_vectors["vectors"][0]
+    signed = CanonicalEnvelope(*vector["canonical_fields"])
+    routes = {(signed.method, signed.path): signed.purpose}
+    assert _run_signed(
+        _signed_request(vector, api_config), b"changed", routes, int(signed.timestamp)
+    ) == (401, [], 0)
+    altered_scope = _signed_request(vector, api_config)
+    altered_scope["path"] = "/v1/other"
+    assert _run_signed(altered_scope, b"", routes, int(signed.timestamp)) == (
+        401,
+        [],
+        0,
+    )
 
 
 @pytest.mark.parametrize(

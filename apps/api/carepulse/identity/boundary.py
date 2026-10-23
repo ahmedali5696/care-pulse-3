@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from hmac import compare_digest, new
 from time import time_ns
+from urllib.parse import unquote
 
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -88,6 +89,8 @@ def _envelope(scope: Scope, headers: dict[str, str], body: bytes) -> CanonicalEn
     if method != method.upper():
         raise BoundaryDenied(401)
     path = canonical_path(scope.get("raw_path", scope["path"].encode("utf-8")))
+    if scope["path"] != unquote(path):
+        raise BoundaryDenied(401)
     query = canonical_query(scope.get("query_string", b""))
     return CanonicalEnvelope(
         headers["protocol-version"],
@@ -133,6 +136,10 @@ class ClosedServiceBoundary:
             return
 
         scope["carepulse.identity"] = envelope
+        # Downstream parsers must process exactly the target HMAC authorized.
+        # Reordered duplicate parameters must not reinterpret a signed request.
+        scope["query_string"] = envelope.query.encode("ascii")
+        scope["raw_path"] = envelope.path.encode("ascii")
         delivered = False
 
         async def replay_body() -> dict:
