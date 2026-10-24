@@ -2,7 +2,9 @@
 
 import json
 import secrets
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
+from threading import Barrier
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -376,3 +378,78 @@ def test_receptionist_invite_acceptance_single_use_with_real_bff(owner_session):
     assert row[3] is True and row[4] is False
     assert row[5] == lifecycle
     assert _login(SimpleNamespace(email=email, password=acceptance["password"]))
+
+
+def test_competing_receptionist_acceptance_cannot_attach_two_credentials(owner_session):
+    owner, cookie = owner_session
+    email = f"synthetic-race-{uuid4()}@example.invalid"
+    status, created = _staff_command(
+        "/api/staff/receptionists",
+        cookie,
+        {"email": email, "name": "Synthetic competing staff", "reason": "Hire"},
+        key=str(uuid4()),
+    )
+    assert status == 201, created
+    staff = created["data"]
+    invitation_id = uuid4()
+    proof = secrets.token_urlsafe(32)
+    with _database() as connection:
+        connection.execute(
+            """
+            INSERT INTO public.invitations
+              (id, organization_id, staff_id, purpose, target_email, proof_digest,
+               expires_at, issued_by_staff_id)
+            VALUES (%s, %s, %s, 'RECEPTIONIST', %s, %s,
+                    clock_timestamp() + interval '20 minutes', %s)
+            """,
+            (
+                invitation_id,
+                owner.clinic,
+                staff["id"],
+                email,
+                sha256(proof.encode()).hexdigest(),
+                owner.staff,
+            ),
+        )
+    base = {
+        "organization_id": str(owner.clinic),
+        "invitation_id": str(invitation_id),
+        "proof": proof,
+        "name": "Synthetic competing staff",
+    }
+    passwords = [f"Synthetic-Race-{uuid4()}!", f"Synthetic-Race-{uuid4()}!"]
+    barrier = Barrier(3)
+
+    def accept(password: str):
+        barrier.wait()
+        return password, _staff_command(
+            "/api/auth/invite-accept", None, {**base, "password": password}
+        )[0]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(accept, password) for password in passwords]
+        barrier.wait()
+        outcomes = [future.result(timeout=30) for future in futures]
+
+    assert len([status for _, status in outcomes if status == 200]) == 1
+    assert all(status in (200, 403, 503) for _, status in outcomes)
+    with _database() as connection:
+        linked_credentials = connection.execute(
+            """
+            SELECT count(*) FROM public.account a
+            JOIN public."user" u ON u.id = a."userId"
+            WHERE u.email = %s AND a."providerId" = 'credential'
+            """,
+            (email,),
+        ).fetchone()[0]
+    assert linked_credentials == 1
+    winner = next(password for password, status in outcomes if status == 200)
+    assert _login(SimpleNamespace(email=email, password=winner))
+    loser = next(password for password, status in outcomes if status != 200)
+    rejected_login, _, _ = _request(
+        "/api/auth/login",
+        method="POST",
+        payload={"email": email, "password": loser},
+        headers=_mutation_headers(),
+    )
+    assert rejected_login == 401

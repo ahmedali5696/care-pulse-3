@@ -4,7 +4,7 @@ import { loadWebConfig } from "../config.ts";
 import { runtimeDatabase } from "../db.ts";
 import { failure, validMutation } from "./http.ts";
 import { signRequest } from "./signing.ts";
-import { withAuthTransaction } from "./postgres-adapter.ts";
+import { scopedAuthClient, withAuthTransaction } from "./postgres-adapter.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INVITE_PROOF = /^[A-Za-z0-9_-]{43}$/;
@@ -122,6 +122,11 @@ async function prepareVerifiedOwner(body: Acceptance, invitation: Invitation): P
   const context = await getAuth().$context;
   if (body.password.length < context.password.config.minPasswordLength ||
       body.password.length > context.password.config.maxPasswordLength) throw new Error("Invalid credential");
+  const client = scopedAuthClient(runtimeDatabase(loadWebConfig()), body.organization_id);
+  if (!client) throw new Error("Invitation preparation requires an owned auth transaction");
+  await client.query('SELECT id FROM public."user" WHERE email = $1 FOR UPDATE', [
+    invitation.target_email,
+  ]);
   const existing = await context.internalAdapter.findUserByEmail(invitation.target_email, { includeAccounts: true });
   if (invitation.purpose === "RECEPTIONIST" &&
       (!existing || existing.user.id !== invitation.prepared_user_id)) {
