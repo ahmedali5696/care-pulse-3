@@ -58,13 +58,7 @@ FILE_POLICY_REQUIRED = (
 def _ci_env() -> dict[str, str]:
     if os.getenv("CI") != "true":
         pytest.skip("Consuming-process integration is CI-only")
-    required = (
-        *SHARED_REQUIRED,
-        "CP_SERVICE_KEY_FILE",
-        "CP_SIGNING_KEY_ID",
-        "CP_DELIVERY_KEY_ID",
-        "CP_DELIVERY_PUBLIC_KEY_FILE",
-    )
+    required = (*SHARED_REQUIRED, "CP_SERVICE_KEY_FILE", "CP_SIGNING_KEY_ID")
     for name in required:
         assert os.environ.get(name), f"Missing CI process input: {name}"
     return dict(os.environ)
@@ -104,14 +98,7 @@ def test_complete_synthetic_profile_starts() -> None:
 
 
 @pytest.mark.parametrize(
-    "missing",
-    (
-        *SHARED_REQUIRED,
-        "CP_SERVICE_KEY_FILE",
-        "CP_SIGNING_KEY_ID",
-        "CP_DELIVERY_KEY_ID",
-        "CP_DELIVERY_PUBLIC_KEY_FILE",
-    ),
+    "missing", (*SHARED_REQUIRED, "CP_SERVICE_KEY_FILE", "CP_SIGNING_KEY_ID")
 )
 def test_missing_each_api_input_denies_start(missing: str) -> None:
     env = _ci_env()

@@ -6,8 +6,6 @@ from pathlib import Path
 
 import pytest
 from carepulse.config import ConfigError, load_config
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 
 POLICY_FIXTURE = (
     Path(__file__).resolve().parents[1] / "fixtures" / "foundation-policy.json"
@@ -54,9 +52,7 @@ SECRET_CANARIES = {
 
 
 @pytest.fixture
-def policy_path(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, synthetic_delivery_key: bytes
-) -> Path:
+def policy_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     # Start independently of the developer's actual application environment.
     for name in tuple(os.environ):
         if name.startswith("CP_"):
@@ -72,27 +68,16 @@ def policy_path(
         "CP_DB_NAME": "carepulse_test",
         "CP_DB_USER": "carepulse_runtime",
         "CP_SIGNING_KEY_ID": "synthetic-ci-v1",
-        "CP_DELIVERY_KEY_ID": "synthetic-test-delivery-v1",
-        "CP_DELIVERY_PUBLIC_KEY_FILE": str(tmp_path / "delivery-public.pem"),
         "CP_MAIL_ENABLED": "false",
         "CP_SCAN_ENABLED": "false",
     }
     for name, setting in settings.items():
         monkeypatch.setenv(name, setting)
-    (tmp_path / "delivery-public.pem").write_bytes(synthetic_delivery_key)
     for name, canary in SECRET_CANARIES.items():
         secret_file = tmp_path / (name.lower() + ".txt")
         secret_file.write_text(canary + "\n", encoding="utf-8")
         monkeypatch.setenv(name, str(secret_file))
     return policy_file
-
-
-@pytest.fixture(scope="session")
-def synthetic_delivery_key() -> bytes:
-    key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
-    return key.public_key().public_bytes(
-        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-    )
 
 
 def replace_policy(policy_path: Path, policy: dict) -> None:
@@ -107,7 +92,6 @@ def test_complete_synthetic_profile(
     capsys: pytest.CaptureFixture[str],
     consumer: str,
     environment: str,
-    synthetic_delivery_key: bytes,
 ) -> None:
     monkeypatch.setenv("CP_ENV", environment)
     expected = json.loads(policy_path.read_text(encoding="utf-8"))
@@ -122,12 +106,6 @@ def test_complete_synthetic_profile(
         SECRET_CANARIES["CP_SERVICE_KEY_FILE"] if consumer == "api" else None
     )
     assert config.signing_key_id == ("synthetic-ci-v1" if consumer == "api" else None)
-    assert config.delivery_key_id == (
-        "synthetic-test-delivery-v1" if consumer == "api" else None
-    )
-    assert config.delivery_public_key_pem == (
-        synthetic_delivery_key if consumer == "api" else None
-    )
     assert config.mail_enabled is False and config.scan_enabled is False
     assert config.mail is None and config.scan is None
     for name in POLICY_NUMBERS:
@@ -146,12 +124,7 @@ def test_complete_synthetic_profile(
 @pytest.mark.parametrize(
     ("consumer", "missing"),
     [(consumer, name) for consumer in ("api", "worker") for name in SHARED_ENV]
-    + [
-        ("api", "CP_SERVICE_KEY_FILE"),
-        ("api", "CP_SIGNING_KEY_ID"),
-        ("api", "CP_DELIVERY_KEY_ID"),
-        ("api", "CP_DELIVERY_PUBLIC_KEY_FILE"),
-    ],
+    + [("api", "CP_SERVICE_KEY_FILE"), ("api", "CP_SIGNING_KEY_ID")],
 )
 def test_each_required_environment_key_is_mandatory(
     policy_path: Path,

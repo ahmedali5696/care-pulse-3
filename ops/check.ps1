@@ -103,42 +103,7 @@ print('PASS approved manifests, complete locks, installed Python closure, privat
         }
         'imports' {
             $env:PYTHONPATH = (Join-Path $PWD 'apps/api') + [IO.Path]::PathSeparator + $PWD
-            $imports = @'
-from carepulse.main import app
-from carepulse.identity.boundary import ClosedServiceBoundary
-import apps.worker.main
-
-expected_paths = {
-    '/health/live', '/health/ready', '/v1/provisioning/owner-activate',
-    '/v1/staff/receptionists', '/v1/staff/receptionists/{staff_id}',
-    '/v1/staff/receptionists/{staff_id}/disable',
-    '/v1/staff/receptionists/{staff_id}/enable',
-    '/v1/staff/receptionists/{staff_id}/permissions',
-    '/v1/staff/receptionists/{staff_id}/invite',
-    '/v1/staff/receptionists/{staff_id}/revoke-invite',
-    '/v1/staff/receptionists/invite-accept',
-}
-assert set(app.openapi()['paths']) == expected_paths
-assert app.openapi_url is None and len(app.user_middleware) == 1
-boundary = app.user_middleware[0]
-assert boundary.cls is ClosedServiceBoundary
-assert boundary.kwargs['routes'] == {
-    ('POST', '/v1/provisioning/owner-activate'): 'OWNER_ACTIVATION',
-    ('GET', '/v1/staff/receptionists'): 'STAFF_MANAGEMENT',
-    ('POST', '/v1/staff/receptionists'): 'STAFF_MANAGEMENT',
-    ('POST', '/v1/staff/receptionists/invite-accept'): 'RECEPTIONIST_ACCEPT',
-}
-patterns = {(method, pattern.pattern, purpose) for method, pattern, purpose in boundary.kwargs['route_patterns']}
-uuid = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
-assert patterns == {
-    ('GET', f'/v1/staff/receptionists/{uuid}', 'STAFF_MANAGEMENT'),
-    ('POST', f'/v1/staff/receptionists/{uuid}/(?:enable|disable|invite|revoke-invite)', 'STAFF_MANAGEMENT'),
-    ('PATCH', f'/v1/staff/receptionists/{uuid}/permissions', 'STAFF_MANAGEMENT'),
-}
-print('PASS exact health/owner/staff routes, default-deny signed boundary, no recovery endpoint')
-'@
-            $imports | & python -
-            if ($LASTEXITCODE -ne 0) { throw "Import and boundary validation failed (exit $LASTEXITCODE)" }
+            Invoke-Checked python @('-c', "from carepulse.main import app; from carepulse.identity.boundary import ClosedServiceBoundary; import apps.worker.main; assert set(app.openapi()['paths']) == {'/health/live', '/health/ready', '/v1/provisioning/owner-activate'}; assert app.openapi_url is None; assert len(app.user_middleware) == 1 and app.user_middleware[0].cls is ClosedServiceBoundary and app.user_middleware[0].kwargs == {'routes': {('POST', '/v1/provisioning/owner-activate'): 'OWNER_ACTIVATION'}}; print('PASS only authorized health/bootstrap routes and signed private boundary')")
             Invoke-Checked python @('-m', 'alembic', 'heads')
         }
         'integration' {
@@ -160,7 +125,7 @@ print('PASS exact health/owner/staff routes, default-deny signed boundary, no re
             if (-not (Test-Path -LiteralPath 'tests/integration/test_sessions.py' -PathType Leaf)) {
                 throw 'Missing required B-02 integration test: tests/integration/test_sessions.py'
             }
-            foreach ($suite in @('tests/integration/test_provisioning.py', 'tests/integration/test_staff.py', 'tests/e2e/owner-invite.spec.ts', 'tests/e2e/extract_mailpit_invitation.py', 'apps/web/mail/delivery-material.test.ts', 'tests/unit/test_delivery_material.py')) {
+            foreach ($suite in @('tests/integration/test_provisioning.py', 'tests/e2e/owner-invite.spec.ts', 'tests/e2e/extract_mailpit_invitation.py', 'apps/web/mail/delivery-material.test.ts', 'tests/unit/test_delivery_material.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-03 verification: $suite" }
             }
             if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Linux' -or $PSVersionTable.PSVersion.Major -lt 7) {
@@ -507,7 +472,7 @@ docker compose --profile test run --rm --no-deps \
   -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" \
   -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_sessions.py tests/integration/test_staff.py
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_sessions.py
 docker compose exec -T web node --no-warnings --experimental-strip-types --test auth/ingress.test.mjs
 echo 'PASS verified source separation, spoof resistance and sole Web listener'
 # The sender target alone has Node, Mailpit access, and the private delivery key.

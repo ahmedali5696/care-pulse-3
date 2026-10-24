@@ -2,7 +2,6 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from re import compile
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -18,7 +17,6 @@ from carepulse.identity.contracts import (
     error_response,
 )
 from carepulse.identity.receipts import ReceiptConflict
-from carepulse.identity.staff_routes import router as staff_router
 from carepulse.provisioning.routes import router as provisioning_router
 
 
@@ -42,7 +40,6 @@ app = FastAPI(
 )
 app.include_router(health_router)
 app.include_router(provisioning_router)
-app.include_router(staff_router)
 app.add_exception_handler(ContractError, contract_exception_handler)
 app.add_exception_handler(
     RequestValidationError, lambda _request, _error: error_response(422)
@@ -54,33 +51,5 @@ app.add_exception_handler(
 )
 app.add_middleware(
     ClosedServiceBoundary,
-    routes={
-        ("POST", "/v1/provisioning/owner-activate"): "OWNER_ACTIVATION",
-        ("GET", "/v1/staff/receptionists"): "STAFF_MANAGEMENT",
-        ("POST", "/v1/staff/receptionists"): "STAFF_MANAGEMENT",
-        ("POST", "/v1/staff/receptionists/invite-accept"): "RECEPTIONIST_ACCEPT",
-    },
-    route_patterns=(
-        (
-            "GET",
-            compile(
-                r"/v1/staff/receptionists/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
-            ),
-            "STAFF_MANAGEMENT",
-        ),
-        (
-            "POST",
-            compile(
-                r"/v1/staff/receptionists/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/(?:enable|disable|invite|revoke-invite)"
-            ),
-            "STAFF_MANAGEMENT",
-        ),
-        (
-            "PATCH",
-            compile(
-                r"/v1/staff/receptionists/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/permissions"
-            ),
-            "STAFF_MANAGEMENT",
-        ),
-    ),
+    routes={("POST", "/v1/provisioning/owner-activate"): "OWNER_ACTIVATION"},
 )
