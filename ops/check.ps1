@@ -512,30 +512,12 @@ docker compose --profile operator run --rm --no-deps -T operator clinics create 
 clinic_id="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["organization_id"])' "$private/clinic-create.json")"
 if ! [[ "$clinic_id" =~ ^[a-f0-9-]{36}$ ]]; then echo 'FAIL synthetic clinic create'; exit 1; fi
 set +e
-sender_result="$(docker compose --profile sender run --rm --no-deps -T --entrypoint python \
-  sender -c '
-import sys
-from uuid import UUID
-from sqlalchemy.exc import SQLAlchemyError
-from carepulse.config import ConfigError
-from carepulse.notifications.email_sender import _settings, send_one_job
-try:
-    print(send_one_job(UUID(sys.argv[1]), None, _settings()))
-except SQLAlchemyError as exc:
-    print("CI_DELIVERY_SQL_" + str(getattr(exc.orig, "sqlstate", "unknown")))
-    sys.exit(1)
-except ConfigError:
-    print("CI_DELIVERY_CONFIG")
-    sys.exit(1)
-except (ValueError, TypeError, KeyError, OSError) as exc:
-    print("CI_DELIVERY_" + type(exc).__name__.upper())
-    sys.exit(1)
-' "$clinic_id")"
+sender_result="$(docker compose --profile sender run --rm --no-deps -T sender --organization-id "$clinic_id")"
 sender_status=$?
 set -e
 if [ "$sender_status" -ne 0 ]; then
   case "$sender_result" in
-    'Delivery unavailable'|READY|FAILED|STALE|NOT_DUE|CI_DELIVERY_SQL_*|CI_DELIVERY_CONFIG|CI_DELIVERY_VALUEERROR|CI_DELIVERY_TYPEERROR|CI_DELIVERY_KEYERROR|CI_DELIVERY_OSERROR)
+    'Delivery unavailable'|READY|FAILED|STALE|NOT_DUE)
       echo "FAIL explicit first-Owner sender: $sender_result";;
     *) echo 'FAIL explicit first-Owner sender: process/error output unavailable';;
   esac

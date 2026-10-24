@@ -257,7 +257,7 @@ def claim_delivery_job(
                    recipient, proof_expires_at, state, attempts, claim_generation,
                    lease_expires_at, not_before
             FROM public.delivery_jobs
-            WHERE (:job IS NULL OR id = :job)
+            WHERE (CAST(:job AS uuid) IS NULL OR id = CAST(:job AS uuid))
               AND ((state = 'READY' AND not_before <= clock_timestamp())
                    OR (state = 'CLAIMED' AND lease_expires_at <= clock_timestamp()))
             ORDER BY not_before, id

@@ -188,7 +188,9 @@ def test_committed_owner_job_delivers_only_intended_mail_and_disposes_material(
     migration, settings = sender_lab
     tenant, invite, job, recipient = _seed_job(migration)
     assert _mailbox(recipient) == []
-    assert send_one_job(tenant, job, settings) == "SENT"
+    # The documented one-shot sender may omit --job-id; PostgreSQL must
+    # type its nullable UUID selector instead of raising SQLSTATE 42P08.
+    assert send_one_job(tenant, None, settings) == "SENT"
     assert _job_state(migration, job) == ("SENT", 1, 1, False)
     ids = _mailbox(recipient)
     assert len(ids) == 1
