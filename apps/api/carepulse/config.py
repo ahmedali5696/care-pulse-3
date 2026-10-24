@@ -351,10 +351,12 @@ def load_config(consumer: Consumer) -> ServiceConfig:
         raise ConfigError("Invalid sender capabilities")
     public_key = (
         _read_file("CP_DELIVERY_PUBLIC_KEY_FILE", max_bytes=_MAX_SECRET_BYTES).encode()
-        if is_operator
+        if consumer in ("api", "operator")
         else None
     )
-    delivery_key_id = _required("CP_DELIVERY_KEY_ID") if is_operator else None
+    delivery_key_id = (
+        _required("CP_DELIVERY_KEY_ID") if consumer in ("api", "operator") else None
+    )
     if delivery_key_id and not _DELIVERY_KEY_ID.fullmatch(delivery_key_id):
         raise ConfigError("Invalid CP_DELIVERY_KEY_ID")
     db_user = _required("CP_DB_USER")
