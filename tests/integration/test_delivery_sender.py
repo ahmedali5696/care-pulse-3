@@ -277,7 +277,7 @@ def test_missing_mailpit_retries_without_losing_proof(sender_lab):
     with migration.connect() as connection:
         assert connection.scalar(
             text(
-                "SELECT not_before > claimed_at FROM public.delivery_jobs WHERE id=:job"
+                "SELECT not_before > updated_at FROM public.delivery_jobs WHERE id=:job"
             ),
             {"job": job},
         )

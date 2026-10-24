@@ -12,8 +12,13 @@ import pytest
 from carepulse.config import ServiceConfig, _load_policy
 from carepulse.db import transaction
 from carepulse.identity.receipts import ReceiptConflict
-from carepulse.provisioning.invitations import create_clinic
+from carepulse.provisioning.invitations import (
+    create_clinic,
+    reissue_invitation,
+    revoke_invitation,
+)
 from carepulse.provisioning.operators import OperatorDenied, authenticate_operator
+from carepulse.provisioning.service import change_clinic_state
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from sqlalchemy import text
@@ -242,6 +247,168 @@ def test_operator_must_commit_complete_provisioning_evidence(operator_identity):
             text("UPDATE public.organizations SET state='ACTIVE' WHERE id=:id"),
             {"id": clinic},
         )
+
+
+def test_reissue_and_revoke_preserve_one_issued_owner_proof(
+    operator_identity, operator_config, monkeypatch
+):
+    migration, operator, actor, secret = operator_identity
+    verified = authenticate_operator(operator, actor, secret, _load_policy())
+    intended = f"{uuid4()}@example.invalid"
+    created = create_clinic(
+        operator,
+        verified,
+        operator_config,
+        "Synthetic reissue",
+        intended,
+        str(uuid4()),
+        "Create first owner",
+    )
+    clinic = uuid4_from_text(created["organization_id"])
+    with migration.connect() as connection:
+        original = connection.scalar(
+            text("""
+            SELECT id FROM public.invitations
+            WHERE organization_id = :clinic AND purpose = 'FIRST_OWNER'
+        """),
+            {"clinic": clinic},
+        )
+
+    with pytest.raises(ValueError):
+        reissue_invitation(
+            operator,
+            verified,
+            operator_config,
+            clinic,
+            original,
+            0,
+            0,
+            "Wrong recipient",
+            owner_email="different@example.invalid",
+        )
+    from carepulse.notifications import delivery_material
+
+    def deny_encryption(*_args, **_kwargs):
+        raise ValueError("Synthetic encryption failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(delivery_material, "encrypt_delivery_token", deny_encryption)
+        with pytest.raises(ValueError):
+            reissue_invitation(
+                operator,
+                verified,
+                operator_config,
+                clinic,
+                original,
+                0,
+                0,
+                "Crypto unavailable",
+            )
+    with migration.connect() as connection:
+        assert (
+            connection.scalar(
+                text("""
+            SELECT count(*) FROM public.invitations
+            WHERE organization_id = :clinic AND state = 'ISSUED'
+        """),
+                {"clinic": clinic},
+            )
+            == 1
+        )
+
+    replacement = reissue_invitation(
+        operator,
+        verified,
+        operator_config,
+        clinic,
+        original,
+        0,
+        0,
+        "Supersede first proof",
+    )
+    new_invite = uuid4_from_text(replacement["invitation_id"])
+    with migration.connect() as connection:
+        assert connection.execute(
+            text("""
+            SELECT state, superseded_by_id FROM public.invitations WHERE id = :old
+        """),
+            {"old": original},
+        ).one() == ("REVOKED", new_invite)
+        assert (
+            connection.scalar(
+                text("""
+            SELECT count(*) FROM public.invitations
+            WHERE organization_id = :clinic AND state = 'ISSUED'
+        """),
+                {"clinic": clinic},
+            )
+            == 1
+        )
+
+    revoked = revoke_invitation(
+        operator, verified, clinic, new_invite, 0, 0, "Revoke first owner"
+    )
+    assert revoked["state"] == "REVOKED"
+    with migration.connect() as connection:
+        assert (
+            connection.scalar(
+                text("""
+            SELECT count(*) FROM public.invitations
+            WHERE organization_id = :clinic AND state = 'ISSUED'
+        """),
+                {"clinic": clinic},
+            )
+            == 0
+        )
+    new_proof = reissue_invitation(
+        operator,
+        verified,
+        operator_config,
+        clinic,
+        None,
+        0,
+        0,
+        "New proof after revoke",
+        owner_email=intended,
+    )
+    assert new_proof["invitation_id"] not in {str(original), str(new_invite)}
+
+
+def uuid4_from_text(value: str):
+    from uuid import UUID
+
+    return UUID(value)
+
+
+def test_pending_suspended_clinic_cannot_reactivate(operator_identity, operator_config):
+    migration, operator, actor, secret = operator_identity
+    verified = authenticate_operator(operator, actor, secret, _load_policy())
+    clinic = uuid4_from_text(
+        create_clinic(
+            operator,
+            verified,
+            operator_config,
+            "Synthetic pending suspend",
+            f"{uuid4()}@example.invalid",
+            str(uuid4()),
+            "Create pending",
+        )["organization_id"]
+    )
+    changed = change_clinic_state(
+        operator, verified, clinic, 0, "SUSPENDED", "Hold pending clinic"
+    )
+    assert changed["state"] == "SUSPENDED" and changed["revision"] == 1
+    with pytest.raises(DBAPIError):
+        change_clinic_state(
+            operator, verified, clinic, 1, "ACTIVE", "Invalid pending reactivation"
+        )
+    with migration.connect() as connection:
+        assert connection.execute(
+            text("""
+            SELECT state, first_activated_at FROM public.organizations WHERE id = :id
+        """),
+            {"id": clinic},
+        ).one() == ("SUSPENDED", None)
 
 
 def test_first_owner_proof_is_single_use_and_tenant_bound(

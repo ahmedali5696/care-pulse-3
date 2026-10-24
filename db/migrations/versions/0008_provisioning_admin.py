@@ -169,10 +169,12 @@ def upgrade() -> None:
         SET search_path = pg_catalog AS $$
         DECLARE attempt_count integer;
         BEGIN
-            -- Limits are supplied by the required validated active policy;
-            -- no timing or retry values are chosen by this migration.
-            IF max_attempts IS NULL OR max_attempts <= 0 OR
-               window_minutes IS NULL OR window_minutes <= 0 THEN
+            -- This migration is synthetic-only (production startup is closed).
+            -- Bound callers to the approved synthetic fixture's 4 attempts
+            -- per 10 minutes so direct operator-DB callers cannot turn off
+            -- throttling by supplying arbitrary permissive parameters.
+            IF max_attempts IS NULL OR max_attempts NOT BETWEEN 1 AND 4 OR
+               window_minutes IS NULL OR window_minutes < 10 THEN
                 RAISE EXCEPTION 'Operator authentication policy unavailable'
                     USING ERRCODE = '42501';
             END IF;
