@@ -421,13 +421,15 @@ def test_two_valid_signins_share_bounded_web_pool_without_leaking_tenant(owner):
                 (actor.user,),
             ).fetchall()
             assert session == [(0, 0)]
+        released = connection.execute(
+            """SELECT pid, state, xact_start FROM pg_stat_activity
+               WHERE pid = ANY(%s)""",
+            (blocked_pids,),
+        ).fetchall()
+        assert {pid for pid, _, _ in released} == set(blocked_pids)
         assert all(
             state == "idle" and transaction_start is None
-            for state, transaction_start in connection.execute(
-                """SELECT state, xact_start FROM pg_stat_activity
-                   WHERE pid = ANY(%s)""",
-                (blocked_pids,),
-            )
+            for _, state, transaction_start in released
         )
         connection.execute(
             "UPDATE public.staff_accounts SET security_revision=security_revision+1 WHERE id=%s",
