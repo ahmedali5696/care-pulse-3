@@ -353,16 +353,17 @@ def test_inflight_old_password_login_cannot_issue_stale_cookie(owner):
             while monotonic() < deadline:
                 waiting = connection.execute("""
                     SELECT EXISTS (
-                      SELECT 1 FROM pg_stat_activity
-                       WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock'
-                         AND query ILIKE '%INSERT%' AND query ILIKE '%session%'
+                      SELECT 1 FROM pg_locks
+                       WHERE pid <> pg_backend_pid() AND NOT granted
+                         AND relation = 'public."session"'::regclass
+                         AND mode = 'RowExclusiveLock'
                     )
                 """).fetchone()[0]
                 if waiting:
                     break
                 if attempt.done():
                     pytest.fail(
-                        "Sign-in finished before credential-verified session insertion"
+                        f"Sign-in finished before session INSERT lock: {attempt.result()}"
                     )
                 sleep(0.025)
             else:
