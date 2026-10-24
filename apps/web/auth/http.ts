@@ -26,9 +26,16 @@ export function json(data: unknown): Response {
 export function validMutation(request: Request): boolean {
   const origin = request.headers.get("origin");
   const from = request.headers.get("sec-fetch-site");
-  return origin === new URL(request.url).origin &&
-    request.headers.get("x-requested-with") === "XMLHttpRequest" &&
-    (from === null || from === "same-origin");
+  const host = request.headers.get("host");
+  if (!origin || !host || request.headers.get("x-requested-with") !== "XMLHttpRequest" ||
+      (from !== null && from !== "same-origin")) return false;
+  try {
+    const source = new URL(origin);
+    return source.origin === origin && source.host === host &&
+      source.protocol === new URL(request.url).protocol;
+  } catch {
+    return false;
+  }
 }
 
 export async function activeActor(request: Request) {
