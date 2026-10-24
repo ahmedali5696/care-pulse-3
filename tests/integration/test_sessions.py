@@ -8,6 +8,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import scrypt, sha256
 from pathlib import Path
+from threading import Barrier
 from time import monotonic, sleep
 from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
@@ -336,6 +337,104 @@ def test_revoked_revision_blocks_existing_cookie(owner):
         )
     _denied(_request("/api/session", cookie=cookie), 401, "UNAUTHENTICATED")
     _denied(_request("/api/events/stream", cookie=cookie), 401, "UNAUTHENTICATED")
+
+
+def test_two_valid_signins_share_bounded_web_pool_without_leaking_tenant(owner):
+    with _database() as connection:
+        other = _seed_owner(connection)
+
+    start = Barrier(3)
+
+    def sign_in(actor):
+        start.wait(timeout=6)
+        return _login(actor)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        with _database() as observer:
+            # Hold session INSERTs only until both actual PostgreSQL backends
+            # are concurrently waiting; a mere thread barrier is insufficient.
+            observer.execute('LOCK TABLE public."session" IN SHARE MODE')
+            first = workers.submit(sign_in, owner)
+            second = workers.submit(sign_in, other)
+            start.wait(timeout=6)
+
+            deadline = monotonic() + 3
+            blocked_pids = []
+            while monotonic() < deadline:
+                blocked_pids = [
+                    row[0]
+                    for row in observer.execute(
+                        """SELECT DISTINCT pid FROM pg_locks
+                           WHERE NOT granted AND pid <> pg_backend_pid()
+                             AND relation = 'public."session"'::regclass
+                             AND mode = 'RowExclusiveLock'"""
+                    )
+                ]
+                if len(blocked_pids) == 2:
+                    break
+                if first.done() or second.done():
+                    pytest.fail(
+                        "A valid sign-in ended before two session INSERTs overlapped"
+                    )
+                # Poll a PostgreSQL lock condition, not a timing-based release.
+                sleep(0.01)
+            else:
+                pytest.fail("Two concurrent session INSERT waiters were not observed")
+
+            backends = observer.execute(
+                """SELECT pid, client_addr::text FROM pg_stat_activity
+                   WHERE pid = ANY(%s) AND usename = 'carepulse_runtime'""",
+                (blocked_pids,),
+            ).fetchall()
+            assert len(backends) == 2
+            assert backends[0][1] and backends[0][1] == backends[1][1]
+            assert (
+                observer.execute(
+                    """SELECT count(*) FROM pg_stat_activity
+                   WHERE datname = 'carepulse' AND usename = 'carepulse_runtime'
+                     AND client_addr::text = %s""",
+                    (backends[0][1],),
+                ).fetchone()[0]
+                == 2
+            )
+        # Releasing the table lock must unblock both real sign-in transactions.
+        first_cookie = first.result(timeout=8)
+        second_cookie = second.result(timeout=8)
+
+    for actor, cookie in ((owner, first_cookie), (other, second_cookie)):
+        status, _, body = _request("/api/session", cookie=cookie)
+        assert status == 200, body
+        assert json.loads(body)["data"] == {
+            "id": str(actor.staff),
+            "organization_id": str(actor.clinic),
+            "role": "DOCTOR_OWNER",
+            "bulk_reschedule": False,
+            "revision": 0,
+        }
+    with _database() as connection:
+        for actor in (owner, other):
+            session = connection.execute(
+                """SELECT s."securityRevision", staff.security_revision
+                     FROM public."session" s
+                     JOIN public.staff_accounts staff ON staff.auth_user_id = s."userId"
+                    WHERE s."userId" = %s""",
+                (actor.user,),
+            ).fetchall()
+            assert session == [(0, 0)]
+        assert all(
+            state == "idle" and transaction_start is None
+            for state, transaction_start in connection.execute(
+                """SELECT state, xact_start FROM pg_stat_activity
+                   WHERE pid = ANY(%s)""",
+                (blocked_pids,),
+            )
+        )
+        connection.execute(
+            "UPDATE public.staff_accounts SET security_revision=security_revision+1 WHERE id=%s",
+            (owner.staff,),
+        )
+    _denied(_request("/api/session", cookie=first_cookie), 401, "UNAUTHENTICATED")
+    assert _request("/api/session", cookie=second_cookie)[0] == 200
 
 
 def test_inflight_old_password_login_cannot_issue_stale_cookie(owner):
