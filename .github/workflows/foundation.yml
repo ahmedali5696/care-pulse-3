@@ -5,6 +5,11 @@ on:
     branches: [feature/wave-0-foundation, development]
   pull_request:
   workflow_dispatch:
+    inputs:
+      b04_spike:
+        description: Run the isolated Issue 7 adapter feasibility experiment
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -86,6 +91,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
+      CP_B04_SPIKE: ${{ inputs.b04_spike || false }}
       COMPOSE_PROJECT_NAME: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
       CP_CI_PROJECT: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
