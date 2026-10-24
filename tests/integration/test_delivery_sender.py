@@ -277,7 +277,7 @@ def test_lost_smtp_acknowledgment_preserves_one_job_and_allows_duplicate_mail(
                 text("SELECT set_config('app.organization_id', :tenant, true)"),
                 {"tenant": str(tenant)},
             )
-            assert not finish_delivery_job(connection, original, JobOutcome("READY"))
+            assert not finish_delivery_job(connection, original, JobOutcome("SENT"))
     finally:
         sender.dispose()
 
