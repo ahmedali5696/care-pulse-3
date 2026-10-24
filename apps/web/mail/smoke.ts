@@ -1,7 +1,6 @@
 // Private CLI only; never mount as an HTTP route or create an auth identity.
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { Pool } from "pg";
 import { getAuth } from "../auth.ts";
 import { loadWebConfig } from "../config.ts";
 import { runtimeDatabase } from "../db.ts";
@@ -17,7 +16,7 @@ async function smoke() {
   } else if (mode === "auth") {
     try {
       const auth = getAuth();
-      assert(auth.options.database instanceof Pool);
+      assert.equal(typeof auth.options.database, "function");
       assert.equal(auth.options.session?.cookieCache?.enabled, false);
       assert.equal("secondaryStorage" in auth.options, false);
       assert.equal(auth.options.emailAndPassword?.enabled, true);
@@ -28,6 +27,7 @@ async function smoke() {
         assert.equal(await auth.api.getSession({ headers: new Headers({ cookie }) }), null);
       }
       const context = await auth.$context;
+      assert.equal(context.adapter.id, "carepulse-postgres");
       const token = "synthetic-nonexistent-session";
       const signature = createHmac("sha256", config.authSecret).update(token).digest("base64");
       const cookie = `${context.authCookies.sessionToken.name}=${encodeURIComponent(`${token}.${signature}`)}`;
