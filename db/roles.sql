@@ -3,6 +3,7 @@
 \getenv migration_password CP_MIGRATION_PASSWORD
 \getenv runtime_password CP_RUNTIME_PASSWORD
 \getenv operator_password CP_OPERATOR_PASSWORD
+\getenv sender_password CP_SENDER_PASSWORD
 
 BEGIN;
 CREATE ROLE carepulse_migration LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
@@ -11,13 +12,16 @@ CREATE ROLE carepulse_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
     NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD :'runtime_password';
 CREATE ROLE carepulse_operator LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
     NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD :'operator_password';
+CREATE ROLE carepulse_sender LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD :'sender_password';
 
 SELECT current_database() AS database_name \gset
 REVOKE ALL ON DATABASE :"database_name" FROM PUBLIC;
 GRANT CONNECT ON DATABASE :"database_name"
-    TO carepulse_migration, carepulse_runtime, carepulse_operator;
+    TO carepulse_migration, carepulse_runtime, carepulse_operator, carepulse_sender;
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 ALTER SCHEMA public OWNER TO carepulse_migration;
 GRANT USAGE ON SCHEMA public TO carepulse_runtime;
+GRANT USAGE ON SCHEMA public TO carepulse_sender;
 -- No operator table grants or future-table grants exist in the empty baseline.
 COMMIT;

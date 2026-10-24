@@ -1,11 +1,11 @@
 // Synthetic Mailpit only. Production delivery/lifecycle remains later-owner work.
 import nodemailer from "nodemailer";
-import { loadWebConfig } from "../config.ts";
+import { loadMailSettings } from "./config.ts";
 import { renderMail, type TemplateKind } from "./templates.ts";
 
-export async function sendSyntheticMail(kind: TemplateKind, recipient: string) {
-  const config = loadWebConfig();
-  if (!config.smtp || config.smtp.host !== "mail" || config.smtp.port !== 1025 ||
+export async function sendSyntheticMail(kind: TemplateKind, recipient: string, link?: string) {
+  const config = loadMailSettings();
+  if (!config.smtp ||
       !/^[a-z0-9-]+@example\.invalid$/.test(recipient)) {
     throw new Error("Synthetic mail unavailable");
   }
@@ -18,7 +18,7 @@ export async function sendSyntheticMail(kind: TemplateKind, recipient: string) {
   try {
     const result = await transport.sendMail({
       from: "CarePulse Synthetic <no-reply@example.invalid>", to: recipient,
-      ...renderMail(kind),
+      ...renderMail(kind, link),
     });
     if (result.accepted.length !== 1 || result.rejected.length) throw new Error("Mail rejected");
   } catch {

@@ -1,5 +1,6 @@
 import { lstatSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
+import { loadMailSettings } from "./mail/config.ts";
 
 // Server-only: never import this module from app pages, layouts or client code.
 // T012 deliberately does not supply production policy values or fallback secrets.
@@ -264,10 +265,7 @@ export function loadWebConfig() {
   const serviceKey = secretFile("CP_SERVICE_KEY_FILE");
   const signingKeyIdValue = signingKeyId();
   const authSecret = secretFile("CP_AUTH_SECRET_FILE");
-  const mailEnabled = choice("CP_MAIL_ENABLED", ["true", "false"]) === "true";
-  const smtp = mailEnabled
-    ? { host: hostname("CP_SMTP_HOST"), port: port("CP_SMTP_PORT") }
-    : null;
+  const { mailEnabled, smtp } = loadMailSettings();
   choice("CP_SCAN_ENABLED", ["false"]);
 
   return { environment, policy, database, apiUrl, serviceKey, signingKeyId: signingKeyIdValue, authSecret, mailEnabled, smtp };

@@ -44,10 +44,33 @@ def _signed_actor(identity: "CanonicalEnvelope") -> tuple[UUID, UUID, int]:
         or not identity.role
         or not identity.purpose
         or identity.purpose.upper()
-        in {"BOOTSTRAP", "RECOVERY", "FIRST_OWNER", "INVITE_ACCEPT", "PASSWORD_RESET"}
+        in {
+            "BOOTSTRAP",
+            "RECOVERY",
+            "FIRST_OWNER",
+            "INVITE_ACCEPT",
+            "PASSWORD_RESET",
+            "OWNER_ACTIVATION",
+        }
     ):
         raise AuthorizationDenied(401)
     return tenant, staff, revision
+
+
+def bootstrap_owner_organization(identity: "CanonicalEnvelope") -> UUID:
+    """Purpose-bound pre-ACTIVE identity grants only the bootstrap command."""
+    if (
+        identity.purpose != "OWNER_ACTIVATION"
+        or identity.role != "BOOTSTRAP"
+        or identity.session_id
+        or identity.staff_id
+        or identity.security_revision != "0"
+    ):
+        raise AuthorizationDenied(403)
+    try:
+        return UUID(identity.organization_id)
+    except (TypeError, ValueError) as invalid:
+        raise AuthorizationDenied(401) from invalid
 
 
 def _current_staff(connection: Connection, tenant: UUID, staff: UUID):

@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from carepulse.config import load_config
@@ -16,6 +17,7 @@ from carepulse.identity.contracts import (
     error_response,
 )
 from carepulse.identity.receipts import ReceiptConflict
+from carepulse.provisioning.routes import router as provisioning_router
 
 
 @asynccontextmanager
@@ -37,10 +39,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(health_router)
+app.include_router(provisioning_router)
 app.add_exception_handler(ContractError, contract_exception_handler)
+app.add_exception_handler(
+    RequestValidationError, lambda _request, _error: error_response(422)
+)
 app.add_exception_handler(SQLAlchemyError, lambda _request, _error: error_response(503))
 app.add_exception_handler(
     ReceiptConflict,
     lambda _request, _error: error_response(409, code="IDEMPOTENCY_CONFLICT"),
 )
-app.add_middleware(ClosedServiceBoundary)
+app.add_middleware(
+    ClosedServiceBoundary,
+    routes={("POST", "/v1/provisioning/owner-activate"): "OWNER_ACTIVATION"},
+)

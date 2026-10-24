@@ -32,6 +32,7 @@ def role_engine(disposable_ci):
             "carepulse_migration": "migration_password",
             "carepulse_runtime": "runtime_db_password",
             "carepulse_operator": "operator_password",
+            "carepulse_sender": "sender_password",
         }[role]
         return create_engine(
             URL.create(

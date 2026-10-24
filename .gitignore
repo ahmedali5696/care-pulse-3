@@ -14,6 +14,8 @@ __pycache__/
 *.tsbuildinfo
 .pytest_cache/
 .ruff_cache/
+.playwright-results/
+playwright-report/
 
 # Credentials, generated logs and editor state
 .env

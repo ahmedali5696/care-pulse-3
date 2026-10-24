@@ -93,14 +93,14 @@ def test_metadata_isolated_but_operator_can_list_only_metadata(tenants, role_eng
                 ).all()
                 == []
             )
-        with operator.connect() as connection:
-            assert {
-                row[0]
-                for row in connection.execute(
-                    text("SELECT id FROM public.organizations WHERE id IN (:a, :b)"),
-                    {"a": clinic_a, "b": clinic_b},
-                )
-            } == {clinic_a, clinic_b}
+        # B-03 requires individual operator authentication for metadata listing;
+        # the DB role itself cannot bypass the restricted CLI/function gate.
+        with pytest.raises(DBAPIError) as denied_list, operator.connect() as connection:
+            connection.execute(
+                text("SELECT id FROM public.organizations WHERE id IN (:a, :b)"),
+                {"a": clinic_a, "b": clinic_b},
+            )
+        assert denied_list.value.orig.sqlstate == "42501"
         with pytest.raises(DBAPIError) as denied_insert, operator.begin() as connection:
             connection.execute(
                 text("""

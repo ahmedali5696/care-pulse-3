@@ -12,8 +12,9 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-type Consumer = Literal["api", "worker"]
+type Consumer = Literal["api", "worker", "operator", "sender"]
 
 _MAX_POLICY_BYTES = 65_536
 _MAX_SECRET_BYTES = 8_192
@@ -49,6 +50,7 @@ _MIME = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*\Z")
 _CLASS = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 _HOST_LABEL = re.compile(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\Z")
 _SIGNING_KEY_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+_DELIVERY_KEY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 
 class ConfigError(RuntimeError):
@@ -99,13 +101,22 @@ class ServiceConfig:
     db_name: str
     db_user: str
     db_password: str
-    file_encryption_key: str
+    file_encryption_key: str | None
     service_key: str | None
     signing_key_id: str | None
     mail_enabled: bool
     scan_enabled: bool
     mail: Endpoint | None
     scan: Endpoint | None
+    operator_secret: str | None = None
+    delivery_public_key_pem: bytes | None = None
+    delivery_key_id: str | None = None
+    delivery_private_key_path: str | None = None
+    delivery_lease_seconds: int | None = None
+    delivery_attempt_timeout_seconds: int | None = None
+    delivery_max_attempts: int | None = None
+    delivery_retry_seconds: int | None = None
+    mail_base_url: str | None = None
 
 
 def _required(name: str) -> str:
@@ -165,6 +176,13 @@ def _port(name: str) -> int:
     if not 1 <= port <= 65_535:
         raise ConfigError(f"Invalid {name}")
     return port
+
+
+def _positive_seconds(name: str) -> int:
+    value = _required(name)
+    if not re.fullmatch(r"[1-9][0-9]{0,8}", value):
+        raise ConfigError(f"Invalid {name}")
+    return int(value)
 
 
 def _read_file(name: str, *, max_bytes: int) -> str:
@@ -310,7 +328,7 @@ def _endpoint(prefix: str, *, enabled: bool) -> Endpoint | None:
 
 def load_config(consumer: Consumer) -> ServiceConfig:
     """Load only this process's inputs; deny any incomplete active policy."""
-    if consumer not in ("api", "worker"):
+    if consumer not in ("api", "worker", "operator", "sender"):
         raise ConfigError("Invalid config consumer")
 
     environment = _required("CP_ENV")
@@ -322,27 +340,96 @@ def load_config(consumer: Consumer) -> ServiceConfig:
         raise ConfigError("Synthetic policy marker required for nonproduction")
 
     policy = _load_policy()
-    mail_enabled = _flag("CP_MAIL_ENABLED")
-    scan_enabled = _flag("CP_SCAN_ENABLED")
+    mail_enabled = _flag("CP_MAIL_ENABLED") if consumer != "operator" else False
+    scan_enabled = _flag("CP_SCAN_ENABLED") if consumer != "operator" else False
     if consumer == "api" and policy.file_policy.scanner_required and not scan_enabled:
         raise ConfigError("Required file scanner is disabled")
 
+    is_operator = consumer == "operator"
+    is_sender = consumer == "sender"
+    if is_sender and (not mail_enabled or scan_enabled):
+        raise ConfigError("Invalid sender capabilities")
+    public_key = (
+        _read_file("CP_DELIVERY_PUBLIC_KEY_FILE", max_bytes=_MAX_SECRET_BYTES).encode()
+        if is_operator
+        else None
+    )
+    delivery_key_id = _required("CP_DELIVERY_KEY_ID") if is_operator else None
+    if delivery_key_id and not _DELIVERY_KEY_ID.fullmatch(delivery_key_id):
+        raise ConfigError("Invalid CP_DELIVERY_KEY_ID")
+    db_user = _required("CP_DB_USER")
+    if is_operator and db_user != "carepulse_operator":
+        raise ConfigError("Invalid operator database role")
+    if is_sender and db_user != "carepulse_sender":
+        raise ConfigError("Invalid sender database role")
+    db_password_source = (
+        "CP_OPERATOR_DB_PASSWORD_FILE"
+        if is_operator
+        else "CP_SENDER_DB_PASSWORD_FILE"
+        if is_sender
+        else "CP_DB_PASSWORD_FILE"
+    )
+    lease = timeout = max_attempts = retry = None
+    private_key_path = mail_base_url = None
+    if is_sender:
+        lease = _positive_seconds("CP_DELIVERY_LEASE_SECONDS")
+        timeout = _positive_seconds("CP_DELIVERY_ATTEMPT_TIMEOUT_SECONDS")
+        max_attempts = _positive_seconds("CP_DELIVERY_MAX_ATTEMPTS")
+        retry = _positive_seconds("CP_DELIVERY_RETRY_SECONDS")
+        if timeout >= lease:
+            raise ConfigError("Delivery timeout exceeds lease")
+        private_key_path = _required_path("CP_DELIVERY_PRIVATE_KEY_FILE")
+        _read_file("CP_DELIVERY_PRIVATE_KEY_FILE", max_bytes=_MAX_SECRET_BYTES)
+        _required("CP_DELIVERY_PRIVATE_KEY_FILES")
+        mail_base_url = _required("CP_MAIL_BASE_URL")
+        try:
+            origin = urlsplit(mail_base_url)
+            valid_origin = (
+                origin.scheme == "http"
+                and origin.hostname in ("localhost", "127.0.0.1")
+                and origin.port == 3000
+                and not origin.username
+                and not origin.password
+                and origin.path in ("", "/")
+                and not origin.query
+                and not origin.fragment
+            )
+        except ValueError as invalid:
+            raise ConfigError("Invalid CP_MAIL_BASE_URL") from invalid
+        if not valid_origin:
+            raise ConfigError("Invalid CP_MAIL_BASE_URL")
+    mail = _endpoint("CP_SMTP", enabled=is_sender)
+    if mail is not None and (mail.host != "mail" or mail.port != 1025):
+        raise ConfigError("Unapproved synthetic SMTP")
     return ServiceConfig(
         environment=environment,
         policy=policy,
         db_host=_host("CP_DB_HOST"),
         db_port=_port("CP_DB_PORT"),
         db_name=_required("CP_DB_NAME"),
-        db_user=_required("CP_DB_USER"),
-        db_password=_secret("CP_DB_PASSWORD_FILE", minimum=16),
-        file_encryption_key=_secret("CP_FILE_ENCRYPTION_KEY_FILE", minimum=32),
+        db_user=db_user,
+        db_password=_secret(db_password_source, minimum=16),
+        file_encryption_key=_secret("CP_FILE_ENCRYPTION_KEY_FILE", minimum=32)
+        if consumer in ("api", "worker")
+        else None,
         service_key=_secret("CP_SERVICE_KEY_FILE", minimum=32)
         if consumer == "api"
         else None,
         signing_key_id=_signing_key_id() if consumer == "api" else None,
         mail_enabled=mail_enabled,
         scan_enabled=scan_enabled,
-        # Mail transport is web-owned (F-07); worker has no SMTP network.
-        mail=None,
+        # Only one-shot sender receives synthetic SMTP configuration.
+        mail=mail,
         scan=_endpoint("CP_SCAN", enabled=consumer == "api" and scan_enabled),
+        operator_secret=_secret("CP_OPERATOR_CREDENTIAL_FILE", minimum=32)
+        if is_operator and os.environ.get("CP_OPERATOR_CREDENTIAL_FILE")
+        else None,
+        delivery_public_key_pem=public_key,
+        delivery_key_id=delivery_key_id,
+        delivery_private_key_path=private_key_path,
+        delivery_lease_seconds=lease,
+        delivery_attempt_timeout_seconds=timeout,
+        delivery_max_attempts=max_attempts,
+        delivery_retry_seconds=retry,
+        mail_base_url=mail_base_url,
     )

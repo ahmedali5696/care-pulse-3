@@ -22,6 +22,8 @@ services:
       CP_DB_PASSWORD_FILE: /run/secrets/runtime_db_password
       CP_INTERNAL_API_URL: ${CP_INTERNAL_API_URL:?Set the private API URL}
       CP_SIGNING_KEY_ID: ${CP_SIGNING_KEY_ID:?Set the active BFF signing key ID}
+      CP_DELIVERY_KEY_ID: ${CP_DELIVERY_KEY_ID:?Set issuer key ID}
+      CP_DELIVERY_PUBLIC_KEY_FILE: /run/secrets/delivery_public_key
       CP_SERVICE_KEY_FILE: /run/secrets/service_key
       CP_AUTH_SECRET_FILE: /run/secrets/auth_secret
       CP_MAIL_ENABLED: ${CP_MAIL_ENABLED:?Set explicit mail enablement}
@@ -33,6 +35,7 @@ services:
       - runtime_db_password
       - service_key
       - auth_secret
+      - delivery_public_key
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/ready', {signal: AbortSignal.timeout(5000)}).then(r => process.exit(r.status === 200 ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 10s
@@ -126,6 +129,74 @@ services:
       start_period: 15s
       retries: 2
 
+  sender:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: sender
+    profiles:
+      - sender
+    networks:
+      - application
+      - database
+    depends_on:
+      - db
+    environment:
+      CP_ENV: ${CP_ENV:?Set an explicit active environment}
+      CP_SYNTHETIC_TEST_PROFILE: ${CP_SYNTHETIC_TEST_PROFILE:?Set the synthetic marker}
+      CP_POLICY_FILE: /run/secrets/active_policy
+      CP_DB_HOST: ${CP_DB_HOST:?Set DB host}
+      CP_DB_PORT: ${CP_DB_PORT:?Set DB port}
+      CP_DB_NAME: ${CP_DB_NAME:?Set DB name}
+      CP_DB_USER: carepulse_sender
+      CP_SENDER_DB_PASSWORD_FILE: /run/secrets/sender_db_password
+      CP_MAIL_ENABLED: "true"
+      CP_SCAN_ENABLED: "false"
+      CP_SMTP_HOST: mail
+      CP_SMTP_PORT: "1025"
+      CP_MAIL_BASE_URL: ${CP_MAIL_BASE_URL:?Set synthetic browser origin}
+      CP_DELIVERY_LEASE_SECONDS: ${CP_DELIVERY_LEASE_SECONDS:?Set synthetic sender lease}
+      CP_DELIVERY_ATTEMPT_TIMEOUT_SECONDS: ${CP_DELIVERY_ATTEMPT_TIMEOUT_SECONDS:?Set synthetic attempt bound}
+      CP_DELIVERY_MAX_ATTEMPTS: ${CP_DELIVERY_MAX_ATTEMPTS:?Set synthetic retry limit}
+      CP_DELIVERY_RETRY_SECONDS: ${CP_DELIVERY_RETRY_SECONDS:?Set synthetic retry delay}
+      CP_DELIVERY_PRIVATE_KEY_FILE: /run/secrets/delivery_private_key
+      CP_DELIVERY_PRIVATE_KEY_FILES: ${CP_DELIVERY_PRIVATE_KEY_FILES:?Set sender key-id path mappings}
+    secrets:
+      - active_policy
+      - sender_db_password
+      - delivery_private_key
+
+  operator:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: operator
+    profiles:
+      - operator
+    networks:
+      - database
+    depends_on:
+      - db
+    environment:
+      CP_ENV: ${CP_ENV:?Set an explicit active environment}
+      CP_SYNTHETIC_TEST_PROFILE: ${CP_SYNTHETIC_TEST_PROFILE:?Set the synthetic marker}
+      CP_POLICY_FILE: /run/secrets/active_policy
+      CP_DB_HOST: ${CP_DB_HOST:?Set DB host}
+      CP_DB_PORT: ${CP_DB_PORT:?Set DB port}
+      CP_DB_NAME: ${CP_DB_NAME:?Set DB name}
+      CP_DB_USER: carepulse_operator
+      CP_OPERATOR_DB_PASSWORD_FILE: /run/secrets/operator_db_password
+      CP_OPERATOR_CREDENTIAL_FILE: /run/secrets/operator_credential
+      CP_MAIL_ENABLED: "false"
+      CP_SCAN_ENABLED: "false"
+      CP_DELIVERY_KEY_ID: ${CP_DELIVERY_KEY_ID:?Set issuer key ID}
+      CP_DELIVERY_PUBLIC_KEY_FILE: /run/secrets/delivery_public_key
+    secrets:
+      - active_policy
+      - operator_db_password
+      - operator_credential
+      - delivery_public_key
+
   db:
     image: postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27
     environment:
@@ -206,3 +277,13 @@ secrets:
     file: ${CP_FILE_ENCRYPTION_KEY_SOURCE_FILE:?Set an ignored file encryption key file path}
   active_policy:
     file: ${CP_ACTIVE_POLICY_SOURCE_FILE:?Set a policy JSON file path (synthetic fixture for test only)}
+  operator_db_password:
+    file: ${CP_OPERATOR_DB_PASSWORD_SOURCE_FILE:?Set operator DB password file}
+  operator_credential:
+    file: ${CP_OPERATOR_CREDENTIAL_SOURCE_FILE:?Set individual operator credential file}
+  sender_db_password:
+    file: ${CP_SENDER_DB_PASSWORD_SOURCE_FILE:?Set scoped sender DB password file}
+  delivery_public_key:
+    file: ${CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE:?Set delivery issuer public PEM file}
+  delivery_private_key:
+    file: ${CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE:?Set sender-only private PEM file}

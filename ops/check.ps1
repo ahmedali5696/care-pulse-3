@@ -36,13 +36,13 @@ require(root['engines'] == {'node': '24.22.1', 'pnpm': '10.34.7'}, 'runtime pins
 require(root['private'] is True, 'private workspace')
 web = json.loads(Path('apps/web/package.json').read_text())
 dependencies = {'better-auth':'1.7.12','next':'15.5.28','nodemailer':'10.1.7','pg':'8.23.1','react':'19.3.1','react-dom':'19.3.1'}
-tooling = {'@eslint/eslintrc':'3.3.1','@types/node':'24.19.2','@types/pg':'8.23.1','@types/react':'19.3.0','@types/react-dom':'19.3.0','eslint':'9.39.5','eslint-config-next':'15.5.28','typescript':'5.9.3'}
+tooling = {'@eslint/eslintrc':'3.3.1','@playwright/test':'1.64.1','@types/node':'24.19.2','@types/pg':'8.23.1','@types/react':'19.3.0','@types/react-dom':'19.3.0','eslint':'9.39.5','eslint-config-next':'15.5.28','typescript':'5.9.3'}
 require(web['dependencies'] == dependencies and web['devDependencies'] == tooling, 'approved manifest pins')
 require(web['private'] is True, 'private web package')
 npmrc = dict(line.split('=', 1) for line in Path('.npmrc').read_text().splitlines() if line.strip())
 require(npmrc == {'engine-strict':'true','package-manager-strict':'true','package-manager-strict-version':'true','manage-package-manager-versions':'false','strict-peer-dependencies':'true','auto-install-peers':'false'}, 'strict engines/peers')
 require(Path('pnpm-workspace.yaml').read_text().split() == ['packages:', '-', 'apps/web'], 'workspace membership')
-approved_locks = {'pnpm-lock.yaml':'e81b48c7ab50811e42a3eee46e58071a243d4f4c0ee873e0d91aa089285911a4','requirements.lock':'f819c9728ebcb2298fbfe5f06022a359b13e8eeed3b4e46a8c7a55f159e23d47'}
+approved_locks = {'pnpm-lock.yaml':'cc80cf7fb9ae5ea3ab0cc671ede25203d06312421687692f826548fde646274b','requirements.lock':'38e65d6ee9a37ee944eef73e772984cdccbf82d797f3a1c64f9fb917289af9b6'}
 for filename, approved in approved_locks.items():
     raw = Path(filename).read_bytes()
     canonical = hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest()
@@ -55,7 +55,7 @@ for line in Path('requirements.in').read_text().splitlines():
     match = re.fullmatch(r'([A-Za-z0-9_\[\]-]+)==([0-9.]+)', line)
     require(match is not None, 'exact Python direct pins')
     direct[match[1].lower()] = match[2]
-require(direct == {'fastapi':'0.158.1','starlette':'1.9.0','uvicorn':'0.54.0','sqlalchemy':'2.0.55','psycopg[binary]':'3.3.6','alembic':'1.20.0','pytest':'9.1.1','ruff':'0.17.1'}, 'approved Python direct pins')
+require(direct == {'fastapi':'0.158.1','starlette':'1.9.0','uvicorn':'0.54.0','sqlalchemy':'2.0.55','psycopg[binary]':'3.3.6','alembic':'1.20.0','pytest':'9.1.1','ruff':'0.17.1','cryptography':'50.0.2'}, 'approved Python direct pins')
 for line in Path('requirements.lock').read_text().splitlines():
     if not line.strip() or line.startswith('#'):
         continue
@@ -68,8 +68,8 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'ee3369cc9bd0997d9f4c629b8d3b8acc0498f0dedab5f10105fb4c8642d21d01',
-    'apps/api/Dockerfile': '293af5bb74f261da9d70fe314241b897b4452e116617758889a9b2dbecfc942a',
+    '.github/workflows/foundation.yml': '915b0827b9415c7984dbdc5129fd81415ff85ea548fc7ce67a64bde2a0d2b4d5',
+    'apps/api/Dockerfile': '27e2068b8295273a281200181850492133d3b9f0e7ddc5f95d65e0b38938ca14',
     'apps/web/Dockerfile': '933af52609f2a4eb638d048605ec555e2a3443cb25b3ba5d64d5a36ec585f02a',
 }
 for filename, approved in approved_bootstrap_files.items():
@@ -97,12 +97,13 @@ print('PASS approved manifests, complete locks, installed Python closure, privat
         'web' {
             Invoke-Checked pnpm @('typecheck')
             Invoke-Checked node @('--no-warnings', '--experimental-strip-types', '--test', 'apps/web/auth/signing.test.ts')
+            Invoke-Checked node @('--no-warnings', '--experimental-strip-types', '--test', 'apps/web/mail/delivery-material.test.ts')
             Invoke-Checked pnpm @('lint')
             Invoke-Checked pnpm @('build')
         }
         'imports' {
             $env:PYTHONPATH = (Join-Path $PWD 'apps/api') + [IO.Path]::PathSeparator + $PWD
-            Invoke-Checked python @('-c', "from carepulse.main import app; from carepulse.identity.boundary import ClosedServiceBoundary; import apps.worker.main; assert set(app.openapi()['paths']) == {'/health/live', '/health/ready'}; assert app.openapi_url is None; assert len(app.user_middleware) == 1 and app.user_middleware[0].cls is ClosedServiceBoundary and app.user_middleware[0].kwargs == {}; print('PASS exact authorized routes, signed private boundary, API/worker imports')")
+            Invoke-Checked python @('-c', "from carepulse.main import app; from carepulse.identity.boundary import ClosedServiceBoundary; import apps.worker.main; assert set(app.openapi()['paths']) == {'/health/live', '/health/ready', '/v1/provisioning/owner-activate'}; assert app.openapi_url is None; assert len(app.user_middleware) == 1 and app.user_middleware[0].cls is ClosedServiceBoundary and app.user_middleware[0].kwargs == {'routes': {('POST', '/v1/provisioning/owner-activate'): 'OWNER_ACTIVATION'}}; print('PASS only authorized health/bootstrap routes and signed private boundary')")
             Invoke-Checked python @('-m', 'alembic', 'heads')
         }
         'integration' {
@@ -124,6 +125,9 @@ print('PASS approved manifests, complete locks, installed Python closure, privat
             if (-not (Test-Path -LiteralPath 'tests/integration/test_sessions.py' -PathType Leaf)) {
                 throw 'Missing required B-02 integration test: tests/integration/test_sessions.py'
             }
+            foreach ($suite in @('tests/integration/test_provisioning.py', 'tests/e2e/owner-invite.spec.ts', 'tests/e2e/extract_mailpit_invitation.py', 'apps/web/mail/delivery-material.test.ts', 'tests/unit/test_delivery_material.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-03 verification: $suite" }
+            }
             if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Linux' -or $PSVersionTable.PSVersion.Major -lt 7) {
                 throw 'Integration requires Docker-capable Linux CI and PowerShell 7; no local Docker probe performed'
             }
@@ -141,8 +145,8 @@ cleanup() {
   code=$?
   trap - EXIT
   if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" ]]; then
-    if ! docker compose --profile mail --profile test down --remove-orphans --volumes; then code=1; fi
-    rm -f "$private"/{postgres-password,runtime-db-password,migration-password,operator-password,service-key,auth-secret,file-key,compose.json,roles.log,web-denial.log,worker-denial.log,denials.log,runtime-logs,canaries,old-worker-status.json,health-logs,auth-logs,mail-denial.log}
+    if ! docker compose --profile mail --profile test --profile sender --profile operator down --remove-orphans --volumes; then code=1; fi
+    rm -f "$private"/{postgres-password,runtime-db-password,migration-password,operator-password,operator-credential,sender-password,service-key,auth-secret,file-key,delivery-public.pem,delivery-private.pem,operator-id,invite-link,clinic-create.json,compose.json,roles.log,web-denial.log,worker-denial.log,denials.log,runtime-logs,canaries,old-worker-status.json,health-logs,auth-logs,mail-denial.log}
     rm -rf "$private/image-scan"
     rmdir "$private" || code=1
   else
@@ -151,13 +155,16 @@ cleanup() {
   exit "$code"
 }
 trap cleanup EXIT
-for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE"; do
+for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE"; do
   test "$(dirname "$file")" = "$private"
   openssl rand -hex 32 > "$file"
   chmod 0444 "$file"
 done
-docker compose --profile mail --profile scan --profile test config --quiet
-docker compose --profile mail --profile scan --profile test config --format json > "$private/compose.json"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" > /dev/null 2>&1
+openssl pkey -in "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" -pubout -out "$CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE" > /dev/null 2>&1
+chmod 0444 "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" "$CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE"
+docker compose --profile mail --profile scan --profile test --profile sender --profile operator config --quiet
+docker compose --profile mail --profile scan --profile test --profile sender --profile operator config --format json > "$private/compose.json"
 chmod 0444 "$private/compose.json"
 for image in \
   'node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205' \
@@ -170,7 +177,7 @@ do
   test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = linux/amd64
   docker image inspect --format '{{json .RepoDigests}} {{.Id}} {{.Os}}/{{.Architecture}}' "$image"
 done
-docker compose --profile test build --pull
+docker compose --profile test --profile sender --profile operator build --pull
 docker compose up -d --no-build db
 for attempt in $(seq 1 40); do
   if docker compose exec -T db pg_isready -U carepulse_bootstrap -d carepulse > /dev/null 2>&1; then break; fi
@@ -180,11 +187,12 @@ done
 export CP_MIGRATION_PASSWORD="$(cat "$CP_MIGRATION_SECRET_FILE")"
 export CP_RUNTIME_PASSWORD="$(cat "$CP_RUNTIME_DB_PASSWORD_FILE")"
 export CP_OPERATOR_PASSWORD="$(cat "$CP_OPERATOR_SECRET_FILE")"
-if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e CP_OPERATOR_PASSWORD \
+export CP_SENDER_PASSWORD="$(cat "$CP_SENDER_DB_PASSWORD_SOURCE_FILE")"
+if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e CP_OPERATOR_PASSWORD -e CP_SENDER_PASSWORD \
   db psql --no-psqlrc -U carepulse_bootstrap -d carepulse < db/roles.sql > "$private/roles.log" 2>&1; then
   echo 'FAIL controlled roles (credential-bearing diagnostics withheld)'; exit 1
 fi
-unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_OPERATOR_PASSWORD
+unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD
 docker compose --profile test run --rm --no-deps \
   -e CP_DB_HOST=db -e CP_DB_PORT=5432 -e CP_DB_NAME=carepulse \
   -e CP_MIGRATION_PASSWORD_FILE=/run/secrets/migration_password \
@@ -196,7 +204,8 @@ docker compose --profile test run --rm --no-deps \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py
+  -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro" \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py
 docker compose up -d --no-build db api worker web
 for attempt in $(seq 1 40); do
   if curl --silent --show-error --fail --max-time 2 http://127.0.0.1:3000/ > /dev/null 2>&1; then break; fi
@@ -359,9 +368,9 @@ for key in CP_POLICY_FILE CP_DB_PASSWORD_FILE CP_FILE_ENCRYPTION_KEY_FILE; do
   echo "PASS worker protected startup denies missing $key"
 done
 cat "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" \
-  "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" > "$private/canaries"
+  "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" > "$private/canaries"
 chmod 0444 "$private/canaries"
-awk 'length($0) != 64 || $0 !~ /^[0-9a-f]+$/ { invalid=1 } END { if (NR != 7 || invalid) exit 1 }' "$private/canaries"
+awk 'length($0) != 64 || $0 !~ /^[0-9a-f]+$/ { invalid=1 } END { if (NR != 9 || invalid) exit 1 }' "$private/canaries"
 if git grep -I -q -f "$private/canaries" -- apps tests ops compose.yaml; then
   echo 'FAIL synthetic key in tracked source'; exit 1
 else
@@ -466,6 +475,51 @@ docker compose --profile test run --rm --no-deps \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_sessions.py
 docker compose exec -T web node --no-warnings --experimental-strip-types --test auth/ingress.test.mjs
 echo 'PASS verified source separation, spoof resistance and sole Web listener'
+# The sender target alone has Node, Mailpit access, and the private delivery key.
+# Migration credentials are mounted ONLY into the disposable test invocation.
+docker compose --profile sender run --rm --no-deps -T --entrypoint python \
+  -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" -e COMPOSE_PROJECT_NAME="$CP_CI_PROJECT" \
+  -v "$PWD/tests:/srv/tests:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  sender -m pytest -q -ra --tb=short -p no:cacheprovider \
+  tests/integration/test_delivery_sender.py -k 'not missing_mailpit'
+# The operator's identity is issued only in the disposable CI DB; the one-shot
+# CLI authenticates with its own secret file, then a separate sender delivers.
+docker compose --profile test run --rm --no-deps -T \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  -v "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE:/run/secrets/operator_credential:ro" \
+  test python - <<'PY' > "$private/operator-id"
+import hashlib
+from pathlib import Path
+from uuid import uuid4
+import psycopg
+password = Path('/run/secrets/migration_password').read_text().strip()
+credential = Path('/run/secrets/operator_credential').read_text().strip()
+actor = uuid4()
+with psycopg.connect(host='db', dbname='carepulse', user='carepulse_migration', password=password) as connection:
+    connection.execute('''INSERT INTO public.operator_identities
+        (id, credential_digest, issued_by_reference, issued_at)
+        VALUES (%s, %s, 'synthetic-B-03-CI', clock_timestamp())''',
+        (actor, hashlib.sha256(credential.encode()).hexdigest()))
+print(actor)
+PY
+operator_id="$(tail -n 1 "$private/operator-id")"
+if ! [[ "$operator_id" =~ ^[a-f0-9-]{36}$ ]]; then echo 'FAIL synthetic operator identity'; exit 1; fi
+docker compose --profile operator run --rm --no-deps -T operator clinics create \
+  --operator-id "$operator_id" --reason synthetic-ci-acceptance \
+  --branch 'Synthetic B-03 clinic' --owner-email first-owner@example.invalid \
+  --idempotency-key synthetic-ci-create > "$private/clinic-create.json"
+clinic_id="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["organization_id"])' "$private/clinic-create.json")"
+if ! [[ "$clinic_id" =~ ^[a-f0-9-]{36}$ ]]; then echo 'FAIL synthetic clinic create'; exit 1; fi
+docker compose --profile sender run --rm --no-deps -T sender --organization-id "$clinic_id" | grep -Fx SENT
+docker compose --profile test run --rm --no-deps -T \
+  test python tests/e2e/extract_mailpit_invitation.py > "$private/invite-link"
+if ! grep -Eq '^http://127\.0\.0\.1:3000/auth/invite-accept#' "$private/invite-link"; then
+  echo 'FAIL private Mailpit invitation artifact'; exit 1
+fi
+CP_INVITE_LINK_FILE="$private/invite-link" CP_INVITE_OWNER_EMAIL=first-owner@example.invalid \
+  pnpm --filter @carepulse/web test:owner-invite
+echo 'PASS real restricted operator, post-commit one-shot sender and browser Owner activation/login'
 docker compose logs --no-color api > "$private/auth-logs"
 if grep -Fq '__foundation_bff_must_not_forward__' "$private/auth-logs"; then
   echo 'FAIL BFF forwarded a protected request'; exit 1
@@ -474,6 +528,13 @@ else
 fi
 # Demonstrate that the same real transport fails, rather than selecting a relay.
 docker compose --profile mail stop mail
+docker compose --profile sender run --rm --no-deps -T --entrypoint python \
+  -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" -e COMPOSE_PROJECT_NAME="$CP_CI_PROJECT" \
+  -e CP_EXPECT_MAILPIT_DOWN=true \
+  -v "$PWD/tests:/srv/tests:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  sender -m pytest -q -ra --tb=short -p no:cacheprovider \
+  tests/integration/test_delivery_sender.py -k missing_mailpit
 set +e
 timeout 15s docker compose exec -T web node --experimental-strip-types mail/smoke.ts mail > "$private/mail-denial.log" 2>&1
 code=$?
@@ -500,7 +561,8 @@ fi
   echo '- D-01 tenant/role isolation and migration rollback/privilege cases: passed'
   echo '- D-02 PostgreSQL identity races, immutable session authority, Better Auth migration compatibility and ephemeral native hashed reset-proof issuance: passed'
   echo '- B-01 signed request, durable nonce replay, live authority/revocation, RLS and idempotent receipt boundary tests: passed'
-  echo '- Synthetic development only; real login, Owner acceptance, recovery protocol, production and later Waves remain closed'
+  echo '- B-03 restricted operator and owner activation, separate committed sender and real Playwright invite/login: passed'
+  echo '- Synthetic development only; production and later Waves remain closed'
 } >> "$GITHUB_STEP_SUMMARY"
 '@
             & bash -e -c $integration
