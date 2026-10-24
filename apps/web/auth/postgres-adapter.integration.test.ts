@@ -119,6 +119,12 @@ test("Stage-1 native adapter parity with real PostgreSQL, RLS and leased transac
         { field: "image", operator: "eq", value: null, connector: "AND" },
       ], limit: 10, sortBy: { field: "email", direction: "asc" } });
       assert.deepEqual(found.map((user) => user.email), [emailA, emailB]);
+      assert.equal(await adapter.count({ model: "user", where: [
+        { field: "email", operator: "ends_with", value: "-a@example.invalid" },
+      ] }), 1);
+      assert.equal(await adapter.count({ model: "user", where: [
+        { field: "email", operator: "contains", value: run + "-b@" },
+      ] }), 1);
       await adapter.update({ model: "user", where: eq("email", emailB),
         update: { image: "synthetic-avatar" } });
       assert.equal(await adapter.count({ model: "user", where: [

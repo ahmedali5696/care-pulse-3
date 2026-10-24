@@ -58,8 +58,8 @@ function whereSql(model: string, where: CleanedWhere[] | undefined, values: unkn
       let value = item.value;
       if (pattern) {
         const escaped = (value as string).replace(/[\\%_]/g, "\\$&");
-        value = (item.operator === "ends_with" ? "%" : "") + escaped +
-          (item.operator === "starts_with" ? "" : "%");
+        value = (item.operator === "starts_with" ? "" : "%") + escaped +
+          (item.operator === "ends_with" ? "" : "%");
       }
       values.push(value);
       clause = `${mode ? `LOWER(${column})` : column} ${operator} ${mode ? `LOWER($${values.length})` : `$${values.length}`}`;
