@@ -255,7 +255,10 @@ try {
       throw new Error(`FAIL supported native schema drift in ${table}`);
     }
   }
-  const plan = await getMigrations(options, { throwOnUnsafe: false });
+  // Better Auth 1.7.12 schema introspection only supports its Kysely bridge.
+  // Inspect the same live schema using the original pool; runtime auth uses
+  // our public custom adapter and must not invoke its migration generator.
+  const plan = await getMigrations({ ...options, database: pool }, { throwOnUnsafe: false });
   if (plan.schemaProblems.length || plan.unsafeChanges.length ||
       plan.toBeCreated.length || plan.toBeAdded.length || plan.toBeAddedIndexes.length) {
     throw new Error('FAIL supported Better Auth migration schema/index compatibility');
