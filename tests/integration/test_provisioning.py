@@ -414,7 +414,7 @@ def test_pending_suspended_clinic_cannot_reactivate(operator_identity, operator_
 def test_first_owner_proof_is_single_use_and_tenant_bound(
     operator_identity, role_engine
 ):
-    migration, _, actor, _ = operator_identity
+    migration, operator, actor, secret = operator_identity
     clinic, other, invite = uuid4(), uuid4(), uuid4()
     proof = secrets.token_urlsafe(32)
     email = f"{uuid4()}@example.invalid"
@@ -538,6 +538,35 @@ def test_first_owner_proof_is_single_use_and_tenant_bound(
             )
     finally:
         runtime.dispose()
+
+    verified = authenticate_operator(operator, actor, secret, _load_policy())
+    suspended = change_clinic_state(
+        operator, verified, clinic, 1, "SUSPENDED", "Synthetic Owner suspension"
+    )
+    assert suspended["revision"] == 2
+    with migration.connect() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT state FROM public.organizations WHERE id=:clinic"),
+                {"clinic": clinic},
+            )
+            == "SUSPENDED"
+        )
+    with pytest.raises(DBAPIError):
+        change_clinic_state(
+            operator, verified, clinic, 1, "ACTIVE", "Stale reactivation"
+        )
+    reactivated = change_clinic_state(
+        operator, verified, clinic, 2, "ACTIVE", "Verified Owner reactivation"
+    )
+    assert reactivated["revision"] == 3
+    with migration.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT state, lifecycle_revision FROM public.organizations WHERE id=:clinic"
+            ),
+            {"clinic": clinic},
+        ).one() == ("ACTIVE", 3)
 
 
 def test_concurrent_acceptance_cannot_create_second_owner(

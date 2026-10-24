@@ -17,7 +17,12 @@ from uuid import uuid4
 
 import pytest
 from carepulse.notifications.delivery_material import encrypt_delivery_token
-from carepulse.notifications.email_sender import _settings, send_one_job
+from carepulse.notifications.email_sender import (
+    _material_payload,
+    _node_call,
+    _settings,
+    send_one_job,
+)
 from carepulse.notifications.evidence import (
     JobOutcome,
     claim_delivery_job,
@@ -233,6 +238,46 @@ def test_committed_crash_before_smtp_requires_explicit_expired_lease_reclaim(
                 {"tenant": str(tenant)},
             )
             assert not finish_delivery_job(connection, original, JobOutcome("FAILED"))
+    finally:
+        sender.dispose()
+
+
+def test_lost_smtp_acknowledgment_preserves_one_job_and_allows_duplicate_mail(
+    sender_lab,
+):
+    migration, settings = sender_lab
+    tenant, _, job, recipient = _seed_job(migration)
+    sender = create_engine(settings.connection_url, hide_parameters=True)
+    try:
+        with sender.begin() as connection:
+            connection.execute(
+                text("SELECT set_config('app.organization_id', :tenant, true)"),
+                {"tenant": str(tenant)},
+            )
+            original = claim_delivery_job(connection, settings.policy, job)
+            assert original is not None
+        with sender.begin() as connection:
+            connection.execute(
+                text("SELECT set_config('app.organization_id', :tenant, true)"),
+                {"tenant": str(tenant)},
+            )
+            payload, remaining = _material_payload(connection, original)
+        assert _node_call(payload, min(settings.timeout_seconds, remaining - 0.5))
+        assert len(_mailbox(recipient)) == 1
+        assert _job_state(migration, job) == ("CLAIMED", 1, 1, True)
+
+        # A process crash loses the SMTP acknowledgment; only a later explicit
+        # invocation may reclaim. Duplicated email cannot duplicate the proof.
+        _expire_claim_for_test(migration, job)
+        assert send_one_job(tenant, job, settings) == "SENT"
+        assert _job_state(migration, job) == ("SENT", 2, 2, False)
+        assert len(_mailbox(recipient)) == 2
+        with sender.begin() as connection:
+            connection.execute(
+                text("SELECT set_config('app.organization_id', :tenant, true)"),
+                {"tenant": str(tenant)},
+            )
+            assert not finish_delivery_job(connection, original, JobOutcome("READY"))
     finally:
         sender.dispose()
 
