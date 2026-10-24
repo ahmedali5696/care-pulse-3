@@ -511,7 +511,25 @@ docker compose --profile operator run --rm --no-deps -T operator clinics create 
   --idempotency-key synthetic-ci-create > "$private/clinic-create.json"
 clinic_id="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["organization_id"])' "$private/clinic-create.json")"
 if ! [[ "$clinic_id" =~ ^[a-f0-9-]{36}$ ]]; then echo 'FAIL synthetic clinic create'; exit 1; fi
-docker compose --profile sender run --rm --no-deps -T sender --organization-id "$clinic_id" | grep -Fx SENT
+set +e
+sender_result="$(docker compose --profile sender run --rm --no-deps -T sender --organization-id "$clinic_id")"
+sender_status=$?
+set -e
+if [ "$sender_status" -ne 0 ]; then
+  case "$sender_result" in
+    'Delivery unavailable'|READY|FAILED|STALE|NOT_DUE)
+      echo "FAIL explicit first-Owner sender: $sender_result";;
+    *) echo 'FAIL explicit first-Owner sender: process/error output unavailable';;
+  esac
+  exit 1
+fi
+if [ "$sender_result" != SENT ]; then
+  case "$sender_result" in
+    READY|FAILED|STALE|NOT_DUE) echo "FAIL explicit first-Owner sender outcome: $sender_result";;
+    *) echo 'FAIL unexpected sender output';;
+  esac
+  exit 1
+fi
 docker compose --profile test run --rm --no-deps -T \
   test python tests/e2e/extract_mailpit_invitation.py > "$private/invite-link"
 if ! grep -Eq '^http://127\.0\.0\.1:3000/auth/invite-accept#' "$private/invite-link"; then
