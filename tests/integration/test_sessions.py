@@ -341,7 +341,7 @@ def test_revoked_revision_blocks_existing_cookie(owner):
 def test_inflight_old_password_login_cannot_issue_stale_cookie(owner):
     with ThreadPoolExecutor(max_workers=1) as pool:
         with _database() as connection:
-            connection.execute('LOCK TABLE public."session" IN ACCESS EXCLUSIVE MODE')
+            connection.execute('LOCK TABLE public."session" IN SHARE MODE')
             attempt = pool.submit(
                 _request,
                 "/api/auth/login",
@@ -373,7 +373,7 @@ def test_inflight_old_password_login_cannot_issue_stale_cookie(owner):
                 (owner.staff,),
             )
         status, headers, body = attempt.result(timeout=6)
-    assert status in (401, 503), body
+    assert status == 401, body
     assert not any(
         "session_token=" in value for value in headers.get_all("Set-Cookie") or []
     )
