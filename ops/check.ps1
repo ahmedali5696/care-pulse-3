@@ -199,17 +199,6 @@ docker compose --profile test run --rm --no-deps \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   test python -m alembic -c alembic.ini upgrade head
 
-if [ "${CP_B04_SPIKE:-false}" = true ]; then
-  docker compose --profile test run --rm --no-deps -T \
-    -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
-    -e CP_B04_SEED_FILE=/tmp/b04-seed.json \
-    -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
-    test sh -c 'python -m pytest -q -p no:cacheprovider tests/integration/b04_spike_seed.py >&2 && cat /tmp/b04-seed.json' | \
-  docker compose run --rm --no-deps -T --entrypoint node \
-    -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" \
-    -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
-    web --experimental-strip-types auth/b04-spike.test.ts
-fi
 docker compose --profile test run --rm --no-deps \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
@@ -578,6 +567,18 @@ if grep -aF -f "$private/canaries" "$private/runtime-logs" "$private/denials.log
   echo 'FAIL synthetic key in runtime/denial logs'; exit 1
 else
   code=$?; if [ "$code" -ne 1 ]; then echo 'FAIL runtime-log scan error'; exit 1; fi
+fi
+# The spike commits an ACTIVE synthetic Owner; run after empty-baseline assertions.
+if [ "${CP_B04_SPIKE:-false}" = true ]; then
+  docker compose --profile test run --rm --no-deps -T \
+    -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+    -e CP_B04_SEED_FILE=/tmp/b04-seed.json \
+    -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+    test sh -c 'python -m pytest -q -p no:cacheprovider tests/integration/b04_spike_seed.py >&2 && cat /tmp/b04-seed.json' | \
+  docker compose run --rm --no-deps -T --entrypoint node \
+    -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" \
+    -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+    web --experimental-strip-types auth/b04-spike.test.ts
 fi
 {
   echo '### Wave 0 and Wave 1 D-01/D-02 foundation checks'
