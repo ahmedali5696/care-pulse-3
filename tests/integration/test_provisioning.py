@@ -380,6 +380,281 @@ def uuid4_from_text(value: str):
     return UUID(value)
 
 
+def _prepared_owner(migration, actor):
+    clinic, invite = uuid4(), uuid4()
+    proof, user = secrets.token_urlsafe(32), f"synthetic-{uuid4()}"
+    email = f"{uuid4()}@example.invalid"
+    with migration.begin() as connection:
+        connection.execute(
+            text("""
+                INSERT INTO public.organizations (id, branch, created_by_operator_id)
+                VALUES (:clinic, 'Synthetic owner race', :actor)
+            """),
+            {"clinic": clinic, "actor": actor},
+        )
+        connection.execute(
+            text("""
+                INSERT INTO public.invitations
+                    (id, organization_id, purpose, target_email, proof_digest,
+                     issued_by_operator_id, expires_at)
+                VALUES (:invite, :clinic, 'FIRST_OWNER', :email, :digest,
+                        :actor, clock_timestamp() + interval '10 minutes')
+            """),
+            {
+                "clinic": clinic,
+                "invite": invite,
+                "email": email,
+                "digest": hashlib.sha256(proof.encode()).hexdigest(),
+                "actor": actor,
+            },
+        )
+        connection.execute(
+            text("""
+                INSERT INTO public."user"
+                    (id, name, email, "emailVerified", "createdAt", "updatedAt")
+                VALUES (:user, 'Synthetic Owner', :email, true,
+                        clock_timestamp(), clock_timestamp())
+            """),
+            {"user": user, "email": email},
+        )
+    return clinic, invite, proof, user
+
+
+def _activate(runtime, clinic, invite, proof, user):
+    with transaction(runtime, clinic) as connection:
+        return connection.scalar(
+            text("""
+                SELECT changed FROM public.activate_first_owner(
+                    :clinic, :invite, :proof, :user, 0, 0, :staff)
+            """),
+            {
+                "clinic": clinic,
+                "invite": invite,
+                "proof": proof,
+                "user": user,
+                "staff": uuid4(),
+            },
+        )
+
+
+@pytest.mark.parametrize("operator_action", ["revoke", "reissue", "suspend"])
+def test_first_owner_activation_serializes_with_operator_mutation(
+    operator_identity, operator_config, role_engine, operator_action
+):
+    migration, operator, actor, secret = operator_identity
+    verified = authenticate_operator(operator, actor, secret, _load_policy())
+    clinic, invite, proof, user = _prepared_owner(migration, actor)
+    runtime = role_engine("carepulse_runtime")
+    start = Barrier(2)
+
+    def accept():
+        start.wait(timeout=10)
+        try:
+            return ("accepted", _activate(runtime, clinic, invite, proof, user))
+        except DBAPIError as error:
+            assert error.orig.sqlstate in {"40001", "42501"}
+            return ("denied", None)
+
+    def mutate():
+        start.wait(timeout=10)
+        try:
+            if operator_action == "revoke":
+                return (
+                    "changed",
+                    revoke_invitation(
+                        operator, verified, clinic, invite, 0, 0, "Concurrent revoke"
+                    ),
+                )
+            if operator_action == "reissue":
+                return (
+                    "changed",
+                    reissue_invitation(
+                        operator,
+                        verified,
+                        operator_config,
+                        clinic,
+                        invite,
+                        0,
+                        0,
+                        "Concurrent reissue",
+                    ),
+                )
+            return (
+                "changed",
+                change_clinic_state(
+                    operator, verified, clinic, 0, "SUSPENDED", "Concurrent suspend"
+                ),
+            )
+        except DBAPIError as error:
+            assert error.orig.sqlstate in {"40001", "42501"}
+            return ("denied", None)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            accepted = pool.submit(accept)
+            changed = pool.submit(mutate)
+            acceptance, mutation = accepted.result(), changed.result()
+        with migration.connect() as connection:
+            state, owner_count, old_proof_state = connection.execute(
+                text("""
+                    SELECT o.state,
+                           (SELECT count(*) FROM public.staff_accounts s
+                            WHERE s.organization_id=o.id AND s.role='DOCTOR_OWNER'),
+                           (SELECT state FROM public.invitations WHERE id=:invite)
+                    FROM public.organizations o WHERE o.id=:clinic
+                """),
+                {"clinic": clinic, "invite": invite},
+            ).one()
+        assert (acceptance[0] == "accepted") != (mutation[0] == "changed")
+        if acceptance[0] == "accepted":
+            assert acceptance[1] is True
+            assert mutation[0] == "denied"
+            assert (state, owner_count, old_proof_state) == ("ACTIVE", 1, "ACCEPTED")
+        elif operator_action == "suspend":
+            assert (state, owner_count, old_proof_state) == ("SUSPENDED", 0, "ISSUED")
+        else:
+            assert mutation[0] == "changed"
+            assert (state, owner_count, old_proof_state) == (
+                "PROVISIONING",
+                0,
+                "REVOKED",
+            )
+        with transaction(runtime, clinic) as connection:
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT * FROM public.verify_first_owner_preparation(:c,:i,:d)"
+                    ),
+                    {
+                        "c": clinic,
+                        "i": invite,
+                        "d": hashlib.sha256(proof.encode()).hexdigest(),
+                    },
+                ).all()
+                == []
+            )
+        if mutation[0] == "changed":
+            with pytest.raises(DBAPIError):
+                _activate(runtime, clinic, invite, proof, user)
+        else:
+            assert _activate(runtime, clinic, invite, proof, user) is False
+    finally:
+        runtime.dispose()
+
+
+def test_operator_suspend_invalidates_persisted_recovery_without_clearing_block(
+    operator_identity, role_engine
+):
+    migration, operator, actor, secret = operator_identity
+    verified = authenticate_operator(operator, actor, secret, _load_policy())
+    clinic, invite, proof, user = _prepared_owner(migration, actor)
+    runtime = role_engine("carepulse_runtime")
+    try:
+        assert _activate(runtime, clinic, invite, proof, user) is True
+    finally:
+        runtime.dispose()
+    receptionist = uuid4()
+    operation = uuid4()
+    receptionist_user = f"synthetic-{uuid4()}"
+    receptionist_email = f"{uuid4()}@example.invalid"
+    with migration.begin() as connection:
+        connection.execute(
+            text("""
+                INSERT INTO public."user"
+                    (id, name, email, "emailVerified", "createdAt", "updatedAt")
+                VALUES (:user, 'Receptionist', :email, true,
+                        clock_timestamp(), clock_timestamp())
+            """),
+            {"user": receptionist_user, "email": receptionist_email},
+        )
+        connection.execute(
+            text("""
+                INSERT INTO public.staff_accounts
+                    (id, organization_id, auth_user_id, verified_email, role,
+                     enabled, verified)
+                VALUES (:staff, :clinic, :user, :email, 'RECEPTIONIST', true, true)
+            """),
+            {
+                "staff": receptionist,
+                "clinic": clinic,
+                "user": receptionist_user,
+                "email": receptionist_email,
+            },
+        )
+        connection.execute(
+            text("""
+                INSERT INTO public.recovery_operations
+                    (id, organization_id, staff_id, auth_user_id, purpose,
+                     proof_digest, proof_reference, proof_expires_at,
+                     request_fingerprint, fingerprint_key_version,
+                     captured_staff_revision, captured_lifecycle_revision,
+                     reserved_security_revision)
+                VALUES (:operation, :clinic, :staff, :user, 'PASSWORD_RESET',
+                        :digest, 'synthetic-d02', clock_timestamp() + interval '2 minutes',
+                        :fingerprint, 'synthetic-v1', 0, 1, 1)
+            """),
+            {
+                "operation": operation,
+                "clinic": clinic,
+                "staff": receptionist,
+                "user": receptionist_user,
+                "digest": hashlib.sha256(b"synthetic-recovery").hexdigest(),
+                "fingerprint": hashlib.sha256(b"synthetic-fingerprint").hexdigest(),
+            },
+        )
+        connection.execute(
+            text("""
+                UPDATE public.staff_accounts
+                SET reset_block_operation_id=:operation, security_revision=1
+                WHERE id=:staff
+            """),
+            {"operation": operation, "staff": receptionist},
+        )
+    assert (
+        change_clinic_state(
+            operator, verified, clinic, 1, "SUSPENDED", "Invalidate D-02 recovery"
+        )["revision"]
+        == 2
+    )
+    for state in ("SUSPENDED", "ACTIVE"):
+        with migration.begin() as connection:
+            assert connection.execute(
+                text("""
+                SELECT r.state, r.invalidated, r.invalidation_reference,
+                       r.closed_at, s.reset_block_operation_id, s.security_revision,
+                       o.state
+                FROM public.recovery_operations r
+                JOIN public.staff_accounts s ON s.id=r.staff_id
+                JOIN public.organizations o ON o.id=r.organization_id
+                WHERE r.id=:operation
+                """),
+                {"operation": operation},
+            ).one() == ("RESERVED", True, "OPERATOR_SUSPEND", None, operation, 1, state)
+            assert (
+                connection.scalar(
+                    text("""
+                UPDATE public.recovery_operations SET auth_fence=auth_fence + 1
+                WHERE id=:operation AND state='RESERVED' AND NOT invalidated
+                RETURNING id
+                    """),
+                    {"operation": operation},
+                )
+                is None
+            )
+        if state == "SUSPENDED":
+            assert (
+                change_clinic_state(
+                    operator,
+                    verified,
+                    clinic,
+                    2,
+                    "ACTIVE",
+                    "Verified Owner reactivation",
+                )["revision"]
+                == 3
+            )
+
+
 def test_pending_suspended_clinic_cannot_reactivate(operator_identity, operator_config):
     migration, operator, actor, secret = operator_identity
     verified = authenticate_operator(operator, actor, secret, _load_policy())
