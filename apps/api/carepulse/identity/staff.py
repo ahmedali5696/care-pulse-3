@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, Engine, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from carepulse.config import ServiceConfig
 from carepulse.identity.authorization import AuthorizedStaff
@@ -179,20 +179,29 @@ def create_receptionist(
     if prepared is None:
         raise ContractError(409)
     staff_id = uuid4()
-    connection.execute(
-        text("""
+    try:
+        connection.execute(
+            text("""
             INSERT INTO public.staff_accounts
                 (id, organization_id, auth_user_id, verified_email, role,
                  enabled, verified, bulk_reschedule)
             VALUES (:id, :tenant, :user, :email, 'RECEPTIONIST', true, false, false)
         """),
-        {
-            "id": staff_id,
-            "tenant": actor.organization_id,
-            "user": prepared,
-            "email": address,
-        },
-    )
+            {
+                "id": staff_id,
+                "tenant": actor.organization_id,
+                "user": prepared,
+                "email": address,
+            },
+        )
+    except IntegrityError as conflict:
+        if (
+            getattr(conflict.orig, "sqlstate", None) == "23505"
+            and getattr(getattr(conflict.orig, "diag", None), "constraint_name", None)
+            == "staff_accounts_auth_user_id_key"
+        ):
+            raise ContractError(409) from conflict
+        raise
     projection = _projection(_staff(connection, actor, staff_id))
     _audit(
         connection,

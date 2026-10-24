@@ -2,6 +2,7 @@
 
 import json
 import secrets
+import time
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from threading import Barrier
@@ -161,8 +162,28 @@ def test_parallel_same_key_receptionist_creation_reuses_receipt(owner_session):
         return _staff_command("/api/staff/receptionists", cookie, command, key=key)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(create) for _ in range(2)]
-        barrier.wait()
+        with _database() as holding:
+            # Reads proceed while both competing native-user INSERTs must wait.
+            holding.execute('LOCK TABLE public."user" IN SHARE MODE')
+            futures = [pool.submit(create) for _ in range(2)]
+            barrier.wait()
+            blocked = 0
+            deadline = time.monotonic() + 4
+            try:
+                while blocked < 2 and time.monotonic() < deadline:
+                    with _database() as observer:
+                        blocked = observer.execute(
+                            """
+                            SELECT count(*) FROM pg_locks
+                             WHERE relation = 'public."user"'::regclass
+                               AND mode = 'RowExclusiveLock' AND NOT granted
+                            """
+                        ).fetchone()[0]
+                    if blocked < 2:
+                        time.sleep(0.02)
+            finally:
+                holding.commit()
+        assert blocked == 2, "Two native inserts never contended on the unique email"
         responses = [future.result(timeout=30) for future in futures]
 
     assert [status for status, _ in responses] == [201, 201]
