@@ -37,9 +37,20 @@ async function preparedReceptionist(request: Request): Promise<Request | Respons
   const canonicalEmail = email.trim().toLowerCase();
   const context = await getAuth().$context;
   const existing = await context.internalAdapter.findUserByEmail(canonicalEmail, { includeAccounts: true });
-  const preparedUserId = existing?.user.id ?? (await context.internalAdapter.createUser({
-    email: canonicalEmail, name: name.trim(), emailVerified: false,
-  }, { method: "email-password" })).id;
+  let preparedUserId = existing?.user.id;
+  if (!preparedUserId) {
+    try {
+      preparedUserId = (await context.internalAdapter.createUser({
+        email: canonicalEmail, name: name.trim(), emailVerified: false,
+      }, { method: "email-password" })).id;
+    } catch (error) {
+      const pg = error as { code?: unknown; constraint?: unknown };
+      if (pg?.code !== "23505" || pg.constraint !== "user_email_key") throw error;
+      const winner = await context.internalAdapter.findUserByEmail(canonicalEmail);
+      if (!winner) throw error;
+      preparedUserId = winner.user.id;
+    }
+  }
   const safe = JSON.stringify({
     email: canonicalEmail, name: name.trim(), reason: reason.trim(),
     prepared_user_id: preparedUserId,

@@ -49,10 +49,10 @@ export default function AcceptInvitationPage() {
 
   return (
     <main style={{ maxWidth: 440, margin: "4rem auto", padding: "1.5rem" }}>
-      <h1>Activate your CarePulse clinic</h1>
+      <h1>Accept your CarePulse invitation</h1>
       {!ready ? <p>Checking invitation…</p> : !invitation.current && state !== "active" ?
         <p role="alert">This invitation link is unavailable.</p> : state === "active" ?
-        <p role="status">The clinic Owner account is active.</p> :
+        <p role="status">Your account is active.</p> :
         <form onSubmit={submit}>
           <p>Use the invitation sent to your registered email.</p>
           <label htmlFor="owner-name">Full name</label>
@@ -60,7 +60,7 @@ export default function AcceptInvitationPage() {
           <label htmlFor="owner-password">Password</label>
           <input id="owner-password" name="password" type="password" autoComplete="new-password" required style={{ display: "block", width: "100%", marginBottom: 16 }} />
           <button disabled={state === "submitting"} type="submit">
-            {state === "submitting" ? "Activating…" : "Activate clinic"}
+            {state === "submitting" ? "Activating…" : "Activate account"}
           </button>
           {state === "failed" && <p role="alert">Unable to activate this invitation.</p>}
         </form>}

@@ -145,6 +145,45 @@ def test_owner_creates_invites_and_revokes_without_partial_sender_job(owner_sess
         )
 
 
+def test_parallel_same_key_receptionist_creation_reuses_receipt(owner_session):
+    owner, cookie = owner_session
+    address = f"synthetic-create-race-{uuid4()}@example.invalid"
+    command = {
+        "email": address,
+        "name": "Synthetic receptionist race",
+        "reason": "Hire",
+    }
+    key = str(uuid4())
+    barrier = Barrier(3)
+
+    def create():
+        barrier.wait()
+        return _staff_command("/api/staff/receptionists", cookie, command, key=key)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(create) for _ in range(2)]
+        barrier.wait()
+        responses = [future.result(timeout=30) for future in futures]
+
+    assert [status for status, _ in responses] == [201, 201]
+    assert responses[0][1]["data"] == responses[1][1]["data"]
+    with _database() as connection:
+        counts = connection.execute(
+            """
+            SELECT
+                (SELECT count(*) FROM public."user" WHERE email = %s),
+                (SELECT count(*) FROM public.staff_accounts s
+                    WHERE s.organization_id = %s
+                      AND s.verified_email = %s
+                      AND s.role = 'RECEPTIONIST'),
+                (SELECT count(*) FROM public.idempotency_receipts r
+                    WHERE r.organization_id = %s AND r.idempotency_key = %s)
+            """,
+            (address, owner.clinic, address, owner.clinic, key),
+        ).fetchone()
+    assert counts == (1, 1, 1)
+
+
 def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session):
     owner, owner_cookie = owner_session
     staff_id = uuid4()
