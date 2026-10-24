@@ -1,4 +1,4 @@
-"""F-07 real deny-only HTTP and isolated Mailpit evidence; no auth schema."""
+"""F-07 deny-only HTTP and isolated Mailpit evidence with D-02 persistence."""
 
 import json
 import os
@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -24,9 +24,11 @@ def disposable_project():
         assert not config["services"][service].get("ports")
 
 
-def _request(url, method="GET", headers=None):
+def _request(url, method="GET", headers=None, body=None):
     try:
-        return urlopen(Request(url, method=method, headers=headers or {}), timeout=6)
+        return urlopen(
+            Request(url, method=method, headers=headers or {}, data=body), timeout=6
+        )
     except HTTPError as error:
         return error
 
@@ -47,6 +49,7 @@ def _denial(response, status, code, method="GET"):
             == {
                 "UNAUTHENTICATED": "Authentication required",
                 "FORBIDDEN": "Operation unavailable",
+                "INVALID_INPUT": "Invalid request",
             }[code]
         )
         assert UUID(error["request_id"]).version == 4
@@ -110,6 +113,62 @@ def test_signup_login_and_public_mail_routes_are_absent():
             assert response.status == 404
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-Requested-With": "XMLHttpRequest"},
+        {"Origin": "http://untrusted.invalid", "X-Requested-With": "XMLHttpRequest"},
+        {"Origin": "http://web:3000"},
+        {
+            "Origin": "http://web:3000",
+            "X-Requested-With": "XMLHttpRequest",
+            "Sec-Fetch-Site": "cross-site",
+        },
+    ],
+)
+def test_owner_invite_rejects_missing_or_foreign_origin_and_csrf(headers):
+    payload = json.dumps(
+        {
+            "organization_id": str(uuid4()),
+            "invitation_id": str(uuid4()),
+            "proof": "A" * 43,
+            "name": "Synthetic forged",
+            "password": "synthetic-forged",
+        }
+    ).encode()
+    headers = {"Content-Type": "application/json", **headers}
+    response = _request(
+        "http://web:3000/api/auth/invite-accept", "POST", headers, payload
+    )
+    assert response.headers.get("Set-Cookie") is None
+    _denial(response, 403, "FORBIDDEN")
+
+
+def test_owner_invite_unknown_proof_is_denied_without_session_cookie():
+    payload = json.dumps(
+        {
+            "organization_id": str(uuid4()),
+            "invitation_id": str(uuid4()),
+            "proof": "B" * 43,
+            "name": "Synthetic forged",
+            "password": "synthetic-forged",
+        }
+    ).encode()
+    response = _request(
+        "http://web:3000/api/auth/invite-accept",
+        "POST",
+        {
+            "Content-Type": "application/json",
+            "Origin": "http://web:3000",
+            "X-Requested-With": "XMLHttpRequest",
+            "Sec-Fetch-Site": "same-origin",
+        },
+        payload,
+    )
+    assert response.headers.get("Set-Cookie") is None
+    _denial(response, 403, "FORBIDDEN")
+
+
 def test_both_reserved_templates_arrived_without_tokens():
     with urlopen("http://mail:8025/api/v1/messages", timeout=5) as response:
         mailbox = json.load(response)
@@ -135,7 +194,7 @@ def test_both_reserved_templates_arrived_without_tokens():
     }
 
 
-def test_denials_created_no_auth_business_or_outbox_schema():
+def test_denied_routes_preserve_current_persistence_boundary():
     with psycopg.connect(
         host="db",
         dbname="carepulse",
@@ -145,8 +204,31 @@ def test_denials_created_no_auth_business_or_outbox_schema():
         tables = connection.execute(
             "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
         ).fetchall()
-        assert set(tables) <= {("alembic_version",)}
-        if tables:
-            assert connection.execute(
-                "SELECT version_num FROM public.alembic_version"
-            ).fetchall() == [("0001_foundation",)]
+        assert set(tables) == {
+            ("alembic_version",),
+            ("organizations",),
+            ("operator_identities",),
+            ("user",),
+            ("session",),
+            ("account",),
+            ("verification",),
+            ("staff_accounts",),
+            ("invitations",),
+            ("recovery_operations",),
+            ("auth_recovery_completions",),
+            ("sensitive_audit",),
+            ("clinical_audit",),
+            ("outbox_events",),
+            ("delivery_jobs",),
+            ("protected_delivery_material",),
+            ("request_nonces",),
+            ("idempotency_receipts",),
+            ("auth_login_attempts",),
+            ("operator_auth_attempts",),
+            ("operator_creation_pending",),
+            ("operator_invitation_pending",),
+            ("operator_action_pending",),
+        }
+        assert connection.execute(
+            "SELECT version_num FROM public.alembic_version"
+        ).fetchall() == [("0008_provisioning_admin",)]

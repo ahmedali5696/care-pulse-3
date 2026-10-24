@@ -1,5 +1,6 @@
 import { lstatSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
+import { loadMailSettings } from "./mail/config.ts";
 
 // Server-only: never import this module from app pages, layouts or client code.
 // T012 deliberately does not supply production policy values or fallback secrets.
@@ -76,6 +77,12 @@ function hostname(name: string): string {
     (label) => /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/.test(label),
   )) invalid(name);
   return host;
+}
+
+function signingKeyId(): string {
+  const id = required("CP_SIGNING_KEY_ID");
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) invalid("CP_SIGNING_KEY_ID");
+  return id;
 }
 
 function readProtectedFile(name: string, maxBytes: number): string {
@@ -256,12 +263,10 @@ export function loadWebConfig() {
   };
   const apiUrl = privateHttpUrl("CP_INTERNAL_API_URL");
   const serviceKey = secretFile("CP_SERVICE_KEY_FILE");
+  const signingKeyIdValue = signingKeyId();
   const authSecret = secretFile("CP_AUTH_SECRET_FILE");
-  const mailEnabled = choice("CP_MAIL_ENABLED", ["true", "false"]) === "true";
-  const smtp = mailEnabled
-    ? { host: hostname("CP_SMTP_HOST"), port: port("CP_SMTP_PORT") }
-    : null;
+  const { mailEnabled, smtp } = loadMailSettings();
   choice("CP_SCAN_ENABLED", ["false"]);
 
-  return { environment, policy, database, apiUrl, serviceKey, authSecret, mailEnabled, smtp };
+  return { environment, policy, database, apiUrl, serviceKey, signingKeyId: signingKeyIdValue, authSecret, mailEnabled, smtp };
 }

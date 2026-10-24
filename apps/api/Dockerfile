@@ -22,8 +22,29 @@ USER 65532:65532
 FROM python-base AS api
 CMD ["python", "-m", "uvicorn", "carepulse.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
+# Build Nodemailer's already locked closure separately. The final worker does
+# not inherit Next, Better Auth, pnpm or any other web runtime dependency.
+FROM node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS mail-node
+WORKDIR /workspace
+RUN npm install --global --ignore-scripts --no-audit --no-fund pnpm@10.34.7
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc ./
+COPY apps/web/package.json apps/web/package.json
+RUN pnpm install --frozen-lockfile
+
 FROM python-base AS worker
+COPY --from=mail-node /usr/local/bin/node /usr/local/bin/node
+COPY --from=mail-node /workspace/node_modules/.pnpm/nodemailer@10.1.7/node_modules/nodemailer /srv/apps/web/mail/node_modules/nodemailer
+COPY --chown=65532:65532 apps/web/mail/config.ts apps/web/mail/transport.ts apps/web/mail/templates.ts apps/web/mail/delivery-material.ts apps/web/mail/send-job.ts /srv/apps/web/mail/
+RUN node --version
 CMD ["python", "apps/worker/main.py"]
+
+FROM worker AS sender
+ENTRYPOINT ["python", "-m", "carepulse.notifications.email_sender"]
+CMD []
+
+FROM python-base AS operator
+ENTRYPOINT ["python", "-m", "carepulse.provisioning.cli"]
+CMD []
 
 FROM python-base AS test
 # T009 adds the integration suite; this target keeps the same locked Python image.

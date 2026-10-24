@@ -76,6 +76,11 @@ def test_running_service_state():
 
 def test_incompatible_revision_denies_then_recovers_without_schema_creation():
     with _admin() as admin:
+        original_tables = set(
+            admin.execute(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+            ).fetchall()
+        )
         try:
             admin.execute(
                 "UPDATE public.alembic_version SET version_num = %s",
@@ -85,12 +90,17 @@ def test_incompatible_revision_denies_then_recovers_without_schema_creation():
         finally:
             admin.execute(
                 "UPDATE public.alembic_version SET version_num = %s",
-                ("0001_foundation",),
+                ("0008_provisioning_admin",),
             )
         _eventually()
-        assert admin.execute(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-        ).fetchall() == [("alembic_version",)]
+        assert (
+            set(
+                admin.execute(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                ).fetchall()
+            )
+            == original_tables
+        )
 
 
 def test_blocked_database_query_times_out_while_processes_remain_live():

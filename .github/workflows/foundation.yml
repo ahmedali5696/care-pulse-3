@@ -5,6 +5,11 @@ on:
     branches: [feature/wave-0-foundation, development]
   pull_request:
   workflow_dispatch:
+    inputs:
+      b04_spike:
+        description: Run the isolated Issue 7 adapter feasibility experiment
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -86,6 +91,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
+      CP_B04_SPIKE: ${{ inputs.b04_spike || false }}
       COMPOSE_PROJECT_NAME: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
       CP_CI_PROJECT: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -102,6 +108,18 @@ jobs:
             echo "CP_RUNTIME_DB_PASSWORD_FILE=$RUNNER_TEMP/foundation-ci-private/runtime-db-password"
             echo "CP_MIGRATION_SECRET_FILE=$RUNNER_TEMP/foundation-ci-private/migration-password"
             echo "CP_OPERATOR_SECRET_FILE=$RUNNER_TEMP/foundation-ci-private/operator-password"
+            echo "CP_OPERATOR_DB_PASSWORD_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/operator-password"
+            echo "CP_OPERATOR_CREDENTIAL_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/operator-credential"
+            echo "CP_SENDER_DB_PASSWORD_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/sender-password"
+            echo "CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/delivery-public.pem"
+            echo "CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/delivery-private.pem"
+            echo "CP_DELIVERY_KEY_ID=synthetic-ci-delivery-v1"
+            echo "CP_DELIVERY_PRIVATE_KEY_FILES=synthetic-ci-delivery-v1=/run/secrets/delivery_private_key"
+            echo "CP_MAIL_BASE_URL=http://127.0.0.1:3000"
+            echo "CP_DELIVERY_LEASE_SECONDS=30"
+            echo "CP_DELIVERY_ATTEMPT_TIMEOUT_SECONDS=5"
+            echo "CP_DELIVERY_MAX_ATTEMPTS=3"
+            echo "CP_DELIVERY_RETRY_SECONDS=2"
             echo "CP_SERVICE_KEY_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/service-key"
             echo "CP_AUTH_SECRET_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/auth-secret"
             echo "CP_FILE_ENCRYPTION_KEY_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/file-key"
@@ -113,6 +131,7 @@ jobs:
             echo "CP_DB_NAME=carepulse"
             echo "CP_DB_USER=carepulse_runtime"
             echo "CP_INTERNAL_API_URL=http://api:8000"
+            echo "CP_SIGNING_KEY_ID=synthetic-ci-v1"
             echo "CP_MAIL_ENABLED=false"
             echo "CP_SCAN_ENABLED=false"
           } >> "$GITHUB_ENV"
@@ -153,7 +172,21 @@ jobs:
           docker buildx version | grep -F 'v0.38.1'
           test "$(dpkg-query -W -f='${Version}' containerd.io)" = '2.4.2-3~ubuntu.24.04~noble'
 
-      - name: Common disposable integration and scoped cleanup
+      - name: Install pinned Playwright browser on disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/node.tar.xz" https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz
+          echo "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6  $RUNNER_TEMP/node.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/node.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/node-v24.22.1-linux-x64/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/node-v24.22.1-linux-x64/bin:$PATH"
+          test "$(node --version)" = v24.22.1
+          npm install --global --ignore-scripts --no-audit --no-fund pnpm@10.34.7
+          pnpm install --frozen-lockfile
+          pnpm --filter @carepulse/web exec playwright install --with-deps chromium
+
+      - name: Disposable PostgreSQL RLS integration and scoped cleanup
         shell: pwsh
         run: |
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }

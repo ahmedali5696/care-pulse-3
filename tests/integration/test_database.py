@@ -20,7 +20,7 @@ from sqlalchemy import URL, create_engine, text
 from sqlalchemy.exc import DBAPIError
 
 ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0001_foundation"
+REVISION = "0008_provisioning_admin"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -117,10 +117,15 @@ def _create_empty_database(admin, name):
                 sql.Identifier(name)
             )
         )
+        connection.execute(
+            sql.SQL("GRANT CONNECT ON DATABASE {} TO carepulse_operator").format(
+                sql.Identifier(name)
+            )
+        )
         connection.execute("GRANT USAGE ON SCHEMA public TO carepulse_runtime")
 
 
-def test_bootstrap_baseline_has_only_supported_version_table():
+def test_organization_schema_owned_by_migration_role():
     engine = _engine("carepulse_runtime")
     try:
         with engine.connect() as connection:
@@ -130,11 +135,19 @@ def test_bootstrap_baseline_has_only_supported_version_table():
                 )
                 == REVISION
             )
-            assert connection.execute(
-                text(
-                    "SELECT tablename, tableowner FROM pg_tables WHERE schemaname = 'public'"
-                )
-            ).all() == [("alembic_version", "carepulse_migration")]
+            owned_tables = dict(
+                connection.execute(
+                    text(
+                        "SELECT tablename, tableowner FROM pg_tables WHERE schemaname = 'public'"
+                    )
+                ).all()
+            )
+            assert {
+                "alembic_version",
+                "operator_identities",
+                "organizations",
+            } <= owned_tables.keys()
+            assert set(owned_tables.values()) == {"carepulse_migration"}
             assert (
                 connection.scalar(
                     text(
@@ -160,6 +173,34 @@ def test_empty_database_reset_and_repeated_upgrade(admin, empty_database):
         try:
             _upgrade(engine)
             _upgrade(engine)
+            config = Config(str(ROOT / "alembic.ini"))
+            with engine.connect() as connection:
+                config.attributes["connection"] = connection
+                command.downgrade(config, "0001_foundation")
+            with engine.connect() as connection:
+                assert (
+                    connection.scalar(
+                        text("SELECT version_num FROM public.alembic_version")
+                    )
+                    == "0001_foundation"
+                )
+                assert (
+                    connection.execute(
+                        text("""
+                    SELECT to_regclass('public.organizations'),
+                           to_regclass('public.operator_identities'),
+                           to_regclass('public.runtime_active_tenant_ids'),
+                           to_regclass('public."user"'),
+                           to_regclass('public."session"'),
+                           to_regclass('public.staff_accounts'),
+                           to_regclass('public.invitations'),
+                           to_regclass('public.recovery_operations'),
+                           to_regclass('public.auth_recovery_completions')
+                """)
+                    ).one()
+                    == (None,) * 9
+                )
+            _upgrade(engine)
         finally:
             engine.dispose()
         runtime = _engine("carepulse_runtime", empty_database)
@@ -181,15 +222,16 @@ def test_failed_isolated_migration_rolls_back_objects_and_version(
     _create_empty_database(admin, empty_database)
     scripts = tmp_path / "migrations"
     shutil.copytree(ROOT / "db/migrations", scripts)
-    (scripts / "versions/0002_failure.py").write_text(
-        'from alembic import op\nrevision = "0002_failure"\n'
-        'down_revision = "0001_foundation"\n'
+    (scripts / "versions/0008_failure.py").write_text(
+        'from alembic import op\nrevision = "0008_failure"\n'
+        'down_revision = "0008_provisioning_admin"\n'
         "def upgrade():\n"
         '    op.execute("CREATE TABLE public.synthetic_partial (value integer)")\n'
         '    op.execute("SELECT 1 / 0")\n'
     )
     engine = _engine("carepulse_migration", empty_database)
     try:
+        _upgrade(engine)
         with pytest.raises(DBAPIError) as failed:
             _upgrade(engine, scripts)
         assert failed.value.orig.sqlstate == "22012"
@@ -201,8 +243,10 @@ def test_failed_isolated_migration_rolls_back_objects_and_version(
                 is None
             )
             assert (
-                connection.scalar(text("SELECT to_regclass('public.alembic_version')"))
-                is None
+                connection.scalar(
+                    text("SELECT version_num FROM public.alembic_version")
+                )
+                == REVISION
             )
     finally:
         engine.dispose()
@@ -298,6 +342,7 @@ def test_reused_runtime_connection_has_no_prior_authority(outcome):
         db_password=_password("carepulse_runtime"),
         file_encryption_key="synthetic-unused-by-database-check",
         service_key=None,
+        signing_key_id=None,
         mail_enabled=False,
         scan_enabled=False,
         mail=None,

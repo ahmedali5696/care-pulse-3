@@ -55,7 +55,17 @@ def test_resolved_compose_topology() -> None:
     config = _ci_compose_config()
 
     services = config["services"]
-    assert set(services) == {"web", "api", "worker", "db", "mail", "scan", "test"}
+    assert set(services) == {
+        "web",
+        "api",
+        "worker",
+        "sender",
+        "operator",
+        "db",
+        "mail",
+        "scan",
+        "test",
+    }
     web_ports = services["web"]["ports"]
     assert len(web_ports) == 1
     assert web_ports[0]["host_ip"] == "127.0.0.1"
@@ -75,6 +85,8 @@ def test_resolved_compose_topology() -> None:
     assert _network_names(services["web"]) == {"application", "database"}
     assert _network_names(services["api"]) == {"application", "database"}
     assert _network_names(services["worker"]) == {"database"}
+    assert _network_names(services["sender"]) == {"application", "database"}
+    assert _network_names(services["operator"]) == {"database"}
     assert _network_names(services["mail"]) == {"application"}
     assert _network_names(services["test"]) == {"application", "database"}
     assert _network_names(services["scan"]) == {"application", "signature_updates"}
@@ -86,6 +98,8 @@ def test_resolved_compose_topology() -> None:
     assert services["mail"]["profiles"] == ["mail"]
     assert services["scan"]["profiles"] == ["scan"]
     assert services["test"]["profiles"] == ["test"]
+    assert services["sender"]["profiles"] == ["sender"]
+    assert services["operator"]["profiles"] == ["operator"]
     expected_secrets = {
         "test": {"postgres_password", "active_policy"},
         "web": {
@@ -93,6 +107,7 @@ def test_resolved_compose_topology() -> None:
             "runtime_db_password",
             "service_key",
             "auth_secret",
+            "delivery_public_key",
         },
         "api": {
             "active_policy",
@@ -101,6 +116,13 @@ def test_resolved_compose_topology() -> None:
             "file_encryption_key",
         },
         "worker": {"active_policy", "runtime_db_password", "file_encryption_key"},
+        "sender": {"active_policy", "sender_db_password", "delivery_private_key"},
+        "operator": {
+            "active_policy",
+            "operator_db_password",
+            "operator_credential",
+            "delivery_public_key",
+        },
     }
     for name, allowed in expected_secrets.items():
         assert {
@@ -114,6 +136,29 @@ def test_resolved_compose_topology() -> None:
             "operator" in key.lower() or "migration" in key.lower()
             for key in services[name].get("environment", {})
         )
+        assert "delivery_private_key" not in {
+            secret["source"] for secret in services[name].get("secrets", ())
+        }
+
+    assert services["sender"]["environment"]["CP_DB_USER"] == "carepulse_sender"
+    assert services["operator"]["environment"]["CP_DB_USER"] == "carepulse_operator"
+    assert services["sender"]["build"]["target"] == "sender"
+    assert services["operator"]["build"]["target"] == "operator"
+    assert not services["sender"].get("ports")
+    assert not services["operator"].get("ports")
+    for name in ("sender", "operator"):
+        assert _volume_targets(services[name]) == {}
+        assert not any(
+            forbidden in services[name]["environment"]
+            for forbidden in (
+                "CP_SERVICE_KEY_FILE",
+                "CP_AUTH_SECRET_FILE",
+                "CP_FILE_ENCRYPTION_KEY_FILE",
+            )
+        )
+    assert "delivery_private_key" not in {
+        secret["source"] for secret in services["operator"].get("secrets", ())
+    }
 
     assert _volume_targets(services["db"])["/var/lib/postgresql/data"] == "db_data"
     for name in ("api", "worker", "test"):

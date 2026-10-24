@@ -1,7 +1,10 @@
 // Server-only; initialize at request time, never during a secret-free Next build.
 import { betterAuth } from "better-auth";
+import { lifecycleSchemaPlugin, sessionFields } from "./auth/schema.ts";
+import { bindSessionAuthority } from "./auth/session.ts";
 import { loadWebConfig } from "./config.ts";
 import { runtimeDatabase } from "./db.ts";
+import { postgresAuthAdapter } from "./auth/postgres-adapter.ts";
 
 function createAuth() {
   const config = loadWebConfig();
@@ -9,11 +12,23 @@ function createAuth() {
     // F-03 admits only synthetic HTTP development; keep cookie names consistent in CLI/Next.
     baseURL: "http://localhost:3000",
     secret: config.authSecret,
-    database: runtimeDatabase(config),
-    // shortcut: no D-02 tables in Wave 0, restore schema preflight with D-02; real lookups still fail closed.
-    advanced: { database: { validateSchema: false } },
-    session: { cookieCache: { enabled: false } },
-    emailAndPassword: { enabled: false, disableSignUp: true },
+    database: postgresAuthAdapter(runtimeDatabase(config)),
+    plugins: [lifecycleSchemaPlugin],
+    advanced: {
+      database: { validateSchema: true },
+      useSecureCookies: process.env.CP_ENV === "production",
+      defaultCookieAttributes: { httpOnly: true, sameSite: "lax", path: "/" },
+    },
+    session: {
+      cookieCache: { enabled: false }, disableSessionRefresh: true,
+      additionalFields: sessionFields,
+    },
+    databaseHooks: { session: { create: { before: bindSessionAuthority } } },
+    verification: { storeInDatabase: true, storeIdentifier: "hashed" },
+    emailAndPassword: {
+      enabled: true, disableSignUp: true, requireEmailVerification: true,
+      revokeSessionsOnPasswordReset: true,
+    },
     // Adapter failures are translated at the boundary, not logged with SQL.
     logger: { disabled: true },
   });

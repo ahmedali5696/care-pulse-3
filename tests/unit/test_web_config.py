@@ -1,5 +1,7 @@
 """Exercise server-only web validation through its public loader on real files."""
 
+import hashlib
+import hmac
 import json
 import os
 import subprocess
@@ -46,6 +48,7 @@ def web_env(tmp_path):
         "CP_DB_NAME": "carepulse",
         "CP_DB_USER": "carepulse_runtime",
         "CP_INTERNAL_API_URL": "http://api:8000",
+        "CP_SIGNING_KEY_ID": "synthetic-ci-v1",
         **secrets,
         "CP_MAIL_ENABLED": "false",
         "CP_SCAN_ENABLED": "false",
@@ -153,6 +156,58 @@ def test_web_api_url_accepts_only_private_http_origins(web_env, api_url, accepte
     else:
         assert completed.returncode != 0
         assert completed.stderr == "Invalid CP_INTERNAL_API_URL"
+
+
+@pytest.mark.parametrize("key_id", ["", "bad/key", " space", "á", "a" * 129])
+def test_web_rejects_invalid_signing_key_id(web_env, key_id):
+    web_env["CP_SIGNING_KEY_ID"] = key_id
+    completed = _web_config(web_env)
+    assert completed.returncode != 0
+    assert completed.stderr == "Invalid CP_SIGNING_KEY_ID"
+
+
+def test_typescript_config_and_signing_bytes_match_python(web_env):
+    from carepulse.identity.signing import CanonicalEnvelope, canonical_payload
+
+    vectors = json.loads(
+        (ROOT / "tests/fixtures/signing-vectors.json").read_text(encoding="utf-8")
+    )["vectors"]
+    probe = """
+import { createHmac } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { loadWebConfig } from './apps/web/config.ts';
+const config = loadWebConfig();
+const vectors = JSON.parse(readFileSync('./tests/fixtures/signing-vectors.json', 'utf8')).vectors;
+for (const vector of vectors) {
+  const fields = [...vector.canonical_fields];
+  fields[1] = config.signingKeyId;
+  const bytes = Buffer.from(JSON.stringify(fields), 'utf8');
+  const signature = createHmac('sha256', config.serviceKey).update(bytes).digest('hex');
+  console.log(JSON.stringify({ fields, bytes: bytes.toString('hex'), signature }));
+}
+"""
+    completed = subprocess.run(
+        ["node", "--no-warnings", "--experimental-strip-types", "--input-type=module"],
+        input=probe,
+        cwd=ROOT,
+        env=web_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    service_key = Path(web_env["CP_SERVICE_KEY_FILE"]).read_text().strip().encode()
+    for vector, line in zip(vectors, completed.stdout.splitlines(), strict=True):
+        signed = json.loads(line)
+        envelope = CanonicalEnvelope(*signed["fields"])
+        payload = canonical_payload(envelope)
+        assert signed["bytes"] == payload.hex()
+        assert (
+            signed["signature"]
+            == hmac.new(service_key, payload, hashlib.sha256).hexdigest()
+        )
+        assert envelope.key_id == web_env["CP_SIGNING_KEY_ID"]
 
 
 @pytest.mark.parametrize("field", ["CP_POLICY_FILE", "CP_AUTH_SECRET_FILE"])
