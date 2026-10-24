@@ -31,10 +31,12 @@ async function inTenant<T>(tenant: string, action: (client: PoolClient) => Promi
     return locked.rows[0]?.active ? action(client) : null;
   };
   const pool = runtimeDatabase(loadWebConfig());
-  // The login hook is inside the adapter's owned transaction; other callers
-  // keep their independent, fully committed authority transactions.
+  // Session creation holds this transaction through INSERT. Taking the
+  // organization FOR UPDATE lock here deadlocks with a simultaneous staff
+  // revision change waiting on that INSERT; the post-commit currentActor
+  // rechecks live authority under the organization lock before issuing cookies.
   const joined = scopedAuthClient(pool, tenant);
-  if (joined) return check(joined);
+  if (joined) return action(joined);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
