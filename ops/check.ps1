@@ -70,7 +70,7 @@ require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9
 approved_bootstrap_files = {
     '.github/workflows/foundation.yml': 'ee3369cc9bd0997d9f4c629b8d3b8acc0498f0dedab5f10105fb4c8642d21d01',
     'apps/api/Dockerfile': '293af5bb74f261da9d70fe314241b897b4452e116617758889a9b2dbecfc942a',
-    'apps/web/Dockerfile': '611bacc8415759957ecf813a220303aa7adc6d2f12eade10cb64e9f99b7560b1',
+    'apps/web/Dockerfile': '933af52609f2a4eb638d048605ec555e2a3443cb25b3ba5d64d5a36ec585f02a',
 }
 for filename, approved in approved_bootstrap_files.items():
     canonical = Path(filename).read_bytes().replace(b'\r\n', b'\n')
@@ -464,6 +464,8 @@ docker compose --profile test run --rm --no-deps \
   -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_sessions.py
+docker compose exec -T web node --no-warnings --experimental-strip-types --test auth/ingress.test.mjs
+echo 'PASS verified source separation, spoof resistance and sole Web listener'
 docker compose logs --no-color api > "$private/auth-logs"
 if grep -Fq '__foundation_bff_must_not_forward__' "$private/auth-logs"; then
   echo 'FAIL BFF forwarded a protected request'; exit 1

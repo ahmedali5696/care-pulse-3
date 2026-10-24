@@ -59,6 +59,9 @@ export async function sessionResponse(request: Request): Promise<Response> {
 
 export async function loginResponse(request: Request): Promise<Response> {
   if (!validMutation(request)) return failure(403);
+  // The single Web listener stamps this value from the TCP peer before Next handles it.
+  const source = request.headers.get("x-carepulse-ingress-source");
+  if (!source) return failure(503);
   let body: unknown;
   try { body = await request.json(); } catch { return failure(422); }
   if (!body || typeof body !== "object" || Array.isArray(body) ||
@@ -67,7 +70,7 @@ export async function loginResponse(request: Request): Promise<Response> {
   if (typeof email !== "string" || typeof password !== "string" ||
       !email || !password) return failure(422);
   try {
-    if (!await allowLoginAttempt(email)) return failure(429);
+    if (!await allowLoginAttempt(email, source)) return failure(429);
     const capture = await captureLoginAuthority(email);
     if (!capture) return failure(401);
     const native = await withLoginAuthority(capture, () => getAuth().api.signInEmail({

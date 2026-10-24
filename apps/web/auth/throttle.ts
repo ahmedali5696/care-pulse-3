@@ -2,12 +2,9 @@ import { createHmac } from "node:crypto";
 import { loadWebConfig } from "../config.ts";
 import { runtimeDatabase } from "../db.ts";
 
-export async function allowLoginAttempt(email: string): Promise<boolean> {
+export async function allowLoginAttempt(email: string, source: string): Promise<boolean> {
   const configuration = loadWebConfig();
   const policy = configuration.policy;
-  // A direct Web listener has no trusted transport-authenticated client IP.
-  // Group unknown origins until a trusted ingress supplies that boundary.
-  const source = "unknown";
   const scopes: Array<[string, string]> = [
     ["identity", email.toLowerCase()],
     ["source", source],

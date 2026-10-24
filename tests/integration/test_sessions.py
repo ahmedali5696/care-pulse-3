@@ -10,7 +10,7 @@ from hashlib import scrypt, sha256
 from pathlib import Path
 from time import monotonic, sleep
 from types import SimpleNamespace
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import UUID, uuid4
 
@@ -422,6 +422,11 @@ def test_wrong_password_throttle_blocks_subsequent_correct_login(owner):
         429,
         "RATE_LIMITED",
     )
+
+
+def test_browser_cannot_reach_an_unstamped_web_listener(disposable_project):
+    with pytest.raises(URLError):
+        urlopen("http://web:3001/api/auth/login", timeout=2)
 
 
 def test_locked_native_session_storage_fails_closed(owner):
