@@ -4,6 +4,7 @@ import { lifecycleSchemaPlugin, sessionFields } from "./auth/schema.ts";
 import { bindSessionAuthority } from "./auth/session.ts";
 import { loadWebConfig } from "./config.ts";
 import { runtimeDatabase } from "./db.ts";
+import { postgresAuthAdapter } from "./auth/postgres-adapter.ts";
 
 function createAuth() {
   const config = loadWebConfig();
@@ -11,7 +12,7 @@ function createAuth() {
     // F-03 admits only synthetic HTTP development; keep cookie names consistent in CLI/Next.
     baseURL: "http://localhost:3000",
     secret: config.authSecret,
-    database: runtimeDatabase(config),
+    database: postgresAuthAdapter(runtimeDatabase(config)),
     plugins: [lifecycleSchemaPlugin],
     advanced: {
       database: { validateSchema: true },

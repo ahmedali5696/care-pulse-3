@@ -3,6 +3,9 @@ import { APIError } from "better-auth/api";
 import { getAuth } from "../auth.ts";
 import { captureLoginAuthority, currentActor, withLoginAuthority } from "./session.ts";
 import { allowLoginAttempt } from "./throttle.ts";
+import { withAuthTransaction } from "./postgres-adapter.ts";
+import { runtimeDatabase } from "../db.ts";
+import { loadWebConfig } from "../config.ts";
 
 export function failure(status: 401 | 403 | 409 | 422 | 429 | 503): Response {
   const errors = {
@@ -73,11 +76,13 @@ export async function loginResponse(request: Request): Promise<Response> {
     if (!await allowLoginAttempt(email, source)) return failure(429);
     const capture = await captureLoginAuthority(email);
     if (!capture) return failure(401);
-    const native = await withLoginAuthority(capture, () => getAuth().api.signInEmail({
+    const native = await withLoginAuthority(capture, () =>
+      withAuthTransaction(runtimeDatabase(loadWebConfig()), capture.organizationId,
+      () => getAuth().api.signInEmail({
       body: { email, password, rememberMe: false },
       headers: new Headers({ "user-agent": request.headers.get("user-agent") ?? "" }),
       asResponse: true,
-    }));
+    })));
     if (!native.ok) return failure(401);
     const issued = await native.clone().json() as { token?: string };
     const cookies = native.headers.getSetCookie();

@@ -4,6 +4,7 @@ import { loadWebConfig } from "../config.ts";
 import { runtimeDatabase } from "../db.ts";
 import { failure, validMutation } from "./http.ts";
 import { signRequest } from "./signing.ts";
+import { withAuthTransaction } from "./postgres-adapter.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INVITE_PROOF = /^[A-Za-z0-9_-]{43}$/;
@@ -159,7 +160,8 @@ export async function acceptFirstOwner(request: Request): Promise<Response> {
   try {
     const invitation = await verifiedInvitation(body);
     if (!invitation) return failure(403);
-    const preparedUserId = await prepareVerifiedOwner(body, invitation);
+    const preparedUserId = await withAuthTransaction(runtimeDatabase(loadWebConfig()),
+      body.organization_id, () => prepareVerifiedOwner(body, invitation));
     return await activateOwner(body, invitation, preparedUserId);
   } catch {
     return failure(503);

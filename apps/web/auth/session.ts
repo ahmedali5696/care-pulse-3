@@ -3,6 +3,7 @@ import type { PoolClient } from "pg";
 import { loadWebConfig } from "../config.ts";
 import { runtimeDatabase } from "../db.ts";
 import { getAuth } from "../auth.ts";
+import { scopedAuthClient } from "./postgres-adapter.ts";
 
 type Authority = {
   userId: string;
@@ -24,17 +25,21 @@ async function resolveTenant(userId: string): Promise<string | null> {
 }
 
 async function inTenant<T>(tenant: string, action: (client: PoolClient) => Promise<T>): Promise<T | null> {
-  const client = await runtimeDatabase(loadWebConfig()).connect();
+  const check = async (client: PoolClient) => {
+    const locked = await client.query<{ active: boolean }>(
+      "SELECT public.lock_active_organization($1::uuid) AS active", [tenant]);
+    return locked.rows[0]?.active ? action(client) : null;
+  };
+  const pool = runtimeDatabase(loadWebConfig());
+  // The login hook is inside the adapter's owned transaction; other callers
+  // keep their independent, fully committed authority transactions.
+  const joined = scopedAuthClient(pool, tenant);
+  if (joined) return check(joined);
+  const client = await pool.connect();
   try {
     await client.query("BEGIN");
     await client.query("SELECT set_config('app.organization_id', $1, true)", [tenant]);
-    const locked = await client.query<{ active: boolean }>(
-      "SELECT public.lock_active_organization($1::uuid) AS active", [tenant]);
-    if (!locked.rows[0]?.active) {
-      await client.query("COMMIT");
-      return null;
-    }
-    const answer = await action(client);
+    const answer = await check(client);
     await client.query("COMMIT");
     return answer;
   } catch (error) {

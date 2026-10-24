@@ -125,7 +125,7 @@ print('PASS approved manifests, complete locks, installed Python closure, privat
             if (-not (Test-Path -LiteralPath 'tests/integration/test_sessions.py' -PathType Leaf)) {
                 throw 'Missing required B-02 integration test: tests/integration/test_sessions.py'
             }
-            foreach ($suite in @('tests/integration/test_provisioning.py', 'tests/e2e/owner-invite.spec.ts', 'tests/e2e/extract_mailpit_invitation.py', 'apps/web/mail/delivery-material.test.ts', 'tests/unit/test_delivery_material.py')) {
+            foreach ($suite in @('tests/integration/test_provisioning.py', 'tests/e2e/owner-invite.spec.ts', 'tests/e2e/extract_mailpit_invitation.py', 'apps/web/mail/delivery-material.test.ts', 'tests/unit/test_delivery_material.py', 'apps/web/auth/postgres-adapter.integration.test.ts')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-03 verification: $suite" }
             }
             if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Linux' -or $PSVersionTable.PSVersion.Major -lt 7) {
@@ -539,6 +539,10 @@ fi
 CP_INVITE_LINK_FILE="$private/invite-link" CP_INVITE_OWNER_EMAIL=first-owner@example.invalid \
   pnpm --filter @carepulse/web test:owner-invite
 echo 'PASS real restricted operator, post-commit one-shot sender and browser Owner activation/login'
+docker compose exec -T -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" \
+  -e CP_ADAPTER_TEST_CLINIC="$clinic_id" web \
+  node --no-warnings --experimental-strip-types --test auth/postgres-adapter.integration.test.ts
+echo 'PASS real PostgreSQL Stage-1 Better Auth adapter parity and transaction isolation'
 docker compose logs --no-color api > "$private/auth-logs"
 if grep -Fq '__foundation_bff_must_not_forward__' "$private/auth-logs"; then
   echo 'FAIL BFF forwarded a protected request'; exit 1
