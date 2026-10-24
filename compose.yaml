@@ -66,6 +66,8 @@ services:
       CP_DB_PASSWORD_FILE: /run/secrets/runtime_db_password
       CP_SERVICE_KEY_FILE: /run/secrets/service_key
       CP_SIGNING_KEY_ID: ${CP_SIGNING_KEY_ID:?Set the active API signing key ID}
+      CP_DELIVERY_KEY_ID: ${CP_DELIVERY_KEY_ID:?Set issuer key ID}
+      CP_DELIVERY_PUBLIC_KEY_FILE: /run/secrets/delivery_public_key
       CP_FILE_ENCRYPTION_KEY_FILE: /run/secrets/file_encryption_key
       CP_MAIL_ENABLED: ${CP_MAIL_ENABLED:?Set explicit mail enablement}
       CP_SCAN_ENABLED: ${CP_SCAN_ENABLED:?Set explicit scan enablement}
@@ -76,6 +78,7 @@ services:
       - runtime_db_password
       - service_key
       - file_encryption_key
+      - delivery_public_key
     healthcheck:
       test:
         - CMD
