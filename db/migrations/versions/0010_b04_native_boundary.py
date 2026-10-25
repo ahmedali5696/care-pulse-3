@@ -27,10 +27,47 @@ def upgrade() -> None:
     # Better Auth's native tables. Never grant either role DDL or BYPASSRLS.
     for table in ("user", "session", "account", "verification"):
         op.execute(f'REVOKE ALL ON public."{table}" FROM carepulse_runtime')
-        op.execute(f'GRANT SELECT ON public."{table}" TO carepulse_runtime')
+        if table != "session":
+            op.execute(f'GRANT SELECT ON public."{table}" TO carepulse_runtime')
         op.execute(
             f'GRANT SELECT, INSERT, UPDATE, DELETE ON public."{table}" TO carepulse_auth'
         )
+
+    # Runtime has neither SELECT nor UPDATE on native sessions. Only this exact
+    # identity-bound definer can hold a share lock for an authorized session.
+    op.execute("""
+        CREATE FUNCTION public.lock_native_session_authority(
+            target_tenant uuid, target_user text, target_session text)
+        RETURNS TABLE (
+            "expiresAt" timestamptz, "absoluteDeadline" timestamptz,
+            "lastActivity" timestamptz, "securityRevision" integer)
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+        BEGIN
+            IF target_tenant IS NULL OR target_tenant IS DISTINCT FROM
+               NULLIF(current_setting('app.organization_id', true), '')::uuid OR
+               target_user IS NULL OR target_session IS NULL THEN
+                RAISE EXCEPTION 'Session authority denied' USING ERRCODE = '42501';
+            END IF;
+            RETURN QUERY
+                SELECT sess."expiresAt", sess."absoluteDeadline",
+                       sess."lastActivity", sess."securityRevision"
+                FROM public."session" sess
+                WHERE sess.id = target_session AND sess."userId" = target_user
+                  AND EXISTS (
+                      SELECT 1 FROM public.staff_accounts s
+                      JOIN public.organizations o ON o.id = s.organization_id
+                      JOIN public."user" u ON u.id = s.auth_user_id
+                      WHERE s.organization_id = target_tenant
+                        AND s.auth_user_id = target_user
+                        AND s.enabled AND s.verified
+                        AND s.reset_block_operation_id IS NULL
+                        AND o.state = 'ACTIVE'
+                        AND u."emailVerified" AND u.email = s.verified_email
+                        AND s.security_revision = sess."securityRevision"
+                  )
+                FOR SHARE OF sess;
+        END $$
+    """)
 
     tenant = "NULLIF(current_setting('app.organization_id', true), '')::uuid"
     op.execute(f"""
@@ -595,22 +632,30 @@ def upgrade() -> None:
         CREATE FUNCTION public.delete_staff_sessions(tenant_id uuid, native_user_id text)
         RETURNS integer LANGUAGE plpgsql SECURITY DEFINER
         SET search_path = pg_catalog AS $$
-        DECLARE deleted integer;
+        DECLARE deleted integer; live_revision bigint;
         BEGIN
-            IF tenant_id IS NULL OR tenant_id IS DISTINCT FROM {tenant} OR
-               NOT EXISTS (
-                   SELECT 1 FROM public.staff_accounts s
-                   WHERE s.organization_id = tenant_id
-                     AND s.auth_user_id = native_user_id) THEN
+            IF tenant_id IS NULL OR tenant_id IS DISTINCT FROM {tenant} THEN
                 RAISE EXCEPTION 'Session cleanup denied' USING ERRCODE = '42501';
             END IF;
-            DELETE FROM public."session" WHERE "userId" = native_user_id;
+            SELECT s.security_revision INTO live_revision
+            FROM public.staff_accounts s
+            WHERE s.organization_id = tenant_id AND s.auth_user_id = native_user_id
+              AND s.role = 'RECEPTIONIST';
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'Session cleanup denied' USING ERRCODE = '42501';
+            END IF;
+            -- Cleanup is best effort after an authority revision increase.
+            -- A runtime caller cannot destroy a currently authorized session.
+            DELETE FROM public."session"
+            WHERE "userId" = native_user_id
+              AND "securityRevision" < live_revision;
             GET DIAGNOSTICS deleted = ROW_COUNT;
             RETURN deleted;
         END $$
     """)
 
     for signature in (
+        "lock_native_session_authority(uuid,text,text)",
         "recovery_native_verified(uuid)",
         "commit_native_recovery_effect(uuid)",
         "capture_native_recovery_effect()",
@@ -622,6 +667,7 @@ def upgrade() -> None:
     ):
         op.execute(f"REVOKE ALL ON FUNCTION public.{signature} FROM PUBLIC")
     for signature in (
+        "lock_native_session_authority(uuid,text,text)",
         "recovery_native_verified(uuid)",
         "abandon_owned_recovery(uuid)",
         "finalize_verified_recovery(uuid)",

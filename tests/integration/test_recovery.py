@@ -208,6 +208,8 @@ def _expire_reserved_attempt(owner, token):
                     WHERE id=%s AND state='RESERVED' AND auth_fence=0""",
                 (operation["id"],),
             )
+            # Deferred recovery/FK checks must drain before trigger DDL resumes.
+            connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
         finally:
             connection.execute(
                 "ALTER TABLE public.recovery_operations ENABLE TRIGGER recovery_operations_mutation_guard"

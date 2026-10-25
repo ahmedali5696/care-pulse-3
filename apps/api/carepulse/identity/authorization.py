@@ -97,6 +97,7 @@ def _current_staff(connection: Connection, tenant: UUID, staff: UUID):
 def _session_is_live(
     connection: Connection,
     identity: "CanonicalEnvelope",
+    tenant: UUID,
     auth_user_id: str,
     idle_minutes: int,
 ) -> bool:
@@ -104,11 +105,9 @@ def _session_is_live(
         connection.execute(
             text("""
             SELECT "expiresAt", "absoluteDeadline", "lastActivity", "securityRevision"
-              FROM public."session"
-             WHERE id = :session AND "userId" = :user
-             FOR SHARE
+              FROM public.lock_native_session_authority(:tenant, :user, :session)
         """),
-            {"session": identity.session_id, "user": auth_user_id},
+            {"tenant": tenant, "session": identity.session_id, "user": auth_user_id},
         )
         .mappings()
         .one_or_none()
@@ -150,6 +149,7 @@ def protected_transaction(
         if staff["security_revision"] != captured_revision or not _session_is_live(
             connection,
             identity,
+            tenant,
             staff["auth_user_id"],
             idle_minutes,
         ):

@@ -408,7 +408,10 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
 
     refreshed_cookie = _login(recipient)
     with _database() as connection:
-        connection.execute('REVOKE DELETE ON public."session" FROM carepulse_runtime')
+        connection.execute(
+            "REVOKE EXECUTE ON FUNCTION public.delete_staff_sessions(uuid,text) "
+            "FROM carepulse_runtime"
+        )
     try:
         status, withdrawn = _staff_command(
             f"{staff_path}/permissions",
@@ -427,7 +430,10 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
         assert old_session_status == 401
     finally:
         with _database() as connection:
-            connection.execute('GRANT DELETE ON public."session" TO carepulse_runtime')
+            connection.execute(
+                "GRANT EXECUTE ON FUNCTION public.delete_staff_sessions(uuid,text) "
+                "TO carepulse_runtime"
+            )
     assert status == 200, withdrawn
     assert withdrawn["data"]["bulk_reschedule"] is False
     status, _, _ = _request("/api/session", cookie=refreshed_cookie)

@@ -512,7 +512,10 @@ def test_application_roles_cannot_forge_native_recovery_completion(
     migration, operator_id, tenant_id, user_id, email, staff_id = identity
     with migration.begin() as connection:
         invitation = _invitation(
-            connection, tenant_id, operator_id, (email, "synthetic-native-boundary")
+            connection,
+            tenant_id,
+            operator_id,
+            (email, f"synthetic-native-boundary-{uuid4()}"),
         )
         connection.execute(
             text("""
@@ -704,6 +707,112 @@ def test_clinic_runtime_cannot_mutate_native_identity(identity, role_engine, sta
         runtime.dispose()
 
 
+def test_runtime_session_cleanup_preserves_live_receptionist_authority(
+    identity, role_engine
+):
+    migration, operator_id, tenant_id, owner_id, owner_email, _ = identity
+    session_id = f"synthetic-cleanup-{uuid4()}"
+    with migration.begin() as connection:
+        invitation = _invitation(
+            connection,
+            tenant_id,
+            operator_id,
+            (owner_email, f"synthetic-cleanup-activation-{uuid4()}"),
+        )
+        connection.execute(
+            text("""
+                UPDATE public.invitations
+                   SET state='ACCEPTED', accepted_by_user_id=:owner
+                 WHERE id=:invitation
+            """),
+            {"owner": owner_id, "invitation": invitation},
+        )
+        connection.execute(
+            text("UPDATE public.organizations SET state='ACTIVE' WHERE id=:tenant"),
+            {"tenant": tenant_id},
+        )
+        receptionist_user, receptionist_email = _user(connection)
+        receptionist_staff = _staff(
+            connection, tenant_id, receptionist_user, receptionist_email, "RECEPTIONIST"
+        )
+        connection.execute(
+            text("""
+                INSERT INTO public."session"
+                    (id, "userId", token, "expiresAt", "createdAt", "updatedAt",
+                     "securityRevision", "absoluteDeadline", "lastActivity")
+                VALUES (:id, :user, :token, clock_timestamp() + interval '1 hour',
+                        clock_timestamp(), clock_timestamp(), 0,
+                        clock_timestamp() + interval '1 hour', clock_timestamp())
+            """),
+            {
+                "id": session_id,
+                "user": receptionist_user,
+                "token": f"synthetic-cleanup-token-{uuid4()}",
+            },
+        )
+
+    runtime = role_engine("carepulse_runtime")
+    try:
+        with transaction(runtime, tenant_id) as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT public.delete_staff_sessions(:tenant, :user)"),
+                    {"tenant": tenant_id, "user": receptionist_user},
+                )
+                == 0
+            )
+
+        for sql in (
+            'SELECT id FROM public."session" WHERE id=:id FOR UPDATE',
+            'UPDATE public."session" SET "userAgent" = \'forged\' WHERE id=:id',
+            'DELETE FROM public."session" WHERE id=:id',
+        ):
+            with (
+                pytest.raises(DBAPIError) as denied,
+                transaction(runtime, tenant_id) as connection,
+            ):
+                connection.execute(text(sql), {"id": session_id})
+            assert denied.value.orig.sqlstate == "42501"
+
+        with migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text('SELECT count(*) FROM public."session" WHERE id=:id'),
+                    {"id": session_id},
+                )
+                == 1
+            )
+
+        with migration.begin() as connection:
+            connection.execute(
+                text("""
+                    UPDATE public.staff_accounts
+                       SET security_revision = security_revision + 1
+                     WHERE organization_id=:tenant AND id=:staff
+                """),
+                {"tenant": tenant_id, "staff": receptionist_staff},
+            )
+
+        with transaction(runtime, tenant_id) as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT public.delete_staff_sessions(:tenant, :user)"),
+                    {"tenant": tenant_id, "user": receptionist_user},
+                )
+                == 1
+            )
+        with migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text('SELECT count(*) FROM public."session" WHERE id=:id'),
+                    {"id": session_id},
+                )
+                == 0
+            )
+    finally:
+        runtime.dispose()
+
+
 @pytest.mark.parametrize("requested_tenant", [None, "foreign"])
 def test_auth_role_cannot_change_blocked_owner_without_exact_tenant(
     identity, role_engine, requested_tenant
@@ -778,6 +887,8 @@ def test_expired_abandonment_cannot_remove_block_without_successor(
                 """),
                 {"operation": operation},
             )
+            # Flush the deferred recovery/FK checks before altering trigger DDL.
+            connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
         finally:
             connection.execute(
                 text("""

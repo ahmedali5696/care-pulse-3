@@ -642,7 +642,8 @@ def test_operator_suspend_invalidates_persisted_recovery_without_clearing_block(
                 """),
                 {"operation": operation},
             )
-        assert forged.value.orig.sqlstate == "23514"
+        # 0010 denies this direct runtime UPDATE at the privilege boundary.
+        assert forged.value.orig.sqlstate == "42501"
     finally:
         runtime.dispose()
     assert (
