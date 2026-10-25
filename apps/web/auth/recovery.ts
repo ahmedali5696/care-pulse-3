@@ -171,8 +171,11 @@ type RecoveryCommand = {
 };
 
 class RecoveryConflict extends Error {
-  constructor(readonly code: "CONFLICT" | "IDEMPOTENCY_CONFLICT" | "RESET_IN_PROGRESS") {
+  readonly code: "CONFLICT" | "IDEMPOTENCY_CONFLICT" | "RESET_IN_PROGRESS";
+
+  constructor(code: RecoveryConflict["code"]) {
     super("Recovery conflict");
+    this.code = code;
   }
 }
 
