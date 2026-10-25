@@ -513,6 +513,8 @@ docker compose --profile test run --rm --no-deps \
   -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" \
   -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_sessions.py tests/integration/test_staff.py tests/integration/test_identity_races.py
 docker compose exec -T web node --no-warnings --experimental-strip-types --test auth/ingress.test.mjs
 echo 'PASS verified source separation, spoof resistance and sole Web listener'

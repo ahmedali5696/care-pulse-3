@@ -551,6 +551,22 @@ def test_operator_suspend_invalidates_persisted_recovery_without_clearing_block(
     runtime = role_engine("carepulse_runtime")
     try:
         assert _activate(runtime, clinic, invite, proof, user) is True
+        with pytest.raises(DBAPIError) as forged, runtime.begin() as connection:
+            connection.execute(
+                text("SELECT set_config('app.organization_id', :tenant, true)"),
+                {"tenant": str(clinic)},
+            )
+            connection.execute(
+                text("""
+                        INSERT INTO public.sensitive_audit
+                            (id, organization_id, operator_id, actor_role,
+                             action, reason, correlation_id)
+                        VALUES (:id, :tenant, :operator, 'OPERATOR',
+                                'RECOVERY_AUTH_INVALIDATED', 'forged', 'forged')
+                    """),
+                {"id": uuid4(), "tenant": clinic, "operator": actor},
+            )
+        assert forged.value.orig.sqlstate == "42501"
     finally:
         runtime.dispose()
     receptionist = uuid4()
@@ -610,6 +626,25 @@ def test_operator_suspend_invalidates_persisted_recovery_without_clearing_block(
             """),
             {"operation": operation, "staff": receptionist},
         )
+    runtime = role_engine("carepulse_runtime")
+    try:
+        with pytest.raises(DBAPIError) as forged, runtime.begin() as connection:
+            connection.execute(
+                text("SELECT set_config('app.organization_id', :tenant, true)"),
+                {"tenant": str(clinic)},
+            )
+            connection.execute(
+                text("""
+                    UPDATE public.recovery_operations
+                       SET invalidated = true,
+                           invalidation_reference = 'OPERATOR_SUSPEND:2'
+                     WHERE id = :operation
+                """),
+                {"operation": operation},
+            )
+        assert forged.value.orig.sqlstate == "23514"
+    finally:
+        runtime.dispose()
     assert (
         change_clinic_state(
             operator, verified, clinic, 1, "SUSPENDED", "Invalidate D-02 recovery"
@@ -629,7 +664,27 @@ def test_operator_suspend_invalidates_persisted_recovery_without_clearing_block(
                 WHERE r.id=:operation
                 """),
                 {"operation": operation},
-            ).one() == ("RESERVED", True, "OPERATOR_SUSPEND", None, operation, 1, state)
+            ).one() == (
+                "RESERVED",
+                True,
+                "OPERATOR_SUSPEND:2",
+                None,
+                operation,
+                1,
+                state,
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                SELECT count(*) FROM public.sensitive_audit
+                 WHERE recovery_operation_id=:operation
+                   AND action='RECOVERY_AUTH_INVALIDATED'
+                   AND correlation_id='OPERATOR_SUSPEND:2'
+            """),
+                    {"operation": operation},
+                )
+                == 1
+            )
             assert (
                 connection.scalar(
                     text("""

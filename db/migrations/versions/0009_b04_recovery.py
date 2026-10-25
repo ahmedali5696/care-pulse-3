@@ -62,6 +62,116 @@ def upgrade() -> None:
         "GRANT EXECUTE ON FUNCTION public.resolve_recovery_operation(text) TO carepulse_runtime"
     )
 
+    # Operator revocation evidence is written only by the authenticated
+    # operator SECURITY DEFINER transition. Runtime recovery may read its
+    # tenant's evidence, but cannot impersonate an OPERATOR audit event.
+    tenant = "NULLIF(current_setting('app.organization_id', true), '')::uuid"
+    op.execute(f"""
+        ALTER POLICY sensitive_audit_insert ON public.sensitive_audit
+        WITH CHECK (organization_id = {tenant} AND actor_role <> 'OPERATOR')
+    """)
+
+    # Never allow a revoked operation to become FINALIZED, irrespective of
+    # which application path attempts the write.
+    op.execute("""
+        ALTER TABLE public.recovery_operations
+        ADD CONSTRAINT recovery_invalidated_never_finalized
+        CHECK (state <> 'FINALIZED' OR NOT invalidated)
+    """)
+    # The operator transaction is the sole author of OPERATOR_SUSPEND evidence.
+    # Runtime may abandon only an expired RESERVED proof with no auth effect.
+    op.execute("""
+        CREATE FUNCTION public.guard_recovery_operator_provenance()
+        RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+        SET search_path = pg_catalog AS $$
+        BEGIN
+            IF session_user = 'carepulse_runtime' AND
+               (NEW.invalidation_reference IS DISTINCT FROM OLD.invalidation_reference OR
+                (NEW.invalidated AND NOT OLD.invalidated)) AND NOT (
+                    OLD.state = 'RESERVED' AND NEW.state = 'ABORTED'
+                    AND OLD.auth_done_at IS NULL AND OLD.auth_fence = 0
+                    AND clock_timestamp() >= OLD.proof_expires_at
+                    AND NEW.invalidated AND NEW.invalidation_reference = 'EXPIRED_INCOMPLETE'
+               ) THEN
+                RAISE EXCEPTION 'Invalid recovery provenance' USING ERRCODE = '23514';
+            END IF;
+            RETURN NEW;
+        END $$
+    """)
+    op.execute("""
+        CREATE TRIGGER recovery_operator_provenance_guard
+        BEFORE UPDATE ON public.recovery_operations
+        FOR EACH ROW EXECUTE FUNCTION public.guard_recovery_operator_provenance()
+    """)
+
+    # Finalization must carry its native completion and exactly-once audit at
+    # commit, after both updates and the audit insert have been applied.
+    op.execute("""
+        CREATE FUNCTION public.check_recovery_final_audit()
+        RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+        SET search_path = pg_catalog AS $$
+        DECLARE finalized public.recovery_operations%ROWTYPE;
+        BEGIN
+            SELECT * INTO finalized FROM public.recovery_operations WHERE id = NEW.id;
+            IF finalized.state = 'FINALIZED' THEN
+                IF finalized.invalidated OR finalized.auth_done_at IS NULL OR
+                   finalized.auth_fence < 1 OR NOT EXISTS (
+                       SELECT 1 FROM public.auth_recovery_completions c
+                        WHERE c.id = finalized.id AND c.auth_user_id = finalized.auth_user_id
+                          AND c.proof_digest = finalized.proof_digest
+                          AND c.request_fingerprint = finalized.request_fingerprint
+                          AND c.reserved_security_revision = finalized.reserved_security_revision
+                          AND c.auth_fence = finalized.auth_fence
+                          AND c.completed_at = finalized.auth_done_at
+                   ) OR (SELECT count(*) FROM public.sensitive_audit a
+                        WHERE a.recovery_operation_id = finalized.id
+                          AND a.organization_id = finalized.organization_id
+                          AND a.actor_staff_id = finalized.staff_id
+                          AND a.action = 'PASSWORD_RESET_SUCCEEDED') <> 1 OR
+                   NOT EXISTS (
+                       SELECT 1 FROM public.staff_accounts s
+                       JOIN public.organizations o ON o.id = s.organization_id
+                        WHERE s.organization_id = finalized.organization_id
+                          AND s.id = finalized.staff_id AND s.auth_user_id = finalized.auth_user_id
+                          AND s.role = 'DOCTOR_OWNER' AND s.enabled AND s.verified
+                          AND s.security_revision = finalized.reserved_security_revision
+                          AND s.reset_block_operation_id IS NULL
+                          AND o.state = 'ACTIVE'
+                          AND o.lifecycle_revision = finalized.captured_lifecycle_revision
+                   ) THEN
+                    RAISE EXCEPTION 'Unverified recovery finalization' USING ERRCODE = '23514';
+                END IF;
+            ELSIF finalized.state = 'ABORTED' THEN
+                -- The old operation may close only together with an active,
+                -- differently bound successor that owns the same Owner block.
+                IF NOT finalized.invalidated OR NOT EXISTS (
+                    SELECT 1 FROM public.recovery_operations successor
+                    JOIN public.staff_accounts s ON s.organization_id = successor.organization_id
+                        AND s.id = successor.staff_id
+                    WHERE successor.auth_user_id = finalized.auth_user_id
+                      AND successor.organization_id = finalized.organization_id
+                      AND successor.staff_id = finalized.staff_id
+                      AND successor.id <> finalized.id
+                      AND successor.proof_digest <> finalized.proof_digest
+                      AND successor.reserved_security_revision = finalized.reserved_security_revision + 1
+                      AND successor.state = 'RESERVED' AND NOT successor.invalidated
+                      AND successor.closed_at IS NULL
+                      AND s.reset_block_operation_id = successor.id
+                      AND s.security_revision = successor.reserved_security_revision
+                ) THEN
+                    RAISE EXCEPTION 'Abandoned recovery has no owned successor' USING ERRCODE = '23514';
+                END IF;
+            END IF;
+            RETURN NULL;
+        END $$
+    """)
+    op.execute("""
+        CREATE CONSTRAINT TRIGGER recovery_final_audit_constraint
+        AFTER UPDATE ON public.recovery_operations
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION public.check_recovery_final_audit()
+    """)
+
     # An Owner reset block protects app access independently from being an
     # enabled/verified Owner. Reactivation may not silently clear the block.
     # Suspension evidence is linked to the exact committed lifecycle revision.
@@ -139,6 +249,22 @@ def downgrade() -> None:
                     USING ERRCODE = '23514';
             END IF;
         END $$
+    """)
+    op.execute(
+        "DROP TRIGGER recovery_final_audit_constraint ON public.recovery_operations"
+    )
+    op.execute("DROP FUNCTION public.check_recovery_final_audit()")
+    op.execute(
+        "DROP TRIGGER recovery_operator_provenance_guard ON public.recovery_operations"
+    )
+    op.execute("DROP FUNCTION public.guard_recovery_operator_provenance()")
+    op.execute(
+        "ALTER TABLE public.recovery_operations DROP CONSTRAINT recovery_invalidated_never_finalized"
+    )
+    tenant = "NULLIF(current_setting('app.organization_id', true), '')::uuid"
+    op.execute(f"""
+        ALTER POLICY sensitive_audit_insert ON public.sensitive_audit
+        WITH CHECK (organization_id = {tenant})
     """)
     # Restore 0008's exact active-Owner guard and invalidation behavior before
     # removing the B-04-only locators. Data-bearing downgrade is prohibited.

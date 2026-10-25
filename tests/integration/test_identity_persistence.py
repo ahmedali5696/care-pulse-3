@@ -707,6 +707,22 @@ def test_closed_recovery_proof_remains_unique(identity):
         """),
             {"id": staff_id},
         )
+        connection.execute(
+            text("""
+            INSERT INTO public.sensitive_audit
+              (id, organization_id, actor_staff_id, actor_role,
+               action, correlation_id, recovery_operation_id)
+            VALUES (:id, :tenant, :staff, 'SYSTEM',
+                    'PASSWORD_RESET_SUCCEEDED', :correlation, :operation)
+        """),
+            {
+                "id": uuid4(),
+                "tenant": tenant_id,
+                "staff": staff_id,
+                "correlation": str(operation),
+                "operation": operation,
+            },
+        )
 
     with pytest.raises(DBAPIError) as replay, migration.begin() as connection:
         other_user, other_email = _user(connection)
