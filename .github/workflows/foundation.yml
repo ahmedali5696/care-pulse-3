@@ -106,6 +106,7 @@ jobs:
           {
             echo "CP_DB_PASSWORD_FILE=$RUNNER_TEMP/foundation-ci-private/postgres-password"
             echo "CP_RUNTIME_DB_PASSWORD_FILE=$RUNNER_TEMP/foundation-ci-private/runtime-db-password"
+            echo "CP_AUTH_DB_PASSWORD_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/auth-db-password"
             echo "CP_MIGRATION_SECRET_FILE=$RUNNER_TEMP/foundation-ci-private/migration-password"
             echo "CP_OPERATOR_SECRET_FILE=$RUNNER_TEMP/foundation-ci-private/operator-password"
             echo "CP_OPERATOR_DB_PASSWORD_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/operator-password"

@@ -114,6 +114,8 @@ def _wait_for_organization_waiters(
 ):
     deadline = monotonic() + 4
     while monotonic() < deadline:
+        # PostgreSQL caches statistics snapshots across queries in a transaction.
+        connection.execute("SELECT pg_stat_clear_snapshot()")
         waiting = connection.execute(
             """
             SELECT count(DISTINCT pid) FROM pg_stat_activity
@@ -299,6 +301,7 @@ def test_operator_revocation_after_native_fence_blocks_stale_finalization(
             try:
                 deadline = monotonic() + 4
                 while monotonic() < deadline:
+                    blocker.execute("SELECT pg_stat_clear_snapshot()")
                     blocked = blocker.execute(
                         """
                         SELECT count(*) FROM pg_locks l

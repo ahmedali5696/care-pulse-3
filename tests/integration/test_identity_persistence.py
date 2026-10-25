@@ -505,6 +505,324 @@ def test_distinct_recovery_proofs_cannot_reserve_same_user_concurrently(
         )
 
 
+@pytest.mark.parametrize("role", ["carepulse_runtime", "carepulse_auth"])
+def test_application_roles_cannot_forge_native_recovery_completion(
+    identity, role_engine, role
+):
+    migration, operator_id, tenant_id, user_id, email, staff_id = identity
+    with migration.begin() as connection:
+        invitation = _invitation(
+            connection, tenant_id, operator_id, (email, "synthetic-native-boundary")
+        )
+        connection.execute(
+            text("""
+                UPDATE public.invitations SET state = 'ACCEPTED',
+                    accepted_by_user_id = :user WHERE id = :invitation
+            """),
+            {"user": user_id, "invitation": invitation},
+        )
+        connection.execute(
+            text("UPDATE public.organizations SET state = 'ACTIVE' WHERE id = :tenant"),
+            {"tenant": tenant_id},
+        )
+        operation = _reservation(
+            connection,
+            tenant_id,
+            staff_id,
+            user_id,
+            f"synthetic-auth-forgery-{uuid4()}",
+        )
+
+    application = role_engine(role)
+    try:
+        for statement in (
+            """
+                UPDATE public.recovery_operations
+                   SET state='AUTH_DONE', auth_fence=1, auth_done_at=clock_timestamp()
+                 WHERE id=:operation
+            """,
+            """
+                INSERT INTO public.auth_recovery_completions
+                    (id, proof_digest, auth_user_id, request_fingerprint,
+                     reserved_security_revision, auth_fence, completed_at)
+                SELECT id, proof_digest, auth_user_id, request_fingerprint,
+                       reserved_security_revision, 1, clock_timestamp()
+                  FROM public.recovery_operations WHERE id=:operation
+            """,
+            """
+                INSERT INTO public.recovery_native_effects
+                    (id, auth_fence, proof_consumed_at, credential_changed_at)
+                VALUES (:operation, 1, clock_timestamp(), clock_timestamp())
+            """,
+            """
+                INSERT INTO public.sensitive_audit
+                    (id, organization_id, actor_staff_id, actor_role,
+                     action, correlation_id, recovery_operation_id)
+                VALUES (:audit_id, :tenant, :staff, 'SYSTEM',
+                        'PASSWORD_RESET_SUCCEEDED', :correlation, :operation)
+            """,
+        ):
+            with (
+                pytest.raises(DBAPIError) as denied,
+                transaction(application, tenant_id) as connection,
+            ):
+                connection.execute(
+                    text(statement),
+                    {
+                        "operation": operation,
+                        "tenant": tenant_id,
+                        "staff": staff_id,
+                        "audit_id": uuid4(),
+                        "correlation": str(operation),
+                    },
+                )
+            assert denied.value.orig.sqlstate == "42501"
+    finally:
+        application.dispose()
+
+    with migration.connect() as connection:
+        state = connection.execute(
+            text("""
+                SELECT r.state, r.auth_fence, r.auth_done_at,
+                       s.reset_block_operation_id,
+                       (SELECT count(*) FROM public.auth_recovery_completions c
+                        WHERE c.id = r.id),
+                       (SELECT count(*) FROM public.sensitive_audit a
+                        WHERE a.recovery_operation_id = r.id
+                          AND a.action = 'PASSWORD_RESET_SUCCEEDED')
+                  FROM public.recovery_operations r
+                  JOIN public.staff_accounts s ON s.id = r.staff_id
+                 WHERE r.id = :operation
+            """),
+            {"operation": operation},
+        ).one()
+    assert state == ("RESERVED", 0, None, operation, 0, 0)
+
+
+def test_synthetic_completion_without_native_effect_cannot_finalize(
+    identity, role_engine
+):
+    migration, operator_id, tenant_id, user_id, email, staff_id = identity
+    with migration.begin() as connection:
+        invitation = _invitation(
+            connection, tenant_id, operator_id, (email, "synthetic-missing-native")
+        )
+        connection.execute(
+            text("""
+                UPDATE public.invitations
+                   SET state='ACCEPTED', accepted_by_user_id=:user
+                 WHERE id=:invitation
+            """),
+            {"user": user_id, "invitation": invitation},
+        )
+        connection.execute(
+            text("UPDATE public.organizations SET state='ACTIVE' WHERE id=:tenant"),
+            {"tenant": tenant_id},
+        )
+        operation = _reservation(
+            connection,
+            tenant_id,
+            staff_id,
+            user_id,
+            f"synthetic-missing-effect-{uuid4()}",
+        )
+        # Migration-only synthetic fixture: immutable completion matching on paper,
+        # but no supported Better Auth proof consumption or credential write.
+        connection.execute(
+            text("""
+                UPDATE public.recovery_operations
+                   SET state='AUTH_DONE', auth_fence=1,
+                       auth_done_at=clock_timestamp()
+                 WHERE id=:operation
+            """),
+            {"operation": operation},
+        )
+        connection.execute(
+            text("""
+                INSERT INTO public.auth_recovery_completions
+                    (id, proof_digest, auth_user_id, request_fingerprint,
+                     reserved_security_revision, auth_fence, completed_at)
+                SELECT id, proof_digest, auth_user_id, request_fingerprint,
+                       reserved_security_revision, auth_fence, auth_done_at
+                  FROM public.recovery_operations WHERE id=:operation
+            """),
+            {"operation": operation},
+        )
+
+    runtime = role_engine("carepulse_runtime")
+    try:
+        with (
+            pytest.raises(DBAPIError) as denied,
+            transaction(runtime, tenant_id) as connection,
+        ):
+            connection.execute(
+                text("SELECT public.finalize_verified_recovery(:operation)"),
+                {"operation": operation},
+            )
+        assert denied.value.orig.sqlstate == "23514"
+    finally:
+        runtime.dispose()
+
+    with migration.connect() as connection:
+        result = connection.execute(
+            text("""
+                SELECT r.state, s.reset_block_operation_id,
+                       (SELECT count(*) FROM public.recovery_native_effects e
+                        WHERE e.id=r.id),
+                       (SELECT count(*) FROM public.sensitive_audit a
+                        WHERE a.recovery_operation_id=r.id
+                          AND a.action='PASSWORD_RESET_SUCCEEDED')
+                  FROM public.recovery_operations r
+                  JOIN public.staff_accounts s ON s.id=r.staff_id
+                 WHERE r.id=:operation
+            """),
+            {"operation": operation},
+        ).one()
+    assert result == ("AUTH_DONE", operation, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        'UPDATE public."account" SET password = NULL WHERE "userId" = :user',
+        'DELETE FROM public."session" WHERE "userId" = :user',
+        'DELETE FROM public."verification" WHERE value = :user',
+        'UPDATE public."user" SET name = name WHERE id = :user',
+    ],
+)
+def test_clinic_runtime_cannot_mutate_native_identity(identity, role_engine, statement):
+    _, _, tenant_id, user_id, _, _ = identity
+    runtime = role_engine("carepulse_runtime")
+    try:
+        with (
+            pytest.raises(DBAPIError) as denied,
+            transaction(runtime, tenant_id) as connection,
+        ):
+            connection.execute(text(statement), {"user": user_id})
+        assert denied.value.orig.sqlstate == "42501"
+    finally:
+        runtime.dispose()
+
+
+@pytest.mark.parametrize("requested_tenant", [None, "foreign"])
+def test_auth_role_cannot_change_blocked_owner_without_exact_tenant(
+    identity, role_engine, requested_tenant
+):
+    migration, _, tenant_id, user_id, _, staff_id = identity
+    account_id = f"synthetic-b04-auth-scope-{uuid4()}"
+    original_password = "synthetic-credential-unchanged"
+    with migration.begin() as connection:
+        connection.execute(
+            text("""
+                INSERT INTO public."account"
+                    (id, "accountId", "providerId", "userId", password,
+                     "createdAt", "updatedAt")
+                VALUES (:id, :user, 'credential', :user, :password,
+                        clock_timestamp(), clock_timestamp())
+            """),
+            {"id": account_id, "user": user_id, "password": original_password},
+        )
+        _reservation(connection, tenant_id, staff_id, user_id, f"scope-{uuid4()}")
+
+    auth = role_engine("carepulse_auth")
+    scope = uuid4() if requested_tenant == "foreign" else None
+    try:
+        with (
+            pytest.raises(DBAPIError) as denied,
+            transaction(auth, scope) as connection,
+        ):
+            connection.execute(
+                text("""
+                    UPDATE public."account" SET password=:password
+                     WHERE id=:id
+                """),
+                {"id": account_id, "password": "synthetic-forged-password"},
+            )
+        assert denied.value.orig.sqlstate == "23514"
+    finally:
+        auth.dispose()
+    with migration.connect() as connection:
+        assert (
+            connection.scalar(
+                text('SELECT password FROM public."account" WHERE id=:id'),
+                {"id": account_id},
+            )
+            == original_password
+        )
+
+
+def test_expired_abandonment_cannot_remove_block_without_successor(
+    identity, role_engine
+):
+    migration, _, tenant_id, user_id, _, staff_id = identity
+    with migration.begin() as connection:
+        operation = _reservation(
+            connection, tenant_id, staff_id, user_id, f"synthetic-abandon-{uuid4()}"
+        )
+    # Controlled CI fixture crosses the immutable expiry guard to exercise a
+    # real expired transaction against the runtime role.
+    with migration.begin() as connection:
+        connection.execute(
+            text("""
+                ALTER TABLE public.recovery_operations
+                    DISABLE TRIGGER recovery_operations_mutation_guard
+            """)
+        )
+        try:
+            connection.execute(
+                text("""
+                    UPDATE public.recovery_operations
+                       SET created_at=clock_timestamp()-interval '2 hours',
+                           proof_expires_at=clock_timestamp()-interval '1 hour'
+                     WHERE id=:operation
+                """),
+                {"operation": operation},
+            )
+        finally:
+            connection.execute(
+                text("""
+                    ALTER TABLE public.recovery_operations
+                        ENABLE TRIGGER recovery_operations_mutation_guard
+                """)
+            )
+
+    runtime = role_engine("carepulse_runtime")
+    try:
+        with (
+            pytest.raises(DBAPIError) as denied,
+            transaction(runtime, tenant_id) as connection,
+        ):
+            assert (
+                connection.scalar(
+                    text("SELECT public.abandon_owned_recovery(:operation)"),
+                    {"operation": operation},
+                )
+                == "ABORTED"
+            )
+            connection.execute(
+                text("""
+                    UPDATE public.staff_accounts
+                       SET reset_block_operation_id=NULL
+                     WHERE organization_id=:tenant AND id=:staff
+                """),
+                {"tenant": tenant_id, "staff": staff_id},
+            )
+        assert denied.value.orig.sqlstate == "23514"
+    finally:
+        runtime.dispose()
+
+    with migration.connect() as connection:
+        assert connection.execute(
+            text("""
+                SELECT r.state, r.closed_at, s.reset_block_operation_id
+                  FROM public.recovery_operations r
+                  JOIN public.staff_accounts s ON s.id=r.staff_id
+                 WHERE r.id=:operation
+            """),
+            {"operation": operation},
+        ).one() == ("RESERVED", None, operation)
+
+
 def test_recovery_block_belongs_to_its_operation_and_completion_is_immutable(identity):
     migration, _, tenant_id, user_id, _, staff_id = identity
     with migration.begin() as connection:

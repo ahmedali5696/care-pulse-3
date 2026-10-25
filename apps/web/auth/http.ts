@@ -4,7 +4,7 @@ import { getAuth } from "../auth.ts";
 import { captureLoginAuthority, currentActor, withLoginAuthority } from "./session.ts";
 import { allowLoginAttempt } from "./throttle.ts";
 import { withAuthTransaction } from "./postgres-adapter.ts";
-import { runtimeDatabase } from "../db.ts";
+import { authDatabase } from "../db.ts";
 import { loadWebConfig } from "../config.ts";
 
 export function failure(status: 401 | 403 | 409 | 422 | 429 | 503): Response {
@@ -77,7 +77,7 @@ export async function loginResponse(request: Request): Promise<Response> {
     const capture = await captureLoginAuthority(email);
     if (!capture) return failure(401);
     const native = await withLoginAuthority(capture, () =>
-      withAuthTransaction(runtimeDatabase(loadWebConfig()), capture.organizationId,
+      withAuthTransaction(authDatabase(loadWebConfig()), capture.organizationId,
       () => getAuth().api.signInEmail({
       body: { email, password, rememberMe: false },
       headers: new Headers({ "user-agent": request.headers.get("user-agent") ?? "" }),
@@ -91,9 +91,7 @@ export async function loginResponse(request: Request): Promise<Response> {
     if (!actor || actor.userId !== capture.userId ||
         actor.securityRevision !== capture.securityRevision) {
       if (issued.token) {
-        const { runtimeDatabase } = await import("../db.ts");
-        const { loadWebConfig } = await import("../config.ts");
-        await runtimeDatabase(loadWebConfig()).query('DELETE FROM public."session" WHERE token = $1', [issued.token]);
+        await authDatabase(loadWebConfig()).query('DELETE FROM public."session" WHERE token = $1', [issued.token]);
       }
       return failure(401);
     }

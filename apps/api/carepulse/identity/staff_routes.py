@@ -121,8 +121,9 @@ def disable_staff(staff_id: UUID, command: StaffCommand, request: Request):
             command,
             "disable",
         )
+        tenant = actor.organization_id
     if native_user:
-        cleanup_native_sessions(request.app.state.db_engine, native_user)
+        cleanup_native_sessions(request.app.state.db_engine, tenant, native_user)
     return success_response(projection, revision)
 
 
@@ -151,8 +152,9 @@ def set_staff_permissions(
             command,
             "permissions",
         )
+        tenant = actor.organization_id
     if native_user:
-        cleanup_native_sessions(request.app.state.db_engine, native_user)
+        cleanup_native_sessions(request.app.state.db_engine, tenant, native_user)
     return success_response(projection, revision)
 
 

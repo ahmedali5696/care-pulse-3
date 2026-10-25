@@ -31,6 +31,7 @@ def role_engine(disposable_ci):
         password_file = {
             "carepulse_migration": "migration_password",
             "carepulse_runtime": "runtime_db_password",
+            "carepulse_auth": "auth_db_password",
             "carepulse_operator": "operator_password",
             "carepulse_sender": "sender_password",
         }[role]

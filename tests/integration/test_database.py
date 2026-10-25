@@ -20,7 +20,7 @@ from sqlalchemy import URL, create_engine, text
 from sqlalchemy.exc import DBAPIError
 
 ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0009_b04_recovery"
+REVISION = "0010_b04_native_boundary"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -40,6 +40,7 @@ def _password(role):
     filename = {
         "carepulse_bootstrap": "postgres_password",
         "carepulse_runtime": "runtime_db_password",
+        "carepulse_auth": "auth_db_password",
         "carepulse_migration": "migration_password",
         "carepulse_operator": "operator_password",
     }[role]
@@ -118,11 +119,17 @@ def _create_empty_database(admin, name):
             )
         )
         connection.execute(
+            sql.SQL("GRANT CONNECT ON DATABASE {} TO carepulse_auth").format(
+                sql.Identifier(name)
+            )
+        )
+        connection.execute(
             sql.SQL("GRANT CONNECT ON DATABASE {} TO carepulse_operator").format(
                 sql.Identifier(name)
             )
         )
         connection.execute("GRANT USAGE ON SCHEMA public TO carepulse_runtime")
+        connection.execute("GRANT USAGE ON SCHEMA public TO carepulse_auth")
 
 
 def test_organization_schema_owned_by_migration_role():
@@ -160,7 +167,9 @@ def test_organization_schema_owned_by_migration_role():
         engine.dispose()
 
 
-def test_empty_database_reset_and_repeated_upgrade(admin, empty_database):
+def test_empty_database_forward_only_boundary_and_repeated_upgrade(
+    admin, empty_database
+):
     for cycle in range(2):
         if cycle:
             admin.execute(
@@ -174,7 +183,10 @@ def test_empty_database_reset_and_repeated_upgrade(admin, empty_database):
             _upgrade(engine)
             _upgrade(engine)
             config = Config(str(ROOT / "alembic.ini"))
-            with engine.connect() as connection:
+            with (
+                pytest.raises(RuntimeError, match="forward-only"),
+                engine.connect() as connection,
+            ):
                 config.attributes["connection"] = connection
                 command.downgrade(config, "0001_foundation")
             with engine.connect() as connection:
@@ -182,23 +194,13 @@ def test_empty_database_reset_and_repeated_upgrade(admin, empty_database):
                     connection.scalar(
                         text("SELECT version_num FROM public.alembic_version")
                     )
-                    == "0001_foundation"
+                    == REVISION
                 )
                 assert (
-                    connection.execute(
-                        text("""
-                    SELECT to_regclass('public.organizations'),
-                           to_regclass('public.operator_identities'),
-                           to_regclass('public.runtime_active_tenant_ids'),
-                           to_regclass('public."user"'),
-                           to_regclass('public."session"'),
-                           to_regclass('public.staff_accounts'),
-                           to_regclass('public.invitations'),
-                           to_regclass('public.recovery_operations'),
-                           to_regclass('public.auth_recovery_completions')
-                """)
-                    ).one()
-                    == (None,) * 9
+                    connection.scalar(
+                        text("SELECT to_regclass('public.recovery_native_effects')")
+                    )
+                    == "recovery_native_effects"
                 )
             _upgrade(engine)
         finally:
@@ -222,9 +224,9 @@ def test_failed_isolated_migration_rolls_back_objects_and_version(
     _create_empty_database(admin, empty_database)
     scripts = tmp_path / "migrations"
     shutil.copytree(ROOT / "db/migrations", scripts)
-    (scripts / "versions/0009_failure.py").write_text(
-        'from alembic import op\nrevision = "0009_failure"\n'
-        'down_revision = "0009_b04_recovery"\n'
+    (scripts / "versions/0011_failure.py").write_text(
+        'from alembic import op\nrevision = "0011_failure"\n'
+        'down_revision = "0010_b04_native_boundary"\n'
         "def upgrade():\n"
         '    op.execute("CREATE TABLE public.synthetic_partial (value integer)")\n'
         '    op.execute("SELECT 1 / 0")\n'
@@ -252,7 +254,9 @@ def test_failed_isolated_migration_rolls_back_objects_and_version(
         engine.dispose()
 
 
-@pytest.mark.parametrize("role", ["carepulse_runtime", "carepulse_operator"])
+@pytest.mark.parametrize(
+    "role", ["carepulse_runtime", "carepulse_auth", "carepulse_operator"]
+)
 def test_restricted_roles_have_no_ownership_or_privileged_membership(role):
     engine = _engine(role)
     try:
@@ -294,7 +298,9 @@ def test_restricted_roles_have_no_ownership_or_privileged_membership(role):
         engine.dispose()
 
 
-@pytest.mark.parametrize("role", ["carepulse_runtime", "carepulse_operator"])
+@pytest.mark.parametrize(
+    "role", ["carepulse_runtime", "carepulse_auth", "carepulse_operator"]
+)
 @pytest.mark.parametrize(
     "statement",
     [

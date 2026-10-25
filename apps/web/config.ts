@@ -264,6 +264,14 @@ export function loadWebConfig() {
     user: required("CP_DB_USER"),
     password: secretFile("CP_DB_PASSWORD_FILE"),
   };
+  const authDatabase = {
+    ...database,
+    user: choice("CP_AUTH_DB_USER", ["carepulse_auth"]),
+    password: secretFile("CP_AUTH_DB_PASSWORD_FILE"),
+  };
+  if (database.user === authDatabase.user || database.password === authDatabase.password) {
+    invalid("CP_AUTH_DB_PASSWORD_FILE");
+  }
   const apiUrl = privateHttpUrl("CP_INTERNAL_API_URL");
   const serviceKey = secretFile("CP_SERVICE_KEY_FILE");
   const signingKeyIdValue = signingKeyId();
@@ -275,7 +283,7 @@ export function loadWebConfig() {
   const deliveryPublicKey = mailEnabled ? readProtectedFile("CP_DELIVERY_PUBLIC_KEY_FILE", 8192) : null;
   choice("CP_SCAN_ENABLED", ["false"]);
 
-  return { environment, policy, database, apiUrl, serviceKey, signingKeyId: signingKeyIdValue, authSecret, deliveryKeyId, deliveryPublicKey, mailEnabled, smtp };
+  return { environment, policy, database, authDatabase, apiUrl, serviceKey, signingKeyId: signingKeyIdValue, authSecret, deliveryKeyId, deliveryPublicKey, mailEnabled, smtp };
 }
 
 // Fingerprints are bound to a configured secret version for the entire retry lifecycle.

@@ -216,6 +216,7 @@ def test_denied_routes_preserve_current_persistence_boundary():
             ("invitations",),
             ("recovery_operations",),
             ("auth_recovery_completions",),
+            ("recovery_native_effects",),
             ("sensitive_audit",),
             ("clinical_audit",),
             ("outbox_events",),
@@ -231,4 +232,4 @@ def test_denied_routes_preserve_current_persistence_boundary():
         }
         assert connection.execute(
             "SELECT version_num FROM public.alembic_version"
-        ).fetchall() == [("0009_b04_recovery",)]
+        ).fetchall() == [("0010_b04_native_boundary",)]

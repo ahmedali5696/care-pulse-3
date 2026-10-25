@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { getAuth } from "../auth.ts";
 import { loadRecoveryFingerprintKeys, loadWebConfig } from "../config.ts";
-import { runtimeDatabase } from "../db.ts";
+import { authDatabase } from "../db.ts";
 import { encryptDeliveryToken } from "../mail/delivery-material.ts";
 import { failAuthIssuance, scopedAuthClient, withAuthTransaction } from "./postgres-adapter.ts";
 import { allowRecoveryAttempt } from "./throttle.ts";
@@ -36,7 +36,7 @@ export async function requestRecoveryIssuance(
   }
   if (!source || !email || !await allowRecoveryAttempt(email, source)) return "RATE_LIMITED";
   if (!tenant) return "ACKNOWLEDGED";
-  const pool = runtimeDatabase(config);
+  const pool = authDatabase(config);
   // Initialize Better Auth before leasing the recovery transaction connection.
   await getAuth().$context;
   await withAuthTransaction(pool, tenant, async () => {
@@ -141,7 +141,7 @@ export async function requestOwnerRecovery(request: Request): Promise<Response> 
   if (typeof email !== "string" || email.length > 254 ||
       !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return failure(422);
   try {
-    const pool = runtimeDatabase(loadWebConfig());
+    const pool = authDatabase(loadWebConfig());
     const users = await pool.query<{ id: string }>(
       'SELECT id FROM public."user" WHERE lower(email) = lower($1) AND "emailVerified"', [email]);
     const tenant = users.rows.length === 1
@@ -293,7 +293,7 @@ export async function completeOwnerRecovery(request: Request): Promise<Response>
         newPassword.length > authContext.password.config.maxPasswordLength) return failure(422);
     const digest = createHash("sha256").update(token, "utf8").digest("hex");
     const identifier = createHash("sha256").update(`reset-password:${token}`, "utf8").digest("base64url");
-    const identity = await recoveryIdentity(runtimeDatabase(config), digest, identifier);
+    const identity = await recoveryIdentity(authDatabase(config), digest, identifier);
     if (!identity) return failure(409);
     const fingerprintKeys = loadRecoveryFingerprintKeys(config.authSecret);
     const keyVersion = identity.keyVersion ?? fingerprintKeys.activeVersion;

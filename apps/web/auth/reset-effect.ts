@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { getAuth } from "../auth.ts";
 import { loadWebConfig } from "../config.ts";
-import { runtimeDatabase } from "../db.ts";
+import { authDatabase } from "../db.ts";
 import { scopedAuthClient, withAuthTransaction } from "./postgres-adapter.ts";
 
 export type ReservedReset = {
@@ -29,7 +29,7 @@ export async function applyReservedReset(
   }
   const expectedIdentifier = createHash("sha256")
     .update(`reset-password:${token}`, "utf8").digest("base64url");
-  const pool = runtimeDatabase(loadWebConfig());
+  const pool = authDatabase(loadWebConfig());
   return withAuthTransaction(pool, reserved.tenant, async () => {
     const client = scopedAuthClient(pool, reserved.tenant);
     if (!client) throw new Error("Recovery transaction unavailable");
@@ -83,25 +83,22 @@ export async function applyReservedReset(
       body: { token, newPassword },
     });
     if (!native.status) throw new Error("Native reset failed");
+    // Only the database's verified native effects may record completion.
+    // The account-password and proof-consumption triggers must both fire in
+    // this same transaction before the application is allowed to commit.
     const done = await client.query(`
-      UPDATE public.recovery_operations
-         SET state = 'AUTH_DONE', auth_done_at = clock_timestamp()
-       WHERE id = $1 AND organization_id = $2 AND state = 'RESERVED'
-         AND auth_fence = $3 AND NOT invalidated AND closed_at IS NULL
-         AND clock_timestamp() < proof_expires_at
-      RETURNING auth_done_at`, [reserved.operationId, reserved.tenant,
-        claimed.rows[0].auth_fence]);
-    if (done.rowCount !== 1) throw new Error("Recovery proof expired before completion");
-    await client.query(`
-      INSERT INTO public.auth_recovery_completions
-        (id, proof_digest, auth_user_id, request_fingerprint,
-         reserved_security_revision, auth_fence, completed_at)
-      SELECT id, proof_digest, auth_user_id, request_fingerprint,
-             reserved_security_revision, auth_fence, auth_done_at
-        FROM public.recovery_operations
-       WHERE id = $1 AND organization_id = $2 AND state = 'AUTH_DONE'
-         AND auth_fence = $3`, [reserved.operationId, reserved.tenant,
-        claimed.rows[0].auth_fence]);
+      SELECT 1 FROM public.recovery_operations o
+      JOIN public.auth_recovery_completions c ON c.id = o.id
+      WHERE o.id = $1 AND o.organization_id = $2 AND o.state = 'AUTH_DONE'
+        AND NOT o.invalidated AND o.closed_at IS NULL
+        AND o.auth_fence = $3 AND o.auth_done_at IS NOT NULL
+        AND o.proof_expires_at > o.auth_done_at
+        AND c.proof_digest = o.proof_digest AND c.auth_user_id = o.auth_user_id
+        AND c.request_fingerprint = o.request_fingerprint
+        AND c.reserved_security_revision = o.reserved_security_revision
+        AND c.auth_fence = o.auth_fence AND c.completed_at = o.auth_done_at
+    `, [reserved.operationId, reserved.tenant, claimed.rows[0].auth_fence]);
+    if (done.rowCount !== 1) throw new Error("Native recovery effects unverified");
     return "AUTH_DONE";
   });
 }

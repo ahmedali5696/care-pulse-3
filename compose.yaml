@@ -20,6 +20,8 @@ services:
       CP_DB_NAME: ${CP_DB_NAME:?Set the runtime DB name}
       CP_DB_USER: ${CP_DB_USER:?Set the runtime DB role}
       CP_DB_PASSWORD_FILE: /run/secrets/runtime_db_password
+      CP_AUTH_DB_USER: carepulse_auth
+      CP_AUTH_DB_PASSWORD_FILE: /run/secrets/auth_db_password
       CP_INTERNAL_API_URL: ${CP_INTERNAL_API_URL:?Set the private API URL}
       CP_SIGNING_KEY_ID: ${CP_SIGNING_KEY_ID:?Set the active BFF signing key ID}
       CP_DELIVERY_KEY_ID: ${CP_DELIVERY_KEY_ID:?Set issuer key ID}
@@ -35,6 +37,7 @@ services:
     secrets:
       - active_policy
       - runtime_db_password
+      - auth_db_password
       - service_key
       - auth_secret
       - delivery_public_key
@@ -274,6 +277,8 @@ secrets:
     file: ${CP_DB_PASSWORD_FILE:?Set a synthetic PostgreSQL password file path for CI}
   runtime_db_password:
     file: ${CP_RUNTIME_DB_PASSWORD_FILE:?Set a separate ignored runtime DB password file path}
+  auth_db_password:
+    file: ${CP_AUTH_DB_PASSWORD_SOURCE_FILE:?Set a separate ignored Web auth DB password file path}
   service_key:
     file: ${CP_SERVICE_KEY_SOURCE_FILE:?Set an ignored service-key file path}
   auth_secret:

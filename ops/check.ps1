@@ -68,7 +68,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'bf2700edb35f4fa7c16e74106dcb50175de7609a13d9c060fffc719ad2ec8854',
+    '.github/workflows/foundation.yml': 'cd9495bea272f0f1ca03d3c2c9ef6ebc39b5c3271fd17ce97f12f0f6582b8cfd',
     'apps/api/Dockerfile': '27e2068b8295273a281200181850492133d3b9f0e7ddc5f95d65e0b38938ca14',
     'apps/web/Dockerfile': '933af52609f2a4eb638d048605ec555e2a3443cb25b3ba5d64d5a36ec585f02a',
 }
@@ -183,7 +183,7 @@ cleanup() {
   trap - EXIT
   if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" ]]; then
     if ! docker compose --profile mail --profile test --profile sender --profile operator down --remove-orphans --volumes; then code=1; fi
-    rm -f "$private"/{postgres-password,runtime-db-password,migration-password,operator-password,operator-credential,sender-password,service-key,auth-secret,file-key,delivery-public.pem,delivery-private.pem,operator-id,invite-link,clinic-create.json,compose.json,roles.log,web-denial.log,worker-denial.log,denials.log,runtime-logs,canaries,old-worker-status.json,health-logs,auth-logs,mail-denial.log}
+    rm -f "$private"/{postgres-password,runtime-db-password,auth-db-password,migration-password,operator-password,operator-credential,sender-password,service-key,auth-secret,file-key,delivery-public.pem,delivery-private.pem,operator-id,invite-link,clinic-create.json,compose.json,roles.log,web-denial.log,worker-denial.log,denials.log,runtime-logs,canaries,old-worker-status.json,health-logs,auth-logs,mail-denial.log}
     rm -rf "$private/image-scan"
     rmdir "$private" || code=1
   else
@@ -192,7 +192,7 @@ cleanup() {
   exit "$code"
 }
 trap cleanup EXIT
-for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE"; do
+for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE"; do
   test "$(dirname "$file")" = "$private"
   openssl rand -hex 32 > "$file"
   chmod 0444 "$file"
@@ -224,14 +224,15 @@ for attempt in $(seq 1 40); do
 done
 export CP_MIGRATION_PASSWORD="$(cat "$CP_MIGRATION_SECRET_FILE")"
 export CP_RUNTIME_PASSWORD="$(cat "$CP_RUNTIME_DB_PASSWORD_FILE")"
+export CP_AUTH_DB_PASSWORD="$(cat "$CP_AUTH_DB_PASSWORD_SOURCE_FILE")"
 export CP_OPERATOR_PASSWORD="$(cat "$CP_OPERATOR_SECRET_FILE")"
 export CP_SENDER_PASSWORD="$(cat "$CP_SENDER_DB_PASSWORD_SOURCE_FILE")"
-if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e CP_OPERATOR_PASSWORD -e CP_SENDER_PASSWORD \
+if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e CP_AUTH_DB_PASSWORD -e CP_OPERATOR_PASSWORD -e CP_SENDER_PASSWORD \
   db psql --no-psqlrc -v VERBOSITY=sqlstate -U carepulse_bootstrap -d carepulse < db/roles.sql > "$private/roles.log" 2>&1; then
   roles_error="$(sed -nE 's/^psql:[^:]+:([0-9]+): ERROR: +([A-Z0-9]{5}).*$/roles.sql:\1 SQLSTATE \2/p' "$private/roles.log" | head -n 1)"
   echo "FAIL controlled roles (${roles_error:-SQLSTATE unavailable}; credential-bearing diagnostics withheld)"; exit 1
 fi
-unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD
+unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_AUTH_DB_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD
 docker compose --profile test run --rm --no-deps \
   -e CP_DB_HOST=db -e CP_DB_PORT=5432 -e CP_DB_NAME=carepulse \
   -e CP_MIGRATION_PASSWORD_FILE=/run/secrets/migration_password \
@@ -242,6 +243,7 @@ docker compose --profile test run --rm --no-deps \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+  -v "$CP_AUTH_DB_PASSWORD_SOURCE_FILE:/run/secrets/auth_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro" \
@@ -260,7 +262,7 @@ import { betterAuth } from 'better-auth';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { getAuth } from './auth.ts';
 import { loadWebConfig } from './config.ts';
-import { runtimeDatabase } from './db.ts';
+import { authDatabase } from './db.ts';
 
 const auth = getAuth();
 const options = auth.options;
@@ -281,7 +283,7 @@ for (const field of ['securityRevision', 'absoluteDeadline', 'lastActivity']) {
     throw new Error('FAIL native session authority fields');
   }
 }
-const pool = runtimeDatabase(loadWebConfig());
+const pool = authDatabase(loadWebConfig());
 try {
   for (const table of expectedTables) {
     const found = await pool.query(
@@ -387,7 +389,7 @@ docker compose exec -T web node -e 'fetch("http://api:8000/__foundation_network_
 docker compose --profile test run --rm --no-deps -e CI=true \
   -v "$GITHUB_WORKSPACE/tests:/srv/tests:ro" api python -m pytest -q -ra -p no:cacheprovider tests/integration/test_secrets.py
 : > "$private/denials.log"
-for key in CP_POLICY_FILE CP_DB_PASSWORD_FILE CP_SERVICE_KEY_FILE CP_AUTH_SECRET_FILE; do
+for key in CP_POLICY_FILE CP_DB_PASSWORD_FILE CP_AUTH_DB_PASSWORD_FILE CP_SERVICE_KEY_FILE CP_AUTH_SECRET_FILE; do
   set +e
   timeout 15s docker compose run --rm --no-deps -e "$key=/run/secrets/missing" web > "$private/web-denial.log" 2>&1
   code=$?
@@ -410,10 +412,10 @@ for key in CP_POLICY_FILE CP_DB_PASSWORD_FILE CP_FILE_ENCRYPTION_KEY_FILE; do
   fi
   echo "PASS worker protected startup denies missing $key"
 done
-cat "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" \
+cat "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" \
   "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" > "$private/canaries"
 chmod 0444 "$private/canaries"
-awk 'length($0) != 64 || $0 !~ /^[0-9a-f]+$/ { invalid=1 } END { if (NR != 9 || invalid) exit 1 }' "$private/canaries"
+awk 'length($0) != 64 || $0 !~ /^[0-9a-f]+$/ { invalid=1 } END { if (NR != 10 || invalid) exit 1 }' "$private/canaries"
 if git grep -I -q -f "$private/canaries" -- apps tests ops compose.yaml; then
   echo 'FAIL synthetic key in tracked source'; exit 1
 else

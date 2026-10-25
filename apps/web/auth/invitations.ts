@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { getAuth } from "../auth.ts";
 import { loadWebConfig } from "../config.ts";
-import { runtimeDatabase } from "../db.ts";
+import { authDatabase } from "../db.ts";
 import { failure, validMutation } from "./http.ts";
 import { signRequest } from "./signing.ts";
 import { scopedAuthClient, withAuthTransaction } from "./postgres-adapter.ts";
@@ -64,7 +64,7 @@ function acceptanceBody(raw: unknown): Acceptance | null {
 
 async function verifiedInvitation(body: Acceptance): Promise<Invitation | null> {
   const digest = createHash("sha256").update(body.proof, "utf8").digest("hex");
-  const client = await runtimeDatabase(loadWebConfig()).connect();
+  const client = await authDatabase(loadWebConfig()).connect();
   try {
     await client.query("BEGIN");
     await client.query("SELECT set_config('app.organization_id', $1, true)", [body.organization_id]);
@@ -122,7 +122,7 @@ async function prepareVerifiedOwner(body: Acceptance, invitation: Invitation): P
   const context = await getAuth().$context;
   if (body.password.length < context.password.config.minPasswordLength ||
       body.password.length > context.password.config.maxPasswordLength) throw new Error("Invalid credential");
-  const client = scopedAuthClient(runtimeDatabase(loadWebConfig()), body.organization_id);
+  const client = scopedAuthClient(authDatabase(loadWebConfig()), body.organization_id);
   if (!client) throw new Error("Invitation preparation requires an owned auth transaction");
   await client.query('SELECT id FROM public."user" WHERE email = $1 FOR UPDATE', [
     invitation.target_email,
@@ -223,7 +223,7 @@ export async function acceptFirstOwner(request: Request): Promise<Response> {
   try {
     const invitation = await verifiedInvitation(body);
     if (!invitation) return failure(403);
-    const preparedUserId = await withAuthTransaction(runtimeDatabase(loadWebConfig()),
+    const preparedUserId = await withAuthTransaction(authDatabase(loadWebConfig()),
       body.organization_id, () => prepareVerifiedOwner(body, invitation));
     return await activateOwner(body, invitation, preparedUserId);
   } catch {

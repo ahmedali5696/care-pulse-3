@@ -13,8 +13,8 @@ assert.equal(process.env.CP_ENV, "test");
 assert.match(process.env.CP_CI_PROJECT ?? "", /^carepulse-ci-[0-9]+-[0-9]+$/);
 const clinic = process.env.CP_ADAPTER_TEST_CLINIC ?? "";
 assert.match(clinic, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
-const settings = loadWebConfig().database;
-assert.equal(settings.user, "carepulse_runtime");
+const settings = loadWebConfig().authDatabase;
+assert.equal(settings.user, "carepulse_auth");
 const credentials = {
   host: settings.host, port: settings.port, database: settings.name,
   user: settings.user, password: settings.password,

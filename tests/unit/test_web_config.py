@@ -29,9 +29,14 @@ def web_env(tmp_path):
     policy_file.write_text(POLICY, encoding="utf-8")
     policy_file.chmod(0o600)
     secrets = {}
-    for name in ("CP_DB_PASSWORD_FILE", "CP_SERVICE_KEY_FILE", "CP_AUTH_SECRET_FILE"):
+    for name in (
+        "CP_DB_PASSWORD_FILE",
+        "CP_AUTH_DB_PASSWORD_FILE",
+        "CP_SERVICE_KEY_FILE",
+        "CP_AUTH_SECRET_FILE",
+    ):
         secret_file = tmp_path / name
-        secret_file.write_bytes(b"synthetic-web-config-secret-0123456789\r\n")
+        secret_file.write_bytes(f"synthetic-web-{name}-secret-0123456789\r\n".encode())
         secret_file.chmod(0o600)
         secrets[name] = str(secret_file)
     return {
@@ -47,6 +52,7 @@ def web_env(tmp_path):
         "CP_DB_PORT": "5432",
         "CP_DB_NAME": "carepulse",
         "CP_DB_USER": "carepulse_runtime",
+        "CP_AUTH_DB_USER": "carepulse_auth",
         "CP_INTERNAL_API_URL": "http://api:8000",
         "CP_SIGNING_KEY_ID": "synthetic-ci-v1",
         **secrets,
@@ -210,7 +216,9 @@ for (const vector of vectors) {
         assert envelope.key_id == web_env["CP_SIGNING_KEY_ID"]
 
 
-@pytest.mark.parametrize("field", ["CP_POLICY_FILE", "CP_AUTH_SECRET_FILE"])
+@pytest.mark.parametrize(
+    "field", ["CP_POLICY_FILE", "CP_AUTH_DB_PASSWORD_FILE", "CP_AUTH_SECRET_FILE"]
+)
 @pytest.mark.parametrize("file_kind", ["missing", "directory", "oversized"])
 def test_web_rejects_unreadable_or_oversized_protected_files(
     web_env, tmp_path, field, file_kind
@@ -231,9 +239,21 @@ def test_web_rejects_unreadable_or_oversized_protected_files(
 @pytest.mark.skipif(
     os.name == "nt", reason="POSIX file permissions are enforced on Linux"
 )
-@pytest.mark.parametrize("field", ["CP_POLICY_FILE", "CP_AUTH_SECRET_FILE"])
+@pytest.mark.parametrize(
+    "field", ["CP_POLICY_FILE", "CP_AUTH_DB_PASSWORD_FILE", "CP_AUTH_SECRET_FILE"]
+)
 def test_web_rejects_writable_protected_files(web_env, field):
     Path(web_env[field]).chmod(0o622)
     completed = _web_config(web_env)
     assert completed.returncode != 0
     assert completed.stderr == f"Invalid {field}"
+
+
+def test_web_rejects_reused_auth_database_credentials(web_env):
+    web_env["CP_AUTH_DB_USER"] = web_env["CP_DB_USER"]
+    assert _web_config(web_env).returncode != 0
+    web_env["CP_AUTH_DB_USER"] = "carepulse_auth"
+    web_env["CP_AUTH_DB_PASSWORD_FILE"] = web_env["CP_DB_PASSWORD_FILE"]
+    denied = _web_config(web_env)
+    assert denied.returncode != 0
+    assert denied.stderr == "Invalid CP_AUTH_DB_PASSWORD_FILE"

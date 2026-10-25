@@ -341,6 +341,57 @@ def test_expired_incomplete_attempt_transfers_owned_block_only_with_new_proof(
     assert _complete(first, f"Synthetic-Abandoned-{uuid4()}!")[0] == 409
 
 
+def test_expired_prior_verification_cleanup_does_not_block_replacement(
+    owner, sender_lab
+):
+    first = _issue(owner, sender_lab)
+    with _reject_commit_for(owner.clinic, "auth_recovery_completions"):
+        assert _complete(first, f"Synthetic-Expired-A-{uuid4()}!")[0] == 503
+    _expire_reserved_attempt(owner, first)
+
+    second = _issue(owner, sender_lab)
+    next_password = f"Synthetic-Cleanup-B-{uuid4()}!"
+    with _reject_commit_for(owner.clinic, "auth_recovery_completions"):
+        assert _complete(second, next_password)[0] == 503
+    assert _operation(owner, first)["state"] == "ABORTED"
+    current = _operation(owner, second)
+    assert current["state"] == "RESERVED" and current["block"] == current["id"]
+
+    with _database() as connection:
+        old_verification = connection.execute(
+            """SELECT verification_id FROM public.delivery_jobs
+                WHERE organization_id=%s AND purpose='PASSWORD_RESET'
+                  AND proof_reference=%s""",
+            (owner.clinic, sha256(first.encode()).hexdigest()),
+        ).fetchone()[0]
+        connection.execute(
+            """UPDATE public.verification
+                  SET "expiresAt"=clock_timestamp()-interval '1 second'
+                WHERE id=%s""",
+            (old_verification,),
+        )
+        connection.execute(
+            "SELECT set_config('app.organization_id', %s, true)",
+            (str(owner.clinic),),
+        )
+        # Disposable bootstrap fixture executes with the actual auth session
+        # identity; the running Web service never receives bootstrap credentials.
+        connection.execute("SET SESSION AUTHORIZATION carepulse_auth")
+        assert (
+            connection.execute("SELECT session_user").fetchone()[0] == "carepulse_auth"
+        )
+        removed = connection.execute(
+            'DELETE FROM public."verification" WHERE id=%s',
+            (old_verification,),
+        )
+        assert removed.rowcount == 1
+
+    assert _operation(owner, second)["state"] == "RESERVED"
+    assert _complete(second, next_password) == (200, {"data": {"success": True}})
+    assert _operation(owner, second)["state"] == "FINALIZED"
+    assert _operation(owner, second)["successes"] == 1
+
+
 def test_revocation_invalidated_auth_done_requires_distinct_proof_after_reactivation(
     owner, sender_lab
 ):

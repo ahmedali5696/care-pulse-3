@@ -105,6 +105,7 @@ def test_resolved_compose_topology() -> None:
         "web": {
             "active_policy",
             "runtime_db_password",
+            "auth_db_password",
             "service_key",
             "auth_secret",
             "delivery_public_key",
@@ -142,6 +143,11 @@ def test_resolved_compose_topology() -> None:
         }
 
     assert services["sender"]["environment"]["CP_DB_USER"] == "carepulse_sender"
+    assert services["web"]["environment"]["CP_AUTH_DB_USER"] == "carepulse_auth"
+    assert (
+        services["web"]["environment"]["CP_AUTH_DB_PASSWORD_FILE"]
+        == "/run/secrets/auth_db_password"
+    )
     assert services["operator"]["environment"]["CP_DB_USER"] == "carepulse_operator"
     assert services["sender"]["build"]["target"] == "sender"
     assert services["operator"]["build"]["target"] == "operator"

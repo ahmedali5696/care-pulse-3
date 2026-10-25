@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { PoolClient } from "pg";
 import { loadWebConfig } from "../config.ts";
-import { runtimeDatabase } from "../db.ts";
+import { authDatabase } from "../db.ts";
 import { getAuth } from "../auth.ts";
 import { scopedAuthClient } from "./postgres-adapter.ts";
 
@@ -19,7 +19,7 @@ export type CurrentActor = Authority & { sessionId: string };
 const loginAuthority = new AsyncLocalStorage<Authority>();
 
 async function resolveTenant(userId: string): Promise<string | null> {
-  const lookup = await runtimeDatabase(loadWebConfig()).query<{ tenant: string }>(
+  const lookup = await authDatabase(loadWebConfig()).query<{ tenant: string }>(
     "SELECT public.resolve_login_tenant($1) AS tenant", [userId]);
   return lookup.rows[0]?.tenant ?? null;
 }
@@ -30,7 +30,7 @@ async function inTenant<T>(tenant: string, action: (client: PoolClient) => Promi
       "SELECT public.lock_active_organization($1::uuid) AS active", [tenant]);
     return locked.rows[0]?.active ? action(client) : null;
   };
-  const pool = runtimeDatabase(loadWebConfig());
+  const pool = authDatabase(loadWebConfig());
   // Session creation holds this transaction through INSERT. Taking the
   // organization FOR UPDATE lock here deadlocks with a simultaneous staff
   // revision change waiting on that INSERT; the post-commit currentActor
@@ -64,7 +64,7 @@ const liveStaff = `
      AND u."emailVerified" AND u.email = s.verified_email`;
 
 export async function captureLoginAuthority(email: string): Promise<Authority | null> {
-  const db = runtimeDatabase(loadWebConfig());
+  const db = authDatabase(loadWebConfig());
   const native = await db.query<{ id: string }>(
     'SELECT id FROM public."user" WHERE lower(email) = lower($1) AND "emailVerified"', [email]);
   if (native.rows.length !== 1) return null;

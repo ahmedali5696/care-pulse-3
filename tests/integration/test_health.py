@@ -90,7 +90,7 @@ def test_incompatible_revision_denies_then_recovers_without_schema_creation():
         finally:
             admin.execute(
                 "UPDATE public.alembic_version SET version_num = %s",
-                ("0009_b04_recovery",),
+                ("0010_b04_native_boundary",),
             )
         _eventually()
         assert (

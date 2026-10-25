@@ -79,6 +79,7 @@ def _completion(connection: Connection, operation):
                AND c.request_fingerprint = :fingerprint
                AND c.reserved_security_revision = :revision
                AND c.auth_fence = :fence AND c.completed_at = :finished
+               AND public.recovery_native_verified(c.id)
         """),
             {
                 "id": operation["id"],
@@ -275,15 +276,12 @@ def reserve_recovery(
             connection, prior, owner
         ):
             raise ContractError(409, "RESET_IN_PROGRESS")
-        connection.execute(
-            text("""
-            UPDATE public.recovery_operations SET state = 'ABORTED',
-                invalidated = true, invalidation_reference = COALESCE(
-                    invalidation_reference, 'EXPIRED_INCOMPLETE'), closed_at = clock_timestamp()
-             WHERE id = :id
-        """),
+        abandoned = connection.scalar(
+            text("SELECT public.abandon_owned_recovery(:id)"),
             {"id": prior["id"]},
         )
+        if abandoned != "ABORTED":
+            raise ContractError(409)
     elif owner["reset_block_operation_id"] is not None:
         raise ContractError(409)
 
@@ -391,40 +389,12 @@ def finalize_recovery(
         or not _completion(connection, operation)
     ):
         raise ContractError(409)
-    connection.execute(
-        text("""
-        UPDATE public.recovery_operations
-           SET state = 'FINALIZED', closed_at = clock_timestamp()
-         WHERE id = :id AND state = 'AUTH_DONE' AND NOT invalidated
-    """),
+    # The database owns finalization and success evidence. A caller must not
+    # manufacture a successful reset by updating the state, block and audit.
+    state = connection.scalar(
+        text("SELECT public.finalize_verified_recovery(:id)"),
         {"id": operation["id"]},
     )
-    changed = connection.execute(
-        text("""
-        UPDATE public.staff_accounts SET reset_block_operation_id = NULL
-         WHERE organization_id = :tenant AND id = :staff
-           AND reset_block_operation_id = :operation
-           AND security_revision = :revision
-    """),
-        {
-            "tenant": tenant,
-            "staff": staff_id,
-            "operation": operation["id"],
-            "revision": operation["reserved_security_revision"],
-        },
-    )
-    if changed.rowcount != 1:
+    if state != "FINALIZED":
         raise ContractError(409)
-    append_sensitive_audit(
-        connection,
-        {
-            "organization_id": tenant,
-            "actor_staff_id": staff_id,
-            "actor_role": "SYSTEM",
-            "action": "PASSWORD_RESET_SUCCEEDED",
-            "reason": "Confirmed native credential reset",
-            "correlation_id": str(operation["id"]),
-            "recovery_operation_id": operation["id"],
-        },
-    )
     return {"state": "FINALIZED"}
