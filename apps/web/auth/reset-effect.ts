@@ -30,6 +30,7 @@ export async function applyReservedReset(
   const expectedIdentifier = createHash("sha256")
     .update(`reset-password:${token}`, "utf8").digest("base64url");
   const pool = authDatabase(loadWebConfig());
+  let stage = "claim";
   return withAuthTransaction(pool, reserved.tenant, async () => {
     const client = scopedAuthClient(pool, reserved.tenant);
     if (!client) throw new Error("Recovery transaction unavailable");
@@ -68,6 +69,7 @@ export async function applyReservedReset(
     }
     // Better Auth's native expiry comparator accepts equality. Persisted
     // PostgreSQL clock time must be strictly earlier at both boundaries.
+    stage = "proof";
     const proof = await client.query(`
       SELECT 1 FROM public.verification v
       JOIN public.recovery_operations o ON o.proof_reference = v.id
@@ -79,6 +81,7 @@ export async function applyReservedReset(
         reserved.proofReference, expectedIdentifier, reserved.nativeUserId]);
     if (proof.rowCount !== 1) throw new Error("Recovery proof expired or unavailable");
 
+    stage = "native";
     const native = await getAuth().api.resetPassword({
       body: { token, newPassword },
     });
@@ -86,6 +89,7 @@ export async function applyReservedReset(
     // Only the database's verified native effects may record completion.
     // The account-password and proof-consumption triggers must both fire in
     // this same transaction before the application is allowed to commit.
+    stage = "verify";
     const done = await client.query(`
       SELECT 1 FROM public.recovery_operations o
       JOIN public.auth_recovery_completions c ON c.id = o.id
@@ -100,5 +104,12 @@ export async function applyReservedReset(
     `, [reserved.operationId, reserved.tenant, claimed.rows[0].auth_fence]);
     if (done.rowCount !== 1) throw new Error("Native recovery effects unverified");
     return "AUTH_DONE";
+  }).catch((error: unknown) => {
+    if (process.env.CP_ENV === "test" && process.env.CP_SYNTHETIC_TEST_PROFILE === "true") {
+      const code = error && typeof error === "object" && "code" in error &&
+        typeof error.code === "string" && /^[A-Z0-9]{5}$/.test(error.code) ? error.code : "none";
+      console.error("B04_SYNTHETIC_STAGE", stage, code);
+    }
+    throw error;
   });
 }

@@ -286,13 +286,16 @@ export async function completeOwnerRecovery(request: Request): Promise<Response>
   const { token, newPassword } = body as Record<string, unknown>;
   if (typeof token !== "string" || !/^[A-Za-z0-9_-]{24}$/.test(token) ||
       typeof newPassword !== "string") return failure(422);
+  let stage = "initialize";
   try {
     const config = loadWebConfig();
+    stage = "auth_context";
     const authContext = await getAuth().$context;
     if (newPassword.length < authContext.password.config.minPasswordLength ||
         newPassword.length > authContext.password.config.maxPasswordLength) return failure(422);
     const digest = createHash("sha256").update(token, "utf8").digest("hex");
     const identifier = createHash("sha256").update(`reset-password:${token}`, "utf8").digest("base64url");
+    stage = "identity";
     const identity = await recoveryIdentity(authDatabase(config), digest, identifier);
     if (!identity) return failure(409);
     const fingerprintKeys = loadRecoveryFingerprintKeys(config.authSecret);
@@ -304,6 +307,7 @@ export async function completeOwnerRecovery(request: Request): Promise<Response>
       request_fingerprint: recoveryFingerprint(identity, digest, newPassword, fingerprintKeys.keys[keyVersion]),
       fingerprint_key_version: keyVersion,
     };
+    stage = "reserve";
     const reservation = await recoveryCommand(identity, command, "reserve");
     if (!reservation) return failure(503);
     if (reservation.state === "FINALIZED") return json({ success: true });
@@ -311,6 +315,7 @@ export async function completeOwnerRecovery(request: Request): Promise<Response>
       if (!reservation.operation_id || !Number.isSafeInteger(reservation.reserved_security_revision)) {
         return failure(503);
       }
+      stage = "native_reset";
       await applyReservedReset({
         tenant: identity.tenant, operationId: reservation.operation_id,
         nativeUserId: identity.user, proofReference: identity.proofReference,
@@ -318,9 +323,16 @@ export async function completeOwnerRecovery(request: Request): Promise<Response>
         fingerprintKeyVersion: keyVersion, reservedSecurityRevision: reservation.reserved_security_revision!,
       }, token, newPassword);
     } else if (reservation.state !== "AUTH_DONE") return failure(409);
+    stage = "finalize";
     const finalized = await recoveryCommand(identity, command, "finalize");
     return finalized?.state === "FINALIZED" ? json({ success: true }) : failure(503);
   } catch (error) {
+    if (process.env.CP_ENV === "test" && process.env.CP_SYNTHETIC_TEST_PROFILE === "true" &&
+        !(error instanceof RecoveryConflict)) {
+      const code = error && typeof error === "object" && "code" in error &&
+        typeof error.code === "string" && /^[A-Z0-9]{5}$/.test(error.code) ? error.code : "none";
+      console.error("B04_SYNTHETIC_STAGE", stage, code);
+    }
     return error instanceof RecoveryConflict ? conflictResponse(error.code) : failure(503);
   }
 }
