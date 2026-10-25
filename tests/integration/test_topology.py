@@ -114,6 +114,7 @@ def test_resolved_compose_topology() -> None:
             "runtime_db_password",
             "service_key",
             "file_encryption_key",
+            "delivery_public_key",
         },
         "worker": {"active_policy", "runtime_db_password", "file_encryption_key"},
         "sender": {"active_policy", "sender_db_password", "delivery_private_key"},
