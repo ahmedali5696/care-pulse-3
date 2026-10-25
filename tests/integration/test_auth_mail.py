@@ -232,4 +232,4 @@ def test_denied_routes_preserve_current_persistence_boundary():
         }
         assert connection.execute(
             "SELECT version_num FROM public.alembic_version"
-        ).fetchall() == [("0010_b04_native_boundary",)]
+        ).fetchall() == [("0011_b04_recovery_lock",)]

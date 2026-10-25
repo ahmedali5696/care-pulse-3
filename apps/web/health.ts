@@ -17,7 +17,7 @@ async function databaseReady(config: WebConfig): Promise<boolean> {
       "SELECT version_num FROM public.alembic_version",
     );
     completed = true;
-    return revision.rows.length === 1 && revision.rows[0].version_num === "0010_b04_native_boundary";
+    return revision.rows.length === 1 && revision.rows[0].version_num === "0011_b04_recovery_lock";
   } catch {
     return false;
   } finally {

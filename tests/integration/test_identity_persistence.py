@@ -707,6 +707,80 @@ def test_clinic_runtime_cannot_mutate_native_identity(identity, role_engine, sta
         runtime.dispose()
 
 
+def test_runtime_owner_recovery_row_lock_is_scoped_without_update_grant(
+    identity, role_engine
+):
+    migration, operator_id, tenant_id, user_id, email, staff_id = identity
+    proof = f"synthetic-owned-lock-{uuid4()}"
+    with migration.begin() as connection:
+        invitation = _invitation(
+            connection, tenant_id, operator_id, (email, f"synthetic-lock-{uuid4()}")
+        )
+        connection.execute(
+            text(
+                "UPDATE public.invitations SET state='ACCEPTED', accepted_by_user_id=:user "
+                "WHERE id=:invitation"
+            ),
+            {"user": user_id, "invitation": invitation},
+        )
+        connection.execute(
+            text("UPDATE public.organizations SET state='ACTIVE' WHERE id=:tenant"),
+            {"tenant": tenant_id},
+        )
+        operation_id = _reservation(connection, tenant_id, staff_id, user_id, proof)
+
+    runtime = role_engine("carepulse_runtime")
+    try:
+        with (
+            pytest.raises(DBAPIError) as denied,
+            transaction(runtime, tenant_id) as connection,
+        ):
+            connection.execute(
+                text("SELECT id FROM public.recovery_operations FOR UPDATE")
+            )
+        assert denied.value.orig.sqlstate == "42501"
+
+        with transaction(runtime, tenant_id) as connection:
+            statement = text(
+                "SELECT id FROM public.lock_owned_recovery(:user, :digest)"
+            )
+            digest = sha256(proof.encode()).hexdigest()
+            params = {"user": user_id, "digest": digest}
+            # The definer must require the Owner identity validated by the caller.
+            assert connection.execute(statement, params).all() == []
+            connection.execute(
+                text("SELECT set_config('app.staff_id', :staff, true)"),
+                {"staff": str(staff_id)},
+            )
+            assert connection.execute(statement, params).scalar_one() == operation_id
+            assert (
+                connection.execute(
+                    statement, {"user": user_id, "digest": None}
+                ).scalar_one()
+                == operation_id
+            )
+            assert (
+                connection.execute(
+                    statement, {"user": "other-user", "digest": digest}
+                ).all()
+                == []
+            )
+            assert (
+                connection.execute(
+                    statement, {"user": user_id, "digest": "0" * 64}
+                ).all()
+                == []
+            )
+        with transaction(runtime, uuid4()) as connection:
+            connection.execute(
+                text("SELECT set_config('app.staff_id', :staff, true)"),
+                {"staff": str(staff_id)},
+            )
+            assert connection.execute(statement, params).all() == []
+    finally:
+        runtime.dispose()
+
+
 def test_runtime_session_cleanup_preserves_live_receptionist_authority(
     identity, role_engine
 ):

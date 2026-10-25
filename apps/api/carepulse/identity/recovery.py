@@ -55,15 +55,13 @@ def _owner(connection: Connection, tenant: UUID, staff_id: UUID, user_id: str):
     return owner
 
 
-def _operation(connection: Connection, digest: str):
+def _operation(connection: Connection, user_id: str, digest: str):
     return (
         connection.execute(
             text("""
-            SELECT * FROM public.recovery_operations
-             WHERE purpose = 'PASSWORD_RESET' AND proof_digest = :digest
-             FOR UPDATE
+            SELECT * FROM public.lock_owned_recovery(:user, :digest)
         """),
-            {"digest": digest},
+            {"user": user_id, "digest": digest},
         )
         .mappings()
         .one_or_none()
@@ -174,9 +172,7 @@ def _pending_operation(connection: Connection, user_id: str):
     return (
         connection.execute(
             text("""
-            SELECT * FROM public.recovery_operations
-             WHERE auth_user_id = :user AND closed_at IS NULL
-             ORDER BY id FOR UPDATE
+            SELECT * FROM public.lock_owned_recovery(:user, NULL::text)
         """),
             {"user": user_id},
         )
@@ -239,7 +235,7 @@ def reserve_recovery(
     connection: Connection, tenant: UUID, staff_id: UUID, command: RecoveryCommand
 ) -> dict:
     owner = _owner(connection, tenant, staff_id, command.native_user_id)
-    current = _operation(connection, command.proof_digest)
+    current = _operation(connection, command.native_user_id, command.proof_digest)
     if current is not None:
         _matching(current, tenant, staff_id, command)
         if current["state"] == "ABORTED" or current["invalidated"]:
@@ -366,7 +362,7 @@ def finalize_recovery(
     connection: Connection, tenant: UUID, staff_id: UUID, command: RecoveryCommand
 ) -> dict:
     owner = _owner(connection, tenant, staff_id, command.native_user_id)
-    operation = _operation(connection, command.proof_digest)
+    operation = _operation(connection, command.native_user_id, command.proof_digest)
     if operation is None:
         raise ContractError(409)
     _matching(operation, tenant, staff_id, command)
