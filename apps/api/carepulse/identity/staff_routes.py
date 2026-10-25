@@ -12,6 +12,11 @@ from carepulse.identity.contracts import (
     require_matching_revision,
     success_response,
 )
+from carepulse.identity.recovery import (
+    RecoveryCommand,
+    finalize_recovery,
+    reserve_recovery,
+)
 from carepulse.identity.staff import (
     _email,
     _owner,
@@ -33,6 +38,36 @@ from carepulse.identity.staff_contracts import (
 )
 
 router = APIRouter()
+
+
+def _recovery_identity(request: Request) -> tuple[UUID, UUID]:
+    identity = request.scope.get("carepulse.identity")
+    if (
+        identity is None
+        or identity.purpose != "OWNER_RECOVERY"
+        or identity.role != "BOOTSTRAP"
+        or identity.session_id
+        or identity.security_revision != "0"
+    ):
+        raise ContractError(403)
+    try:
+        return UUID(identity.organization_id), UUID(identity.staff_id)
+    except (TypeError, ValueError) as invalid:
+        raise ContractError(401) from invalid
+
+
+@router.post("/v1/staff/recovery/reserve")
+def reserve_staff_recovery(command: RecoveryCommand, request: Request):
+    tenant, staff = _recovery_identity(request)
+    with transaction(request.app.state.db_engine, tenant) as connection:
+        return reserve_recovery(connection, tenant, staff, command)
+
+
+@router.post("/v1/staff/recovery/finalize")
+def finalize_staff_recovery(command: RecoveryCommand, request: Request):
+    tenant, staff = _recovery_identity(request)
+    with transaction(request.app.state.db_engine, tenant) as connection:
+        return finalize_recovery(connection, tenant, staff, command)
 
 
 def _actor_transaction(request: Request):

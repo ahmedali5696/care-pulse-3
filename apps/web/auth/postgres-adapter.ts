@@ -6,6 +6,7 @@ import type { Pool, PoolClient } from "pg";
 
 const connection = new AsyncLocalStorage<{
   client: PoolClient; pool: Pool; tenant: string | null; closed: boolean;
+  callbackFailure?: unknown;
 }>();
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -94,11 +95,13 @@ export async function withAuthTransaction<T>(pool: Pool, tenant: string | null,
   return (async () => {
     const client = await pool.connect();
     let released = false;
-    const transaction = { client, pool, tenant, closed: false };
+    const transaction: { client: PoolClient; pool: Pool; tenant: string | null;
+      closed: boolean; callbackFailure?: unknown } = { client, pool, tenant, closed: false };
     try {
       await client.query("BEGIN");
       await client.query("SELECT set_config('app.organization_id', $1, true)", [tenant ?? ""]);
       const result = await connection.run(transaction, action);
+      if (transaction.callbackFailure !== undefined) throw transaction.callbackFailure;
       if ((await client.query("COMMIT")).command !== "COMMIT") {
         throw new Error("Auth transaction did not commit");
       }
@@ -112,6 +115,14 @@ export async function withAuthTransaction<T>(pool: Pool, tenant: string | null,
       if (!released) client.release();
     }
   })();
+}
+
+// Better Auth 1.7.12 logs and swallows sendResetPassword callback failures.
+// The owner must see the original failure before committing the native proof.
+export function failAuthIssuance(error: unknown): void {
+  const active = connection.getStore();
+  if (!active || active.closed) throw new Error("Recovery issuance requires an active transaction");
+  active.callbackFailure = error;
 }
 
 export function scopedAuthClient(pool: Pool, tenant: string): PoolClient | null {

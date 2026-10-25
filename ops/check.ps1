@@ -68,7 +68,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'f7c99b5f7aa62d2a324cab4c911a9146792fc58ec52a415c5a41d1afa06b0839',
+    '.github/workflows/foundation.yml': 'bf2700edb35f4fa7c16e74106dcb50175de7609a13d9c060fffc719ad2ec8854',
     'apps/api/Dockerfile': '27e2068b8295273a281200181850492133d3b9f0e7ddc5f95d65e0b38938ca14',
     'apps/web/Dockerfile': '933af52609f2a4eb638d048605ec555e2a3443cb25b3ba5d64d5a36ec585f02a',
 }
@@ -117,6 +117,7 @@ expected_paths = {
     '/v1/staff/receptionists/{staff_id}/invite',
     '/v1/staff/receptionists/{staff_id}/revoke-invite',
     '/v1/staff/receptionists/invite-accept',
+    '/v1/staff/recovery/reserve', '/v1/staff/recovery/finalize',
 }
 assert set(app.openapi()['paths']) == expected_paths
 assert app.openapi_url is None and len(app.user_middleware) == 1
@@ -127,6 +128,8 @@ assert boundary.kwargs['routes'] == {
     ('GET', '/v1/staff/receptionists'): 'STAFF_MANAGEMENT',
     ('POST', '/v1/staff/receptionists'): 'STAFF_MANAGEMENT',
     ('POST', '/v1/staff/receptionists/invite-accept'): 'RECEPTIONIST_ACCEPT',
+    ('POST', '/v1/staff/recovery/reserve'): 'OWNER_RECOVERY',
+    ('POST', '/v1/staff/recovery/finalize'): 'OWNER_RECOVERY',
 }
 uuid = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
 assert {(method, pattern.pattern, purpose) for method, pattern, purpose in boundary.kwargs['route_patterns']} == {
@@ -134,7 +137,7 @@ assert {(method, pattern.pattern, purpose) for method, pattern, purpose in bound
     ('POST', f'/v1/staff/receptionists/{uuid}/(?:enable|disable|invite|revoke-invite)', 'STAFF_MANAGEMENT'),
     ('PATCH', f'/v1/staff/receptionists/{uuid}/permissions', 'STAFF_MANAGEMENT'),
 }
-print('PASS approved signed Owner and Receptionist routes, recovery closed')
+print('PASS approved signed Owner, Receptionist and recovery routes')
 '@
             $imports | & python -
             if ($LASTEXITCODE -ne 0) { throw "Import and boundary validation failed (exit $LASTEXITCODE)" }
@@ -159,7 +162,7 @@ print('PASS approved signed Owner and Receptionist routes, recovery closed')
             if (-not (Test-Path -LiteralPath 'tests/integration/test_sessions.py' -PathType Leaf)) {
                 throw 'Missing required B-02 integration test: tests/integration/test_sessions.py'
             }
-            foreach ($suite in @('tests/integration/test_provisioning.py', 'tests/integration/test_staff.py', 'tests/e2e/owner-invite.spec.ts', 'tests/e2e/extract_mailpit_invitation.py', 'apps/web/mail/delivery-material.test.ts', 'tests/unit/test_delivery_material.py', 'apps/web/auth/postgres-adapter.integration.test.ts')) {
+            foreach ($suite in @('tests/integration/test_provisioning.py', 'tests/integration/test_staff.py', 'tests/integration/test_recovery.py', 'tests/integration/test_identity_races.py', 'tests/e2e/owner-invite.spec.ts', 'tests/e2e/extract_mailpit_invitation.py', 'apps/web/mail/delivery-material.test.ts', 'tests/unit/test_delivery_material.py', 'apps/web/auth/postgres-adapter.integration.test.ts')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-03 verification: $suite" }
             }
             if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Linux' -or $PSVersionTable.PSVersion.Major -lt 7) {
@@ -510,7 +513,7 @@ docker compose --profile test run --rm --no-deps \
   -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" \
   -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_sessions.py tests/integration/test_staff.py
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_sessions.py tests/integration/test_staff.py tests/integration/test_identity_races.py
 docker compose exec -T web node --no-warnings --experimental-strip-types --test auth/ingress.test.mjs
 echo 'PASS verified source separation, spoof resistance and sole Web listener'
 # The sender target alone has Node, Mailpit access, and the private delivery key.
@@ -521,6 +524,14 @@ docker compose --profile sender run --rm --no-deps -T --entrypoint python \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   sender -m pytest -q -ra --tb=short -p no:cacheprovider \
   tests/integration/test_delivery_sender.py -k 'not missing_mailpit'
+docker compose --profile sender run --rm --no-deps -T --entrypoint python \
+  -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" -e COMPOSE_PROJECT_NAME="$CP_CI_PROJECT" \
+  -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$PWD/tests:/srv/tests:ro" \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$CP_DB_PASSWORD_FILE:/run/secrets/postgres_password:ro" \
+  sender -m pytest -q -ra --tb=short -p no:cacheprovider \
+  tests/integration/test_recovery.py
 # The operator's identity is issued only in the disposable CI DB; the one-shot
 # CLI authenticates with its own secret file, then a separate sender delivers.
 docker compose --profile test run --rm --no-deps -T \

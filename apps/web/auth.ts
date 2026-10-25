@@ -5,6 +5,7 @@ import { bindSessionAuthority } from "./auth/session.ts";
 import { loadWebConfig } from "./config.ts";
 import { runtimeDatabase } from "./db.ts";
 import { postgresAuthAdapter } from "./auth/postgres-adapter.ts";
+import { persistRecoveryIntent } from "./auth/recovery.ts";
 
 function createAuth() {
   const config = loadWebConfig();
@@ -28,6 +29,8 @@ function createAuth() {
     emailAndPassword: {
       enabled: true, disableSignUp: true, requireEmailVerification: true,
       revokeSessionsOnPasswordReset: true,
+      resetPasswordTokenExpiresIn: config.policy.reset_expiry_minutes * 60,
+      sendResetPassword: persistRecoveryIntent,
     },
     // Adapter failures are translated at the boundary, not logged with SQL.
     logger: { disabled: true },

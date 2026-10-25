@@ -26,6 +26,8 @@ services:
       CP_DELIVERY_PUBLIC_KEY_FILE: /run/secrets/delivery_public_key
       CP_SERVICE_KEY_FILE: /run/secrets/service_key
       CP_AUTH_SECRET_FILE: /run/secrets/auth_secret
+      CP_RECOVERY_FINGERPRINT_KEY_VERSION: ${CP_RECOVERY_FINGERPRINT_KEY_VERSION:?Set current recovery fingerprint key version}
+      CP_RECOVERY_FINGERPRINT_RETAINED_KEY_FILES: ${CP_RECOVERY_FINGERPRINT_RETAINED_KEY_FILES:-}
       CP_MAIL_ENABLED: ${CP_MAIL_ENABLED:?Set explicit mail enablement}
       CP_SCAN_ENABLED: ${CP_SCAN_ENABLED:?Set explicit scan enablement}
       CP_SMTP_HOST: ${CP_SMTP_HOST:-}

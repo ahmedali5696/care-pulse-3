@@ -59,6 +59,8 @@ app.add_middleware(
         ("GET", "/v1/staff/receptionists"): "STAFF_MANAGEMENT",
         ("POST", "/v1/staff/receptionists"): "STAFF_MANAGEMENT",
         ("POST", "/v1/staff/receptionists/invite-accept"): "RECEPTIONIST_ACCEPT",
+        ("POST", "/v1/staff/recovery/reserve"): "OWNER_RECOVERY",
+        ("POST", "/v1/staff/recovery/finalize"): "OWNER_RECOVERY",
     },
     route_patterns=(
         (

@@ -85,8 +85,7 @@ function signingKeyId(): string {
   return id;
 }
 
-function readProtectedFile(name: string, maxBytes: number): string {
-  const filename = required(name);
+function readProtectedPath(filename: string, name: string, maxBytes: number): string {
   if (!isAbsolute(filename)) invalid(name);
   try {
     const info = lstatSync(filename);
@@ -96,6 +95,10 @@ function readProtectedFile(name: string, maxBytes: number): string {
   } catch {
     return invalid(name);
   }
+}
+
+function readProtectedFile(name: string, maxBytes: number): string {
+  return readProtectedPath(required(name), name, maxBytes);
 }
 
 function secretFile(name: string): string {
@@ -266,7 +269,43 @@ export function loadWebConfig() {
   const signingKeyIdValue = signingKeyId();
   const authSecret = secretFile("CP_AUTH_SECRET_FILE");
   const { mailEnabled, smtp } = loadMailSettings();
+  // Non-mail processes remain valid without a delivery key; issuance checks mailEnabled.
+  const deliveryKeyId = mailEnabled ? required("CP_DELIVERY_KEY_ID") : null;
+  if (deliveryKeyId && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(deliveryKeyId)) invalid("CP_DELIVERY_KEY_ID");
+  const deliveryPublicKey = mailEnabled ? readProtectedFile("CP_DELIVERY_PUBLIC_KEY_FILE", 8192) : null;
   choice("CP_SCAN_ENABLED", ["false"]);
 
-  return { environment, policy, database, apiUrl, serviceKey, signingKeyId: signingKeyIdValue, authSecret, mailEnabled, smtp };
+  return { environment, policy, database, apiUrl, serviceKey, signingKeyId: signingKeyIdValue, authSecret, deliveryKeyId, deliveryPublicKey, mailEnabled, smtp };
+}
+
+// Fingerprints are bound to a configured secret version for the entire retry lifecycle.
+// When rotating the auth secret, keep older version files mounted until their
+// recovery operations can no longer be retried or reconciled.
+export function loadRecoveryFingerprintKeys(currentAuthSecret: string) {
+  const activeVersion = required("CP_RECOVERY_FINGERPRINT_KEY_VERSION");
+  const validVersion = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+  if (!validVersion.test(activeVersion)) invalid("CP_RECOVERY_FINGERPRINT_KEY_VERSION");
+  const keys: Record<string, string> = Object.create(null) as Record<string, string>;
+  keys[activeVersion] = currentAuthSecret;
+  const retained = process.env.CP_RECOVERY_FINGERPRINT_RETAINED_KEY_FILES ?? "";
+  if (retained) {
+    const entries = retained.split(",");
+    if (entries.length > 7) invalid("CP_RECOVERY_FINGERPRINT_RETAINED_KEY_FILES");
+    for (const entry of entries) {
+      const separator = entry.indexOf("=");
+      const version = entry.slice(0, separator);
+      const path = entry.slice(separator + 1);
+      if (separator < 1 || !validVersion.test(version) ||
+          !isAbsolute(path) || path.length > 2048 || /[\x00-\x1f\x7f]/.test(path) ||
+          Object.hasOwn(keys, version)) {
+        invalid("CP_RECOVERY_FINGERPRINT_RETAINED_KEY_FILES");
+      }
+      const value = readProtectedPath(path, "CP_RECOVERY_FINGERPRINT_RETAINED_KEY_FILES", 8192)
+        .replace(/\r?\n$/, "");
+      if (value.length < 32 || value.length > 4096 || value !== value.trim() ||
+          /[\x00-\x1f\x7f]/.test(value)) invalid("CP_RECOVERY_FINGERPRINT_RETAINED_KEY_FILES");
+      keys[version] = value;
+    }
+  }
+  return { activeVersion, keys };
 }

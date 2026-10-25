@@ -145,6 +145,27 @@ def test_owner_creates_invites_and_revokes_without_partial_sender_job(owner_sess
             == 1
         )
 
+    status, reissued = _staff_command(
+        f"{staff_path}/invite", cookie, _changes(revoked["data"])
+    )
+    assert status == 200, reissued
+    assert reissued["data"]["invitation_state"] == "ISSUED"
+    with _database() as connection:
+        states = connection.execute(
+            """
+            SELECT i.state FROM public.invitations i
+            WHERE i.organization_id = %s AND i.staff_id = %s
+            ORDER BY i.issued_at, i.id
+            """,
+            (owner.clinic, staff["id"]),
+        ).fetchall()
+        jobs = connection.execute(
+            "SELECT count(*) FROM public.delivery_jobs WHERE organization_id = %s AND staff_id = %s",
+            (owner.clinic, staff["id"]),
+        ).fetchone()[0]
+    assert [state for (state,) in states] == ["REVOKED", "ISSUED"]
+    assert jobs == 2
+
 
 def test_parallel_same_key_receptionist_creation_reuses_receipt(owner_session):
     owner, cookie = owner_session
@@ -205,6 +226,63 @@ def test_parallel_same_key_receptionist_creation_reuses_receipt(owner_session):
     assert counts == (1, 1, 1)
 
 
+def test_expired_receptionist_proof_is_rejected_and_replaced_by_owner(owner_session):
+    owner, cookie = owner_session
+    email = f"synthetic-expired-{uuid4()}@example.invalid"
+    status, created = _staff_command(
+        "/api/staff/receptionists",
+        cookie,
+        {"email": email, "name": "Synthetic expired proof", "reason": "Hire"},
+        key=str(uuid4()),
+    )
+    assert status == 201, created
+    staff = created["data"]
+    expired_id, proof = uuid4(), secrets.token_urlsafe(32)
+    with _database() as connection:
+        connection.execute(
+            """
+            INSERT INTO public.invitations
+                (id, organization_id, staff_id, purpose, target_email,
+                 proof_digest, issued_at, expires_at, issued_by_staff_id)
+            VALUES (%s, %s, %s, 'RECEPTIONIST', %s, %s,
+                    clock_timestamp() - interval '20 minutes',
+                    clock_timestamp() - interval '1 minute', %s)
+            """,
+            (
+                expired_id,
+                owner.clinic,
+                staff["id"],
+                email,
+                sha256(proof.encode()).hexdigest(),
+                owner.staff,
+            ),
+        )
+    status, _ = _staff_command(
+        "/api/auth/invite-accept",
+        None,
+        {
+            "organization_id": str(owner.clinic),
+            "invitation_id": str(expired_id),
+            "proof": proof,
+            "name": "Synthetic expired proof",
+            "password": f"Synthetic-Expired-{uuid4()}!",
+        },
+    )
+    assert status == 403
+    staff_path = f"/api/staff/receptionists/{staff['id']}"
+    status, reissued = _staff_command(f"{staff_path}/invite", cookie, _changes(staff))
+    assert status == 200, reissued
+    assert reissued["data"]["invitation_state"] == "ISSUED"
+    with _database() as connection:
+        rows = connection.execute(
+            "SELECT id, state FROM public.invitations WHERE staff_id = %s",
+            (staff["id"],),
+        ).fetchall()
+    assert len(rows) == 2
+    assert dict(rows)[expired_id] == "REVOKED"
+    assert len([1 for _, state in rows if state == "ISSUED"]) == 1
+
+
 def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session):
     owner, owner_cookie = owner_session
     staff_id = uuid4()
@@ -246,6 +324,45 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
     second_cookie = _login(recipient)
     staff_path = f"/api/staff/receptionists/{staff_id}"
 
+    for path, method, payload in (
+        ("/api/staff/receptionists", "GET", None),
+        (staff_path, "GET", None),
+        (
+            f"{staff_path}/disable",
+            "POST",
+            {
+                "reason": "Unauthorized",
+                "expected_revision": 0,
+                "expected_security_revision": 0,
+            },
+        ),
+    ):
+        status, _ = _staff_command(path, first_cookie, payload, method=method)
+        assert status == 403
+    status, _ = _staff_command(
+        f"/api/staff/receptionists/{owner.staff}/disable",
+        owner_cookie,
+        {
+            "reason": "Owner mutation",
+            "expected_revision": 0,
+            "expected_security_revision": 0,
+        },
+    )
+    assert status == 404
+    status, _ = _staff_command(
+        f"{staff_path}/permissions",
+        owner_cookie,
+        {
+            "reason": "Admin delegation",
+            "expected_revision": 0,
+            "expected_security_revision": 0,
+            "role": "DOCTOR_OWNER",
+            "bulk_reschedule": True,
+        },
+        method="PATCH",
+    )
+    assert status == 422
+
     status, restricted = _staff_command(
         f"{staff_path}/permissions",
         first_cookie,
@@ -273,17 +390,44 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
     assert status == 200, granted
     assert granted["data"]["bulk_reschedule"] is True
     assert granted["data"]["security_revision"] == 1
+    status, stale = _staff_command(
+        f"{staff_path}/permissions",
+        owner_cookie,
+        {
+            "reason": "Stale competing edit",
+            "expected_revision": 0,
+            "expected_security_revision": 0,
+            "bulk_reschedule": False,
+        },
+        method="PATCH",
+    )
+    assert status == 409, stale
     for old_cookie in (first_cookie, second_cookie):
         status, _, _ = _request("/api/session", cookie=old_cookie)
         assert status == 401
 
     refreshed_cookie = _login(recipient)
-    status, withdrawn = _staff_command(
-        f"{staff_path}/permissions",
-        owner_cookie,
-        {**_changes(granted["data"]), "bulk_reschedule": False},
-        method="PATCH",
-    )
+    with _database() as connection:
+        connection.execute('REVOKE DELETE ON public."session" FROM carepulse_runtime')
+    try:
+        status, withdrawn = _staff_command(
+            f"{staff_path}/permissions",
+            owner_cookie,
+            {**_changes(granted["data"]), "bulk_reschedule": False},
+            method="PATCH",
+        )
+        assert status == 200, withdrawn
+        with _database() as connection:
+            remaining = connection.execute(
+                'SELECT count(*) FROM public."session" WHERE "userId" = %s',
+                (native_user_id,),
+            ).fetchone()[0]
+        assert remaining >= 1, "Cleanup unexpectedly deleted the live native session"
+        status, _, _ = _request("/api/session", cookie=refreshed_cookie)
+        assert status == 401
+    finally:
+        with _database() as connection:
+            connection.execute('GRANT DELETE ON public."session" TO carepulse_runtime')
     assert status == 200, withdrawn
     assert withdrawn["data"]["bulk_reschedule"] is False
     status, _, _ = _request("/api/session", cookie=refreshed_cookie)
@@ -339,6 +483,9 @@ def test_foreign_owner_cannot_discover_staff_or_delegate_receptionist(owner_sess
         )
     assert owner.clinic != foreign.clinic
     path = f"/api/staff/receptionists/{staff_id}"
+    status, visible = _staff_command("/api/staff/receptionists", cookie, method="GET")
+    assert status == 200
+    assert all(entry["id"] != str(staff_id) for entry in visible["data"]["items"])
     status, _ = _staff_command(path, cookie, method="GET")
     assert status == 404
     status, _ = _staff_command(
