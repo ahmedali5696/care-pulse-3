@@ -99,7 +99,9 @@ export async function bindSessionAuthority(session: { userId: string }) {
 }
 
 async function authorizedSession(client: PoolClient, userId: string, sessionId: string) {
-  const staff = await client.query<Authority>(`${liveStaff} FOR UPDATE OF s`, [userId]);
+  // Ordinary protected requests hold the Organization lifecycle lock through
+  // inTenant; auth has no native write or row-lock grant on clinic staff.
+  const staff = await client.query<Authority>(liveStaff, [userId]);
   const actor = staff.rows[0];
   if (!actor) return null;
   const policy = loadWebConfig().policy;
