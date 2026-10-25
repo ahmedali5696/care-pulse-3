@@ -17,7 +17,7 @@ async function databaseReady(config: WebConfig): Promise<boolean> {
       "SELECT version_num FROM public.alembic_version",
     );
     completed = true;
-    return revision.rows.length === 1 && revision.rows[0].version_num === "0011_b04_recovery_lock";
+    return revision.rows.length === 1 && revision.rows[0].version_num === "0012_b04_lifecycle_lock_order";
   } catch {
     return false;
   } finally {
