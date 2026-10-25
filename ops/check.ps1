@@ -217,7 +217,8 @@ done
 docker compose --profile test --profile sender --profile operator build --pull
 docker compose up -d --no-build db
 for attempt in $(seq 1 40); do
-  if docker compose exec -T db pg_isready -U carepulse_bootstrap -d carepulse > /dev/null 2>&1; then break; fi
+  # TCP readiness excludes the temporary Unix-socket-only bootstrap server.
+  if docker compose exec -T db pg_isready -h 127.0.0.1 -U carepulse_bootstrap -d carepulse > /dev/null 2>&1; then break; fi
   if [ "$attempt" = 40 ]; then echo 'FAIL disposable database startup'; exit 1; fi
   sleep 2
 done
@@ -226,8 +227,9 @@ export CP_RUNTIME_PASSWORD="$(cat "$CP_RUNTIME_DB_PASSWORD_FILE")"
 export CP_OPERATOR_PASSWORD="$(cat "$CP_OPERATOR_SECRET_FILE")"
 export CP_SENDER_PASSWORD="$(cat "$CP_SENDER_DB_PASSWORD_SOURCE_FILE")"
 if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e CP_OPERATOR_PASSWORD -e CP_SENDER_PASSWORD \
-  db psql --no-psqlrc -U carepulse_bootstrap -d carepulse < db/roles.sql > "$private/roles.log" 2>&1; then
-  echo 'FAIL controlled roles (credential-bearing diagnostics withheld)'; exit 1
+  db psql --no-psqlrc -v VERBOSITY=sqlstate -U carepulse_bootstrap -d carepulse < db/roles.sql > "$private/roles.log" 2>&1; then
+  roles_error="$(sed -nE 's/^psql:[^:]+:([0-9]+): ERROR: +([A-Z0-9]{5}).*$/roles.sql:\1 SQLSTATE \2/p' "$private/roles.log" | head -n 1)"
+  echo "FAIL controlled roles (${roles_error:-SQLSTATE unavailable}; credential-bearing diagnostics withheld)"; exit 1
 fi
 unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD
 docker compose --profile test run --rm --no-deps \
