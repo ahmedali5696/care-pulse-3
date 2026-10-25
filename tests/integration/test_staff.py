@@ -423,8 +423,8 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
                 (native_user_id,),
             ).fetchone()[0]
         assert remaining >= 1, "Cleanup unexpectedly deleted the live native session"
-        status, _, _ = _request("/api/session", cookie=refreshed_cookie)
-        assert status == 401
+        old_session_status, _, _ = _request("/api/session", cookie=refreshed_cookie)
+        assert old_session_status == 401
     finally:
         with _database() as connection:
             connection.execute('GRANT DELETE ON public."session" TO carepulse_runtime')
