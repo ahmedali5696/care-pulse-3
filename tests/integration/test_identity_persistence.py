@@ -80,7 +80,10 @@ def _reservation(connection, tenant_id, staff_id, user_id, proof):
                  captured_lifecycle_revision, reserved_security_revision)
             VALUES (:id, :tenant, :staff, :user, 'PASSWORD_RESET', :digest,
                     'synthetic-ci', clock_timestamp() + interval '2 minutes', :fingerprint,
-                    'synthetic-v1', 0, 0, 1)
+                    'synthetic-v1',
+                    (SELECT revision + 1 FROM public.staff_accounts WHERE id = :staff),
+                    (SELECT lifecycle_revision FROM public.organizations WHERE id = :tenant),
+                    (SELECT security_revision + 1 FROM public.staff_accounts WHERE id = :staff))
         """),
         {
             "id": operation_id,
@@ -671,9 +674,23 @@ def test_competing_auth_completion_has_one_durable_winner(identity, two_transact
 
 
 def test_closed_recovery_proof_remains_unique(identity):
-    migration, _, tenant_id, native_user, _, staff_id = identity
+    migration, operator_id, tenant_id, native_user, email, staff_id = identity
     proof = "synthetic-consumed-proof"
     with migration.begin() as connection:
+        invitation = _invitation(
+            connection, tenant_id, operator_id, (email, "activate-closed-proof")
+        )
+        connection.execute(
+            text("""
+            UPDATE public.invitations SET state = 'ACCEPTED', accepted_by_user_id = :user
+            WHERE id = :invitation
+        """),
+            {"invitation": invitation, "user": native_user},
+        )
+        connection.execute(
+            text("UPDATE public.organizations SET state = 'ACTIVE' WHERE id = :tenant"),
+            {"tenant": tenant_id},
+        )
         operation = _reservation(connection, tenant_id, staff_id, native_user, proof)
         connection.execute(
             text("""
