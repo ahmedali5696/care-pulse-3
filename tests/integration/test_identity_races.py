@@ -308,7 +308,7 @@ def test_operator_revocation_after_native_fence_blocks_stale_finalization(
                         JOIN pg_stat_activity a ON a.pid = l.pid
                         WHERE l.relation = 'public."session"'::regclass
                           AND l.mode = 'RowExclusiveLock' AND NOT l.granted
-                          AND a.usename = 'carepulse_runtime'
+                          AND a.usename = 'carepulse_auth'
                         """
                     ).fetchone()[0]
                     if blocked == 1:

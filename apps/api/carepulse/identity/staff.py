@@ -244,33 +244,6 @@ def _lock_target(
     return row
 
 
-def _invalidate_recovery(
-    connection: Connection, actor: AuthorizedStaff, staff_id: UUID, correlation: UUID
-) -> None:
-    operation_ids = (
-        connection.execute(
-            text("""
-            SELECT id FROM public.recovery_operations
-             WHERE organization_id = :tenant AND staff_id = :staff
-               AND closed_at IS NULL
-             ORDER BY id FOR UPDATE
-        """),
-            {"tenant": actor.organization_id, "staff": staff_id},
-        )
-        .scalars()
-        .all()
-    )
-    for operation_id in operation_ids:
-        connection.execute(
-            text("""
-                UPDATE public.recovery_operations SET invalidated = true,
-                    invalidation_reference = COALESCE(invalidation_reference, :reference)
-                 WHERE id = :operation AND NOT invalidated
-            """),
-            {"operation": operation_id, "reference": str(correlation)},
-        )
-
-
 def _revoke_pending(
     connection: Connection,
     actor: AuthorizedStaff,
@@ -327,8 +300,6 @@ def change_receptionist(
     if not changed:
         raise ContractError(409)
     correlation = uuid4()
-    if withdrawn:
-        _invalidate_recovery(connection, actor, staff_id, correlation)
     connection.execute(
         text(f"""
             UPDATE public.staff_accounts SET {column} = :new_state,

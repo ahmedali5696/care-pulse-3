@@ -383,7 +383,7 @@ def test_two_valid_signins_share_bounded_web_pool_without_leaking_tenant(owner):
 
             backends = observer.execute(
                 """SELECT pid, client_addr::text FROM pg_stat_activity
-                   WHERE pid = ANY(%s) AND usename = 'carepulse_runtime'""",
+                   WHERE pid = ANY(%s) AND usename = 'carepulse_auth'""",
                 (blocked_pids,),
             ).fetchall()
             assert len(backends) == 2
@@ -391,7 +391,7 @@ def test_two_valid_signins_share_bounded_web_pool_without_leaking_tenant(owner):
             assert (
                 observer.execute(
                     """SELECT count(*) FROM pg_stat_activity
-                   WHERE datname = 'carepulse' AND usename = 'carepulse_runtime'
+                   WHERE datname = 'carepulse' AND usename = 'carepulse_auth'
                      AND client_addr::text = %s""",
                     (backends[0][1],),
                 ).fetchone()[0]
