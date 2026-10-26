@@ -235,7 +235,12 @@ def test_denied_routes_preserve_current_persistence_boundary():
             ("clinic_schedule_intervals",),
             ("clinic_schedule_holidays",),
             ("clinic_policy_previews",),
+            ("appointments",),
+            ("appointment_price_snapshots",),
+            ("appointment_day_counters",),
+            ("appointment_number_assignments",),
+            ("appointment_history",),
         }
         assert connection.execute(
             "SELECT version_num FROM public.alembic_version"
-        ).fetchall() == [("0017_d04_policy_versions",)]
+        ).fetchall() == [("0018_d05_appointments",)]
