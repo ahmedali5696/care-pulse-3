@@ -12,7 +12,7 @@ from carepulse.config import ConfigError, Consumer, load_config
 from carepulse.db import create_db_engine, transaction
 
 PROBE_DEADLINE_SECONDS = 4
-COMPATIBLE_REVISION = "0016_d03_patient_name_bounds"
+COMPATIBLE_REVISION = "0017_d04_policy_versions"
 router = APIRouter()
 
 
