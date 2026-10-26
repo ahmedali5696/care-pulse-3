@@ -11,11 +11,13 @@ from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
+from unicodedata import normalize
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import urlopen
 from uuid import uuid4
 
 import pytest
+from carepulse.config import _load_policy
 from carepulse.notifications.email_sender import _settings, send_one_job
 from carepulse.provisioning.operators import VerifiedOperator
 from carepulse.provisioning.service import change_clinic_state
@@ -261,6 +263,42 @@ def test_issuance_write_failure_keeps_native_proof_and_delivery_atomic(
         material_count,
         issuance_audit_count,
     ) == (0, 0, 0, 0)
+
+
+def test_recovery_request_source_limit_does_not_reveal_registered_owner(owner):
+    unknown = f"missing-{uuid4()}@example.invalid"
+    limit = _load_policy().recovery_max_attempts
+    for _ in range(limit):
+        assert _post("/api/auth/reset-request", {"email": unknown}) == (
+            200,
+            {"data": {"acknowledged": True}},
+        )
+    assert _post("/api/auth/reset-request", {"email": unknown})[0] == 429
+    # A known Owner must not bypass the source fence or reveal eligibility.
+    assert _post("/api/auth/reset-request", {"email": owner.email})[0] == 429
+    with _database() as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM public.verification WHERE value=%s",
+                (owner.user,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_same_proof_distinguishes_exact_unicode_password_bytes(owner, sender_lab):
+    token = _issue(owner, sender_lab)
+    composed = f"Synthetic-É-{uuid4()}!"
+    decomposed = normalize("NFD", composed)
+    assert composed != decomposed and composed.encode() != decomposed.encode()
+    with _reject_commit_for(owner.clinic, "auth_recovery_completions"):
+        assert _complete(token, composed)[0] == 503
+    assert _complete(token, decomposed)[1]["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    pending = _operation(owner, token)
+    assert pending["state"] == "RESERVED" and pending["auth_fence"] == 0
+    assert pending["completions"] == pending["successes"] == 0
+    assert _complete(token, composed) == (200, {"data": {"success": True}})
+    assert _operation(owner, token)["successes"] == 1
 
 
 def _expire_reserved_attempt(owner, token):

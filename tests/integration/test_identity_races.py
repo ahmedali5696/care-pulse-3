@@ -18,6 +18,7 @@ from carepulse.provisioning.operators import authenticate_operator
 from carepulse.provisioning.service import change_clinic_state
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from test_recovery import _reject_commit_for
 from test_sessions import _database, _login, _mutation_headers, _request, _seed_owner
 
 operator_identity = test_provisioning.operator_identity
@@ -367,3 +368,57 @@ def test_operator_revocation_after_native_fence_blocks_stale_finalization(
     assert durable == ("AUTH_DONE", True, 1, operation[0], 1, 0, 0)
     assert credential_after != credential_before
     assert _request("/api/session", cookie=stale_cookie)[0] == 401
+
+
+def test_duplicate_auth_done_finalizers_keep_one_success_and_revision(recovery_owner):
+    owner = recovery_owner
+    token, digest = _issued_proof(owner)
+    password = f"Synthetic-Finalizer-{uuid4()}!"
+    # The supported native effect commits; only the later Python success audit fails.
+    with _reject_commit_for(owner.clinic, "sensitive_audit"):
+        assert _reset(token, password)[0] == 503
+    with _database() as connection:
+        before = connection.execute(
+            """SELECT r.id, r.state, r.auth_fence, s.security_revision,
+                      (SELECT count(*) FROM public.auth_recovery_completions c
+                        WHERE c.id=r.id)
+                 FROM public.recovery_operations r
+                 JOIN public.staff_accounts s ON s.id=r.staff_id
+                WHERE r.proof_digest=%s""",
+            (digest,),
+        ).fetchone()
+    assert before[1:] == ("AUTH_DONE", 1, 1, 1)
+
+    ready = Barrier(3)
+
+    def finalize():
+        ready.wait(timeout=6)
+        return _reset(token, password)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        with _database() as blocker:
+            blocker.execute(
+                "SELECT id FROM public.organizations WHERE id=%s FOR UPDATE",
+                (owner.clinic,),
+            )
+            futures = [executor.submit(finalize) for _ in range(2)]
+            ready.wait(timeout=6)
+            try:
+                _wait_for_organization_waiters(blocker, 2)
+            finally:
+                blocker.commit()
+        assert [future.result(timeout=25)[0] for future in futures] == [200, 200]
+    with _database() as connection:
+        after = connection.execute(
+            """SELECT r.state, r.auth_fence, s.security_revision, s.reset_block_operation_id,
+                      (SELECT count(*) FROM public.auth_recovery_completions c
+                        WHERE c.id=r.id),
+                      (SELECT count(*) FROM public.sensitive_audit a
+                        WHERE a.recovery_operation_id=r.id
+                          AND a.action='PASSWORD_RESET_SUCCEEDED')
+                 FROM public.recovery_operations r
+                 JOIN public.staff_accounts s ON s.id=r.staff_id
+                WHERE r.id=%s""",
+            (before[0],),
+        ).fetchone()
+    assert after == ("FINALIZED", 1, 1, None, 1, 1)
