@@ -681,9 +681,19 @@ def test_expired_fresh_proof_cannot_abort_an_expired_blocked_predecessor(
     _expire_reserved_attempt(owner, proof_a)
     before = _operation(owner, proof_a)
     native_before = _native(owner)
-    proof_b, _ = _issued_proof(owner, lifetime_seconds=1)
+    proof_b, digest_b = _issued_proof(owner, lifetime_seconds=5)
     with _database() as connection:
-        connection.execute("SELECT pg_sleep(1.1)")
+        deadline = connection.execute(
+            "SELECT proof_expires_at FROM public.delivery_jobs WHERE proof_reference=%s",
+            (digest_b,),
+        ).fetchone()[0]
+        connection.execute(
+            "SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM (%s::timestamptz - clock_timestamp())) + 0.05))",
+            (deadline,),
+        )
+        assert connection.execute(
+            "SELECT clock_timestamp() >= %s", (deadline,)
+        ).fetchone()[0]
     status, _ = _reset(proof_b, f"Synthetic-Expired-B-{uuid4()}!")
     assert status == 409
     after = _operation(owner, proof_a)

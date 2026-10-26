@@ -35,11 +35,10 @@ export async function requestRecoveryIssuance(
     throw new Error("Recovery delivery unavailable");
   }
   if (!source || !email || !await allowRecoveryAttempt(email, source)) return "RATE_LIMITED";
-  if (!tenant) return "ACKNOWLEDGED";
   const pool = authDatabase(config);
-  // Initialize Better Auth before leasing the recovery transaction connection.
+  // Shared infrastructure failures must have the same response for every email.
   await getAuth().$context;
-  let eligibleIssuance = false;
+  if (!tenant) return "ACKNOWLEDGED";
   try {
     await withAuthTransaction(pool, tenant, async () => {
     const client = scopedAuthClient(pool, tenant);
@@ -57,7 +56,6 @@ export async function requestRecoveryIssuance(
                         AND a.password IS NOT NULL)
     `, [email]);
     if (eligible.rows.length !== 1) return;
-    eligibleIssuance = true;
     const owner = eligible.rows[0];
     const context: Issuance = {
       tenant, staff: owner.staff, user: owner.user, email: owner.email,
@@ -69,9 +67,8 @@ export async function requestRecoveryIssuance(
     if (!context.issued) throw new Error("Native recovery proof was not committed");
     });
   } catch (error) {
-    if (!eligibleIssuance) throw error;
-    // Eligible issuance failures have the same public response as an unknown
-    // address. Transaction failures retain their ordinary rollback semantics.
+    // Tenant-specific lookup and issuance errors cannot disclose identity.
+    // The owned transaction has already rolled back before this handler runs.
     const code = error && typeof error === "object" && "code" in error &&
       typeof error.code === "string" && /^[A-Z0-9]{5}$/.test(error.code) ? error.code : "none";
     console.error("B04_RECOVERY_ISSUANCE_FAILED", code);
@@ -166,10 +163,16 @@ export async function requestOwnerRecovery(request: Request): Promise<Response> 
     const pool = authDatabase(loadWebConfig());
     const users = await pool.query<{ id: string }>(
       'SELECT id FROM public."user" WHERE lower(email) = lower($1) AND "emailVerified"', [email]);
-    const tenant = users.rows.length === 1
-      ? (await pool.query<{ tenant: string | null }>(
-        "SELECT public.resolve_recovery_tenant($1) AS tenant", [users.rows[0].id])).rows[0]?.tenant ?? null
-      : null;
+    let tenant: string | null = null;
+    if (users.rows.length === 1) {
+      try {
+        tenant = (await pool.query<{ tenant: string | null }>(
+          "SELECT public.resolve_recovery_tenant($1) AS tenant", [users.rows[0].id])).rows[0]?.tenant ?? null;
+      } catch {
+        // A failure of this identity-only lookup cannot disclose account existence.
+        console.error("B04_RECOVERY_TENANT_LOOKUP_FAILED");
+      }
+    }
     const outcome = await requestRecoveryIssuance(email, source, tenant);
     return outcome === "RATE_LIMITED" ? failure(429) : json({ acknowledged: true });
   } catch (error) {

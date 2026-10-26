@@ -272,6 +272,55 @@ def test_issuance_write_failure_keeps_native_proof_and_delivery_atomic(
     assert _issue(owner, sender_lab)
 
 
+@pytest.mark.parametrize(
+    ("revoke", "restore", "privilege"),
+    [
+        (
+            "REVOKE SELECT ON public.staff_accounts FROM carepulse_auth",
+            "GRANT SELECT ON public.staff_accounts TO carepulse_auth",
+            "SELECT has_table_privilege('carepulse_auth', 'public.staff_accounts', 'SELECT')",
+        ),
+        (
+            "REVOKE EXECUTE ON FUNCTION public.resolve_recovery_tenant(text) FROM carepulse_auth",
+            "GRANT EXECUTE ON FUNCTION public.resolve_recovery_tenant(text) TO carepulse_auth",
+            "SELECT has_function_privilege('carepulse_auth', 'public.resolve_recovery_tenant(text)', 'EXECUTE')",
+        ),
+    ],
+    ids=["staff-eligibility", "tenant-locator"],
+)
+def test_identity_dependent_lookup_failure_does_not_disclose_owner_email(
+    owner, revoke, restore, privilege
+):
+    with _database() as connection:
+        connection.execute(revoke)
+    try:
+        with _database() as connection:
+            assert not connection.execute(privilege).fetchone()[0]
+        eligible = _post("/api/auth/reset-request", {"email": owner.email})
+        unknown = _post(
+            "/api/auth/reset-request", {"email": f"{uuid4()}@example.invalid"}
+        )
+        assert eligible == unknown == (200, {"data": {"acknowledged": True}})
+    finally:
+        with _database() as connection:
+            connection.execute(restore)
+
+    with _database() as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM public.verification WHERE value=%s", (owner.user,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM public.delivery_jobs WHERE staff_id=%s",
+                (owner.staff,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def test_recovery_request_source_limit_does_not_reveal_registered_owner(owner):
     unknown = f"missing-{uuid4()}@example.invalid"
     limit = _load_policy().recovery_max_attempts
