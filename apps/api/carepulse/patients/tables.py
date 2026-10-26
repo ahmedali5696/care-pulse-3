@@ -60,9 +60,11 @@ patients = Table(
     CheckConstraint(
         "array_ndims(name_parts) = 1 AND cardinality(name_parts) IN (3, 4) "
         "AND array_position(name_parts, NULL) IS NULL "
-        "AND btrim(name_parts[1]) <> '' AND btrim(name_parts[2]) <> '' "
-        "AND btrim(name_parts[3]) <> '' "
-        "AND (cardinality(name_parts) = 3 OR btrim(name_parts[4]) <> '')",
+        "AND name_parts[1] ~ '[^[:space:]]' "
+        "AND name_parts[2] ~ '[^[:space:]]' "
+        "AND name_parts[3] ~ '[^[:space:]]' "
+        "AND (cardinality(name_parts) = 3 "
+        "OR name_parts[4] ~ '[^[:space:]]')",
         name="patients_name_parts_valid",
     ),
     CheckConstraint(

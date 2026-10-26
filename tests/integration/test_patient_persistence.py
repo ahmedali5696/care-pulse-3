@@ -54,7 +54,7 @@ def _create(connection, tenant, *, phone=None, name=None, dob=None):
 
 
 def test_patient_rls_clinic_scope_and_privilege_denials(patient_storage, role_engine):
-    runtime, _, tenant_a, tenant_b = patient_storage
+    runtime, migration, tenant_a, tenant_b = patient_storage
     with transaction(runtime, tenant_a) as connection:
         a = _create(connection, tenant_a, phone="01012345678")
     with transaction(runtime, tenant_b) as connection:
@@ -64,6 +64,13 @@ def test_patient_rls_clinic_scope_and_privilege_denials(patient_storage, role_en
     with transaction(runtime, tenant_a) as connection:
         assert connection.scalars(
             text("SELECT id FROM public.patients ORDER BY id")
+        ).all() == [a]
+        assert connection.scalars(
+            text("""
+                SELECT id FROM public.patients
+                WHERE name_parts = ARRAY['Synthetic','Family','Patient']
+                ORDER BY id LIMIT 10
+            """)
         ).all() == [a]
         assert (
             connection.execute(
@@ -84,6 +91,11 @@ def test_patient_rls_clinic_scope_and_privilege_denials(patient_storage, role_en
             _create(connection, tenant_a)
         assert denied.value.orig.sqlstate == "42501"
 
+    with migration.begin() as connection:
+        with pytest.raises(DBAPIError) as invalid_fk, connection.begin_nested():
+            _create(connection, uuid4())
+        assert invalid_fk.value.orig.sqlstate == "23503"
+
     operator = role_engine("carepulse_operator")
     try:
         with pytest.raises(DBAPIError) as denied, operator.connect() as connection:
@@ -94,10 +106,42 @@ def test_patient_rls_clinic_scope_and_privilege_denials(patient_storage, role_en
 
 
 @pytest.mark.parametrize(
+    ("archived", "demographic_revision", "lifecycle_revision"),
+    [(True, 0, 0), (False, 1, 0), (False, 0, 1)],
+)
+def test_patient_insert_cannot_forge_initial_archive_or_revisions(
+    patient_storage, archived, demographic_revision, lifecycle_revision
+):
+    runtime, _, tenant, _ = patient_storage
+    with transaction(runtime, tenant) as connection:
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(
+                text("""
+                    INSERT INTO public.patients (
+                        id, organization_id, name_parts, date_of_birth,
+                        archived, archived_at, demographic_revision, lifecycle_revision)
+                    VALUES (:id, :tenant, ARRAY['Synthetic','Initial','State'],
+                            DATE '2000-01-01', :archived,
+                            CASE WHEN :archived THEN clock_timestamp() ELSE NULL END,
+                            :demographic_revision, :lifecycle_revision)
+                """),
+                {
+                    "id": uuid4(),
+                    "tenant": tenant,
+                    "archived": archived,
+                    "demographic_revision": demographic_revision,
+                    "lifecycle_revision": lifecycle_revision,
+                },
+            )
+        assert denied.value.orig.sqlstate == "23514"
+
+
+@pytest.mark.parametrize(
     "field, value",
     [
         ("name_parts", ["Two", "Parts"]),
         ("name_parts", ["Valid", " ", "Name"]),
+        ("name_parts", ["Valid", "\t", "Name"]),
         ("name_parts", ["Valid", None, "Name"]),
         ("name_parts", ["One", "Two", "Three", "Four", "Five"]),
         ("date_of_birth", date(2999, 1, 1)),
@@ -225,6 +269,58 @@ def test_optional_unparseable_phone_and_declared_age_are_persisted(patient_stora
         assert invalid.value.orig.sqlstate == "23514"
 
 
+def test_preliminary_intake_fields_are_independent_and_identity_immutable(
+    patient_storage,
+):
+    runtime, migration, tenant, other_tenant = patient_storage
+    intake_fields = (
+        "preliminary_medical_history",
+        "chronic_illnesses",
+        "drug_allergies",
+        "food_allergies",
+        "prior_examination_notes",
+        "preliminary_test_information",
+    )
+    with transaction(runtime, tenant) as connection:
+        patient_id = _create(connection, tenant)
+        connection.execute(
+            text("""
+                UPDATE public.patients SET
+                    preliminary_medical_history = 'intake-history',
+                    chronic_illnesses = 'intake-chronic',
+                    drug_allergies = 'intake-drug',
+                    food_allergies = 'intake-food',
+                    prior_examination_notes = 'intake-notes',
+                    preliminary_test_information = 'intake-tests',
+                    demographic_revision = demographic_revision + 1
+                WHERE organization_id = :tenant AND id = :id
+            """),
+            {"tenant": tenant, "id": patient_id},
+        )
+        row = connection.execute(
+            text(
+                f"SELECT {', '.join(intake_fields)} FROM public.patients WHERE id = :id"
+            ),
+            {"id": patient_id},
+        ).one()
+        assert row == tuple(
+            f"intake-{suffix}"
+            for suffix in ("history", "chronic", "drug", "food", "notes", "tests")
+        )
+
+    with migration.begin() as connection:
+        for change, params in (
+            ("id = :changed_id", {"changed_id": uuid4()}),
+            ("organization_id = :changed_tenant", {"changed_tenant": other_tenant}),
+        ):
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(
+                    text(f"UPDATE public.patients SET {change} WHERE id = :id"),
+                    {"id": patient_id, **params},
+                )
+            assert denied.value.orig.sqlstate == "23514"
+
+
 def test_archive_revision_immutability_and_existing_id_continuation(patient_storage):
     runtime, migration, tenant, _ = patient_storage
     with transaction(runtime, tenant) as connection:
@@ -281,7 +377,58 @@ def test_archive_revision_immutability_and_existing_id_continuation(patient_stor
         assert denied.value.orig.sqlstate == "23514"
 
 
-def test_concurrent_archive_fences_new_id_guard(patient_storage):
+def test_archive_preserves_existing_record_reference(patient_storage):
+    runtime, migration, tenant, _ = patient_storage
+    with transaction(runtime, tenant) as connection:
+        patient_id = _create(connection, tenant)
+    with migration.connect() as marker:
+        with marker.begin():
+            marker.execute(
+                text("""
+                CREATE TEMP TABLE synthetic_d03_record (
+                    organization_id uuid NOT NULL,
+                    patient_id uuid NOT NULL,
+                    FOREIGN KEY (organization_id, patient_id)
+                        REFERENCES public.patients(organization_id, id)
+                ) ON COMMIT PRESERVE ROWS
+            """)
+            )
+            marker.execute(
+                text("""
+                    INSERT INTO synthetic_d03_record VALUES (:tenant, :patient)
+                """),
+                {"tenant": tenant, "patient": patient_id},
+            )
+        with transaction(runtime, tenant) as connection:
+            connection.execute(
+                text("""
+                    UPDATE public.patients
+                    SET archived = true, lifecycle_revision = lifecycle_revision + 1
+                    WHERE organization_id = :tenant AND id = :patient
+                """),
+                {"tenant": tenant, "patient": patient_id},
+            )
+        with transaction(runtime, tenant) as connection:
+            assert lock_patient_for_existing_appointment(
+                connection, tenant, patient_id
+            ).archived
+        assert (
+            marker.scalar(
+                text("""
+                SELECT count(*) FROM synthetic_d03_record
+                WHERE organization_id = :tenant AND patient_id = :patient
+            """),
+                {"tenant": tenant, "patient": patient_id},
+            )
+            == 1
+        )
+        marker.rollback()
+
+
+@pytest.mark.parametrize("operation", ["new_id", "demographic_edit"])
+def test_concurrent_archive_serializes_new_id_guard_or_demographic_edit(
+    patient_storage, operation
+):
     runtime, migration, tenant, _ = patient_storage
     with transaction(runtime, tenant) as connection:
         patient_id = _create(connection, tenant)
@@ -294,7 +441,19 @@ def test_concurrent_archive_fences_new_id_guard(patient_storage):
             connection.execute(text("SET LOCAL lock_timeout = '5s'"))
             waiter_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             started.set()
-            return lock_patient_for_new_appointment(connection, tenant, patient_id)
+            if operation == "new_id":
+                return lock_patient_for_new_appointment(connection, tenant, patient_id)
+            lifecycle = lock_patient_lifecycle(connection, tenant, patient_id)
+            connection.execute(
+                text("""
+                    UPDATE public.patients
+                    SET phone_raw = 'new contact',
+                        demographic_revision = demographic_revision + 1
+                    WHERE organization_id = :tenant AND id = :id
+                """),
+                {"tenant": tenant, "id": patient_id},
+            )
+            return lifecycle
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         with transaction(runtime, tenant) as archiver:
@@ -321,6 +480,25 @@ def test_concurrent_archive_fences_new_id_guard(patient_storage):
                 """),
                 {"id": patient_id},
             )
-        with pytest.raises(ContractError) as blocked_guard:
-            waiting.result(timeout=8)
-        assert blocked_guard.value.status_code == 409
+        if operation == "new_id":
+            with pytest.raises(ContractError) as blocked_guard:
+                waiting.result(timeout=8)
+            assert blocked_guard.value.status_code == 409
+        else:
+            updated = waiting.result(timeout=8)
+            assert (updated.archived, updated.revision) == (True, 1)
+        with transaction(runtime, tenant) as connection:
+            row = connection.execute(
+                text("""
+                    SELECT archived, lifecycle_revision, demographic_revision, phone_raw
+                    FROM public.patients WHERE organization_id = :tenant AND id = :id
+                """),
+                {"tenant": tenant, "id": patient_id},
+            ).one()
+            assert row.archived and row.lifecycle_revision == 1
+            assert row.demographic_revision == (
+                1 if operation == "demographic_edit" else 0
+            )
+            assert row.phone_raw == (
+                "new contact" if operation == "demographic_edit" else None
+            )
