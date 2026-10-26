@@ -71,6 +71,7 @@ export async function requestRecoveryIssuance(
 export async function persistRecoveryIntent({ token, user }: {
   token: string; user: { id: string; email: string };
 }): Promise<void> {
+  let stage = "binding";
   try {
     const current = issuance.getStore();
     if (!current || current.user !== user.id || current.email !== user.email || current.issued) {
@@ -79,6 +80,7 @@ export async function persistRecoveryIntent({ token, user }: {
     const client = scopedAuthClient(current.pool, current.tenant);
     if (!client) throw new Error("Recovery callback lost transaction");
     const identifier = createHash("sha256").update(`reset-password:${token}`).digest("base64url");
+    stage = "verification";
     const found = await client.query<{ id: string; expires: Date }>(`
       SELECT v.id, v."expiresAt" AS expires
         FROM public.verification v
@@ -99,18 +101,22 @@ export async function persistRecoveryIntent({ token, user }: {
       tenant_id: current.tenant, committed_recipient: current.email,
       expiry_epoch_ms: String(verifier.expires.getTime()),
     };
+    stage = "encrypt";
     const material = encryptDeliveryToken(token, context, current.keyId, current.publicKey);
+    stage = "job";
     await client.query(`
       INSERT INTO public.delivery_jobs
         (id, organization_id, staff_id, verification_id, proof_reference,
          purpose, recipient, template, logical_key, proof_expires_at)
       VALUES ($1, $2, $3, $4, $5, 'PASSWORD_RESET', $6, 'PASSWORD_RESET', $1::text, $7)
     `, [job, current.tenant, current.staff, verifier.id, proofDigest, current.email, verifier.expires]);
+    stage = "material";
     await client.query(`
       INSERT INTO public.protected_delivery_material
         (job_id, format_version, delivery_key_id, ciphertext_base64url)
       VALUES ($1, 1, $2, $3)
     `, [job, material.key_id, material.ciphertext_base64url]);
+    stage = "audit";
     await client.query(`
       INSERT INTO public.sensitive_audit
         (id, organization_id, actor_role, action, after_state, correlation_id)
@@ -119,6 +125,11 @@ export async function persistRecoveryIntent({ token, user }: {
     `, [randomUUID(), current.tenant, current.staff, verifier.id, job]);
     current.issued = true;
   } catch (error) {
+    if (process.env.CP_ENV === "test" && process.env.CP_SYNTHETIC_TEST_PROFILE === "true") {
+      const code = error && typeof error === "object" && "code" in error &&
+        typeof error.code === "string" && /^[A-Z0-9]{5}$/.test(error.code) ? error.code : "none";
+      console.error("B04_SYNTHETIC_ISSUE", stage, code);
+    }
     failAuthIssuance(error);
     throw error;
   }
@@ -150,7 +161,14 @@ export async function requestOwnerRecovery(request: Request): Promise<Response> 
       : null;
     const outcome = await requestRecoveryIssuance(email, source, tenant);
     return outcome === "RATE_LIMITED" ? failure(429) : json({ acknowledged: true });
-  } catch { return failure(503); }
+  } catch (error) {
+    if (process.env.CP_ENV === "test" && process.env.CP_SYNTHETIC_TEST_PROFILE === "true") {
+      const code = error && typeof error === "object" && "code" in error &&
+        typeof error.code === "string" && /^[A-Z0-9]{5}$/.test(error.code) ? error.code : "none";
+      console.error("B04_SYNTHETIC_ISSUE", "request", code);
+    }
+    return failure(503);
+  }
 }
 
 type RecoveryIdentity = {

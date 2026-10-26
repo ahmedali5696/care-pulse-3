@@ -533,14 +533,17 @@ docker compose --profile sender run --rm --no-deps -T --entrypoint python \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   sender -m pytest -q -ra --tb=short -p no:cacheprovider \
   tests/integration/test_delivery_sender.py -k 'not missing_mailpit'
-docker compose --profile sender run --rm --no-deps -T --entrypoint python \
+if ! docker compose --profile sender run --rm --no-deps -T --entrypoint python \
   -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" -e COMPOSE_PROJECT_NAME="$CP_CI_PROJECT" \
   -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$PWD/tests:/srv/tests:ro" \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_DB_PASSWORD_FILE:/run/secrets/postgres_password:ro" \
   sender -m pytest -q -ra --tb=short -p no:cacheprovider \
-  tests/integration/test_recovery.py
+  tests/integration/test_recovery.py; then
+  docker compose logs --no-color web 2>&1 | grep -aE 'B04_SYNTHETIC_ISSUE' || true
+  exit 1
+fi
 # The operator's identity is issued only in the disposable CI DB; the one-shot
 # CLI authenticates with its own secret file, then a separate sender delivers.
 docker compose --profile test run --rm --no-deps -T \
