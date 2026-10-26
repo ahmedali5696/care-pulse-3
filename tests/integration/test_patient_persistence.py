@@ -381,24 +381,24 @@ def test_archive_preserves_existing_record_reference(patient_storage):
     runtime, migration, tenant, _ = patient_storage
     with transaction(runtime, tenant) as connection:
         patient_id = _create(connection, tenant)
-    with migration.connect() as marker:
-        with marker.begin():
-            marker.execute(
-                text("""
-                CREATE TEMP TABLE synthetic_d03_record (
+    with migration.begin() as marker:
+        marker.execute(
+            text("""
+                CREATE TABLE public.synthetic_d03_record (
                     organization_id uuid NOT NULL,
                     patient_id uuid NOT NULL,
                     FOREIGN KEY (organization_id, patient_id)
                         REFERENCES public.patients(organization_id, id)
-                ) ON COMMIT PRESERVE ROWS
+                )
             """)
-            )
-            marker.execute(
-                text("""
-                    INSERT INTO synthetic_d03_record VALUES (:tenant, :patient)
-                """),
-                {"tenant": tenant, "patient": patient_id},
-            )
+        )
+        marker.execute(
+            text("""
+                INSERT INTO public.synthetic_d03_record VALUES (:tenant, :patient)
+            """),
+            {"tenant": tenant, "patient": patient_id},
+        )
+    try:
         with transaction(runtime, tenant) as connection:
             connection.execute(
                 text("""
@@ -412,17 +412,20 @@ def test_archive_preserves_existing_record_reference(patient_storage):
             assert lock_patient_for_existing_appointment(
                 connection, tenant, patient_id
             ).archived
-        assert (
-            marker.scalar(
-                text("""
-                SELECT count(*) FROM synthetic_d03_record
+        with migration.connect() as marker:
+            assert (
+                marker.scalar(
+                    text("""
+                SELECT count(*) FROM public.synthetic_d03_record
                 WHERE organization_id = :tenant AND patient_id = :patient
             """),
-                {"tenant": tenant, "patient": patient_id},
+                    {"tenant": tenant, "patient": patient_id},
+                )
+                == 1
             )
-            == 1
-        )
-        marker.rollback()
+    finally:
+        with migration.begin() as marker:
+            marker.execute(text("DROP TABLE public.synthetic_d03_record"))
 
 
 @pytest.mark.parametrize("operation", ["new_id", "demographic_edit"])
