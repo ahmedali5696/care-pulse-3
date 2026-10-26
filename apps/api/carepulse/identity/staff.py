@@ -172,10 +172,15 @@ def create_receptionist(
             SELECT u.id FROM public."user" u
              WHERE u.id = :user AND u.email = :email AND u.name = :name
                AND NOT u."emailVerified"
-               AND NOT EXISTS (SELECT 1 FROM public.account a WHERE a."userId" = u.id)
+               AND public.native_account_unbound_for_receptionist(:tenant, u.id)
                AND NOT EXISTS (SELECT 1 FROM public.staff_accounts s WHERE s.auth_user_id = u.id)
         """),
-        {"user": command.prepared_user_id, "email": address, "name": command.name},
+        {
+            "tenant": actor.organization_id,
+            "user": command.prepared_user_id,
+            "email": address,
+            "name": command.name,
+        },
     ).scalar_one_or_none()
     if prepared is None:
         raise ContractError(409)
@@ -513,14 +518,12 @@ def accept_receptionist(
         command.expected_security_revision, staff["security_revision"]
     )
     native = connection.scalar(
-        text("""
-        SELECT 1 FROM public."user" u JOIN public.account a ON a."userId" = u.id
-         WHERE u.id = :user AND u.email = :email AND u."emailVerified"
-           AND a."providerId" = 'credential' AND a.password IS NOT NULL
-    """),
-        {"user": command.prepared_user_id, "email": invitation["target_email"]},
+        text(
+            "SELECT public.native_receptionist_credential_ready(:tenant, :invitation)"
+        ),
+        {"tenant": clinic, "invitation": command.invitation_id},
     )
-    if native is None:
+    if not native:
         raise ContractError(403)
     connection.execute(
         text("""

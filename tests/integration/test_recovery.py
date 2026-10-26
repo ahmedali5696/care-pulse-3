@@ -27,6 +27,7 @@ from test_sessions import (
     _database,
     _login,
     _mutation_headers,
+    _password_hash,
     _request,
     _seed_owner,
 )
@@ -234,8 +235,11 @@ def test_issuance_write_failure_keeps_native_proof_and_delivery_atomic(
     owner, sender_lab, table
 ):
     with _reject_issuance_write_for(owner.clinic, table):
-        status, response = _post("/api/auth/reset-request", {"email": owner.email})
-        assert status == 503 and response["error"]["code"] == "UNAVAILABLE"
+        eligible = _post("/api/auth/reset-request", {"email": owner.email})
+        unknown = _post(
+            "/api/auth/reset-request", {"email": f"{uuid4()}@example.invalid"}
+        )
+        assert eligible == unknown == (200, {"data": {"acknowledged": True}})
     with _database() as connection:
         verification_count = connection.execute(
             "SELECT count(*) FROM public.verification WHERE value=%s",
@@ -287,6 +291,94 @@ def test_recovery_request_source_limit_does_not_reveal_registered_owner(owner):
             ).fetchone()[0]
             == 0
         )
+
+
+@pytest.mark.parametrize(
+    "path", ["/api/auth/reset-request", "/api/auth/reset-complete"]
+)
+@pytest.mark.parametrize("invalid_header", ["origin", "xhr", "fetch_site"])
+def test_recovery_mutations_reject_foreign_origin_or_missing_csrf(
+    owner, path, invalid_header
+):
+    headers = _mutation_headers()
+    if invalid_header == "origin":
+        headers["Origin"] = "https://attacker.example.invalid"
+    elif invalid_header == "xhr":
+        headers.pop("X-Requested-With")
+    else:
+        headers["Sec-Fetch-Site"] = "cross-site"
+    payload = (
+        {"email": owner.email}
+        if path.endswith("reset-request")
+        else {"token": "A" * 24, "newPassword": "Synthetic-CSRF-Only!"}
+    )
+    status, _, response = _request(
+        path, method="POST", payload=payload, headers=headers
+    )
+    assert status == 403
+    assert json.loads(response)["error"]["code"] == "FORBIDDEN"
+    with _database() as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM public.verification WHERE value=%s",
+                (owner.user,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_recovery_ineligible_verified_native_user_gets_unknown_ack(owner):
+    other = f"synthetic-nonowner-{uuid4()}"
+    address = f"{uuid4()}@example.invalid"
+    with _database() as connection:
+        connection.execute(
+            'INSERT INTO public."user" (id, name, email, "emailVerified", "createdAt", "updatedAt") '
+            "VALUES (%s, %s, %s, true, clock_timestamp(), clock_timestamp())",
+            (other, "Synthetic non-owner", address),
+        )
+        connection.execute(
+            'INSERT INTO public."account" '
+            '(id, "accountId", "providerId", "userId", password, "createdAt", "updatedAt") '
+            "VALUES (%s, %s, 'credential', %s, %s, clock_timestamp(), clock_timestamp())",
+            (
+                f"synthetic-nonowner-account-{uuid4()}",
+                other,
+                other,
+                _password_hash(f"Synthetic-Nonowner-{uuid4()}!"),
+            ),
+        )
+    expected = (200, {"data": {"acknowledged": True}})
+    assert _post("/api/auth/reset-request", {"email": address}) == expected
+    assert (
+        _post("/api/auth/reset-request", {"email": f"{uuid4()}@example.invalid"})
+        == expected
+    )
+    with _database() as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM public.verification WHERE value=%s", (other,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM public.delivery_jobs WHERE recipient=%s",
+                (address,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_invalid_password_denies_before_proof_reservation(owner, sender_lab):
+    token = _issue(owner, sender_lab)
+    before = _native(owner)
+    assert _complete(token, "short")[0] == 422
+    assert _operation(owner, token) is None
+    assert _native(owner) == before
+    assert _complete(token, f"Synthetic-Valid-{uuid4()}!") == (
+        200,
+        {"data": {"success": True}},
+    )
 
 
 def test_same_proof_distinguishes_exact_unicode_password_bytes(owner, sender_lab):
@@ -466,6 +558,44 @@ def test_lost_finalization_ack_retries_consumed_proof_without_rechanging_passwor
     assert _operation(owner, token)["successes"] == 1
 
 
+def test_committed_auth_done_can_finalize_after_proof_expiry(owner, sender_lab):
+    token = _issue(owner, sender_lab)
+    password = f"Synthetic-Expired-Finalizer-{uuid4()}!"
+    with _reject_commit_for(owner.clinic, "sensitive_audit"):
+        assert _complete(token, password)[0] == 503
+    before = _operation(owner, token)
+    assert before["state"] == "AUTH_DONE" and before["completions"] == 1
+    saved_native = _native(owner)
+
+    # The native effect already committed; only the finalization deadline is
+    # moved into the past in this disposable migration-owned fixture.
+    with _database() as connection:
+        connection.execute(
+            "ALTER TABLE public.recovery_operations DISABLE TRIGGER recovery_operations_mutation_guard"
+        )
+        try:
+            connection.execute(
+                """UPDATE public.recovery_operations
+                     SET proof_expires_at = auth_done_at + interval '1 microsecond'
+                   WHERE id=%s AND state='AUTH_DONE' AND auth_done_at IS NOT NULL""",
+                (before["id"],),
+            )
+            connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
+        finally:
+            connection.execute(
+                "ALTER TABLE public.recovery_operations ENABLE TRIGGER recovery_operations_mutation_guard"
+            )
+
+    assert _complete(token, password) == (200, {"data": {"success": True}})
+    after = _operation(owner, token)
+    assert after["state"] == "FINALIZED" and after["successes"] == 1
+    assert after["completions"] == before["completions"] == 1
+    assert after["auth_fence"] == before["auth_fence"] == 1
+    assert after["security_revision"] == before["security_revision"] == 1
+    assert after["block"] is None and _native(owner) == saved_native
+    assert _complete(token, f"Synthetic-Other-{uuid4()}!")[0] == 409
+
+
 def test_expired_incomplete_attempt_transfers_owned_block_only_with_new_proof(
     owner, sender_lab
 ):
@@ -481,6 +611,8 @@ def test_expired_incomplete_attempt_transfers_owned_block_only_with_new_proof(
     assert _operation(owner, second) is None
     assert _native(owner)[0] == original_hash
     _expire_reserved_attempt(owner, first)
+    assert _complete("A" * 24, replacement_password)[0] == 409
+    assert _operation(owner, first)["state"] == "RESERVED"
     with _reject_commit_for(owner.clinic, "auth_recovery_completions"):
         assert _complete(second, replacement_password)[0] == 503
     after_transfer = _operation(owner, second)

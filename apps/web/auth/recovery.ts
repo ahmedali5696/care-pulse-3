@@ -39,7 +39,9 @@ export async function requestRecoveryIssuance(
   const pool = authDatabase(config);
   // Initialize Better Auth before leasing the recovery transaction connection.
   await getAuth().$context;
-  await withAuthTransaction(pool, tenant, async () => {
+  let eligibleIssuance = false;
+  try {
+    await withAuthTransaction(pool, tenant, async () => {
     const client = scopedAuthClient(pool, tenant);
     if (!client) throw new Error("Recovery requires owned transaction");
     const eligible = await client.query<{ staff: string; user: string; email: string }>(`
@@ -55,6 +57,7 @@ export async function requestRecoveryIssuance(
                         AND a.password IS NOT NULL)
     `, [email]);
     if (eligible.rows.length !== 1) return;
+    eligibleIssuance = true;
     const owner = eligible.rows[0];
     const context: Issuance = {
       tenant, staff: owner.staff, user: owner.user, email: owner.email,
@@ -64,7 +67,15 @@ export async function requestRecoveryIssuance(
       body: { email: owner.email },
     }));
     if (!context.issued) throw new Error("Native recovery proof was not committed");
-  });
+    });
+  } catch (error) {
+    if (!eligibleIssuance) throw error;
+    // Eligible issuance failures have the same public response as an unknown
+    // address. Transaction failures retain their ordinary rollback semantics.
+    const code = error && typeof error === "object" && "code" in error &&
+      typeof error.code === "string" && /^[A-Z0-9]{5}$/.test(error.code) ? error.code : "none";
+    console.error("B04_RECOVERY_ISSUANCE_FAILED", code);
+  }
   return "ACKNOWLEDGED";
 }
 

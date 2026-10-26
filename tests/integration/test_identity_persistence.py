@@ -198,6 +198,38 @@ def test_native_models_and_server_session_columns_are_persisted(identity, role_e
         operator.dispose()
 
 
+def test_runtime_cannot_read_native_account_secrets(identity, role_engine):
+    _, _, tenant, _, _, _ = identity
+    runtime = role_engine("carepulse_runtime")
+    auth = role_engine("carepulse_auth")
+    try:
+        for column in ("password", '"accessToken"', '"refreshToken"', '"idToken"', "*"):
+            with (
+                pytest.raises(DBAPIError) as denied,
+                transaction(runtime, tenant) as connection,
+            ):
+                connection.execute(text(f'SELECT {column} FROM public."account"'))
+            assert denied.value.orig.sqlstate == "42501"
+        with transaction(auth) as connection:
+            connection.execute(text('SELECT password FROM public."account" LIMIT 1'))
+        with transaction(runtime, tenant) as connection:
+            assert not connection.scalar(
+                text(
+                    "SELECT public.native_account_unbound_for_receptionist(:tenant, :user)"
+                ),
+                {"tenant": tenant, "user": "synthetic-nonexistent"},
+            )
+            assert not connection.scalar(
+                text(
+                    "SELECT public.native_receptionist_credential_ready(:tenant, :invite)"
+                ),
+                {"tenant": tenant, "invite": uuid4()},
+            )
+    finally:
+        runtime.dispose()
+        auth.dispose()
+
+
 def test_native_session_captured_authority_is_immutable_but_activity_advances(identity):
     migration, _, _, native_user, _, _ = identity
     session_id = f"synthetic-{uuid4()}"

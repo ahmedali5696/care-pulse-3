@@ -18,7 +18,7 @@ from carepulse.provisioning.operators import authenticate_operator
 from carepulse.provisioning.service import change_clinic_state
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from test_recovery import _reject_commit_for
+from test_recovery import _native, _operation, _reject_commit_for
 from test_sessions import _database, _login, _mutation_headers, _request, _seed_owner
 
 operator_identity = test_provisioning.operator_identity
@@ -33,7 +33,7 @@ def recovery_owner(disposable_ci):
         return _seed_owner(connection)
 
 
-def _issued_proof(owner):
+def _issued_proof(owner, lifetime_seconds=900):
     """Persist native proof and a sealed job; issuance itself is tested in T056."""
     token = secrets.token_urlsafe(18)
     digest = sha256(token.encode()).hexdigest()
@@ -49,7 +49,8 @@ def _issued_proof(owner):
     )
     with _database() as connection:
         expiry = connection.execute(
-            "SELECT clock_timestamp() + interval '15 minutes'"
+            "SELECT clock_timestamp() + (%s * interval '1 second')",
+            (lifetime_seconds,),
         ).fetchone()[0]
         context = {
             "job_id": str(job),
@@ -150,6 +151,80 @@ def _wait_for_native_session_delete(connection):
             return
         sleep(0.02)
     pytest.fail("Native recovery never reached the session deletion lock")
+
+
+def test_expiry_inside_native_transaction_rolls_back_every_auth_effect(recovery_owner):
+    owner = recovery_owner
+    stale_cookie = _login(owner)
+    token, digest = _issued_proof(owner, lifetime_seconds=4)
+    with _database() as connection:
+        password_before = connection.execute(
+            'SELECT password FROM public."account" WHERE "userId"=%s',
+            (owner.user,),
+        ).fetchone()[0]
+        expires_at = connection.execute(
+            'SELECT "expiresAt" FROM public.verification WHERE value=%s AND '
+            "identifier = %s",
+            (
+                owner.user,
+                base64.urlsafe_b64encode(
+                    sha256(f"reset-password:{token}".encode()).digest()
+                )
+                .decode()
+                .rstrip("="),
+            ),
+        ).fetchone()[0]
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with _database() as blocker:
+            blocker.execute('LOCK TABLE public."session" IN SHARE MODE')
+            pending = executor.submit(
+                _reset, token, f"Synthetic-Expired-During-Auth-{uuid4()}!"
+            )
+            try:
+                _wait_for_native_session_delete(blocker)
+                assert (
+                    blocker.execute("SELECT clock_timestamp()").fetchone()[0]
+                    < expires_at
+                )
+                # The PostgreSQL lock is the synchronization point; this wait
+                # only reaches the actual proof deadline before releasing it.
+                blocker.execute(
+                    "SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM (%s::timestamptz - clock_timestamp()))))",
+                    (expires_at,),
+                )
+            finally:
+                blocker.commit()
+        assert pending.result(timeout=10)[0] == 503
+
+    with _database() as connection:
+        native = connection.execute(
+            'SELECT password, (SELECT count(*) FROM public."session" WHERE "userId"=%s) '
+            'FROM public."account" WHERE "userId"=%s',
+            (owner.user, owner.user),
+        ).fetchone()
+        operation = connection.execute(
+            """SELECT r.id, r.state, r.auth_fence, s.security_revision,
+                      s.reset_block_operation_id,
+                      (SELECT count(*) FROM public.auth_recovery_completions c WHERE c.id=r.id),
+                      (SELECT count(*) FROM public.sensitive_audit a
+                        WHERE a.recovery_operation_id=r.id AND a.action='PASSWORD_RESET_SUCCEEDED')
+                 FROM public.recovery_operations r
+                 JOIN public.staff_accounts s ON s.id=r.staff_id
+                WHERE r.proof_digest=%s""",
+            (digest,),
+        ).fetchone()
+        assert (
+            connection.execute(
+                'SELECT count(*) FROM public.verification WHERE value=%s AND "expiresAt"<=clock_timestamp()',
+                (owner.user,),
+            ).fetchone()[0]
+            == 1
+        )
+    assert native == (password_before, 1)
+    assert operation[1:4] == ("RESERVED", 0, 1)
+    assert operation[4] == operation[0] and operation[5:] == (0, 0)
+    assert _request("/api/session", cookie=stale_cookie)[0] == 401
 
 
 @pytest.mark.parametrize("same_password", [True, False], ids=["matching", "competing"])
@@ -478,3 +553,108 @@ def test_duplicate_auth_done_finalizers_keep_one_success_and_revision(recovery_o
             (before[0],),
         ).fetchone()
     assert after == ("FINALIZED", 1, 1, None, 1, 1)
+
+
+@pytest.mark.parametrize("first_winner", ["operator", "replacement"])
+def test_replacement_competes_with_suspension_and_stale_finalizer(
+    recovery_owner, request, first_winner
+):
+    owner = recovery_owner
+    _, operator_engine, actor, secret = request.getfixturevalue("operator_identity")
+    verified = authenticate_operator(operator_engine, actor, secret, _load_policy())
+    proof_a, _ = _issued_proof(owner)
+    password_a = f"Synthetic-Revoked-A-{uuid4()}!"
+    with _reject_commit_for(owner.clinic, "sensitive_audit"):
+        assert _reset(proof_a, password_a)[0] == 503
+    before = _operation(owner, proof_a)
+    assert before["state"] == "AUTH_DONE" and before["completions"] == 1
+    with _database() as connection:
+        lifecycle = connection.execute(
+            "SELECT lifecycle_revision FROM public.organizations WHERE id=%s",
+            (owner.clinic,),
+        ).fetchone()[0]
+    assert (
+        change_clinic_state(
+            operator_engine,
+            verified,
+            owner.clinic,
+            lifecycle,
+            "SUSPENDED",
+            "Invalidate A's native completion",
+        )["state"]
+        == "SUSPENDED"
+    )
+    assert (
+        change_clinic_state(
+            operator_engine,
+            verified,
+            owner.clinic,
+            lifecycle + 1,
+            "ACTIVE",
+            "Allow a fresh verified recovery proof",
+        )["state"]
+        == "ACTIVE"
+    )
+    proof_b, _ = _issued_proof(owner)
+    password_b = f"Synthetic-Replacement-B-{uuid4()}!"
+    completed_a_hash = _native(owner)[0]
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        with _database() as blocker:
+            if first_winner == "operator":
+                blocker.execute(
+                    "SELECT id FROM public.organizations WHERE id=%s FOR UPDATE",
+                    (owner.clinic,),
+                )
+                suspension = executor.submit(
+                    change_clinic_state,
+                    operator_engine,
+                    verified,
+                    owner.clinic,
+                    lifecycle + 2,
+                    "SUSPENDED",
+                    "Operator wins new proof transfer",
+                )
+                _wait_for_organization_waiters(
+                    blocker, 1, "carepulse_operator", "operator_change_clinic_state"
+                )
+                replacement = executor.submit(_reset, proof_b, password_b)
+                stale_a = executor.submit(_reset, proof_a, password_a)
+                _wait_for_organization_waiters(blocker, 2)
+            else:
+                blocker.execute('LOCK TABLE public."session" IN SHARE MODE')
+                replacement = executor.submit(_reset, proof_b, password_b)
+                _wait_for_native_session_delete(blocker)
+                suspension = executor.submit(
+                    change_clinic_state,
+                    operator_engine,
+                    verified,
+                    owner.clinic,
+                    lifecycle + 2,
+                    "SUSPENDED",
+                    "Revoke after B native fence",
+                )
+                stale_a = executor.submit(_reset, proof_a, password_a)
+                _wait_for_organization_waiters(
+                    blocker, 1, "carepulse_operator", "operator_change_clinic_state"
+                )
+                _wait_for_organization_waiters(blocker, 1)
+            blocker.commit()
+        assert suspension.result(timeout=25)["state"] == "SUSPENDED"
+        assert replacement.result(timeout=25)[0] != 200
+        assert stale_a.result(timeout=25)[0] != 200
+
+    previous, current = _operation(owner, proof_a), _operation(owner, proof_b)
+    assert previous["completions"] == 1 and previous["successes"] == 0
+    assert previous["invalidated"]
+    if first_winner == "operator":
+        assert current is None and previous["state"] == "AUTH_DONE"
+        assert previous["block"] == previous["id"]
+        assert _native(owner)[0] == completed_a_hash
+    else:
+        assert previous["state"] == "ABORTED"
+        assert current["state"] == "AUTH_DONE" and current["invalidated"]
+        assert current["completions"] == 1 and current["successes"] == 0
+        assert current["block"] == current["id"]
+        assert current["security_revision"] == before["security_revision"] + 1
+        assert _native(owner)[0] != completed_a_hash
