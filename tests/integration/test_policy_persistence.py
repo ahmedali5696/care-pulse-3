@@ -268,6 +268,17 @@ def test_policy_seed_role_function_and_trigger_are_privilege_isolated(policy_sto
             assert function.proconfig == ["search_path=pg_catalog"]
             assert function.runtime_execute is False
             assert function.operator_execute is False
+        assert (
+            connection.scalar(
+                text("""
+            SELECT has_function_privilege(
+                'carepulse_migration',
+                'public.seed_clinic_policy_defaults(uuid)', 'EXECUTE'
+            )
+        """)
+            )
+            is True
+        )
 
         assert connection.execute(
             text("""

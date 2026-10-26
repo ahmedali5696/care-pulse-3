@@ -360,10 +360,6 @@ def upgrade() -> None:
     ):
         op.execute(f"REVOKE ALL ON FUNCTION public.{function} FROM PUBLIC")
     op.execute("""
-        GRANT EXECUTE ON FUNCTION public.seed_clinic_policy_defaults(uuid)
-        TO carepulse_migration
-    """)
-    op.execute("""
         CREATE TRIGGER organizations_policy_defaults
         AFTER INSERT ON public.organizations
         FOR EACH ROW EXECUTE FUNCTION public.seed_policy_on_organization_insert()
@@ -380,6 +376,15 @@ def upgrade() -> None:
         OWNER TO carepulse_policy_seed
     """)
     op.execute("REVOKE CREATE ON SCHEMA public FROM carepulse_policy_seed")
+    # ALTER OWNER transfers the old owner's ACL entries to the new owner.
+    # Re-grant the backfill helper *as the new owner* under the explicitly
+    # authorized SET-role membership; the trigger function remains private.
+    op.execute("SET ROLE carepulse_policy_seed")
+    op.execute("""
+        GRANT EXECUTE ON FUNCTION public.seed_clinic_policy_defaults(uuid)
+        TO carepulse_migration
+    """)
+    op.execute("RESET ROLE")
     # Same transaction as trigger installation, and CREATE TRIGGER locks the
     # parent against concurrent inserts until commit.
     op.execute("""
