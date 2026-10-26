@@ -351,19 +351,9 @@ def upgrade() -> None:
             RETURN NEW;
         END $$
     """)
-    # A NOLOGIN role owns both SECURITY DEFINER entry points. Migration role
-    # can administer its own owned schema; CREATE is granted only for ownership
-    # transfer, then immediately revoked.
-    op.execute("GRANT USAGE, CREATE ON SCHEMA public TO carepulse_policy_seed")
-    op.execute("""
-        ALTER FUNCTION public.seed_clinic_policy_defaults(uuid)
-        OWNER TO carepulse_policy_seed
-    """)
-    op.execute("""
-        ALTER FUNCTION public.seed_policy_on_organization_insert()
-        OWNER TO carepulse_policy_seed
-    """)
-    op.execute("REVOKE CREATE ON SCHEMA public FROM carepulse_policy_seed")
+    # Revoke the implicit PUBLIC EXECUTE while the migration role still owns
+    # both functions. A later REVOKE under the non-inheriting seed membership
+    # does not necessarily remove the original owner's grants.
     for function in (
         "seed_clinic_policy_defaults(uuid)",
         "seed_policy_on_organization_insert()",
@@ -374,18 +364,22 @@ def upgrade() -> None:
         TO carepulse_migration
     """)
     op.execute("""
-        GRANT EXECUTE ON FUNCTION public.seed_policy_on_organization_insert()
-        TO carepulse_migration
-    """)
-    op.execute("""
         CREATE TRIGGER organizations_policy_defaults
         AFTER INSERT ON public.organizations
         FOR EACH ROW EXECUTE FUNCTION public.seed_policy_on_organization_insert()
     """)
+    # Migration owns the function at CREATE TRIGGER time; the final NOLOGIN
+    # owner is assigned before the same-transaction historical backfill.
+    op.execute("GRANT USAGE, CREATE ON SCHEMA public TO carepulse_policy_seed")
     op.execute("""
-        REVOKE EXECUTE ON FUNCTION public.seed_policy_on_organization_insert()
-        FROM carepulse_migration
+        ALTER FUNCTION public.seed_clinic_policy_defaults(uuid)
+        OWNER TO carepulse_policy_seed
     """)
+    op.execute("""
+        ALTER FUNCTION public.seed_policy_on_organization_insert()
+        OWNER TO carepulse_policy_seed
+    """)
+    op.execute("REVOKE CREATE ON SCHEMA public FROM carepulse_policy_seed")
     # Same transaction as trigger installation, and CREATE TRIGGER locks the
     # parent against concurrent inserts until commit.
     op.execute("""
