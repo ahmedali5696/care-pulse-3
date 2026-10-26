@@ -229,7 +229,8 @@ def test_denied_routes_preserve_current_persistence_boundary():
             ("operator_creation_pending",),
             ("operator_invitation_pending",),
             ("operator_action_pending",),
+            ("patients",),
         }
         assert connection.execute(
             "SELECT version_num FROM public.alembic_version"
-        ).fetchall() == [("0013_b04_native_secret_isolation",)]
+        ).fetchall() == [("0014_patients",)]
