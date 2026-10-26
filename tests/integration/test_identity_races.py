@@ -133,6 +133,25 @@ def _wait_for_organization_waiters(
     pytest.fail(f"Only {waiting} of {count} PostgreSQL clinic-lock waiters observed")
 
 
+def _wait_for_native_session_delete(connection):
+    deadline = monotonic() + 4
+    while monotonic() < deadline:
+        connection.execute("SELECT pg_stat_clear_snapshot()")
+        blocked = connection.execute(
+            """
+            SELECT count(*) FROM pg_locks l
+            JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE l.relation = 'public."session"'::regclass
+              AND l.mode = 'RowExclusiveLock' AND NOT l.granted
+              AND a.usename = 'carepulse_auth'
+            """
+        ).fetchone()[0]
+        if blocked == 1:
+            return
+        sleep(0.02)
+    pytest.fail("Native recovery never reached the session deletion lock")
+
+
 @pytest.mark.parametrize("same_password", [True, False], ids=["matching", "competing"])
 def test_parallel_recovery_proof_has_one_credential_effect_and_audit(
     recovery_owner, same_password
@@ -300,25 +319,7 @@ def test_operator_revocation_after_native_fence_blocks_stale_finalization(
             blocker.execute('LOCK TABLE public."session" IN SHARE MODE')
             reset = executor.submit(_reset, token, new_password)
             try:
-                deadline = monotonic() + 4
-                while monotonic() < deadline:
-                    blocker.execute("SELECT pg_stat_clear_snapshot()")
-                    blocked = blocker.execute(
-                        """
-                        SELECT count(*) FROM pg_locks l
-                        JOIN pg_stat_activity a ON a.pid = l.pid
-                        WHERE l.relation = 'public."session"'::regclass
-                          AND l.mode = 'RowExclusiveLock' AND NOT l.granted
-                          AND a.usename = 'carepulse_auth'
-                        """
-                    ).fetchone()[0]
-                    if blocked == 1:
-                        break
-                    sleep(0.02)
-                else:
-                    pytest.fail(
-                        "Native recovery never reached the session deletion lock"
-                    )
+                _wait_for_native_session_delete(blocker)
 
                 with _database() as observer:
                     operation = observer.execute(
@@ -368,6 +369,61 @@ def test_operator_revocation_after_native_fence_blocks_stale_finalization(
     assert durable == ("AUTH_DONE", True, 1, operation[0], 1, 0, 0)
     assert credential_after != credential_before
     assert _request("/api/session", cookie=stale_cookie)[0] == 401
+
+
+def test_two_distinct_proofs_cannot_replace_unresolved_native_reset(recovery_owner):
+    owner = recovery_owner
+    stale_cookie = _login(owner)
+    proof_a, digest_a = _issued_proof(owner)
+    proof_b, digest_b = _issued_proof(owner)
+    password_a = f"Synthetic-First-Proof-{uuid4()}!"
+    password_b = f"Synthetic-Second-Proof-{uuid4()}!"
+    with (
+        _reject_commit_for(owner.clinic, "sensitive_audit"),
+        ThreadPoolExecutor(max_workers=2) as executor,
+    ):
+        with _database() as blocker:
+            blocker.execute('LOCK TABLE public."session" IN SHARE MODE')
+            first = executor.submit(_reset, proof_a, password_a)
+            try:
+                _wait_for_native_session_delete(blocker)
+                second = executor.submit(_reset, proof_b, password_b)
+                _wait_for_organization_waiters(blocker, 1)
+            finally:
+                blocker.commit()
+        first_status, _ = first.result(timeout=25)
+        second_status, second_response = second.result(timeout=25)
+    assert first_status == 503
+    assert second_status == 409
+    assert second_response["error"]["code"] == "RESET_IN_PROGRESS"
+
+    with _database() as connection:
+        operations = connection.execute(
+            """SELECT r.proof_digest, r.id, r.state, r.auth_fence,
+                      (SELECT count(*) FROM public.auth_recovery_completions c WHERE c.id=r.id),
+                      (SELECT count(*) FROM public.sensitive_audit a
+                         WHERE a.recovery_operation_id=r.id
+                           AND a.action='PASSWORD_RESET_SUCCEEDED')
+                 FROM public.recovery_operations r WHERE r.organization_id=%s
+                   AND r.proof_digest IN (%s,%s)""",
+            (owner.clinic, digest_a, digest_b),
+        ).fetchall()
+        native_proof_b = connection.execute(
+            """SELECT count(*) FROM public."verification" v
+                 JOIN public.delivery_jobs j ON j.verification_id=v.id
+                WHERE j.organization_id=%s AND j.proof_reference=%s""",
+            (owner.clinic, digest_b),
+        ).fetchone()[0]
+        block, revision = connection.execute(
+            "SELECT reset_block_operation_id, security_revision "
+            "FROM public.staff_accounts WHERE id=%s",
+            (owner.staff,),
+        ).fetchone()
+    assert len(operations) == 1 and operations[0][0] == digest_a
+    assert operations[0][2:] == ("AUTH_DONE", 1, 1, 0)
+    assert native_proof_b == 1 and block == operations[0][1] and revision == 1
+    assert _request("/api/session", cookie=stale_cookie)[0] == 401
+    assert _reset(proof_a, password_a) == (200, {"data": {"success": True}})
 
 
 def test_duplicate_auth_done_finalizers_keep_one_success_and_revision(recovery_owner):

@@ -263,6 +263,9 @@ def test_issuance_write_failure_keeps_native_proof_and_delivery_atomic(
         material_count,
         issuance_audit_count,
     ) == (0, 0, 0, 0)
+    # Positive control: removing the injected guard restores the actual
+    # Better Auth -> encrypted material -> sender/Mailpit issuance journey.
+    assert _issue(owner, sender_lab)
 
 
 def test_recovery_request_source_limit_does_not_reveal_registered_owner(owner):
@@ -299,6 +302,43 @@ def test_same_proof_distinguishes_exact_unicode_password_bytes(owner, sender_lab
     assert pending["completions"] == pending["successes"] == 0
     assert _complete(token, composed) == (200, {"data": {"success": True}})
     assert _operation(owner, token)["successes"] == 1
+
+
+def test_missing_retained_fingerprint_version_keeps_reset_owned_block(
+    owner, sender_lab
+):
+    token = _issue(owner, sender_lab)
+    password = f"Synthetic-Unavailable-Key-{uuid4()}!"
+    with _reject_commit_for(owner.clinic, "auth_recovery_completions"):
+        assert _complete(token, password)[0] == 503
+    before = _operation(owner, token)
+    original_native = _native(owner)
+    assert before["state"] == "RESERVED" and before["block"] == before["id"]
+
+    # Synthetic migration fixture models a prior key version no longer mounted
+    # in Web. This mutation is impossible for normal runtime roles.
+    with _database() as connection:
+        connection.execute(
+            "ALTER TABLE public.recovery_operations DISABLE TRIGGER recovery_operations_mutation_guard"
+        )
+        try:
+            connection.execute(
+                """UPDATE public.recovery_operations
+                      SET fingerprint_key_version='retired-test-key-unavailable'
+                    WHERE id=%s AND state='RESERVED'""",
+                (before["id"],),
+            )
+            connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
+        finally:
+            connection.execute(
+                "ALTER TABLE public.recovery_operations ENABLE TRIGGER recovery_operations_mutation_guard"
+            )
+    assert _complete(token, password)[0] == 503
+    after = _operation(owner, token)
+    assert after["state"] == "RESERVED" and after["block"] == before["id"]
+    assert after["security_revision"] == before["security_revision"]
+    assert after["auth_fence"] == after["completions"] == after["successes"] == 0
+    assert _native(owner) == original_native
 
 
 def _expire_reserved_attempt(owner, token):
