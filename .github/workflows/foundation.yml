@@ -188,7 +188,7 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --filter @carepulse/web exec playwright install --with-deps chromium
 
-      - name: Disposable PostgreSQL RLS integration and scoped cleanup
+      - name: Disposable PostgreSQL, signed Patient API, invited-role acceptance and scoped cleanup
         shell: pwsh
         run: |
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }

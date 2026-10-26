@@ -5,3 +5,4 @@ line-length = 88
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["apps/api", "."]
+markers = ["b05_browser: real invited Owner/Receptionist B-05 acceptance through guarded BFF"]

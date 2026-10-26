@@ -68,7 +68,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'cd9495bea272f0f1ca03d3c2c9ef6ebc39b5c3271fd17ce97f12f0f6582b8cfd',
+    '.github/workflows/foundation.yml': 'de4aef0c758f3fac16913ed749f35df708fc61ccd7d229a47424cc1db2014ca6',
     'apps/api/Dockerfile': '27e2068b8295273a281200181850492133d3b9f0e7ddc5f95d65e0b38938ca14',
     'apps/web/Dockerfile': '933af52609f2a4eb638d048605ec555e2a3443cb25b3ba5d64d5a36ec585f02a',
 }
@@ -118,6 +118,8 @@ expected_paths = {
     '/v1/staff/receptionists/{staff_id}/revoke-invite',
     '/v1/staff/receptionists/invite-accept',
     '/v1/staff/recovery/reserve', '/v1/staff/recovery/finalize',
+    '/v1/patients', '/v1/patients/{patient_id}',
+    '/v1/patients/{patient_id}/archive', '/v1/patients/{patient_id}/unarchive',
 }
 assert set(app.openapi()['paths']) == expected_paths
 assert app.openapi_url is None and len(app.user_middleware) == 1
@@ -130,10 +132,15 @@ assert boundary.kwargs['routes'] == {
     ('POST', '/v1/staff/receptionists/invite-accept'): 'RECEPTIONIST_ACCEPT',
     ('POST', '/v1/staff/recovery/reserve'): 'OWNER_RECOVERY',
     ('POST', '/v1/staff/recovery/finalize'): 'OWNER_RECOVERY',
+    ('GET', '/v1/patients'): 'PATIENT_REGISTRY',
+    ('POST', '/v1/patients'): 'PATIENT_REGISTRY',
 }
 uuid = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
 assert {(method, pattern.pattern, purpose) for method, pattern, purpose in boundary.kwargs['route_patterns']} == {
     ('GET', f'/v1/staff/receptionists/{uuid}', 'STAFF_MANAGEMENT'),
+    ('GET', f'/v1/patients/{uuid}', 'PATIENT_REGISTRY'),
+    ('PATCH', f'/v1/patients/{uuid}', 'PATIENT_REGISTRY'),
+    ('POST', f'/v1/patients/{uuid}/(?:archive|unarchive)', 'PATIENT_REGISTRY'),
     ('POST', f'/v1/staff/receptionists/{uuid}/(?:enable|disable|invite|revoke-invite)', 'STAFF_MANAGEMENT'),
     ('PATCH', f'/v1/staff/receptionists/{uuid}/permissions', 'STAFF_MANAGEMENT'),
 }
@@ -174,6 +181,9 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             if ($env:CP_CI_PROJECT -notmatch '^carepulse-ci-[0-9]+-[0-9]+$' -or $env:COMPOSE_PROJECT_NAME -ne $env:CP_CI_PROJECT) {
                 throw 'Explicit matching disposable CI project required'
             }
+            foreach ($suite in @('tests/integration/test_patients.py', 'tests/integration/test_patient_races.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-05 verification: $suite" }
+            }
             # Linux CI retains the accepted Bash probes; PowerShell checks their exit immediately.
             $integration = @'
 set -euo pipefail
@@ -186,7 +196,7 @@ cleanup() {
   trap - EXIT
   if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" ]]; then
     if ! docker compose --profile mail --profile test --profile sender --profile operator down --remove-orphans --volumes; then code=1; fi
-    rm -f "$private"/{postgres-password,runtime-db-password,auth-db-password,migration-password,operator-password,operator-credential,sender-password,service-key,auth-secret,file-key,delivery-public.pem,delivery-private.pem,operator-id,invite-link,clinic-create.json,compose.json,roles.log,web-denial.log,worker-denial.log,denials.log,runtime-logs,canaries,old-worker-status.json,health-logs,auth-logs,mail-denial.log}
+    rm -f "$private"/{postgres-password,runtime-db-password,auth-db-password,migration-password,operator-password,operator-credential,sender-password,service-key,auth-secret,file-key,delivery-public.pem,delivery-private.pem,operator-id,invite-link,clinic-create.json,compose.json,roles.log,web-denial.log,worker-denial.log,denials.log,runtime-logs,canaries,old-worker-status.json,health-logs,auth-logs,mail-denial.log,b05-backend.log,b05-invited.log}
     rm -rf "$private/image-scan"
     rmdir "$private" || code=1
   else
@@ -251,6 +261,17 @@ docker compose --profile test run --rm --no-deps \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro" \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_patient_persistence.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py
+# B-05 backend proof has no BFF/invitation prerequisite and cannot silently skip.
+docker compose --profile test run --rm --no-deps \
+  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider -m 'not b05_browser' \
+  tests/integration/test_patients.py tests/integration/test_patient_races.py | tee "$private/b05-backend.log"
+if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b05-backend.log"; then
+  echo 'FAIL mandatory B-05 backend evidence skipped'; exit 1
+fi
 docker compose up -d --no-build db api worker web
 for attempt in $(seq 1 40); do
   if curl --silent --show-error --fail --max-time 2 http://127.0.0.1:3000/ > /dev/null 2>&1; then break; fi
@@ -525,6 +546,15 @@ if ! docker compose --profile test run --rm --no-deps \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_sessions.py tests/integration/test_staff.py tests/integration/test_identity_races.py; then
   docker compose logs --no-color web 2>&1 | grep -aE 'B04_SYNTHETIC_STAGE' || true
   exit 1
+fi
+# B-02/B-03/B-04 are integrated: both actually invited roles are mandatory now.
+docker compose --profile test run --rm --no-deps \
+  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider -m b05_browser \
+  tests/integration/test_patients.py | tee "$private/b05-invited.log"
+if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b05-invited.log"; then
+  echo 'FAIL mandatory B-05 invited-session evidence skipped'; exit 1
 fi
 docker compose exec -T web node --no-warnings --experimental-strip-types --test auth/ingress.test.mjs
 echo 'PASS verified source separation, spoof resistance and sole Web listener'

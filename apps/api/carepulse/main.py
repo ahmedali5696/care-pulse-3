@@ -19,6 +19,7 @@ from carepulse.identity.contracts import (
 )
 from carepulse.identity.receipts import ReceiptConflict
 from carepulse.identity.staff_routes import router as staff_router
+from carepulse.patients.routes import router as patient_router
 from carepulse.provisioning.routes import router as provisioning_router
 
 
@@ -43,6 +44,7 @@ app = FastAPI(
 app.include_router(health_router)
 app.include_router(provisioning_router)
 app.include_router(staff_router)
+app.include_router(patient_router)
 app.add_exception_handler(ContractError, contract_exception_handler)
 app.add_exception_handler(
     RequestValidationError, lambda _request, _error: error_response(422)
@@ -61,8 +63,31 @@ app.add_middleware(
         ("POST", "/v1/staff/receptionists/invite-accept"): "RECEPTIONIST_ACCEPT",
         ("POST", "/v1/staff/recovery/reserve"): "OWNER_RECOVERY",
         ("POST", "/v1/staff/recovery/finalize"): "OWNER_RECOVERY",
+        ("GET", "/v1/patients"): "PATIENT_REGISTRY",
+        ("POST", "/v1/patients"): "PATIENT_REGISTRY",
     },
     route_patterns=(
+        (
+            "GET",
+            compile(
+                r"/v1/patients/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+            ),
+            "PATIENT_REGISTRY",
+        ),
+        (
+            "PATCH",
+            compile(
+                r"/v1/patients/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+            ),
+            "PATIENT_REGISTRY",
+        ),
+        (
+            "POST",
+            compile(
+                r"/v1/patients/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/(?:archive|unarchive)"
+            ),
+            "PATIENT_REGISTRY",
+        ),
         (
             "GET",
             compile(
