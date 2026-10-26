@@ -3,7 +3,7 @@
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from carepulse.appointments.persistence import AppointmentDraft, persist_appointment
@@ -29,12 +29,12 @@ def _patient(connection, tenant):
     return patient_id
 
 
-def _raw_appointment(connection, tenant, patient, doctor, **changes):
+def _raw_appointment(connection, tenant, patient_id, doctor_id, **changes):
     fields = {
         "id": uuid4(),
         "tenant": tenant,
-        "patient": patient,
-        "doctor": doctor,
+        "patient": patient_id,
+        "doctor": doctor_id,
         "service_date": date(2026, 10, 27),
         "status": "Booked",
         "service_type": "NEW_EXAMINATION",
@@ -357,7 +357,7 @@ def test_terminal_cancel_or_no_show_allows_new_id_and_retains_old_number(
                 WHERE a.id = :old AND h.appointment_revision = 1
             """),
             {"old": first["id"]},
-        ).one() == (first["id"], terminal, second["id"])
+        ).one() == (UUID(first["id"]), terminal, UUID(second["id"]))
         assert connection.scalars(
             text("""
                 SELECT number FROM public.appointment_number_assignments
@@ -544,7 +544,14 @@ def test_terminal_records_and_frozen_snapshot_number_history_are_immutable(
                 text("DELETE FROM public.appointments WHERE id = :id"),
                 {"id": created["id"]},
             )
-        assert delete_denied.value.orig.sqlstate == "23514"
+        assert delete_denied.value.orig.sqlstate == "42501"
+
+    with pytest.raises(DBAPIError) as migration_denied, migration.begin() as connection:
+        connection.execute(
+            text("DELETE FROM public.appointments WHERE id = :id"),
+            {"id": created["id"]},
+        )
+    assert migration_denied.value.orig.sqlstate == "23514"
 
     updates = (
         ("appointment_price_snapshots", "net_egp = 1"),
@@ -648,9 +655,9 @@ def test_followup_cannot_take_urgent_or_emergency_classification(
 @pytest.mark.parametrize(
     ("changes", "constraint"),
     [
-        ({"base": Decimal("NaN")}, "appointment_price_money_valid"),
-        ({"base": Decimal("Infinity")}, "appointment_price_money_valid"),
-        ({"base": Decimal("100.001")}, "appointment_price_money_valid"),
+        ({"base": Decimal("NaN")}, "appointment_price_final_valid"),
+        ({"base": Decimal("Infinity")}, "appointment_price_final_valid"),
+        ({"base": Decimal("100.001")}, "appointment_price_final_valid"),
         ({"discount_value": Decimal(-1)}, "appointment_price_discount_valid"),
         (
             {"discount_type": "FIXED", "discount_value": Decimal(110)},
