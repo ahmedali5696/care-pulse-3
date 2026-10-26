@@ -177,6 +177,22 @@ def test_patient_database_rejects_invalid_demographics(patient_storage, field, v
         assert denied.value.orig.sqlstate == "23514"
 
 
+def test_patient_database_rejects_nonstandard_array_subscripts(patient_storage):
+    runtime, _, tenant, _ = patient_storage
+    with transaction(runtime, tenant) as connection:
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(
+                text("""
+                    INSERT INTO public.patients
+                        (id, organization_id, name_parts, date_of_birth)
+                    VALUES (:id, :tenant,
+                            '[5:7]={"","",""}'::text[], DATE '2000-01-01')
+                """),
+                {"id": uuid4(), "tenant": tenant},
+            )
+        assert denied.value.orig.sqlstate == "23514"
+
+
 @pytest.mark.parametrize("age", ["NaN", "Infinity", "-1"])
 def test_nonfinite_and_negative_declared_age_denied(patient_storage, age):
     runtime, _, tenant, _ = patient_storage

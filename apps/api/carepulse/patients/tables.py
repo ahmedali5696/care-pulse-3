@@ -58,6 +58,9 @@ patients = Table(
     ),
     UniqueConstraint("organization_id", "id", name="patients_tenant_id_unique"),
     CheckConstraint(
+        "array_lower(name_parts, 1) = 1", name="patients_name_array_starts_at_one"
+    ),
+    CheckConstraint(
         "array_ndims(name_parts) = 1 AND cardinality(name_parts) IN (3, 4) "
         "AND array_position(name_parts, NULL) IS NULL "
         "AND name_parts[1] ~ '[^[:space:]]' "
