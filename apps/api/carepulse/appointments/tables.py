@@ -151,7 +151,7 @@ appointment_price_snapshots = Table(
     Column("pricing_kind", Text, nullable=False, server_default=text("'PRICE'")),
     Column("pricing_version", BigInteger, nullable=False),
     Column("creation_standard_base_egp", Numeric, nullable=False),
-    Column("entitlement_provenance", JSONB),
+    Column("entitlement_provenance", JSONB(none_as_null=True)),
     Column(
         "created_at", DateTime(timezone=True), nullable=False, server_default=func.now()
     ),
