@@ -186,6 +186,83 @@ def _reject_commit_for(tenant, table):
             connection.execute(f"DROP FUNCTION public.{name}()")
 
 
+@contextmanager
+def _reject_issuance_write_for(tenant, table):
+    """Reject one real issuance write so its entire native transaction rolls back."""
+    assert table in ("delivery_jobs", "protected_delivery_material", "sensitive_audit")
+    marker = f"issuance_failure_{uuid4().hex}"
+    if table == "protected_delivery_material":
+        condition = (
+            "EXISTS (SELECT 1 FROM public.delivery_jobs j "
+            f"WHERE j.id=NEW.job_id AND j.organization_id='{tenant}'::uuid "
+            "AND j.purpose='PASSWORD_RESET')"
+        )
+    else:
+        condition = f"NEW.organization_id='{tenant}'::uuid"
+        if table == "sensitive_audit":
+            condition += " AND NEW.action='PASSWORD_RESET_PROOF_ISSUED'"
+        else:
+            condition += " AND NEW.purpose='PASSWORD_RESET'"
+    with _database() as connection:
+        connection.execute(f"""
+            CREATE FUNCTION public.{marker}() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                IF {condition} THEN
+                    RAISE EXCEPTION 'synthetic issuance rollback' USING ERRCODE='P0001';
+                END IF;
+                RETURN NEW;
+            END $$""")
+        connection.execute(
+            f"CREATE TRIGGER {marker} BEFORE INSERT ON public.{table} "
+            f"FOR EACH ROW EXECUTE FUNCTION public.{marker}()"
+        )
+    try:
+        yield
+    finally:
+        with _database() as connection:
+            connection.execute(f"DROP TRIGGER {marker} ON public.{table}")
+            connection.execute(f"DROP FUNCTION public.{marker}()")
+
+
+@pytest.mark.parametrize(
+    "table", ["delivery_jobs", "protected_delivery_material", "sensitive_audit"]
+)
+def test_issuance_write_failure_keeps_native_proof_and_delivery_atomic(
+    owner, sender_lab, table
+):
+    with _reject_issuance_write_for(owner.clinic, table):
+        status, response = _post("/api/auth/reset-request", {"email": owner.email})
+        assert status == 503 and response["error"]["code"] == "UNAVAILABLE"
+    with _database() as connection:
+        verification_count = connection.execute(
+            "SELECT count(*) FROM public.verification WHERE value=%s",
+            (owner.user,),
+        ).fetchone()[0]
+        delivery_count = connection.execute(
+            "SELECT count(*) FROM public.delivery_jobs "
+            "WHERE organization_id=%s AND purpose='PASSWORD_RESET'",
+            (owner.clinic,),
+        ).fetchone()[0]
+        material_count = connection.execute(
+            "SELECT count(*) FROM public.protected_delivery_material m "
+            "JOIN public.delivery_jobs j ON j.id=m.job_id "
+            "WHERE j.organization_id=%s AND j.purpose='PASSWORD_RESET'",
+            (owner.clinic,),
+        ).fetchone()[0]
+        issuance_audit_count = connection.execute(
+            "SELECT count(*) FROM public.sensitive_audit "
+            "WHERE organization_id=%s AND action='PASSWORD_RESET_PROOF_ISSUED'",
+            (owner.clinic,),
+        ).fetchone()[0]
+    assert (
+        verification_count,
+        delivery_count,
+        material_count,
+        issuance_audit_count,
+    ) == (0, 0, 0, 0)
+
+
 def _expire_reserved_attempt(owner, token):
     """Advance persisted proof deadlines to the real database's past in disposable CI.
 

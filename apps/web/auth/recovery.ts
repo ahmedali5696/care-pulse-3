@@ -108,8 +108,8 @@ export async function persistRecoveryIntent({ token, user }: {
       INSERT INTO public.delivery_jobs
         (id, organization_id, staff_id, verification_id, proof_reference,
          purpose, recipient, template, logical_key, proof_expires_at)
-      VALUES ($1, $2, $3, $4, $5, 'PASSWORD_RESET', $6, 'PASSWORD_RESET', $1::text, $7)
-    `, [job, current.tenant, current.staff, verifier.id, proofDigest, current.email, verifier.expires]);
+      VALUES ($1, $2, $3, $4, $5, 'PASSWORD_RESET', $6, 'PASSWORD_RESET', $8, $7)
+    `, [job, current.tenant, current.staff, verifier.id, proofDigest, current.email, verifier.expires, job]);
     stage = "material";
     await client.query(`
       INSERT INTO public.protected_delivery_material
