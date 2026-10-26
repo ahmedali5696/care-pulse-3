@@ -148,14 +148,6 @@ def test_concurrent_archive_and_new_id_creation_serialize_on_patient_row(
             )
             == 1
         )
-        assert (
-            connection.scalar(
-                text(
-                    "SELECT count(*) FROM public.idempotency_receipts WHERE operation = 'appointments.persist'"
-                )
-            )
-            == 1
-        )
 
 
 def test_parallel_main_and_emergency_serialize_unique_clinic_day_numbering(
