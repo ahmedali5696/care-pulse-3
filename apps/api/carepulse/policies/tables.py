@@ -106,6 +106,9 @@ policy_previews = Table(
     Column("policy_kind", Text, nullable=False),
     Column("policy_version", BigInteger, nullable=False),
     Column("policy_revision", BigInteger, nullable=False),
+    Column(
+        "service_day_revision", BigInteger, nullable=False, server_default=text("0")
+    ),
     Column("actor_staff_id", UUID(as_uuid=True), nullable=False),
     Column("service_date", Date),
     Column("selected_refs", JSONB, nullable=False),

@@ -143,6 +143,44 @@ def test_policy_payload_null_required_fields_fail_database_check(
         )
 
 
+def test_enabled_no_show_without_explicit_cutoff_is_accepted(policy_storage):
+    runtime, _, _, tenant, _ = policy_storage
+    payload = {
+        **DEFAULTS["SCHEDULE"],
+        "no_show_cutoff": {"enabled": True, "local_time": None},
+    }
+    with transaction(runtime, tenant) as connection:
+        assert (
+            connection.scalar(
+                text("""
+                SELECT public.valid_clinic_policy(
+                    'SCHEDULE', CAST(:payload AS jsonb)
+                )
+            """),
+                {"payload": json.dumps(payload)},
+            )
+            is True
+        )
+        assert (
+            append_version(connection, tenant, "SCHEDULE", payload, expected_revision=1)
+            == 2
+        )
+        assert (
+            connection.execute(
+                text("""
+                SELECT payload FROM public.clinic_policy_versions
+                WHERE organization_id = :tenant AND kind = 'SCHEDULE'
+                  AND version = 2
+            """),
+                {"tenant": tenant},
+            ).scalar_one()
+            == payload
+        )
+        assert next(row for row in _heads(connection) if row.kind == "SCHEDULE")[
+            1:3
+        ] == (2, 2)
+
+
 def test_policy_rls_tenant_separation_and_operator_denial(policy_storage):
     runtime, _, operator, tenant_a, tenant_b = policy_storage
     for table in (
@@ -190,6 +228,85 @@ def test_policy_rls_tenant_separation_and_operator_denial(policy_storage):
             )
             == 0
         )
+
+
+def test_policy_seed_role_function_and_trigger_are_privilege_isolated(policy_storage):
+    _, migration, _, _, _ = policy_storage
+    with migration.connect() as connection:
+        assert connection.execute(
+            text("""
+                SELECT rolcanlogin, rolbypassrls, rolsuper
+                FROM pg_roles WHERE rolname = 'carepulse_policy_seed'
+            """)
+        ).one() == (False, False, False)
+
+        functions = {
+            row.proname: row
+            for row in connection.execute(
+                text("""
+                    SELECT p.proname, owner.rolname AS function_owner,
+                           p.prosecdef, p.proconfig,
+                           has_function_privilege('carepulse_runtime', p.oid, 'EXECUTE')
+                               AS runtime_execute,
+                           has_function_privilege('carepulse_operator', p.oid, 'EXECUTE')
+                               AS operator_execute
+                    FROM pg_proc p JOIN pg_roles owner ON owner.oid = p.proowner
+                    WHERE p.oid IN (
+                        'public.seed_clinic_policy_defaults(uuid)'::regprocedure,
+                        'public.seed_policy_on_organization_insert()'::regprocedure
+                    )
+                """)
+            )
+        }
+        assert set(functions) == {
+            "seed_clinic_policy_defaults",
+            "seed_policy_on_organization_insert",
+        }
+        for function in functions.values():
+            assert function.function_owner == "carepulse_policy_seed"
+            assert function.prosecdef is True
+            assert function.proconfig == ["search_path=pg_catalog"]
+            assert function.runtime_execute is False
+            assert function.operator_execute is False
+
+        assert connection.execute(
+            text("""
+                SELECT t.tgtype, t.tgenabled, t.tgisinternal,
+                       t.tgfoid =
+                         'public.seed_policy_on_organization_insert()'::regprocedure
+                FROM pg_trigger t
+                WHERE t.tgrelid = 'public.organizations'::regclass
+                  AND t.tgname = 'organizations_policy_defaults'
+            """)
+        ).one() == (5, "O", False, True)  # AFTER INSERT FOR EACH ROW
+
+        operator_grants = dict(
+            connection.execute(
+                text("""
+                    SELECT c.relname,
+                           has_table_privilege(
+                               'carepulse_operator', c.oid,
+                               'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+                           )
+                    FROM pg_class c
+                    WHERE c.oid IN (
+                        'public.clinic_policy_versions'::regclass,
+                        'public.clinic_policy_heads'::regclass,
+                        'public.clinic_schedule_intervals'::regclass,
+                        'public.clinic_schedule_holidays'::regclass,
+                        'public.clinic_policy_previews'::regclass
+                    )
+                """)
+            ).all()
+        )
+        assert set(operator_grants) == {
+            "clinic_policy_versions",
+            "clinic_policy_heads",
+            "clinic_schedule_intervals",
+            "clinic_schedule_holidays",
+            "clinic_policy_previews",
+        }
+        assert not any(operator_grants.values())
 
 
 def test_historical_policy_versions_cannot_be_mutated(policy_storage):
@@ -530,9 +647,9 @@ def _preview(connection, tenant, staff, *, preview_id=None):
         text("""
         INSERT INTO public.clinic_policy_previews
             (id, organization_id, policy_kind, policy_version,
-             policy_revision, actor_staff_id, service_date,
+             policy_revision, service_day_revision, actor_staff_id, service_date,
              selected_refs, affected_refs, record_revisions, candidate_payload)
-        VALUES (:id, :tenant, 'SCHEDULE', 1, 1, :staff, DATE '2026-10-30',
+        VALUES (:id, :tenant, 'SCHEDULE', 1, 1, 3, :staff, DATE '2026-10-30',
                 CAST(:selected AS jsonb), CAST(:affected AS jsonb),
                 CAST(:captured AS jsonb), CAST(:candidate AS jsonb))
     """),
@@ -559,7 +676,8 @@ def test_preview_retains_actor_refs_and_captured_revisions_immutably(policy_stor
         record = connection.execute(
             text("""
             SELECT actor_staff_id, policy_kind, policy_version, policy_revision,
-                   service_date, selected_refs, affected_refs, record_revisions,
+                   service_day_revision, service_date,
+                   selected_refs, affected_refs, record_revisions,
                    candidate_payload
             FROM public.clinic_policy_previews WHERE id = :id
         """),
@@ -570,6 +688,7 @@ def test_preview_retains_actor_refs_and_captured_revisions_immutably(policy_stor
             "SCHEDULE",
             1,
             1,
+            3,
             date(2026, 10, 30),
             selected,
             affected,

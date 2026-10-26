@@ -60,9 +60,7 @@ def upgrade() -> None:
                       ('null','string')
                   AND (value->'no_show_cutoff'->>'local_time' IS NULL OR
                        (value->'no_show_cutoff'->>'local_time') ~
-                       '^([01][0-9]|2[0-3]):[0-5][0-9]$')
-                  AND (NOT (value->'no_show_cutoff'->>'enabled')::boolean OR
-                       value->'no_show_cutoff'->>'local_time' IS NOT NULL);
+                       '^([01][0-9]|2[0-3]):[0-5][0-9]$');
             ELSIF kind = 'QUEUE' THEN
                 RETURN value ?& ARRAY['routine_order','late_depth']
                   AND value->>'routine_order' IN ('BOOKED_NUMBER','ARRIVAL_FIFO')
@@ -181,6 +179,8 @@ def upgrade() -> None:
             policy_kind text NOT NULL,
             policy_version bigint NOT NULL,
             policy_revision bigint NOT NULL CHECK (policy_revision > 0),
+            service_day_revision bigint NOT NULL DEFAULT 0 CHECK
+                (service_day_revision >= 0),
             actor_staff_id uuid NOT NULL,
             service_date date,
             selected_refs jsonb NOT NULL CHECK (jsonb_typeof(selected_refs) = 'array'),
@@ -312,7 +312,9 @@ def upgrade() -> None:
         """)
         op.execute(f"GRANT SELECT, INSERT ON public.{table} TO carepulse_policy_seed")
 
-    op.execute("""
+    # JSON object colons are literal SQL, not SQLAlchemy named bind markers.
+    # Use the driver-level execution boundary for this trusted fixed DDL.
+    op.get_bind().exec_driver_sql("""
         CREATE FUNCTION public.seed_clinic_policy_defaults(target uuid)
         RETURNS void LANGUAGE plpgsql SECURITY DEFINER
         SET search_path = pg_catalog AS $$
