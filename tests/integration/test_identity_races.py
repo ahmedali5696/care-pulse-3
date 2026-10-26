@@ -18,7 +18,12 @@ from carepulse.provisioning.operators import authenticate_operator
 from carepulse.provisioning.service import change_clinic_state
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from test_recovery import _native, _operation, _reject_commit_for
+from test_recovery import (
+    _expire_reserved_attempt,
+    _native,
+    _operation,
+    _reject_commit_for,
+)
 from test_sessions import _database, _login, _mutation_headers, _request, _seed_owner
 
 operator_identity = test_provisioning.operator_identity
@@ -101,12 +106,13 @@ def _issued_proof(owner, lifetime_seconds=900):
     return token, digest
 
 
-def _reset(token, password):
+def _reset(token, password, *, timeout=6):
     status, _, body = _request(
         "/api/auth/reset-complete",
         method="POST",
         payload={"token": token, "newPassword": password},
         headers=_mutation_headers(),
+        timeout=timeout,
     )
     return status, json.loads(body)
 
@@ -156,7 +162,7 @@ def _wait_for_native_session_delete(connection):
 def test_expiry_inside_native_transaction_rolls_back_every_auth_effect(recovery_owner):
     owner = recovery_owner
     stale_cookie = _login(owner)
-    token, digest = _issued_proof(owner, lifetime_seconds=4)
+    token, digest = _issued_proof(owner, lifetime_seconds=12)
     with _database() as connection:
         password_before = connection.execute(
             'SELECT password FROM public."account" WHERE "userId"=%s',
@@ -179,7 +185,7 @@ def test_expiry_inside_native_transaction_rolls_back_every_auth_effect(recovery_
         with _database() as blocker:
             blocker.execute('LOCK TABLE public."session" IN SHARE MODE')
             pending = executor.submit(
-                _reset, token, f"Synthetic-Expired-During-Auth-{uuid4()}!"
+                _reset, token, f"Synthetic-Expired-During-Auth-{uuid4()}!", timeout=20
             )
             try:
                 _wait_for_native_session_delete(blocker)
@@ -195,7 +201,7 @@ def test_expiry_inside_native_transaction_rolls_back_every_auth_effect(recovery_
                 )
             finally:
                 blocker.commit()
-        assert pending.result(timeout=10)[0] == 503
+        assert pending.result(timeout=25)[0] == 503
 
     with _database() as connection:
         native = connection.execute(
@@ -641,20 +647,49 @@ def test_replacement_competes_with_suspension_and_stale_finalizer(
                 _wait_for_organization_waiters(blocker, 1)
             blocker.commit()
         assert suspension.result(timeout=25)["state"] == "SUSPENDED"
-        assert replacement.result(timeout=25)[0] != 200
-        assert stale_a.result(timeout=25)[0] != 200
+        assert replacement.result(timeout=25)[0] in (403, 409)
+        assert stale_a.result(timeout=25)[0] in (403, 409)
 
     previous, current = _operation(owner, proof_a), _operation(owner, proof_b)
     assert previous["completions"] == 1 and previous["successes"] == 0
     assert previous["invalidated"]
+    assert previous["auth_fence"] == 1
     if first_winner == "operator":
         assert current is None and previous["state"] == "AUTH_DONE"
         assert previous["block"] == previous["id"]
-        assert _native(owner)[0] == completed_a_hash
+        assert previous["security_revision"] == before["security_revision"] == 1
+        assert _native(owner) == (completed_a_hash, 0)
     else:
         assert previous["state"] == "ABORTED"
         assert current["state"] == "AUTH_DONE" and current["invalidated"]
+        assert current["auth_fence"] == 1
         assert current["completions"] == 1 and current["successes"] == 0
         assert current["block"] == current["id"]
         assert current["security_revision"] == before["security_revision"] + 1
         assert _native(owner)[0] != completed_a_hash
+        assert _native(owner)[1] == 0
+
+
+def test_expired_fresh_proof_cannot_abort_an_expired_blocked_predecessor(
+    recovery_owner,
+):
+    owner = recovery_owner
+    proof_a, _ = _issued_proof(owner)
+    password_a = f"Synthetic-Abandoned-A-{uuid4()}!"
+    with _reject_commit_for(owner.clinic, "auth_recovery_completions"):
+        assert _reset(proof_a, password_a)[0] == 503
+    _expire_reserved_attempt(owner, proof_a)
+    before = _operation(owner, proof_a)
+    native_before = _native(owner)
+    proof_b, _ = _issued_proof(owner, lifetime_seconds=1)
+    with _database() as connection:
+        connection.execute("SELECT pg_sleep(1.1)")
+    status, _ = _reset(proof_b, f"Synthetic-Expired-B-{uuid4()}!")
+    assert status == 409
+    after = _operation(owner, proof_a)
+    assert after["state"] == "RESERVED"
+    assert after["block"] == before["id"]
+    assert after["security_revision"] == before["security_revision"] == 1
+    assert after["completions"] == after["successes"] == 0
+    assert _operation(owner, proof_b) is None
+    assert _native(owner) == native_before

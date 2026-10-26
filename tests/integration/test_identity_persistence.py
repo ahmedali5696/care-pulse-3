@@ -199,7 +199,13 @@ def test_native_models_and_server_session_columns_are_persisted(identity, role_e
 
 
 def test_runtime_cannot_read_native_account_secrets(identity, role_engine):
-    _, _, tenant, _, _, _ = identity
+    migration, _, tenant, _, _, _ = identity
+    with migration.begin() as connection:
+        unbound_user, _ = _user(connection)
+        connection.execute(
+            text('UPDATE public."user" SET "emailVerified"=false WHERE id=:user'),
+            {"user": unbound_user},
+        )
     runtime = role_engine("carepulse_runtime")
     auth = role_engine("carepulse_auth")
     try:
@@ -213,6 +219,18 @@ def test_runtime_cannot_read_native_account_secrets(identity, role_engine):
         with transaction(auth) as connection:
             connection.execute(text('SELECT password FROM public."account" LIMIT 1'))
         with transaction(runtime, tenant) as connection:
+            assert connection.scalar(
+                text(
+                    "SELECT public.native_account_unbound_for_receptionist(:tenant, :user)"
+                ),
+                {"tenant": tenant, "user": unbound_user},
+            )
+            assert not connection.scalar(
+                text(
+                    "SELECT public.native_account_unbound_for_receptionist(:tenant, :user)"
+                ),
+                {"tenant": uuid4(), "user": unbound_user},
+            )
             assert not connection.scalar(
                 text(
                     "SELECT public.native_account_unbound_for_receptionist(:tenant, :user)"

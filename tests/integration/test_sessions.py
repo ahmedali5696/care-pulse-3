@@ -128,7 +128,7 @@ def owner(disposable_project):
         return _seed_owner(connection)
 
 
-def _request(path, *, method="GET", payload=None, cookie=None, headers=None):
+def _request(path, *, method="GET", payload=None, cookie=None, headers=None, timeout=6):
     supplied = dict(headers or {})
     if cookie:
         supplied["Cookie"] = cookie
@@ -140,7 +140,7 @@ def _request(path, *, method="GET", payload=None, cookie=None, headers=None):
     try:
         response = urlopen(
             Request(_WEB + path, data=encoded, headers=supplied, method=method),
-            timeout=6,
+            timeout=timeout,
         )
     except HTTPError as error:
         response = error

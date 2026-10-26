@@ -369,6 +369,29 @@ def test_recovery_ineligible_verified_native_user_gets_unknown_ack(owner):
         )
 
 
+def test_foreign_origin_cannot_consume_a_live_owner_proof(owner, sender_lab):
+    token = _issue(owner, sender_lab)
+    original = _native(owner)
+    status, _, response = _request(
+        "/api/auth/reset-complete",
+        method="POST",
+        payload={"token": token, "newPassword": f"Synthetic-CSRF-{uuid4()}!"},
+        headers={**_mutation_headers(), "Origin": "https://attacker.example.invalid"},
+    )
+    assert status == 403
+    assert json.loads(response)["error"]["code"] == "FORBIDDEN"
+    assert _operation(owner, token) is None
+    assert _native(owner) == original
+    with _database() as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM public.verification WHERE value=%s",
+                (owner.user,),
+            ).fetchone()[0]
+            == 1
+        )
+
+
 def test_invalid_password_denies_before_proof_reservation(owner, sender_lab):
     token = _issue(owner, sender_lab)
     before = _native(owner)
@@ -761,3 +784,100 @@ def test_revocation_invalidated_auth_done_requires_distinct_proof_after_reactiva
     assert current["security_revision"] == 2 and current["block"] is None
     assert _complete(first, first_password)[0] == 409
     assert _native(owner)[1] == 0
+
+
+@pytest.mark.parametrize("missing_evidence", ["native_completion", "revocation_audit"])
+def test_revoked_auth_done_with_missing_evidence_cannot_transfer_block(
+    owner, sender_lab, missing_evidence
+):
+    proof_a = _issue(owner, sender_lab)
+    password_a = f"Synthetic-Missing-Evidence-A-{uuid4()}!"
+    with _reject_commit_for(owner.clinic, "sensitive_audit"):
+        assert _complete(proof_a, password_a)[0] == 503
+    blocked = _operation(owner, proof_a)
+    assert blocked["state"] == "AUTH_DONE" and blocked["completions"] == 1
+
+    with _database() as connection:
+        actor, revision = connection.execute(
+            "SELECT created_by_operator_id, lifecycle_revision FROM public.organizations WHERE id=%s",
+            (owner.clinic,),
+        ).fetchone()
+        digest = sha256(f"synthetic-missing-{uuid4()}".encode()).hexdigest()
+        connection.execute(
+            "UPDATE public.operator_identities SET credential_digest=%s WHERE id=%s",
+            (digest, actor),
+        )
+    engine = create_engine(
+        URL.create(
+            "postgresql+psycopg",
+            username="carepulse_bootstrap",
+            password=Path("/run/secrets/postgres_password").read_text().strip(),
+            host="db",
+            database="carepulse",
+        ),
+        hide_parameters=True,
+    )
+    try:
+        operator = VerifiedOperator(actor, digest)
+        assert (
+            change_clinic_state(
+                engine,
+                operator,
+                owner.clinic,
+                revision,
+                "SUSPENDED",
+                "Invalidate incomplete recovery finalization",
+            )["state"]
+            == "SUSPENDED"
+        )
+        assert (
+            change_clinic_state(
+                engine,
+                operator,
+                owner.clinic,
+                revision + 1,
+                "ACTIVE",
+                "Reopen verified owner access for new proof",
+            )["state"]
+            == "ACTIVE"
+        )
+    finally:
+        engine.dispose()
+
+    proof_b = _issue(owner, sender_lab)
+    password_b = f"Synthetic-Missing-Evidence-B-{uuid4()}!"
+    assert _complete("A" * 24, password_b)[0] == 409
+    assert _operation(owner, proof_b) is None
+
+    with _database() as connection:
+        table, guard = (
+            ("auth_recovery_completions", "auth_recovery_completions_mutation_guard")
+            if missing_evidence == "native_completion"
+            else ("sensitive_audit", "sensitive_audit_immutable")
+        )
+        connection.execute(f"ALTER TABLE public.{table} DISABLE TRIGGER {guard}")
+        try:
+            if missing_evidence == "native_completion":
+                removed = connection.execute(
+                    "DELETE FROM public.auth_recovery_completions WHERE id=%s",
+                    (blocked["id"],),
+                )
+            else:
+                removed = connection.execute(
+                    """DELETE FROM public.sensitive_audit
+                         WHERE recovery_operation_id=%s AND action='RECOVERY_AUTH_INVALIDATED'""",
+                    (blocked["id"],),
+                )
+            assert removed.rowcount == 1
+        finally:
+            connection.execute(f"ALTER TABLE public.{table} ENABLE TRIGGER {guard}")
+
+    native_before = _native(owner)
+    status, _ = _complete(proof_b, password_b)
+    assert status in (409, 503)
+    old = _operation(owner, proof_a)
+    assert old["state"] == "AUTH_DONE" and old["invalidated"]
+    assert old["block"] == old["id"] and old["security_revision"] == 1
+    assert old["successes"] == 0
+    assert _operation(owner, proof_b) is None
+    assert _native(owner) == native_before
