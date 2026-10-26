@@ -772,6 +772,10 @@ def test_history_cannot_reference_other_snapshot_or_foreign_replacement(
             _query(tenant, doctor),
         )
         with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(
+                text("UPDATE public.appointments SET revision = 1 WHERE id = :id"),
+                {"id": first["id"]},
+            )
             _raw_history(
                 connection, tenant, first["id"], doctor, 1, snapshot=second["id"]
             )
@@ -786,6 +790,10 @@ def test_history_cannot_reference_other_snapshot_or_foreign_replacement(
         pytest.raises(DBAPIError) as foreign_denied,
         transaction(runtime, tenant) as connection,
     ):
+        connection.execute(
+            text("UPDATE public.appointments SET revision = 1 WHERE id = :id"),
+            {"id": first["id"]},
+        )
         _raw_history(
             connection,
             tenant,
