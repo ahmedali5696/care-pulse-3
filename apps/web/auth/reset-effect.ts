@@ -35,6 +35,18 @@ export async function applyReservedReset(
     const client = scopedAuthClient(pool, reserved.tenant);
     if (!client) throw new Error("Recovery transaction unavailable");
 
+    // PostgreSQL rechecks the RecoveryOperation's Organization/Staff FKs
+    // after the native completion updates its already-written row. Acquire
+    // the same lifecycle lock before the operation fence, never afterward,
+    // so an operator suspension cannot deadlock with native completion.
+    const authority = await client.query<{ active: boolean }>(
+      "SELECT public.lock_active_organization($1::uuid) AS active",
+      [reserved.tenant],
+    );
+    if (authority.rows.length !== 1 || authority.rows[0].active !== true) {
+      throw new Error("Recovery organization unavailable");
+    }
+
     // The guarded UPDATE takes the operation row's real write lock. A competing
     // handler waits until this transaction commits or rolls back, then rechecks.
     const claimed = await client.query<{ auth_fence: string }>(`
