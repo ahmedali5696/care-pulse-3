@@ -690,7 +690,13 @@ def test_receptionist_invite_acceptance_single_use_with_real_bff(owner_session):
     assert row[1] == row[2]
     assert row[3] is True and row[4] is False
     assert row[5] == lifecycle
-    assert _login(SimpleNamespace(email=email, password=acceptance["password"]))
+    receptionist_cookie = _login(
+        SimpleNamespace(email=email, password=acceptance["password"])
+    )
+    status, denial = _staff_command(
+        "/api/staff/receptionists", receptionist_cookie, method="GET"
+    )
+    assert status == 403, denial
 
 
 def test_competing_receptionist_acceptance_cannot_attach_two_credentials(owner_session):
