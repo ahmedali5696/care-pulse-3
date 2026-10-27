@@ -125,22 +125,25 @@ def list_receptionists(
     rows = (
         connection.execute(
             text("""
-            SELECT id FROM public.staff_accounts
-             WHERE organization_id = :tenant AND role = 'RECEPTIONIST'
-               AND (CAST(:after AS uuid) IS NULL OR id > CAST(:after AS uuid))
-             ORDER BY id LIMIT :limit
+            SELECT s.id, s.verified_email, s.enabled, s.verified,
+                   s.bulk_reschedule, s.revision, s.security_revision,
+                   (SELECT i.state FROM public.invitations i
+                     WHERE i.organization_id = s.organization_id AND i.staff_id = s.id
+                     ORDER BY i.issued_at DESC, i.id DESC LIMIT 1) AS invitation_state
+              FROM public.staff_accounts s
+             WHERE s.organization_id = :tenant AND s.role = 'RECEPTIONIST'
+               AND (CAST(:after AS uuid) IS NULL OR s.id > CAST(:after AS uuid))
+             ORDER BY s.id LIMIT :limit
         """),
             {"tenant": actor.organization_id, "after": after, "limit": limit + 1},
         )
-        .scalars()
+        .mappings()
         .all()
     )
     selected = rows[:limit]
     return {
-        "items": [
-            _projection(_staff(connection, actor, staff_id)) for staff_id in selected
-        ],
-        "next_cursor": str(selected[-1]) if len(rows) > limit else None,
+        "items": [_projection(row) for row in selected],
+        "next_cursor": str(selected[-1]["id"]) if len(rows) > limit else None,
     }
 
 

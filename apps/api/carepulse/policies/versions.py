@@ -52,13 +52,23 @@ def _next_operating_day(
             {"tenant": tenant, "version": schedule},
         ).all()
     )
-    for offset in range(1, 367):
-        candidate = today + timedelta(days=offset)
-        if candidate not in holidays and (
-            candidate in overrides or candidate.isoweekday() in weekdays
-        ):
-            return candidate
-    return None
+    next_override = min(
+        (day for day in overrides if day > today and day not in holidays),
+        default=None,
+    )
+    if not weekdays:
+        return next_override
+
+    candidate = today
+    while True:
+        offset = min(
+            (weekday - candidate.isoweekday()) % 7 or 7 for weekday in weekdays
+        )
+        if candidate.toordinal() + offset > date.max.toordinal():
+            return next_override
+        candidate += timedelta(days=offset)
+        if candidate not in holidays:
+            return min(candidate, next_override) if next_override else candidate
 
 
 def append_version(
