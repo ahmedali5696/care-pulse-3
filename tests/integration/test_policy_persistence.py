@@ -3,7 +3,7 @@
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from threading import Barrier
 from uuid import uuid4
@@ -494,6 +494,65 @@ def test_queue_effective_date_uses_working_calendar_and_skips_holidays(policy_st
             ).payload
             == DEFAULTS["QUEUE"]
         )
+
+
+@pytest.mark.parametrize(
+    ("kind", "weekday", "service_date", "holidays", "expected"),
+    [
+        ("OVERRIDE_WORK", None, date(2027, 11, 1), [], date(2027, 11, 1)),
+        (
+            "WORK",
+            3,
+            None,
+            [date(2026, 10, 28) + timedelta(weeks=week) for week in range(54)],
+            date(2027, 11, 10),
+        ),
+    ],
+    ids=["future-date-override", "long-holiday-exclusion"],
+)
+def test_queue_effective_date_beyond_366_days(
+    policy_storage, kind, weekday, service_date, holidays, expected
+):
+    runtime, _, _, tenant, _ = policy_storage
+    today = date(2026, 10, 26)
+    assert expected > today + timedelta(days=366)
+    with transaction(runtime, tenant) as connection:
+        assert (
+            append_version(
+                connection,
+                tenant,
+                "SCHEDULE",
+                DEFAULTS["SCHEDULE"],
+                expected_revision=1,
+                intervals=[
+                    {
+                        "interval_kind": kind,
+                        "weekday": weekday,
+                        "service_date": service_date,
+                        "starts_at": "09:00",
+                        "ends_at": "17:00",
+                    }
+                ],
+                holidays=holidays,
+            )
+            == 2
+        )
+        assert (
+            append_version(
+                connection,
+                tenant,
+                "QUEUE",
+                DEFAULTS["QUEUE"],
+                expected_revision=1,
+                today=today,
+            )
+            == 2
+        )
+        head = next(row for row in _heads(connection) if row.kind == "QUEUE")
+        assert (head.queue_effective_on, head.queue_pending) == (expected, False)
+        assert [
+            row.version for row in _versions(connection) if row.kind == "QUEUE"
+        ] == [1, 2]
 
 
 def test_schedule_rejects_nonpositive_and_wrong_tenant_periods(policy_storage):

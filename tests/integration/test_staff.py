@@ -10,6 +10,10 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from carepulse.db import transaction
+from carepulse.identity.authorization import AuthorizedStaff
+from carepulse.identity.staff import list_receptionists
+from sqlalchemy import event
 from test_sessions import (
     _database,
     _login,
@@ -50,6 +54,102 @@ def _changes(staff, reason="Synthetic staff management"):
         "expected_revision": staff["revision"],
         "expected_security_revision": staff["security_revision"],
     }
+
+
+def test_receptionist_listing_paginates_full_projection_in_one_query(
+    owner_session, role_engine
+):
+    owner, cookie = owner_session
+    expected = {}
+    with _database() as connection:
+        for index in range(101):
+            staff_id = uuid4()
+            user_id = f"synthetic-list-{uuid4()}"
+            email = f"synthetic-list-{uuid4()}@example.invalid"
+            enabled, verified, bulk = index % 2 == 0, index % 3 == 0, index % 5 == 0
+            connection.execute(
+                'INSERT INTO public."user" '
+                '(id, name, email, "emailVerified", "createdAt", "updatedAt") '
+                "VALUES (%s, %s, %s, true, clock_timestamp(), clock_timestamp())",
+                (user_id, "Synthetic Receptionist", email),
+            )
+            connection.execute(
+                """INSERT INTO public.staff_accounts
+                       (id, organization_id, auth_user_id, verified_email, role,
+                        enabled, verified, bulk_reschedule)
+                     VALUES (%s, %s, %s, %s, 'RECEPTIONIST', %s, %s, %s)""",
+                (staff_id, owner.clinic, user_id, email, enabled, verified, bulk),
+            )
+            expected[str(staff_id)] = {
+                "id": str(staff_id),
+                "email": email,
+                "enabled": enabled,
+                "verified": verified,
+                "bulk_reschedule": bulk,
+                "revision": 0,
+                "security_revision": 0,
+                "invitation_state": None,
+            }
+        first_staff = min(expected)
+        for days_ago in (2, 1):
+            invitation_id = uuid4()
+            connection.execute(
+                """INSERT INTO public.invitations
+                       (id, organization_id, staff_id, purpose, target_email,
+                        proof_digest, issued_at, expires_at, issued_by_staff_id)
+                     VALUES (%s, %s, %s, 'RECEPTIONIST', %s, %s,
+                             clock_timestamp() - (%s * interval '1 day'),
+                             clock_timestamp() + interval '1 day', %s)""",
+                (
+                    invitation_id,
+                    owner.clinic,
+                    first_staff,
+                    expected[first_staff]["email"],
+                    sha256(str(uuid4()).encode()).hexdigest(),
+                    days_ago,
+                    owner.staff,
+                ),
+            )
+            if days_ago == 2:
+                connection.execute(
+                    "UPDATE public.invitations SET state = 'REVOKED' WHERE id = %s",
+                    (invitation_id,),
+                )
+        expected[first_staff]["invitation_state"] = "ISSUED"
+
+    page_ids = []
+    after = None
+    for expected_count in (100, 1):
+        path = "/api/staff/receptionists?limit=100"
+        if after:
+            path += f"&after={after}"
+        status, page = _staff_command(path, cookie, method="GET")
+        assert status == 200, page
+        items = page["data"]["items"]
+        assert len(items) == expected_count
+        assert all(item == expected[item["id"]] for item in items)
+        page_ids.extend(item["id"] for item in items)
+        after = page["data"]["next_cursor"]
+        assert after == (items[-1]["id"] if expected_count == 100 else None)
+    assert page_ids == sorted(expected)
+
+    engine = role_engine("carepulse_runtime")
+    statements = []
+    event.listen(engine, "before_cursor_execute", lambda *args: statements.append(1))
+    try:
+        actor = AuthorizedStaff(
+            owner.clinic, owner.staff, "DOCTOR_OWNER", False, 0, 0, 0
+        )
+        with transaction(engine, owner.clinic) as connection:
+            for limit in (1, 100):
+                statements.clear()
+                result = list_receptionists(connection, actor, None, limit)
+                assert len(statements) == 1, (
+                    f"{limit}-row page issued {len(statements)} queries"
+                )
+                assert len(result["items"]) == limit
+    finally:
+        engine.dispose()
 
 
 def test_owner_creates_invites_and_revokes_without_partial_sender_job(owner_session):
