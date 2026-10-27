@@ -119,8 +119,9 @@ def test_receptionist_listing_paginates_full_projection_in_one_query(
 
     page_ids = []
     after = None
-    for expected_count in (100, 1):
-        path = "/api/staff/receptionists?limit=100"
+    page_sizes = (25, 25, 25, 25, 1)
+    for page_index, expected_count in enumerate(page_sizes):
+        path = "/api/staff/receptionists?limit=25"
         if after:
             path += f"&after={after}"
         status, page = _staff_command(path, cookie, method="GET")
@@ -130,7 +131,7 @@ def test_receptionist_listing_paginates_full_projection_in_one_query(
         assert all(item == expected[item["id"]] for item in items)
         page_ids.extend(item["id"] for item in items)
         after = page["data"]["next_cursor"]
-        assert after == (items[-1]["id"] if expected_count == 100 else None)
+        assert after == (items[-1]["id"] if page_index < len(page_sizes) - 1 else None)
     assert page_ids == sorted(expected)
 
     engine = role_engine("carepulse_runtime")
