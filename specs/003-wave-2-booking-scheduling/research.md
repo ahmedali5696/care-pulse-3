@@ -1,0 +1,132 @@
+# Wave 2 Phase 0 Research
+
+**Date**: 2026-10-28. Research/design only. Authority order and exact master scope are in [plan.md](plan.md); [spec.md](spec.md) supplies the approved outcomes. No policy value, task generation or implementation is authorized here.
+
+## Research disposition
+
+| Bounded question | Resolution | Owning master(s) |
+| --- | --- | --- |
+| Existing storage/security contracts versus new booking behavior | Reuse Wave 1 substrate; add authoritative commands, not a parallel engine (§1). | All relevant owners |
+| Money wire/storage compatibility and exact final rounding | Canonical string publication with forward-compatible legacy reads; Decimal/NUMERIC, one final half-up rounding (§2). | B-06 |
+| Calendar precedence, cutoff and activation phantoms | Explicit date eligibility/periods; enforce publish-time cutoff; shared existing SCHEDULE head before day guards (§3). | B-07 |
+| Exact-Time capacity and Cairo gaps/folds | Peak simultaneous endpoint sweep and UTC round-trip resolution (§4). | B-08 |
+| Booking retry/archive/receipt ordering | Live authorization first, original receipt before new-creation calculation; new-ID lifecycle guard (§5). | B-09 |
+| Eligibility fallback, source reservation and immutable entitlement | Explicit busy conflict/foreign denial, qualifying source serialization and separate extension evidence (§6). | D-08/B-10 |
+| Independent queue/Visit schema delivery and later integrations | Dependency-local constraints and foundation simulation; no hidden D-06↔D-07 edge (§7). | D-06/D-07/D-08 |
+| Original-day review and actual query shape | Separate review metadata; targeted indexes and representative EXPLAIN, no report pipeline (§8). | D-11 |
+| Upgrade, privilege, failure and unknown-outcome evidence | Per-owner representative predecessor upgrade and real PostgreSQL CI, not deferred combined proof (§9). | All relevant owners |
+| Unapproved production values | Existing synthetic variance only; retain existing Issues and fail-closed release gates (§10). | Applicable gate owners |
+
+The final 2026-10-28 clarification records twelve Product Owner answers in [spec.md](spec.md#clarifications), preserving the prior ten and adding only CHK002/CHK011. No maximum booking horizon or additional percentage fractional-digit cap is imposed; all other guards remain. [Booking review](checklists/booking-review.md) records the final revalidation; independent documentation review completed and Issue #19 closed as completed. Actual database/API behavior still requires implementation evidence; neither this review nor the issue closure authorizes task generation or implementation.
+
+## 1. Reuse the installed monolith and contracts
+
+**Decision:** Keep FastAPI business ownership, SQLAlchemy 2 Core/psycopg synchronous caller-owned transactions, Alembic and the existing PostgreSQL runtime/security roles. Reuse D-04 policy heads/versions/service-day guards/previews, D-05 metadata/snapshots/number ledger/history, B-05 patient lifecycle and B-01/D-09 authorization/receipts/audit/outbox. Next adds explicit authenticated forwarding only. Use existing Python domain modules for later consumers.
+
+**Rationale:** These contracts are already integration-verified for synthetic data; their existence does not provide the new operational validators. In particular, `appointments.persistence.persist_appointment` is deliberately fixture-oriented and accepts arbitrary stored status/classification/snapshot inputs. Its lower-level persistence guarantees can be reused, but it must not become a public mass-assignment command. `identity.contracts` supplies typed canonical bodies, revisions, projections and sanitized errors; `apps/web/auth/proxy.ts:forwardPrivate` supplies live-session/Origin/signing transport.
+
+**Alternatives considered:** No new ORM/repository, receipt table, scheduling service, Redis, broker, duplicate BFF rules or fixture-auth route. No UI component/dependency work; that belongs to U tasks.
+
+## 2. Pricing and legacy JSON compatibility
+
+**Decision:** API monetary inputs/outputs are finite decimal strings, confirmed amounts are NUMERIC with two EGP fractional digits, and calculations use Decimal with sufficient precision to retain exact intermediates. Round final net once using ROUND_HALF_UP; validate Urgent **base and rounded net** strictly above current standard base under the shared policy lock. Reuse `appointments/snapshots.py:validate_price_snapshot` to verify complete snapshots; add live calculation at B-06, not client-supplied totals.
+
+D-04's `0017_d04_policy_versions.py` PRICE JSON validator currently accepts numeric/null fields, not canonical monetary strings. B-06 owns a forward-only compatible validator evolution: preserve/read existing immutable numeric versions, permit and emit canonical decimal strings for new versions, and extract legacy JSON numeric values as database text before Decimal parsing. Do not decode legacy money through Python binary float, cast a rounded float to a string, or rewrite historic JSON/version identity. Verify mixed historical/new versions and existing D-04 initialization.
+
+**Rationale:** Decimal wire values and legacy policy storage must agree without corrupting existing evidence. Exact `10.05 × (1 − 50/100)` gives `5.025 → 5.03`; prematurely rounding the discount gives the wrong result. Price/Follow-up policy edits and confirmation must see a complete valid revision. Existing snapshots already require consistent monetary/classification evidence.
+
+**Alternatives considered:** Binary float, intermediate quantization, accepting client net, inventing initial prices, rewriting D-04 or snapshots, and a second money representation without a compatible reader are rejected. Emergency remains standard New Examination pricing; Urgent is not payment.
+
+**CHK011 Product Owner clarification (Option A):** Accept finite percentage decimal strings in [0,100] with no additional fractional-digit cap, within existing request-size safeguards. EGP's two-digit precision is not a percentage rule. Preserve the full accepted numeric value in quotes/snapshots and size exact arithmetic to accepted operands, including fractional scale, rather than silently losing digits to a default context. Reuse D-05's unconstrained NUMERIC `discount_value`; verify its validator, persistence and role-safe serialization round-trip full percentage values. On a 100.00 base, 12.345% gives 87.66; on a 1.00 base, 0.500000000000000000000000000001% gives 0.99, exposing premature precision loss. These examples are not precision limits. Existing invalid-input, reason, zero-base and Urgent premium guards remain. PRD FR-013/014/BR-024/AC-32, Domain §9.1 and Master B-06 supply the immutable-money/final-rounding authority; the explicit answer settles input precision. No new dependency, schema rewrite or arbitrary digit cap is selected.
+
+## 3. Calendar and publication serialization
+
+**Decision:** Resolve explicit date overrides before weekly periods. Holiday/non-working ordinary booking requires its approved toggle; Open needs no hours, while Exact-Time additionally needs a positive explicitly date-applicable opening period outside breaks. The toggle/manual slot never supplies a 24-hour opening. Keep explicit cutoff enablement/time separate from period end; B-07 publication rejects enabled-without-valid-time even though the D-04 substrate permits that storage shape. Retain old versions; do not invent a migration-time cutoff.
+
+Use the always-present clinic SCHEDULE head as the common row-lock publication gate, acquired before creating/locking dated schedule guards, for booking and activation. Per P1, booking takes that head `FOR SHARE`, while activation takes it `FOR UPDATE`; then acquire relevant day rows in deterministic order. Activation freshly queries the entire affected confirmed set after acquiring/waiting for the gate, compares preview actor/candidate/revisions/records and rejects stale or unresolved conflicts. Pricing/schedule publication shares deterministic head ordering for cross-policy Urgent validity. Preserve the exact master lock order.
+
+**Rationale:** Known dated-row locks cannot prevent the first booking on a date absent from the preview. READ COMMITTED needs a fresh statement snapshot after the serialization point. Under the approved 2026-10-28 Product Owner decision, preview blocks proposed date/period/break invalidation of future `Booked` and `Waiting` (including Waiting-only dates), but does not retroactively invalidate `In Examination`/`Completed` care. Peak timed occupancy still includes all four counted statuses on relevant future dates, even without `Booked` or an overlap-setting change, and a proposed limit below peak blocks activation. Prospective cutoff exposure concerns still-`Booked` only; cutoff is not an interval boundary and saving it does not invalidate a state automatically. Include slot/duration/mode/overlap changes and reject a proposed effective timed limit below current peak, including disabling overlap with overlapping bookings; this is 1 with overlap OFF or saved examination capacity with overlap ON, not a schedule-editable capacity setting. Preserve prior intervals rather than retroactively matching them to new candidates. D-04/B-07 own this mechanism; D-11 has no preview responsibility. A conflicting activation may remain blocked until later authorized cancellation/rescheduling exists.
+
+**Alternatives considered:** Date-only locking, trusting affected IDs captured earlier, silent cancellation/rescheduling, DayReview dependency, serializable-isolation redesign and advisory-lock infrastructure are unnecessary or incorrect. The current design adds no performance target.
+
+## 4. Interval capacity and Cairo time
+
+**Decision:** Validate positive manual/generated candidates inside applicable periods and outside breaks. Suppress every generated interval intersecting a manual one. At confirmation, under schedule/date serialization, rescan counted timed reservations and compare canonical UTC half-open intervals. With overlap enabled, sweep endpoints with ends before starts at equality and enforce peak simultaneous occupancy against configured same-time booking capacity. Overlap OFF permits no true intersection; touching endpoints remain valid. Do not conflate timed reservation capacity with later active-examination capacity/confirmation requirements.
+
+**CHK006 Product Owner clarification (Option A):** The same-time booking limit is saved examination capacity itself, not a second configurable limit. Enabling requires configured Exact-Time slots and explicit Owner confirmation of current integer capacity >=2 and its revision; no additional ceiling is selected. Recheck saved CAPACITY under existing policy locks at confirmation; stale expected evidence conflicts. This avoids independently drifting limits and implements PRD FR-053 without moving B-14 capacity writes into Wave 2. Shared numeric policy does not equate reservation occupancy with active examinations or waive later Doctor confirmations. Existing bookings and historical policy payloads remain preserved.
+
+**CHK007 Product Owner clarification (Option A):** Generate full duration-sized slots from each applicable working period's start. Omit slots intersecting breaks without restarting the grid; discard trailing remainders, then apply valid-manual intersection suppression. A fixed period-start grid keeps later starts stable when a break changes and avoids partial-duration candidates. Restarting at break end or offering shortened trailing slots is not the approved behavior. PRD FR-054/BR-032 and master B-08 supply the period/break guards; the explicit answer selects these previously unsettled boundaries.
+
+**CHK008 Product Owner clarification (Option A):** Support weekly recurring manual slots and explicit date-specific replacement sets. A configured date set replaces that date's weekly manual set; absent date configuration inherits weekly. Reuse the established weekly/date-keyed schedule substrate rather than add a recurrence engine. Replacement avoids accidental unions; it never supplies work periods or changes the generated grid. Apply all guards and manual precedence to the valid effective set, and preview changes without rewriting existing commitments. PRD FR-054/055/BR-032 and Domain §9.2 constrain validity; the explicit answer approves the recurrence scope and precedence.
+
+Resolve local wall-clock endpoints by testing both zoneinfo fold interpretations through UTC round trips, retaining matching wall time/offset interpretations and deduplicating actual instants. Zero valid instants is a gap; two distinct instants needs a uniquely matching explicit offset/instant; one is unambiguous. Validate both endpoints, positive UTC ordering and intended Cairo service date; never silently choose a fold. Require available IANA Africa/Cairo data; inability to resolve it fails rather than substituting fixed offsets.
+
+**Rationale:** At capacity two, an added 09:00–10:00 interval can coexist with separate 09:00–09:30 and 09:30–10:00 reservations: peak is two, not three. Pairwise-intersection totals overreject. Assigning ZoneInfo to a datetime alone does not prove a valid wall time, and same-zone wall-clock comparison is unsafe across folds. Cairo date arithmetic for Follow-up is separate from elapsed UTC duration.
+
+**Alternatives considered:** Count intersecting rows, identical-start-only checks, exclusion constraint as the whole capacity>1 solution, silent fold=0, fixed Cairo offsets and adding a time library are rejected.
+
+## 5. Ordinary creation and uncertain results
+
+**Decision:** B-09 first reauthorizes actual staff/session/clinic and checks the existing actor/operation/key receipt. For new work, use the existing patient new-ID lifecycle lock and current policy/date validator, derive Routine/New Examination/MAIN/Booked, calculate snapshot and commit number/Appointment/history/audit/outbox/receipt together. Preserve counted patient/day uniqueness across all lanes/classes and committed historical numbers. Ordinary booking produces zero Visits/active entries and is unaffected by Pause/walk-in OFF.
+
+**Rationale:** A retry after price change or later archive must recover the original committed result, not recalculate a new booking; revocation must still deny recovery. `patients/lifecycle.py` already distinguishes new from permitted pre-existing Appointment operations. BFF fetch failure/timeout can occur after commit; it is not evidence of rollback.
+
+**Alternatives considered:** Blind new-key retries, caching before auth, treating every 503 as rollback, per-lane numbers, family-phone identity, fused booking/check-in and arbitrary booking lead time are rejected. Existing D-05 fixture persistence is not authorization.
+
+**CHK002 Product Owner clarification (Option A):** Wave 2 imposes no maximum future horizon for Open/Exact-Time availability or new confirmation. Evaluate the requested date using current calendar/candidate/capacity and all ordinary guards; do not add a horizon setting or pre-generate an unbounded future calendar. Synthetic dates 366 and 3,650 Cairo days ahead are acceptance examples, not cutoffs. A preferential request still needs its authorized source deadline; ordinary fallback still requires the approved acknowledgment/reaffirmation. PRD FR-011/053–055/BR-032, Domain §9.2 and Master B-08/B-09 constrain eligibility but specify no horizon; the explicit answer, not their silence, approves this non-requirement. No later-wave reschedule/intake behavior is changed.
+
+## 6. Qualification, source locking and extensions
+
+**Decision:** Source only an accessible same-patient/Doctor/tenant Completed New Examination Visit from Routine/Emergency/Urgent. Require the Doctor's stored default/justified decision; compute day zero from actual Cairo completion date and include all of day seven. Serialize eligibility/extension/reservation/consumption on the existing source Appointment/Visit and entitlement boundary, including when no active claim row exists. Add one active claim/source and one permanent completion/source database guard; retain frozen original authorization/deadline/price and append any later justified extension evidence separately.
+
+Absent/ineligible/expired/opted-out/consumed entitlement uses New Examination at ordinary current price under all normal guards. **Already active source reservation is 409**, not automatic fallback that evades exclusivity. An explicit non-visible/missing source ID is non-oracular 404, never a mutation that discloses whether a foreign source exists. A source search with no selected candidate may offer ordinary New Examination without identifying hidden records. Fresh claims after a valid release requalify under current policy/price.
+
+Doctor source eligibility uses only a narrowed approved Visit PATCH; extension uses the approved extend-followup command. No general clinical fields or completion/cancellation route ships. Receptionist gets only operational eligibility, not Doctor decisions/narrative/revision content. An extension records prior authorization; it does not itself reschedule/reprice/reopen anything. Later B-18 must consume its meaning under fresh locks.
+
+**CHK013 Product Owner clarification (Option A):** A specific justified Doctor deadline may be any date on/after source Cairo completion, including before day seven or beyond it, without a maximum duration. This retains clinical discretion without an invented numeric ceiling. Before-completion deadlines fail; source edits never reduce frozen confirmed entitlement. Confirmed-target extensions remain separate prior audited non-shortening authorizations. PRD FR-009a/009c/BR-002a/002c and Domain §8 protect those boundaries.
+
+**CHK014 Product Owner clarification (Option A):** Completion day zero is eligible through the authorized deadline; earlier intended dates never qualify. This adds no artificial waiting period and never overrides ordinary booking guards or counted uniqueness. A source with original service date equal to target blocks another counted appointment there; an older-service-date source completing on target day does not itself occupy that day's allowance. Preserve the distinction between original service date and actual Cairo completion date. PRD FR-009a/009c/BR-002a/061, Domain §8/INV-02 and master B-10 remain binding; no clinical projection or later-wave command is expanded.
+
+**Rationale:** Qualifying recommendation is not a booking, a busy claim is not an unqualified source, and cancelled retained Visits cannot create clinical entitlement. Release on Cancelled/No-show and consumption on Completed must be inseparable from their qualifying outcomes, including exceptional cancellation retaining Visit. D-08 proves this at persistence level; B-16/B-17/B-20 later prove commands.
+
+**Alternatives considered:** Follow-up without source, recursive Follow-up source, universal fallback for busy/foreign IDs, mutable confirmed deadline and 168-hour expiry are rejected. No new clinical policy or reschedule shortcut is needed.
+
+**Pre-task review correction:** The earlier fallback description did not settle staff acknowledgment or discount treatment. Spec CHK035–036 now require actual New Examination/ordinary quote acknowledgment and explicit discount reaffirmation before fallback commit. CHK001 rejects past dates/passed starts; CHK003 selects one clinic-wide mode for new bookings; CHK021 requires exact current-candidate endpoints. The HTTP pricing projection gives both booking roles bases/revisions and a server-calculated quote without settings mutation or Doctor narrative. Stale new-confirmation revisions/quotes reject (master Wave 2 exit); receipt recovery does not reprice. These corrections supersede any earlier shorthand suggesting silent conversion/current-price substitution. All shared serialization, claim and tenant/field protections remain binding.
+
+## 7. Independent persistence foundations
+
+**Decision:** D-06 installs constraints against D-04/D-05 only: dated partitions, Waiting/active-entry equivalence, immutable arrival evidence, shared Doctor controls and scoped confirmation evidence. Simulate shared capacity with valid Appointment-state transitions and a shared control lock, not a hard dependency on a future Visit table. D-07 independently installs unique admission-associated Visit and protected clinical revision persistence against D-05. Later owners add only their own cross-table integration guards when dependencies exist. Deferred commit checks permit atomic multi-row transitions while rejecting final ghosts; partial unique indexes provide cardinality but are not the whole equivalence check.
+
+**Rationale:** Exact direct dependencies prohibit requiring D-07 for D-06 or vice versa. D-08/D-11 may integrate the tables they actually depend on. Durable approval scope binds Doctor/patient/Appointment/original date/lane/revisions/expiry and one-use consumption; runtime client flags cannot stand in for authorization. History must survive queue departure and exceptional cancellation.
+
+**Alternatives considered:** Waiting-only uniqueness without existence/date checks, per-lane capacity, a live-examination counter that can drift, a seventh Appointment status, shipping admission to manufacture fixtures, and hidden dependency edges are rejected. Valid test-owned records are not operational routes.
+
+## 8. Dated review and query foundations
+
+**Decision:** Store DayReview/current revision plus immutable review/amendment evidence independently of Appointment states. Final close rejects unresolved Waiting under the same relevant serialization boundary; it does not complete In Examination, mark Booked No-show or migrate queues. Preserve original service day versus event instants and historical number assignment. Add/reuse tenant-first indexes only for actual date/status/lane/family/report foundations, and inspect representative PostgreSQL EXPLAIN plans.
+
+**Rationale:** Midnight changes display context, not care history. Retained cancelled Visits do not become Completed value. Reporting definitions remain master §11.3 and B-26; D-11 supplies paths, not an analytics pipeline or report endpoint.
+
+**Alternatives considered:** Materialized analytics, speculative indexes/load targets, automatic midnight status/queue changes, schedule previews in DayReview and close-as-seventh-status are rejected.
+
+## 9. Verification and safe evolution
+
+**Decision:** Each relevant owner proves representative synthetic-row upgrade from its immediately preceding Alembic revision, alongside fresh/repeated upgrades and injected failure. Preserve IDs, composite relationships, frozen snapshots/history and effective RLS/grants. Check new privileged SQL only if needed, with fixed safe search_path/narrow EXECUTE. Use deterministic clocks and real PostgreSQL concurrent connections with actual lock coordination. Test SQL/timeout/deadlock/connection failures, pool cleanup, bounded requests/cursors and unknown outcome recovery through existing receipts.
+
+**Rationale:** Empty migration smoke and D-12/B-27's later combined gate cannot substitute for focused acceptance. Existing Issue #13 concerns older populated intermediate upgrades and remains separately open. A historical row incompatible with a new invariant must cause safe refusal and separately authorized remediation, not invented clinical history, destructive cleanup or false schema success. Readiness/head assertions, SQLAlchemy metadata, route/purpose checks and CI suite collection are affected consumers.
+
+**Alternatives considered:** Local Docker installation, SQLite/mock RLS/races, migration rewriting, tests skipped as green, synthetic history fabrication and deferring all proof to Wave 4 are rejected. No new test framework is necessary.
+
+## 10. Production gates and authority
+
+**Decision:** Use only existing visibly synthetic policy fixtures under the 2026-10-21 timing variance. D-06 stores expiry and verifies its boundary without choosing production confirmation TTL. Keep SECURITY-POLICY-NUMERICS, OPEN-OPS-01/02/03 and OPEN-FILES-01 OPEN, with owners and evidence unchanged. Existing Issues #2/#4/#5/#13/#18 cover the relevant deferred obligations; no duplicate Issue or closure is warranted by planning.
+
+**Rationale:** No approved initial prices, retention limits, numerical security thresholds, backup/RPO/RTO/legal conclusions or release decisions can be inferred. Production must fail closed; a non-billed pilot is not an exemption.
+
+**Alternatives considered:** Framework defaults as production approval, recommended test thresholds and pulling future operational/file/deployment work into Wave 2 are rejected.
+
+## Evidence consulted
+
+- Approved PRD §§3–7/9; Domain §§3–11; System Design §§1–7; master §§2–4/6–7/11–14; constitution v1.1.0; the feature spec and Wave 1 contracts/evidence linked from the plan.
+- Existing sources: `apps/api/carepulse/{db.py,identity/contracts.py,identity/receipts.py,patients/lifecycle.py,policies/tables.py,policies/versions.py,appointments/persistence.py,appointments/snapshots.py}`; D-04/D-05 migration chain; `apps/web/auth/proxy.ts`; current readiness and `ops/check.ps1` suite/head assertions. CodeGraph was used for indexed source.
+- Bounded parallel read-only research covered persistence/concurrency and booking/interface decisions. Context7 documentation checks confirmed [PostgreSQL row locking](https://www.postgresql.org/docs/17/explicit-locking.html), [READ COMMITTED statement snapshots](https://www.postgresql.org/docs/17/transaction-iso.html), [Python datetime](https://docs.python.org/3.13/library/datetime.html), [zoneinfo](https://docs.python.org/3.13/library/zoneinfo.html) and [Decimal](https://docs.python.org/3.13/library/decimal.html). Generic technical queries contained no proprietary source. These docs explain mechanics; approved project authorities alone define product behavior.
