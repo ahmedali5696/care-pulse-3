@@ -42,6 +42,10 @@ def test_concurrent_owner_writes_same_revision_have_one_serial_winner(
     changes = iter(("100.00", "120.00"))
 
     def patch(connection):
+        connection.execute(
+            text("SELECT set_config('app.organization_id', :tenant, true)"),
+            {"tenant": str(tenant)},
+        )
         value = next(changes)
         return update_pricing(
             connection, actor, _change(1, standard_new_exam_egp=value), str(uuid4())
@@ -114,6 +118,10 @@ def test_standard_raise_and_urgent_enable_cannot_publish_invalid_mixed_state(
     )
 
     def patch(connection):
+        connection.execute(
+            text("SELECT set_config('app.organization_id', :tenant, true)"),
+            {"tenant": str(tenant)},
+        )
         return update_pricing(
             connection, actor, _change(2, **next(changes)), str(uuid4())
         )
