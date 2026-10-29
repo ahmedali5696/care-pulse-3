@@ -557,6 +557,53 @@ def test_mode_duration_and_manual_slot_changes_are_review_only_for_confirmed_tim
         assert read_schedule(connection, owner)["config"] == candidate
 
 
+@pytest.mark.parametrize(
+    ("active", "candidate", "timed", "status", "effects"),
+    [
+        (_config(), _config(duration_minutes=240), True, "Booked", ["SLOTS_CHANGED"]),
+        (
+            _config(
+                duration_minutes=None,
+                weekly_manual_slots=[
+                    {"weekday": WEEKDAY, "starts_at": "09:00", "ends_at": "10:00"}
+                ],
+            ),
+            _config(duration_minutes=None),
+            True,
+            "Waiting",
+            ["SLOTS_CHANGED"],
+        ),
+        (
+            _config(mode="OPEN"),
+            _config(duration_minutes=240),
+            False,
+            "Waiting",
+            ["MODE_CHANGED"],
+        ),
+    ],
+)
+def test_existing_confirmed_bookings_survive_disappearing_new_slot_candidates(
+    appointment_storage, active, candidate, timed, status, effects
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    owner = _actor(tenant, doctor)
+    with transaction(runtime, tenant) as connection:
+        _publish(connection, owner, active)
+        booked = _booking(connection, tenant, doctor, timed=timed, status=status)
+        frozen = _frozen(connection, booked["id"])
+        preview = _stage(connection, owner, candidate, revision=2)
+        assert preview["affected"] == [
+            {
+                "appointment_id": booked["id"],
+                "service_date": SERVICE_DAY.isoformat(),
+                "effects": effects,
+                "blocking": False,
+            }
+        ]
+        assert _activate(connection, owner, preview)["schedule_revision"] == 3
+        assert _frozen(connection, booked["id"]) == frozen
+
+
 def test_weekly_manual_slots_inherit_except_explicit_date_replacements(
     appointment_storage,
 ):

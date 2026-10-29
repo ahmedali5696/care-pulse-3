@@ -232,9 +232,12 @@ def load_current_schedule(connection: Connection, tenant) -> ScheduleConfig:
         {"tenant": tenant, "version": head["current_version"]},
     ).all()
     payload = head["payload"]
+    duration = payload["duration_minutes"]
+    if type(duration) is float and duration.is_integer():
+        duration = int(duration)
     fields = {
         "booking_mode": payload["booking_mode"],
-        "duration_minutes": payload["duration_minutes"],
+        "duration_minutes": duration,
         "holiday_booking_enabled": payload["holiday_booking_enabled"],
         "allow_overlap": payload["allow_overlap"],
         "no_show_cutoff": payload["no_show_cutoff"],
@@ -260,6 +263,11 @@ def load_current_schedule(connection: Connection, tenant) -> ScheduleConfig:
         "OVERRIDE_WORK": "override_work_periods",
     }
     for row in intervals:
+        if any(
+            row[column].second or row[column].microsecond
+            for column in ("starts_at", "ends_at")
+        ):
+            raise ContractError(409)
         entry = {
             "starts_at": row["starts_at"].strftime("%H:%M"),
             "ends_at": row["ends_at"].strftime("%H:%M"),
@@ -476,6 +484,10 @@ def compute_affected(
             candidate_config, day
         )
         candidate_rules = date_rules(candidate_config, day)
+        date_eligible = (
+            is_working_day(candidate_config, day)
+            or candidate_config.holiday_booking_enabled
+        )
         if changed:
             for appointment in records:
                 if appointment["status"] not in ("Booked", "Waiting"):
@@ -483,7 +495,7 @@ def compute_affected(
                 # Keep the changed date's confirmed row in the revision-bound review
                 # even when the proposed edit does not make this booking invalid.
                 record(appointment, None, False)
-                if not candidate_rules.eligible:
+                if not date_eligible:
                     record(appointment, "DATE_CLOSED", True)
                 else:
                     for effect in _timed_effects(appointment, candidate_config):

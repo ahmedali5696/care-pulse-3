@@ -11,6 +11,8 @@ from alembic import command
 from alembic.config import Config
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
+from carepulse.identity.contracts import ContractError
+from carepulse.policies.schedule_service import load_current_schedule
 from carepulse.policies.versions import append_version
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
@@ -161,10 +163,19 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
                     connection,
                     str(tenant),
                     "SCHEDULE",
-                    SCHEDULE,
+                    {**SCHEDULE, "duration_minutes": 30.0}
+                    if tenant == tenants[0]
+                    else SCHEDULE,
                     1,
                     intervals=[
-                        _period("WORK", weekday=1, start="09:00", end="17:00"),
+                        _period(
+                            "WORK",
+                            weekday=1,
+                            start="09:00:01.123456"
+                            if tenant == tenants[1]
+                            else "09:00",
+                            end="17:00",
+                        ),
                         _period("BREAK", weekday=1, start="12:00", end="13:00"),
                         _period(
                             "OVERRIDE_WORK",
@@ -246,6 +257,34 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
                 for role, relation, _, allowed in before[2]
                 if role == "carepulse_operator" and relation in TABLES
             )
+
+        with transaction(runtime, tenants[0]) as connection:
+            assert load_current_schedule(connection, tenants[0]).duration_minutes == 30
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT payload->>'duration_minutes'
+                    FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant AND kind='SCHEDULE' AND version=2
+                """),
+                    {"tenant": tenants[0]},
+                )
+                == "30.0"
+            )
+
+        with transaction(runtime, tenants[1]) as connection:
+            with pytest.raises(ContractError) as conflict:
+                load_current_schedule(connection, tenants[1])
+            assert conflict.value.status_code == 409
+            assert conflict.value.code is None
+            assert connection.scalar(
+                text("""
+                SELECT starts_at FROM public.clinic_schedule_intervals
+                WHERE organization_id=:tenant AND policy_version=2
+                  AND interval_kind='WORK'
+            """),
+                {"tenant": tenants[1]},
+            ) == time(9, 0, 1, 123456)
 
         with transaction(runtime, tenants[0]) as connection:
             assert (
