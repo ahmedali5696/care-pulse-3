@@ -9,10 +9,34 @@ from sqlalchemy.engine import Connection
 
 CAIRO = ZoneInfo("Africa/Cairo")
 KINDS = frozenset({"PRICE", "SCHEDULE", "QUEUE", "ADMISSION", "CAPACITY", "FOLLOWUP"})
+POLICY_LOCK_ORDER = ("SCHEDULE", "CAPACITY", "FOLLOWUP", "PRICE")
 
 
 class StalePolicyRevision(ValueError):
     """The requested policy base has been superseded."""
+
+
+def lock_policy_heads(
+    connection: Connection, tenant: str, modes: dict[str, str]
+) -> None:
+    """Lock applicable heads in the Wave 2 publication order."""
+    if any(
+        kind not in POLICY_LOCK_ORDER or mode not in ("SHARE", "UPDATE")
+        for kind, mode in modes.items()
+    ):
+        raise ValueError("Invalid policy lock request")
+    for kind in POLICY_LOCK_ORDER:
+        if kind not in modes:
+            continue
+        found = connection.scalar(
+            text(f"""
+                SELECT 1 FROM public.clinic_policy_heads
+                WHERE organization_id = :tenant AND kind = :kind FOR {modes[kind]}
+            """),
+            {"tenant": tenant, "kind": kind},
+        )
+        if found != 1:
+            raise StalePolicyRevision("Policy head unavailable")
 
 
 def _next_operating_day(

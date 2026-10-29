@@ -120,6 +120,7 @@ expected_paths = {
     '/v1/staff/recovery/reserve', '/v1/staff/recovery/finalize',
     '/v1/patients', '/v1/patients/{patient_id}',
     '/v1/patients/{patient_id}/archive', '/v1/patients/{patient_id}/unarchive',
+    '/v1/settings/pricing',
 }
 assert set(app.openapi()['paths']) == expected_paths
 assert app.openapi_url is None and len(app.user_middleware) == 1
@@ -134,6 +135,8 @@ assert boundary.kwargs['routes'] == {
     ('POST', '/v1/staff/recovery/finalize'): 'OWNER_RECOVERY',
     ('GET', '/v1/patients'): 'PATIENT_REGISTRY',
     ('POST', '/v1/patients'): 'PATIENT_REGISTRY',
+    ('GET', '/v1/settings/pricing'): 'SETTINGS_PRICING',
+    ('PATCH', '/v1/settings/pricing'): 'SETTINGS_PRICING',
 }
 uuid = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
 assert {(method, pattern.pattern, purpose) for method, pattern, purpose in boundary.kwargs['route_patterns']} == {
@@ -190,6 +193,9 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             foreach ($suite in @('tests/integration/test_patients.py', 'tests/integration/test_patient_races.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-05 verification: $suite" }
             }
+            foreach ($suite in @('tests/integration/test_pricing.py', 'tests/integration/test_pricing_races.py', 'tests/integration/test_pricing_migration.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-06 verification: $suite" }
+            }
             # Linux CI retains the accepted Bash probes; PowerShell checks their exit immediately.
             $integration = @'
 set -euo pipefail
@@ -202,7 +208,7 @@ cleanup() {
   trap - EXIT
   if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" ]]; then
     if ! docker compose --profile mail --profile test --profile sender --profile operator down --remove-orphans --volumes; then code=1; fi
-    rm -f "$private"/{postgres-password,runtime-db-password,auth-db-password,migration-password,operator-password,operator-credential,sender-password,service-key,auth-secret,file-key,delivery-public.pem,delivery-private.pem,operator-id,invite-link,clinic-create.json,compose.json,roles.log,web-denial.log,worker-denial.log,denials.log,runtime-logs,canaries,old-worker-status.json,health-logs,auth-logs,mail-denial.log,b05-backend.log,b05-invited.log}
+    rm -f "$private"/{postgres-password,runtime-db-password,auth-db-password,migration-password,operator-password,operator-credential,sender-password,service-key,auth-secret,file-key,delivery-public.pem,delivery-private.pem,operator-id,invite-link,clinic-create.json,compose.json,roles.log,web-denial.log,worker-denial.log,denials.log,runtime-logs,canaries,old-worker-status.json,health-logs,auth-logs,mail-denial.log,b05-backend.log,b05-invited.log,b06-pricing.log}
     rm -rf "$private/image-scan"
     rmdir "$private" || code=1
   else
@@ -267,6 +273,17 @@ docker compose --profile test run --rm --no-deps \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro" \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_patient_persistence.py tests/integration/test_policy_persistence.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py tests/integration/test_appointment_persistence.py tests/integration/test_appointment_races.py
+# All B-06 suites run against disposable PostgreSQL; no silent skip counts.
+docker compose --profile test run --rm --no-deps \
+  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider \
+  tests/integration/test_pricing.py tests/integration/test_pricing_races.py tests/integration/test_pricing_migration.py | tee "$private/b06-pricing.log"
+if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b06-pricing.log"; then
+  echo 'FAIL mandatory B-06 pricing evidence skipped'; exit 1
+fi
 # B-05 backend proof has no BFF/invitation prerequisite and cannot silently skip.
 docker compose --profile test run --rm --no-deps \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \

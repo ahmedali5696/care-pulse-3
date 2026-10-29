@@ -1,7 +1,9 @@
 """Validate supplied frozen EGP money; live pricing belongs to B-06."""
 
 from collections.abc import Mapping
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
+from decimal import Decimal, InvalidOperation, localcontext
+
+from carepulse.policies.pricing import exact_net
 
 PENNY = Decimal("0.01")
 
@@ -13,8 +15,14 @@ def _decimal(amount: object, *, money: bool) -> Decimal:
         number = Decimal(amount)
         if not number.is_finite() or number < 0:
             raise ValueError("Nonfinite or negative amount")
-        if money and number != number.quantize(PENNY):
-            raise ValueError("EGP amounts cannot contain fractional piastres")
+        if money:
+            with localcontext() as context:
+                context.prec = max(
+                    28,
+                    len(number.as_tuple().digits) + abs(number.as_tuple().exponent) + 8,
+                )
+                if number != number.quantize(PENNY):
+                    raise ValueError("EGP amounts cannot contain fractional piastres")
     except InvalidOperation as invalid:
         raise ValueError("Invalid decimal amount") from invalid
     return number
@@ -46,16 +54,7 @@ def validate_price_snapshot(fields: Mapping[str, object]) -> dict:
             raise ValueError("Discount exceeds applicable base")
     else:
         raise ValueError("Unknown discount type")
-    with localcontext() as context:
-        context.prec = max(
-            28, len(base.as_tuple().digits) + len(discount.as_tuple().digits) + 8
-        )
-        deduction = (
-            base * discount / 100
-            if discount_type == "PERCENT"
-            else (discount if discount_type == "FIXED" else Decimal(0))
-        )
-        expected = (base - deduction).quantize(PENNY, rounding=ROUND_HALF_UP)
+    expected = exact_net(base, discount_type, discount)
     if expected != net or fields["is_free"] is not (net == 0):
         raise ValueError("Net price or free status differs from frozen calculation")
     if (
