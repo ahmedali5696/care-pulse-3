@@ -8,7 +8,7 @@ from decimal import Decimal
 from hashlib import sha256
 from hmac import new
 from urllib.parse import urlencode
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from carepulse.appointments.persistence import persist_appointment
@@ -364,6 +364,438 @@ def test_legacy_numeric_null_and_mixed_string_versions_remain_readable(patient_b
         )[1]["data"]["price_quote"]["net_egp"]
         == "94.50"
     )
+
+
+def test_noncanonical_legacy_price_requires_explicit_owner_remediation(patient_backend):
+    clinic = patient_backend
+    with transaction(clinic.runtime, clinic.tenant) as conn:
+        saved = persist_appointment(
+            conn,
+            _draft(
+                _patient(conn, clinic.tenant),
+                UUID(clinic.owner.staff_id),
+            ),
+            _query(clinic.tenant, UUID(clinic.owner.staff_id)),
+        )
+    with transaction(clinic.runtime, clinic.tenant) as conn:
+        append_version(
+            conn,
+            str(clinic.tenant),
+            "PRICE",
+            '{"standard_new_exam_egp":100.123,"preferential_followup_egp":30,'
+            '"urgent_base_egp":null,"urgent_enabled":false}',
+            1,
+        )
+
+    with transaction(clinic.runtime, clinic.tenant) as conn:
+        snapshot_before = conn.scalar(
+            text("""
+                SELECT row_to_json(s)::text FROM public.appointment_price_snapshots s
+                WHERE appointment_id = :id
+            """),
+            {"id": saved["id"]},
+        )
+    owner_status, owner_result = pricing_request(clinic, clinic.owner)
+    assert owner_status == 200, owner_result
+    assert owner_result["data"]["standard_new_exam_egp"] is None
+    assert owner_result["data"]["preferential_followup_egp"] == "30.00"
+    assert owner_result["data"]["legacy_price_remediation"] == {
+        "standard_new_exam_egp": "100.123"
+    }
+    for actor in (clinic.owner, clinic.receptionist):
+        status, result = pricing_request(clinic, actor)
+        assert status == 200, result
+        assert result["data"]["standard_new_exam_egp"] is None
+        if actor == clinic.receptionist:
+            assert "legacy_price_remediation" not in result["data"]
+        for service_type, expected_status in (
+            ("NEW_EXAMINATION", 409),
+            ("FOLLOW_UP", 200),
+        ):
+            status, response = pricing_request(
+                clinic,
+                actor,
+                query={
+                    "service_type": service_type,
+                    "discount_type": "PERCENT",
+                    "discount_value": "10",
+                },
+            )
+            assert status == expected_status, response
+            if status == 200:
+                assert response["data"]["price_quote"]["net_egp"] == "27.00"
+                if actor == clinic.receptionist:
+                    assert "legacy_price_remediation" not in response["data"]
+
+    for actor in (
+        clinic.receptionist,
+        replace(clinic.owner, role="OPERATOR"),
+        replace(clinic.owner, organization_id=str(clinic.other)),
+    ):
+        assert pricing_request(
+            clinic,
+            actor,
+            method="PATCH",
+            body={
+                **_patch(standard_new_exam_egp="100.12"),
+                "expected_price_revision": 2,
+            },
+            key=str(uuid4()),
+        )[0] in (401, 403)
+        get_status, get_result = pricing_request(clinic, actor)
+        if actor == clinic.receptionist:
+            assert get_status == 200
+            assert "legacy_price_remediation" not in get_result["data"]
+        else:
+            assert get_status in (401, 403)
+
+    # Publishing an unrelated canonical field cannot silently repair the legacy amount.
+    unrelated = {
+        **_patch(preferential_followup_egp="31.00"),
+        "expected_price_revision": 2,
+    }
+    unrelated_key = str(uuid4())
+    status, unresolved = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=unrelated, key=unrelated_key
+    )
+    assert status == 200, unresolved
+    assert unresolved["data"]["standard_new_exam_egp"] is None
+    assert unresolved["data"]["legacy_price_remediation"] == {
+        "standard_new_exam_egp": "100.123"
+    }
+    assert pricing_request(
+        clinic, clinic.owner, method="PATCH", body=unrelated, key=unrelated_key
+    ) == (status, unresolved)
+    correction = {
+        **_patch(standard_new_exam_egp="100.12"),
+        "expected_price_revision": 3,
+    }
+    key = str(uuid4())
+    status, corrected = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=correction, key=key
+    )
+    assert status == 200, corrected
+    assert corrected["data"]["standard_new_exam_egp"] == "100.12"
+    assert corrected["data"]["price_revision"] == 4
+    assert "legacy_price_remediation" not in corrected["data"]
+    assert pricing_request(
+        clinic, clinic.owner, method="PATCH", body=correction, key=key
+    ) == (status, corrected)
+    status, conflict = pricing_request(
+        clinic,
+        clinic.owner,
+        method="PATCH",
+        body={**correction, "standard_new_exam_egp": "100.13"},
+        key=key,
+    )
+    assert status == 409 and conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert (
+        pricing_request(
+            clinic,
+            clinic.receptionist,
+            query={
+                "service_type": "NEW_EXAMINATION",
+                "discount_type": "NONE",
+                "discount_value": "0",
+            },
+        )[1]["data"]["price_quote"]["base_egp"]
+        == "100.12"
+    )
+
+    with transaction(clinic.runtime, clinic.tenant) as conn:
+        versions = conn.execute(
+            text("""
+                SELECT version, payload->>'standard_new_exam_egp',
+                       jsonb_typeof(payload->'standard_new_exam_egp')
+                FROM public.clinic_policy_versions
+                WHERE kind = 'PRICE' ORDER BY version
+            """)
+        ).all()
+        assert versions == [
+            (1, None, "null"),
+            (2, "100.123", "number"),
+            (3, "100.123", "number"),
+            (4, "100.12", "string"),
+        ]
+        assert (
+            conn.scalar(
+                text("""
+                SELECT row_to_json(s)::text FROM public.appointment_price_snapshots s
+                WHERE appointment_id = :id
+            """),
+                {"id": saved["id"]},
+            )
+            == snapshot_before
+        )
+        assert (
+            conn.scalar(
+                text("""
+            SELECT count(*) FROM public.idempotency_receipts
+            WHERE operation = 'settings.pricing.update'
+        """)
+            )
+            == 2
+        )
+
+
+def test_noncanonical_followup_legacy_blocks_only_followup_quotes(patient_backend):
+    clinic = patient_backend
+    with transaction(clinic.runtime, clinic.tenant) as conn:
+        append_version(
+            conn,
+            str(clinic.tenant),
+            "PRICE",
+            '{"standard_new_exam_egp":100,"preferential_followup_egp":100.123,'
+            '"urgent_base_egp":null,"urgent_enabled":false}',
+            1,
+        )
+    for actor in (clinic.owner, clinic.receptionist):
+        status, response = pricing_request(clinic, actor)
+        assert status == 200, response
+        assert response["data"]["standard_new_exam_egp"] == "100.00"
+        assert response["data"]["preferential_followup_egp"] is None
+        if actor == clinic.owner:
+            assert response["data"]["legacy_price_remediation"] == {
+                "preferential_followup_egp": "100.123"
+            }
+        else:
+            assert "legacy_price_remediation" not in response["data"]
+        for service, expected in (("NEW_EXAMINATION", 200), ("FOLLOW_UP", 409)):
+            status, result = pricing_request(
+                clinic,
+                actor,
+                query={
+                    "service_type": service,
+                    "discount_type": "NONE",
+                    "discount_value": "0",
+                },
+            )
+            assert status == expected, result
+            if status == 200:
+                assert result["data"]["price_quote"]["net_egp"] == "100.00"
+
+
+def test_legacy_numeric_trailing_zero_preserves_scale_without_blocking_quotes(
+    patient_backend,
+):
+    clinic = patient_backend
+    with transaction(clinic.runtime, clinic.tenant) as conn:
+        append_version(
+            conn,
+            str(clinic.tenant),
+            "PRICE",
+            '{"standard_new_exam_egp":100.120,"preferential_followup_egp":30.123,'
+            '"urgent_base_egp":null,"urgent_enabled":false}',
+            1,
+        )
+
+    for actor in (clinic.owner, clinic.receptionist):
+        status, result = pricing_request(clinic, actor)
+        assert status == 200, result
+        assert result["data"]["standard_new_exam_egp"] == "100.12"
+        assert result["data"]["preferential_followup_egp"] is None
+        if actor == clinic.owner:
+            assert result["data"]["legacy_price_remediation"] == {
+                "preferential_followup_egp": "30.123"
+            }
+        else:
+            assert "legacy_price_remediation" not in result["data"]
+        for service, expected in (("NEW_EXAMINATION", 200), ("FOLLOW_UP", 409)):
+            status, response = pricing_request(
+                clinic,
+                actor,
+                query={
+                    "service_type": service,
+                    "discount_type": "NONE",
+                    "discount_value": "0",
+                },
+            )
+            assert status == expected, response
+            if status == 200:
+                assert response["data"]["price_quote"]["net_egp"] == "100.12"
+
+    status, result = pricing_request(
+        clinic,
+        clinic.owner,
+        method="PATCH",
+        body={**_patch(urgent_base_egp="150.00"), "expected_price_revision": 2},
+        key=str(uuid4()),
+    )
+    assert status == 200, result
+    assert result["data"]["standard_new_exam_egp"] == "100.12"
+    assert result["data"]["legacy_price_remediation"] == {
+        "preferential_followup_egp": "30.123"
+    }
+
+    with transaction(clinic.runtime, clinic.tenant) as conn:
+        retained = conn.execute(
+            text("""
+                SELECT version, payload->>'standard_new_exam_egp',
+                       jsonb_typeof(payload->'standard_new_exam_egp'),
+                       payload->>'preferential_followup_egp',
+                       jsonb_typeof(payload->'preferential_followup_egp')
+                FROM public.clinic_policy_versions
+                WHERE kind = 'PRICE' AND version IN (2, 3) ORDER BY version
+            """)
+        ).all()
+    assert retained == [
+        (2, "100.120", "number", "30.123", "number"),
+        (3, "100.120", "number", "30.123", "number"),
+    ]
+
+
+def test_two_noncanonical_legacy_fields_are_corrected_independently(patient_backend):
+    clinic = patient_backend
+    with transaction(clinic.runtime, clinic.tenant) as conn:
+        append_version(
+            conn,
+            str(clinic.tenant),
+            "PRICE",
+            '{"standard_new_exam_egp":100.123,"preferential_followup_egp":30.123,'
+            '"urgent_base_egp":null,"urgent_enabled":false}',
+            1,
+        )
+    assert pricing_request(clinic, clinic.owner)[1]["data"][
+        "legacy_price_remediation"
+    ] == {
+        "standard_new_exam_egp": "100.123",
+        "preferential_followup_egp": "30.123",
+    }
+
+    first_command = {
+        **_patch(standard_new_exam_egp="100.12"),
+        "expected_price_revision": 2,
+    }
+    first_key = str(uuid4())
+    status, first = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=first_command, key=first_key
+    )
+    assert status == 200, first
+    assert first["data"]["price_revision"] == 3
+    assert first["data"]["standard_new_exam_egp"] == "100.12"
+    assert first["data"]["preferential_followup_egp"] is None
+    assert first["data"]["legacy_price_remediation"] == {
+        "preferential_followup_egp": "30.123"
+    }
+    assert pricing_request(
+        clinic, clinic.owner, method="PATCH", body=first_command, key=first_key
+    ) == (status, first)
+    receptionist = pricing_request(clinic, clinic.receptionist)
+    assert receptionist[0] == 200
+    assert "legacy_price_remediation" not in receptionist[1]["data"]
+    for service, expected in (("NEW_EXAMINATION", 200), ("FOLLOW_UP", 409)):
+        status, response = pricing_request(
+            clinic,
+            clinic.receptionist,
+            query={
+                "service_type": service,
+                "discount_type": "NONE",
+                "discount_value": "0",
+            },
+        )
+        assert status == expected, response
+
+    second_command = {
+        **_patch(preferential_followup_egp="30.12"),
+        "expected_price_revision": 3,
+    }
+    second_key = str(uuid4())
+    status, second = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=second_command, key=second_key
+    )
+    assert status == 200, second
+    assert second["data"]["price_revision"] == 4
+    assert second["data"]["preferential_followup_egp"] == "30.12"
+    assert "legacy_price_remediation" not in second["data"]
+    assert pricing_request(
+        clinic, clinic.owner, method="PATCH", body=second_command, key=second_key
+    ) == (status, second)
+    assert (
+        pricing_request(
+            clinic,
+            clinic.receptionist,
+            query={
+                "service_type": "FOLLOW_UP",
+                "discount_type": "NONE",
+                "discount_value": "0",
+            },
+        )[1]["data"]["price_quote"]["net_egp"]
+        == "30.12"
+    )
+    with transaction(clinic.runtime, clinic.tenant) as conn:
+        retained = conn.execute(
+            text("""
+                SELECT version, payload->>'standard_new_exam_egp',
+                       payload->>'preferential_followup_egp',
+                       jsonb_typeof(payload->'standard_new_exam_egp'),
+                       jsonb_typeof(payload->'preferential_followup_egp')
+                FROM public.clinic_policy_versions
+                WHERE kind = 'PRICE' ORDER BY version
+            """)
+        ).all()
+        assert retained == [
+            (1, None, None, "null", "null"),
+            (2, "100.123", "30.123", "number", "number"),
+            (3, "100.12", "30.123", "string", "number"),
+            (4, "100.12", "30.12", "string", "string"),
+        ]
+        assert (
+            conn.scalar(
+                text("""
+            SELECT count(*) FROM public.idempotency_receipts
+            WHERE operation = 'settings.pricing.update'
+        """)
+            )
+            == 2
+        )
+
+
+def test_remediation_preserves_untouched_legacy_numeric_and_nested_precision(
+    patient_backend,
+):
+    clinic = patient_backend
+    with transaction(clinic.runtime, clinic.tenant) as conn:
+        append_version(
+            conn,
+            str(clinic.tenant),
+            "PRICE",
+            '{"standard_new_exam_egp":100.123,'
+            '"preferential_followup_egp":30.5,'
+            '"urgent_base_egp":null,"urgent_enabled":false,'
+            '"nested_extra":{"rate":7.123}}',
+            1,
+        )
+    status, result = pricing_request(
+        clinic,
+        clinic.owner,
+        method="PATCH",
+        body={
+            **_patch(standard_new_exam_egp="100.12"),
+            "expected_price_revision": 2,
+        },
+        key=str(uuid4()),
+    )
+    assert status == 200, result
+    assert result["data"]["standard_new_exam_egp"] == "100.12"
+    assert result["data"]["preferential_followup_egp"] == "30.50"
+    assert "legacy_price_remediation" not in result["data"]
+    with transaction(clinic.runtime, clinic.tenant) as conn:
+        retained = conn.execute(
+            text("""
+                SELECT version, payload->>'standard_new_exam_egp',
+                       jsonb_typeof(payload->'standard_new_exam_egp'),
+                       payload->>'preferential_followup_egp',
+                       jsonb_typeof(payload->'preferential_followup_egp'),
+                       payload->'nested_extra'->>'rate',
+                       jsonb_typeof(payload->'nested_extra'->'rate')
+                FROM public.clinic_policy_versions
+                WHERE kind = 'PRICE' AND version IN (2, 3) ORDER BY version
+            """)
+        ).all()
+    assert retained == [
+        (2, "100.123", "number", "30.5", "number", "7.123", "number"),
+        (3, "100.12", "string", "30.5", "number", "7.123", "number"),
+    ]
 
 
 @pytest.mark.parametrize(

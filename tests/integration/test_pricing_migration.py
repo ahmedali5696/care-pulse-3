@@ -139,35 +139,35 @@ def test_predecessor_legacy_numeric_null_snapshots_receipts_survive_upgrade(
                 doctors.append(_activate_clinic(conn, tenant, operator))
         for tenant, doctor in zip(tenants, doctors, strict=True):
             with transaction(runtime, tenant) as conn:
+                saved = persist_appointment(
+                    conn,
+                    _draft(_patient(conn, tenant), doctor),
+                    _query(tenant, doctor),
+                )
+                assert saved["net_egp"] == "100.00"
                 if tenant == tenants[0]:
                     append_version(
                         conn,
                         str(tenant),
                         "PRICE",
-                        {
-                            "standard_new_exam_egp": 100,
-                            "preferential_followup_egp": 30.5,
-                            "urgent_base_egp": None,
-                            "urgent_enabled": False,
-                        },
+                        '{"standard_new_exam_egp":100.123,'
+                        '"preferential_followup_egp":30.123,'
+                        '"urgent_base_egp":null,"urgent_enabled":false}',
                         1,
                     )
-                saved = persist_appointment(
-                    conn,
-                    _draft(
-                        _patient(conn, tenant),
-                        doctor,
-                        price_snapshot={
-                            "pricing_version": 2 if tenant == tenants[0] else 1
-                        },
-                    ),
-                    _query(tenant, doctor),
-                )
-                assert saved["net_egp"] == "100.00"
         with migration.connect() as conn:
             before = _database_fingerprint(conn)
             assert len(before["tenants"]) == 2
             assert len(before["snapshots"]) == len(before["receipts"]) == 2
+            assert conn.execute(
+                text("""
+                    SELECT payload->>'standard_new_exam_egp',
+                           payload->>'preferential_followup_egp'
+                    FROM public.clinic_policy_versions
+                    WHERE organization_id = :tenant AND kind = 'PRICE' AND version = 2
+                """),
+                {"tenant": tenants[0]},
+            ).one() == ("100.123", "30.123")
         _upgrade(migration)
         _upgrade(migration)
         with migration.connect() as conn:
@@ -176,30 +176,52 @@ def test_predecessor_legacy_numeric_null_snapshots_receipts_survive_upgrade(
                 == head
             )
             assert _database_fingerprint(conn) == before
+            assert (
+                conn.scalar(
+                    text("""
+                    SELECT public.valid_clinic_policy('PRICE', payload)
+                    FROM public.clinic_policy_versions
+                    WHERE organization_id = :tenant AND kind = 'PRICE' AND version = 2
+                """),
+                    {"tenant": tenants[0]},
+                )
+                is True
+            )
         with transaction(runtime, tenants[0]) as conn:
             assert (
                 append_version(
                     conn,
                     str(tenants[0]),
                     "PRICE",
-                    {
-                        "standard_new_exam_egp": "100.00",
-                        "preferential_followup_egp": "30.50",
-                        "urgent_base_egp": None,
-                        "urgent_enabled": False,
-                    },
+                    '{"standard_new_exam_egp":"100.12",'
+                    '"preferential_followup_egp":30.123,'
+                    '"urgent_base_egp":null,"urgent_enabled":false}',
                     2,
                 )
                 == 3
             )
-        with transaction(runtime, tenants[0]) as conn:
-            saved = conn.scalar(
+        with migration.connect() as conn:
+            values = conn.execute(
                 text("""
-                SELECT payload::text FROM public.clinic_policy_versions
-                WHERE kind = 'PRICE' AND version = 3
-            """)
-            )
-            assert '"100.00"' in saved and '"30.50"' in saved
+                    SELECT version, payload->>'standard_new_exam_egp',
+                           payload->>'preferential_followup_egp',
+                           jsonb_typeof(payload->'preferential_followup_egp')
+                    FROM public.clinic_policy_versions
+                    WHERE organization_id = :tenant AND kind = 'PRICE'
+                    ORDER BY version
+                """),
+                {"tenant": tenants[0]},
+            ).all()
+            assert values == [
+                (1, None, None, "null"),
+                (2, "100.123", "30.123", "number"),
+                (3, "100.12", "30.123", "number"),
+            ]
+            after = _database_fingerprint(conn)
+            assert after["snapshots"] == before["snapshots"]
+            assert after["receipts"] == before["receipts"]
+            assert after["row_security"] == before["row_security"]
+            assert after["privileges"] == before["privileges"]
         with pytest.raises(DBAPIError) as bad, transaction(runtime, tenants[1]) as conn:
             append_version(
                 conn,

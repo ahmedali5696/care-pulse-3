@@ -80,22 +80,73 @@ def _money_output(value: object) -> str | None:
         raise ContractError(409) from invalid
 
 
+def _noncanonical_legacy_money(value: object) -> str | None:
+    """Identify old JSON numbers that lose value at two-decimal EGP scale."""
+    if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+        return None
+    if value.as_tuple().exponent >= -2:
+        return None
+    try:
+        _money_output(value)
+    except ContractError:
+        return format(value, "f")
+    return None
+
+
+def _price_payload_json(value: object) -> str:
+    """Preserve all untouched D-04 JSON numeric scales, even in extra fields."""
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("Invalid policy JSON number")
+        return format(value, "f")
+    if isinstance(value, dict):
+        return (
+            "{"
+            + ",".join(
+                f"{json.dumps(key)}:{_price_payload_json(item)}"
+                for key, item in value.items()
+            )
+            + "}"
+        )
+    if isinstance(value, list):
+        return "[" + ",".join(_price_payload_json(item) for item in value) + "]"
+    if isinstance(value, float):
+        raise TypeError("Binary float cannot encode a policy JSON number")
+    return json.dumps(value, allow_nan=False)
+
+
 def _projection(state: dict, owner: bool) -> dict:
     pricing, followup = state["PRICE"], state["FOLLOWUP"]
     price = pricing["payload"]
+    values = {}
+    remediation = {}
+    for name in (
+        "standard_new_exam_egp",
+        "preferential_followup_egp",
+        "urgent_base_egp",
+    ):
+        raw = _noncanonical_legacy_money(price[name])
+        if raw is not None:
+            values[name] = None
+            if owner:
+                remediation[name] = raw
+        else:
+            values[name] = _money_output(price[name])
     result = {
-        "standard_new_exam_egp": _money_output(price["standard_new_exam_egp"]),
-        "preferential_followup_egp": _money_output(price["preferential_followup_egp"]),
+        "standard_new_exam_egp": values["standard_new_exam_egp"],
+        "preferential_followup_egp": values["preferential_followup_egp"],
         "price_revision": pricing["revision"],
         "followup_revision": followup["revision"],
     }
     if owner:
         result.update(
-            urgent_base_egp=_money_output(price["urgent_base_egp"]),
+            urgent_base_egp=values["urgent_base_egp"],
             urgent_enabled=price["urgent_enabled"],
             completion_day_zero=followup["payload"]["completion_day_zero"],
             followup_last_day_inclusive=int(followup["payload"]["last_day_inclusive"]),
         )
+        if remediation:
+            result["legacy_price_remediation"] = remediation
     return result
 
 
@@ -235,19 +286,21 @@ def update_pricing(
             "preferential_followup_egp",
             "urgent_base_egp",
         ):
+            if name not in provided and isinstance(price[name], Decimal):
+                if _noncanonical_legacy_money(price[name]) is None:
+                    _money_output(price[name])
+                continue  # Preserve every untouched D-04 numeric type and scale.
             formatted = _money_output(price[name])
             if formatted is not None:
                 parse_money(formatted)
             if price_requested:
                 price[name] = formatted
-        standard, premium = (
-            _money_output(price["standard_new_exam_egp"]),
-            _money_output(price["urgent_base_egp"]),
-        )
+        standard = price["standard_new_exam_egp"]
+        premium = price["urgent_base_egp"]
         if price["urgent_enabled"] and (
             standard is None
             or premium is None
-            or Decimal(premium) <= Decimal(standard)
+            or Decimal(str(premium)) <= Decimal(str(standard))
             or not _has_operating_periods(connection, tenant)
         ):
             raise ValueError(
@@ -257,14 +310,14 @@ def update_pricing(
         raise ContractError(422) from invalid
     changed_price = price_requested and price != state["PRICE"]["payload"]
     changed_followup = followup != state["FOLLOWUP"]["payload"]
-    # Legacy numeric policy rows become canonical strings on the next update.
+    # Corrected fields are canonical; uncorrected D-04 numbers retain exact scale.
     if changed_price:
         try:
             append_version(
                 connection,
                 tenant,
                 "PRICE",
-                price,
+                _price_payload_json(price),
                 state["PRICE"]["revision"],
                 actor_staff_id=str(actor.staff_id),
             )

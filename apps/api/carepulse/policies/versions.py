@@ -99,7 +99,7 @@ def append_version(
     connection: Connection,
     tenant: str,
     kind: str,
-    payload: dict,
+    payload: dict | str,
     expected_revision: int,
     *,
     actor_staff_id: str | None = None,
@@ -145,7 +145,9 @@ def append_version(
             "tenant": tenant,
             "kind": kind,
             "version": new_version,
-            "payload": json.dumps(payload, allow_nan=False),
+            "payload": payload
+            if isinstance(payload, str)
+            else json.dumps(payload, allow_nan=False),
             "actor": actor_staff_id,
             "effective": effective_on,
             "pending": kind == "QUEUE" and effective_on is None,
