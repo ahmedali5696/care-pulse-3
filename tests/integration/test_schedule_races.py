@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
+from time import monotonic
 
 import pytest
 from carepulse.appointments.persistence import persist_appointment
@@ -10,11 +11,28 @@ from carepulse.identity.contracts import ContractError
 from carepulse.policies.schedule import date_rules
 from carepulse.policies.schedule_service import load_current_schedule
 from carepulse.policies.versions import lock_schedule_barrier
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _draft, _patient, _query
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_schedule import SERVICE_DAY, _activate, _actor, _config, _publish, _stage
+
+
+def _blocked_query(observer, waiter_pid, holder_pid):
+    deadline = monotonic() + 15
+    while monotonic() < deadline:
+        observer.execute(text("SELECT pg_stat_clear_snapshot()"))
+        query = observer.scalar(
+            text("""
+                SELECT query FROM pg_stat_activity
+                WHERE pid = :waiter AND wait_event_type = 'Lock'
+                  AND :holder = ANY(pg_blocking_pids(pid))
+            """),
+            {"waiter": waiter_pid, "holder": holder_pid},
+        )
+        if query:
+            return " ".join(query.split())
+    pytest.fail("Expected PostgreSQL lock waiter was not observed")
 
 
 def _setup(runtime, tenant, owner):
@@ -82,6 +100,11 @@ def test_booking_first_on_date_absent_at_preview_stales_activation(appointment_s
             assert release_booking.wait(timeout=15)
         return booked
 
+    observed_sql = []
+
+    def record_sql(_connection, _cursor, statement, _parameters, _context, _many):
+        observed_sql.append(" ".join(statement.split()))
+
     with ThreadPoolExecutor(max_workers=1) as pool:
         booking_future = pool.submit(book)
         try:
@@ -91,8 +114,18 @@ def test_booking_first_on_date_absent_at_preview_stales_activation(appointment_s
                 transaction(runtime, tenant) as connection,
             ):
                 connection.execute(text("SET LOCAL lock_timeout = '1s'"))
-                _activate(connection, owner, preview)
+                event.listen(connection, "before_cursor_execute", record_sql)
+                try:
+                    _activate(connection, owner, preview)
+                finally:
+                    event.remove(connection, "before_cursor_execute", record_sql)
             assert blocked.value.orig.sqlstate == "55P03"
+            assert any(
+                sql.startswith("SELECT 1 FROM public.clinic_policy_heads ")
+                and " FOR UPDATE" in sql
+                for sql in observed_sql
+            )
+            assert not any("FROM public.appointments" in sql for sql in observed_sql)
         finally:
             release_booking.set()
         booked = booking_future.result(timeout=30)
@@ -116,19 +149,34 @@ def test_activation_first_closes_absent_date_before_stale_booking_can_commit(
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
     owner = _actor(tenant, doctor)
     patient, preview = _setup(runtime, tenant, owner)
-    activation_published = Event()
-    booking_blocked = Event()
+    activation_started = Event()
+    activation_pid = []
 
     def publish():
         with transaction(runtime, tenant) as connection:
-            published = _activate(connection, owner, preview)
-            activation_published.set()
-            assert booking_blocked.wait(timeout=15)
-        return published
+            activation_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            activation_started.set()
+            return _activate(connection, owner, preview)
 
-    def book():
-        assert activation_published.wait(timeout=15)
-        try:
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with transaction(runtime, tenant) as capacity_gate:
+            capacity_pid = capacity_gate.scalar(text("SELECT pg_backend_pid()"))
+            assert (
+                capacity_gate.scalar(
+                    text("""
+                    SELECT 1 FROM public.clinic_policy_heads
+                    WHERE organization_id = :tenant AND kind = 'CAPACITY' FOR UPDATE
+                """),
+                    {"tenant": tenant},
+                )
+                == 1
+            )
+            activated_future = pool.submit(publish)
+            assert activation_started.wait(timeout=15)
+            with transaction(runtime, tenant) as observer:
+                blocked_sql = _blocked_query(observer, activation_pid[0], capacity_pid)
+            assert blocked_sql.startswith("SELECT 1 FROM public.clinic_policy_heads ")
+            assert " FOR SHARE" in blocked_sql
             with (
                 pytest.raises(DBAPIError) as blocked,
                 transaction(runtime, tenant) as connection,
@@ -136,31 +184,23 @@ def test_activation_first_closes_absent_date_before_stale_booking_can_commit(
                 connection.execute(text("SET LOCAL lock_timeout = '1s'"))
                 lock_schedule_barrier(connection, tenant, shared=True)
             assert blocked.value.orig.sqlstate == "55P03"
-        finally:
-            booking_blocked.set()
-        with (
-            pytest.raises(ContractError) as denied,
-            transaction(runtime, tenant) as connection,
-        ):
-            lock_schedule_barrier(connection, tenant, shared=True)
-            if not date_rules(
-                load_current_schedule(connection, tenant), SERVICE_DAY
-            ).eligible:
-                raise ContractError(409)
-            persist_appointment(
-                connection,
-                _draft(patient, doctor, service_date=SERVICE_DAY),
-                _query(tenant, doctor),
-            )
-        return denied.value
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        activated_future = pool.submit(publish)
-        booked_future = pool.submit(book)
         published = activated_future.result(timeout=30)
-        denied = booked_future.result(timeout=30)
+    with (
+        pytest.raises(ContractError) as denied,
+        transaction(runtime, tenant) as connection,
+    ):
+        lock_schedule_barrier(connection, tenant, shared=True)
+        if not date_rules(
+            load_current_schedule(connection, tenant), SERVICE_DAY
+        ).eligible:
+            raise ContractError(409)
+        persist_appointment(
+            connection,
+            _draft(patient, doctor, service_date=SERVICE_DAY),
+            _query(tenant, doctor),
+        )
     assert published["schedule_revision"] == 3
-    assert denied.status_code == 409
+    assert denied.value.status_code == 409
     revision, eligible, appointments, versions = _read_final(runtime, tenant)
     assert revision == versions == 3 and eligible is False
     assert appointments == []

@@ -130,7 +130,14 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
     try:
         _at_revision(migration, predecessor)
         operator = uuid4()
-        tenants = (uuid4(), uuid4())
+        legacy_payloads = (
+            {**SCHEDULE, "duration_minutes": 30.0},
+            SCHEDULE,
+            json.dumps(SCHEDULE).replace(
+                '"duration_minutes": null', '"duration_minutes": 9007199254740993.0'
+            ),
+        )
+        tenants = tuple(uuid4() for _ in legacy_payloads)
         with migration.begin() as connection:
             connection.execute(
                 text("""
@@ -152,7 +159,9 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
                 )
                 doctors.append(_activate_clinic(connection, tenant, operator))
 
-        for tenant, doctor in zip(tenants, doctors, strict=True):
+        for tenant, doctor, payload in zip(
+            tenants, doctors, legacy_payloads, strict=True
+        ):
             with transaction(runtime, tenant) as connection:
                 persist_appointment(
                     connection,
@@ -163,9 +172,7 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
                     connection,
                     str(tenant),
                     "SCHEDULE",
-                    {**SCHEDULE, "duration_minutes": 30.0}
-                    if tenant == tenants[0]
-                    else SCHEDULE,
+                    payload,
                     1,
                     intervals=[
                         _period(
@@ -216,9 +223,9 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
             old_checks = _shape_checks(connection)
             assert len(old_checks) == 1
             assert old_checks[0].conname != "clinic_schedule_interval_shape"
-            assert len(before[0]["appointments"]) == 2
-            assert len(before[0]["clinic_policy_previews"]) == 2
-            assert len(before[0]["clinic_schedule_intervals"]) == 8
+            assert len(before[0]["appointments"]) == 3
+            assert len(before[0]["clinic_policy_previews"]) == 3
+            assert len(before[0]["clinic_schedule_intervals"]) == 12
         _upgrade(migration)
         _upgrade(migration)
         with migration.connect() as connection:
@@ -258,19 +265,27 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
                 if role == "carepulse_operator" and relation in TABLES
             )
 
-        with transaction(runtime, tenants[0]) as connection:
-            assert load_current_schedule(connection, tenants[0]).duration_minutes == 30
-            assert (
-                connection.scalar(
-                    text("""
+        preserved_durations = (
+            (tenants[0], 30, "30.0"),
+            (tenants[2], 9007199254740993, "9007199254740993.0"),
+        )
+        for tenant, duration, original in preserved_durations:
+            with transaction(runtime, tenant) as connection:
+                assert (
+                    load_current_schedule(connection, tenant).duration_minutes
+                    == duration
+                )
+                assert (
+                    connection.scalar(
+                        text("""
                     SELECT payload->>'duration_minutes'
                     FROM public.clinic_policy_versions
                     WHERE organization_id=:tenant AND kind='SCHEDULE' AND version=2
                 """),
-                    {"tenant": tenants[0]},
+                        {"tenant": tenant},
+                    )
+                    == original
                 )
-                == "30.0"
-            )
 
         with transaction(runtime, tenants[1]) as connection:
             with pytest.raises(ContractError) as conflict:
@@ -286,26 +301,43 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
                 {"tenant": tenants[1]},
             ) == time(9, 0, 1, 123456)
 
-        with transaction(runtime, tenants[0]) as connection:
-            assert (
-                append_version(
-                    connection,
-                    str(tenants[0]),
-                    "SCHEDULE",
-                    SCHEDULE,
-                    2,
-                    intervals=[
-                        _period("MANUAL_SLOT", weekday=1, start="13:00", end="13:30"),
-                        _period(
-                            "MANUAL_SLOT",
-                            service_date=date(2026, 11, 5),
-                            start="13:30",
-                            end="14:00",
-                        ),
-                    ],
+        for tenant, duration, original in preserved_durations:
+            with transaction(runtime, tenant) as connection:
+                assert (
+                    append_version(
+                        connection,
+                        str(tenant),
+                        "SCHEDULE",
+                        {**SCHEDULE, "duration_minutes": duration},
+                        2,
+                        intervals=[
+                            _period(
+                                "MANUAL_SLOT", weekday=1, start="13:00", end="13:30"
+                            ),
+                            _period(
+                                "MANUAL_SLOT",
+                                service_date=date(2026, 11, 5),
+                                start="13:30",
+                                end="14:00",
+                            ),
+                        ],
+                    )
+                    == 3
                 )
-                == 3
-            )
+            with transaction(runtime, tenant) as connection:
+                assert (
+                    load_current_schedule(connection, tenant).duration_minutes
+                    == duration
+                )
+                assert connection.execute(
+                    text("""
+                    SELECT version, payload->>'duration_minutes'
+                    FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant AND kind='SCHEDULE' AND version IN (2, 3)
+                    ORDER BY version
+                """),
+                    {"tenant": tenant},
+                ).all() == [(2, original), (3, str(duration))]
 
         invalid_shapes = [
             _period("WORK", weekday=1, service_date=date(2026, 11, 5)),

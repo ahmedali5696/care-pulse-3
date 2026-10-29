@@ -5,6 +5,7 @@ import re
 from collections import defaultdict
 from dataclasses import replace
 from datetime import date, datetime, time
+from decimal import Decimal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -170,7 +171,7 @@ def _schedule_head(connection: Connection, tenant):
     row = (
         connection.execute(
             text("""
-            SELECT h.revision, h.current_version, v.payload
+            SELECT h.revision, h.current_version, v.payload::text AS payload
             FROM public.clinic_policy_heads AS h
             JOIN public.clinic_policy_versions AS v
               ON (v.organization_id,v.kind,v.version) =
@@ -184,7 +185,10 @@ def _schedule_head(connection: Connection, tenant):
     )
     if row is None:
         raise ContractError(409)
-    return row
+    return {
+        **row,
+        "payload": json.loads(row["payload"], parse_float=Decimal),
+    }
 
 
 def _capacity_state(connection: Connection, tenant) -> dict:
@@ -233,7 +237,17 @@ def load_current_schedule(connection: Connection, tenant) -> ScheduleConfig:
     ).all()
     payload = head["payload"]
     duration = payload["duration_minutes"]
-    if type(duration) is float and duration.is_integer():
+    if duration is not None:
+        if (
+            type(duration) not in (int, Decimal)
+            or (isinstance(duration, Decimal) and not duration.is_finite())
+            or duration <= 0
+            or (
+                isinstance(duration, Decimal)
+                and duration != duration.to_integral_value()
+            )
+        ):
+            raise ContractError(409)
         duration = int(duration)
     fields = {
         "booking_mode": payload["booking_mode"],
@@ -484,6 +498,7 @@ def compute_affected(
             candidate_config, day
         )
         candidate_rules = date_rules(candidate_config, day)
+        # A preserved Open booking needs only the holiday date toggle; new timed slots need hours.
         date_eligible = (
             is_working_day(candidate_config, day)
             or candidate_config.holiday_booking_enabled

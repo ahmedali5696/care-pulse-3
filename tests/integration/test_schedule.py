@@ -604,6 +604,37 @@ def test_existing_confirmed_bookings_survive_disappearing_new_slot_candidates(
         assert _frozen(connection, booked["id"]) == frozen
 
 
+def test_open_booking_survives_exact_time_holiday_without_new_timed_hours(
+    appointment_storage,
+):
+    from carepulse.policies.schedule import date_rules
+    from carepulse.policies.schedule_service import load_current_schedule
+
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    owner = _actor(tenant, doctor)
+    with transaction(runtime, tenant) as connection:
+        _publish(connection, owner, _config(mode="OPEN"))
+        booked = _booking(connection, tenant, doctor, timed=False)
+        frozen = _frozen(connection, booked["id"])
+        candidate = _config(
+            holiday_booking_enabled=True, holidays=[SERVICE_DAY.isoformat()]
+        )
+        preview = _stage(connection, owner, candidate, revision=2)
+        assert preview["affected"] == [
+            {
+                "appointment_id": booked["id"],
+                "service_date": SERVICE_DAY.isoformat(),
+                "effects": ["MODE_CHANGED"],
+                "blocking": False,
+            }
+        ]
+        assert _activate(connection, owner, preview)["schedule_revision"] == 3
+        assert not date_rules(
+            load_current_schedule(connection, tenant), SERVICE_DAY
+        ).eligible
+        assert _frozen(connection, booked["id"]) == frozen
+
+
 def test_weekly_manual_slots_inherit_except_explicit_date_replacements(
     appointment_storage,
 ):
