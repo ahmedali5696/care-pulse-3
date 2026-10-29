@@ -26,6 +26,7 @@ from sqlalchemy import text
 from test_appointment_persistence import _draft, _patient, _query
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
+from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 
 CAIRO = ZoneInfo("Africa/Cairo")
 SERVICE_DAY = datetime.now(CAIRO).date() + timedelta(days=28)
@@ -674,9 +675,11 @@ def test_cutoff_exposure_is_booked_only_and_does_not_mutate_frozen_open_or_timed
             ),
             revision=2,
         )
-        assert {row["appointment_id"] for row in preview["affected"]} == {booked["id"]}
-        assert preview["affected"][0]["effects"] == ["CUTOFF_EXPOSURE"]
-        assert preview["affected"][0]["blocking"] is False
+        affected = {row["appointment_id"]: row for row in preview["affected"]}
+        assert set(affected) == {booked["id"], waiting["id"]}
+        assert affected[booked["id"]]["effects"] == ["CUTOFF_EXPOSURE"]
+        assert affected[waiting["id"]]["effects"] == []
+        assert all(not row["blocking"] for row in affected.values())
         assert _activate(connection, owner, preview)["schedule_revision"] == 3
         assert {
             row["id"]: _frozen(connection, row["id"]) for row in (booked, waiting)
