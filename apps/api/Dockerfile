@@ -48,5 +48,6 @@ CMD []
 
 FROM python-base AS test
 # T009 adds the integration suite; this target keeps the same locked Python image.
+COPY --from=mail-node /usr/local/bin/node /usr/local/bin/node
 COPY --chown=65532:65532 . /srv/
 CMD ["python", "-m", "pytest", "tests/integration"]
