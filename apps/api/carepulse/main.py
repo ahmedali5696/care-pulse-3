@@ -21,6 +21,7 @@ from carepulse.identity.receipts import ReceiptConflict
 from carepulse.identity.staff_routes import router as staff_router
 from carepulse.patients.routes import router as patient_router
 from carepulse.policies.pricing_routes import router as pricing_router
+from carepulse.policies.schedule_routes import router as schedule_router
 from carepulse.provisioning.routes import router as provisioning_router
 
 
@@ -47,6 +48,7 @@ app.include_router(provisioning_router)
 app.include_router(staff_router)
 app.include_router(patient_router)
 app.include_router(pricing_router)
+app.include_router(schedule_router)
 app.add_exception_handler(ContractError, contract_exception_handler)
 app.add_exception_handler(
     RequestValidationError, lambda _request, _error: error_response(422)
@@ -69,6 +71,10 @@ app.add_middleware(
         ("POST", "/v1/patients"): "PATIENT_REGISTRY",
         ("GET", "/v1/settings/pricing"): "SETTINGS_PRICING",
         ("PATCH", "/v1/settings/pricing"): "SETTINGS_PRICING",
+        ("GET", "/v1/settings/schedule"): "SETTINGS_SCHEDULE",
+        ("PATCH", "/v1/settings/schedule"): "SETTINGS_SCHEDULE",
+        ("POST", "/v1/settings/schedule/preview"): "SETTINGS_SCHEDULE",
+        ("POST", "/v1/settings/schedule/activate"): "SETTINGS_SCHEDULE",
     },
     route_patterns=(
         (

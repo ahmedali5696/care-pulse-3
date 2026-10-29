@@ -8,10 +8,16 @@ type RouteContext = { params: Promise<{ path?: string[] }> };
 
 async function delegate(request: Request, context: RouteContext): Promise<Response> {
   const segments = (await context.params).path ?? [];
-  if (segments.length !== 1 || segments[0] !== "pricing" ||
-      (request.method !== "GET" && request.method !== "PATCH")) return failure(403);
+  const isSettingsReadOrPatch = segments.length === 1 &&
+    ["pricing", "schedule"].includes(segments[0]) &&
+    (request.method === "GET" || request.method === "PATCH");
+  const isScheduleAction = segments.length === 2 && segments[0] === "schedule" &&
+    ["preview", "activate"].includes(segments[1]) && request.method === "POST";
+  if (!isSettingsReadOrPatch && !isScheduleAction) return failure(403);
   return forwardPrivate(request, {
-    path: "/v1/settings/pricing", purpose: "SETTINGS_PRICING", method: request.method,
+    path: `/v1/settings/${segments.join("/")}`,
+    purpose: segments[0] === "pricing" ? "SETTINGS_PRICING" : "SETTINGS_SCHEDULE",
+    method: request.method,
   });
 }
 

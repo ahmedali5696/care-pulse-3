@@ -28,7 +28,6 @@ from test_database import (
     ROOT,
     _create_empty_database,
     _engine,
-    _upgrade,
 )
 from test_database import (
     admin as admin,  # noqa: PLC0414 - fixture export
@@ -49,8 +48,10 @@ def _revisions():
     return info["down_revision"], info["revision"]
 
 
-def _at_revision(engine, revision):
+def _at_revision(engine, revision, scripts=None):
     config = Config(str(ROOT / "alembic.ini"))
+    if scripts is not None:
+        config.set_main_option("script_location", str(scripts))
     with engine.connect() as conn:
         config.attributes["connection"] = conn
         command.upgrade(config, revision)
@@ -168,8 +169,8 @@ def test_predecessor_legacy_numeric_null_snapshots_receipts_survive_upgrade(
                 """),
                 {"tenant": tenants[0]},
             ).one() == ("100.123", "30.123")
-        _upgrade(migration)
-        _upgrade(migration)
+        _at_revision(migration, head)
+        _at_revision(migration, head)
         with migration.connect() as conn:
             assert (
                 conn.scalar(text("SELECT version_num FROM public.alembic_version"))
@@ -246,7 +247,7 @@ def test_fresh_install_and_repeated_upgrade_are_no_ops(admin, empty_database):
     _create_empty_database(admin, empty_database)
     migration = _engine("carepulse_migration", empty_database)
     try:
-        _upgrade(migration)
+        _at_revision(migration, head)
         with migration.connect() as conn:
             first = conn.scalar(
                 text("""
@@ -254,7 +255,7 @@ def test_fresh_install_and_repeated_upgrade_are_no_ops(admin, empty_database):
                 FROM pg_proc WHERE oid = 'public.valid_clinic_policy(text,jsonb)'::regprocedure
             """)
             )
-        _upgrade(migration)
+        _at_revision(migration, head)
         with migration.connect() as conn:
             assert (
                 conn.scalar(text("SELECT version_num FROM public.alembic_version"))
@@ -307,9 +308,9 @@ def test_failed_following_revision_keeps_head_and_ddl_atomic(
         '    op.execute("SELECT 1 / 0")\n'
     )
     try:
-        _upgrade(migration)
+        _at_revision(migration, head)
         with pytest.raises(DBAPIError) as error:
-            _upgrade(migration, scripts)
+            _at_revision(migration, "9999_pricing_failure", scripts)
         assert error.value.orig.sqlstate == "22012"
         with migration.connect() as conn:
             assert (

@@ -39,13 +39,18 @@ def lock_policy_heads(
             raise StalePolicyRevision("Policy head unavailable")
 
 
+def lock_schedule_barrier(connection: Connection, tenant: str, shared: bool) -> None:
+    """Serialize schedule publishing with booking and pricing policy reads."""
+    lock_policy_heads(connection, tenant, {"SCHEDULE": "SHARE" if shared else "UPDATE"})
+
+
 def _next_operating_day(
     connection: Connection, tenant: str, today: date
 ) -> date | None:
     """Absent operating periods mean pending queue effectiveness, never tomorrow."""
     schedule = connection.execute(
         text("""
-        SELECT v.version FROM public.clinic_policy_heads h
+        SELECT v.version, v.payload FROM public.clinic_policy_heads h
         JOIN public.clinic_policy_versions v
           ON (v.organization_id, v.kind, v.version) =
              (h.organization_id, h.kind, h.current_version)
@@ -53,7 +58,7 @@ def _next_operating_day(
         FOR SHARE OF h
     """),
         {"tenant": tenant},
-    ).scalar_one()
+    ).one()
     rows = connection.execute(
         text("""
         SELECT interval_kind, weekday, service_date
@@ -61,19 +66,28 @@ def _next_operating_day(
         WHERE organization_id = :tenant AND policy_kind = 'SCHEDULE'
           AND policy_version = :version AND interval_kind IN ('WORK', 'OVERRIDE_WORK')
     """),
-        {"tenant": tenant, "version": schedule},
+        {"tenant": tenant, "version": schedule.version},
     ).all()
-    weekdays = {row.weekday for row in rows if row.interval_kind == "WORK"}
+    weekdays = set(
+        schedule.payload.get(
+            "working_weekdays",
+            [row.weekday for row in rows if row.interval_kind == "WORK"],
+        )
+    )
     overrides = {
         row.service_date for row in rows if row.interval_kind == "OVERRIDE_WORK"
     }
+    overrides.update(
+        date.fromisoformat(day)
+        for day in schedule.payload.get("open_override_dates", [])
+    )
     holidays = set(
         connection.scalars(
             text("""
         SELECT service_date FROM public.clinic_schedule_holidays
         WHERE organization_id = :tenant AND policy_version = :version
     """),
-            {"tenant": tenant, "version": schedule},
+            {"tenant": tenant, "version": schedule.version},
         ).all()
     )
     next_override = min(

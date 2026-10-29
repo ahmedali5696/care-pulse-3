@@ -90,7 +90,7 @@ def test_incompatible_revision_denies_then_recovers_without_schema_creation():
         finally:
             admin.execute(
                 "UPDATE public.alembic_version SET version_num = %s",
-                ("0019_b06_price_policy_strings",),
+                ("0020_b07_manual_slot_weekly",),
             )
         _eventually()
         assert (
