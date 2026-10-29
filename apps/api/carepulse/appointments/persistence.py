@@ -54,6 +54,12 @@ def _allocate_number(connection: Connection, clinic: UUID, service_date: date) -
     )
 
 
+def allocate_day_number(
+    connection: Connection, organization_id: UUID, service_date: date
+) -> int:
+    return _allocate_number(connection, organization_id, service_date)
+
+
 def persist_appointment(
     connection: Connection, draft: AppointmentDraft, query: TenantReceiptQuery
 ) -> dict:
