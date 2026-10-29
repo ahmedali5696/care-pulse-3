@@ -1,7 +1,9 @@
 """B-07 pure schedule eligibility and validation regressions."""
 
+import json
 from dataclasses import replace
 from datetime import date, time, timedelta
+from decimal import Decimal
 
 import pytest
 from carepulse.policies.schedule import (
@@ -18,6 +20,13 @@ from carepulse.policies.schedule import (
     resolved_periods,
     validate_schedule,
 )
+from carepulse.policies.schedule_contracts import ScheduleConfigInput
+from carepulse.policies.schedule_service import (
+    _payload_config,
+    _to_config,
+    _version_payload,
+)
+from pydantic import ValidationError
 
 MONDAY = date(2026, 11, 2)
 TUESDAY = MONDAY + timedelta(days=1)
@@ -76,6 +85,29 @@ def test_duration_longer_than_a_day_produces_no_candidate_without_an_artificial_
     config = replace(_weekly_config(), duration_minutes=10**30)
     validate_schedule(config, 1)
     assert not date_rules(config, MONDAY).eligible
+
+
+@pytest.mark.parametrize("duration", ["9007199254740993", "9" * 4301])
+def test_duration_wire_and_published_numeric_payload_preserve_exact_digits(duration):
+    config = ScheduleConfig(
+        duration_minutes=int(Decimal(duration)), working_weekdays=frozenset()
+    )
+    wire = _payload_config(config)
+    assert wire["duration_minutes"] == duration
+    parsed = ScheduleConfigInput.model_validate(wire)
+    assert _to_config(parsed).duration_minutes == config.duration_minutes
+    published = _version_payload(config, False)
+    assert json.loads(published, parse_int=Decimal)["duration_minutes"] == Decimal(
+        duration
+    )
+    assert f'"duration_minutes": {duration}' in published
+
+
+@pytest.mark.parametrize("invalid", [30, 30.0, True, "0", "01", "1.0", "+1", "-1"])
+def test_duration_wire_rejects_numbers_and_noncanonical_text(invalid):
+    wire = _payload_config(ScheduleConfig(working_weekdays=frozenset()))
+    with pytest.raises(ValidationError):
+        ScheduleConfigInput.model_validate({**wire, "duration_minutes": invalid})
 
 
 def test_legacy_weekdays_derive_from_work_periods_only_when_metadata_absent():

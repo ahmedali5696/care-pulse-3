@@ -4,6 +4,7 @@ import json
 import runpy
 import shutil
 from datetime import date, time
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -44,6 +45,7 @@ SCHEDULE = {
     "allow_overlap": False,
     "no_show_cutoff": {"enabled": False, "local_time": None},
 }
+HUGE_DURATION = "9" * 4301
 
 
 def _revisions():
@@ -136,6 +138,9 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
             json.dumps(SCHEDULE).replace(
                 '"duration_minutes": null', '"duration_minutes": 9007199254740993.0'
             ),
+            json.dumps(SCHEDULE).replace(
+                '"duration_minutes": null', f'"duration_minutes": {HUGE_DURATION}'
+            ),
         )
         tenants = tuple(uuid4() for _ in legacy_payloads)
         with migration.begin() as connection:
@@ -223,9 +228,9 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
             old_checks = _shape_checks(connection)
             assert len(old_checks) == 1
             assert old_checks[0].conname != "clinic_schedule_interval_shape"
-            assert len(before[0]["appointments"]) == 3
-            assert len(before[0]["clinic_policy_previews"]) == 3
-            assert len(before[0]["clinic_schedule_intervals"]) == 12
+            assert len(before[0]["appointments"]) == 4
+            assert len(before[0]["clinic_policy_previews"]) == 4
+            assert len(before[0]["clinic_schedule_intervals"]) == 16
         _upgrade(migration)
         _upgrade(migration)
         with migration.connect() as connection:
@@ -266,10 +271,11 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
             )
 
         preserved_durations = (
-            (tenants[0], 30, "30.0"),
-            (tenants[2], 9007199254740993, "9007199254740993.0"),
+            (tenants[0], 30, "30.0", "30"),
+            (tenants[2], 9007199254740993, "9007199254740993.0", "9007199254740993"),
+            (tenants[3], int(Decimal(HUGE_DURATION)), HUGE_DURATION, HUGE_DURATION),
         )
-        for tenant, duration, original in preserved_durations:
+        for tenant, duration, original, _ in preserved_durations:
             with transaction(runtime, tenant) as connection:
                 assert (
                     load_current_schedule(connection, tenant).duration_minutes
@@ -301,14 +307,21 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
                 {"tenant": tenants[1]},
             ) == time(9, 0, 1, 123456)
 
-        for tenant, duration, original in preserved_durations:
+        for tenant, duration, original, encoded in preserved_durations:
             with transaction(runtime, tenant) as connection:
+                next_payload = (
+                    json.dumps(SCHEDULE).replace(
+                        '"duration_minutes": null', f'"duration_minutes": {encoded}'
+                    )
+                    if len(encoded) > 4300
+                    else {**SCHEDULE, "duration_minutes": duration}
+                )
                 assert (
                     append_version(
                         connection,
                         str(tenant),
                         "SCHEDULE",
-                        {**SCHEDULE, "duration_minutes": duration},
+                        next_payload,
                         2,
                         intervals=[
                             _period(
@@ -331,13 +344,14 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
                 )
                 assert connection.execute(
                     text("""
-                    SELECT version, payload->>'duration_minutes'
+                    SELECT version, jsonb_typeof(payload->'duration_minutes'),
+                           payload->>'duration_minutes'
                     FROM public.clinic_policy_versions
                     WHERE organization_id=:tenant AND kind='SCHEDULE' AND version IN (2, 3)
                     ORDER BY version
                 """),
                     {"tenant": tenant},
-                ).all() == [(2, original), (3, str(duration))]
+                ).all() == [(2, "number", original), (3, "number", encoded)]
 
         invalid_shapes = [
             _period("WORK", weekday=1, service_date=date(2026, 11, 5)),

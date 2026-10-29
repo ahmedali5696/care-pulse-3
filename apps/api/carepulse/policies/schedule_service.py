@@ -69,7 +69,9 @@ def _to_config(body: ScheduleConfigInput, confirmation=None) -> ScheduleConfig:
     )
     return ScheduleConfig(
         booking_mode=body.booking_mode,
-        duration_minutes=body.duration_minutes,
+        duration_minutes=int(Decimal(body.duration_minutes))
+        if body.duration_minutes is not None
+        else None,
         holiday_booking_enabled=body.holiday_booking_enabled,
         allow_overlap=body.allow_overlap,
         no_show_cutoff=NoShowCutoff(
@@ -132,7 +134,9 @@ def _payload_config(config: ScheduleConfig) -> dict:
 
     return {
         "booking_mode": config.booking_mode,
-        "duration_minutes": config.duration_minutes,
+        "duration_minutes": format(Decimal(config.duration_minutes), "f")
+        if config.duration_minutes is not None
+        else None,
         "holiday_booking_enabled": config.holiday_booking_enabled,
         "allow_overlap": config.allow_overlap,
         "no_show_cutoff": {
@@ -187,7 +191,11 @@ def _schedule_head(connection: Connection, tenant):
         raise ContractError(409)
     return {
         **row,
-        "payload": json.loads(row["payload"], parse_float=Decimal),
+        "payload": json.loads(
+            row["payload"],
+            parse_float=Decimal,
+            parse_int=lambda digits: int(Decimal(digits)),
+        ),
     }
 
 
@@ -251,7 +259,9 @@ def load_current_schedule(connection: Connection, tenant) -> ScheduleConfig:
         duration = int(duration)
     fields = {
         "booking_mode": payload["booking_mode"],
-        "duration_minutes": duration,
+        "duration_minutes": format(Decimal(duration), "f")
+        if duration is not None
+        else None,
         "holiday_booking_enabled": payload["holiday_booking_enabled"],
         "allow_overlap": payload["allow_overlap"],
         "no_show_cutoff": payload["no_show_cutoff"],
@@ -366,10 +376,10 @@ def _schedule_rows(config: ScheduleConfig):
     return rows
 
 
-def _version_payload(config: ScheduleConfig, routine_walk_in: bool) -> dict:
-    return {
+def _version_payload(config: ScheduleConfig, routine_walk_in: bool) -> str:
+    payload = {
         "booking_mode": config.booking_mode,
-        "duration_minutes": config.duration_minutes,
+        "duration_minutes": _payload_config(config)["duration_minutes"],
         "holiday_booking_enabled": config.holiday_booking_enabled,
         "allow_overlap": config.allow_overlap,
         "routine_walk_in_enabled": routine_walk_in,
@@ -382,6 +392,16 @@ def _version_payload(config: ScheduleConfig, routine_walk_in: bool) -> dict:
             day.isoformat() for day in config.manual_slots_by_date
         ),
     }
+    # JSONB stores duration as a number; Python's int JSON serializer rejects >4300 digits.
+    encoded = json.dumps(payload, allow_nan=False)
+    duration = payload["duration_minutes"]
+    if duration is not None:
+        encoded = encoded.replace(
+            f'"duration_minutes": "{duration}"',
+            f'"duration_minutes": {duration}',
+            1,
+        )
+    return encoded
 
 
 def _day_signature(config: ScheduleConfig, day: date):

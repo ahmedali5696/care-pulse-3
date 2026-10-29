@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import shutil
+import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
 from hashlib import sha256
@@ -40,7 +42,7 @@ def _actor(tenant, staff, role="DOCTOR_OWNER"):
 def _config(*, mode="EXACT_TIME", **changes):
     fields = {
         "booking_mode": mode,
-        "duration_minutes": 30 if mode == "EXACT_TIME" else None,
+        "duration_minutes": "30" if mode == "EXACT_TIME" else None,
         "holiday_booking_enabled": False,
         "allow_overlap": False,
         "no_show_cutoff": {"enabled": False, "local_time": None},
@@ -155,7 +157,9 @@ def _frozen(connection, appointment_id):
     ).one()
 
 
-def _schedule_request(clinic, actor, *, method="GET", suffix="", body=None, key=""):
+def _schedule_request(
+    clinic, actor, *, method="GET", suffix="", body=None, key="", raw_response=False
+):
     path = "/v1/settings/schedule" + suffix
     encoded = (
         json.dumps(body, separators=(",", ":")).encode() if body is not None else b""
@@ -224,9 +228,8 @@ def _schedule_request(clinic, actor, *, method="GET", suffix="", body=None, key=
         outgoing.append(message)
 
     asyncio.run(app(scope, receive, send))
-    return outgoing[0]["status"], json.loads(
-        b"".join(message.get("body", b"") for message in outgoing[1:])
-    )
+    payload = b"".join(message.get("body", b"") for message in outgoing[1:])
+    return outgoing[0]["status"], payload if raw_response else json.loads(payload)
 
 
 def test_owner_patch_and_preview_stage_without_publication_then_activate(
@@ -323,6 +326,155 @@ def test_owner_patch_and_preview_stage_without_publication_then_activate(
         0
     ] in (401, 403)
     assert _schedule_request(clinic, clinic.owner)[0] in (401, 403)
+
+
+@pytest.mark.parametrize(
+    "duration",
+    ["9007199254740993", "9" * 4301],
+    ids=["js_precision", "over_4300_digits"],
+)
+def test_duration_string_survives_signed_http_activation_and_preserves_history(
+    patient_backend, duration
+):
+    clinic = patient_backend
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    status, initial = _schedule_request(clinic, clinic.owner)
+    assert status == 200
+    assert initial["data"]["config"]["duration_minutes"] is None
+
+    candidate = _config(duration_minutes=duration)
+    body = {
+        "expected_schedule_revision": initial["data"]["schedule_revision"],
+        "reason": "Synthetic duration precision regression",
+        "config": candidate,
+        "overlap_capacity_confirmation": None,
+    }
+    status, staged = _schedule_request(
+        clinic, clinic.owner, method="PATCH", body=body, key=str(uuid4())
+    )
+    assert status == 200 and staged["data"]["revisions"]["schedule"] == 1
+    assert (
+        _schedule_request(clinic, clinic.owner)[1]["data"]["config"]["duration_minutes"]
+        is None
+    )
+
+    status, preview = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/preview",
+        body=body,
+        key=str(uuid4()),
+    )
+    assert status == 200 and preview["data"]["affected"] == []
+    status, published = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/activate",
+        body={
+            "preview_id": preview["data"]["preview_id"],
+            "expected_schedule_revision": 1,
+            "expected_capacity_revision": 1,
+            "reason": "Synthetic duration activation",
+        },
+        key=str(uuid4()),
+    )
+    assert status == 200 and published["data"]["schedule_revision"] == 2
+    assert published["data"]["config"]["duration_minutes"] == duration
+
+    status, raw = _schedule_request(clinic, clinic.owner, raw_response=True)
+    assert status == 200
+    assert json.loads(raw)["data"]["config"]["duration_minutes"] == duration
+    node = shutil.which("node")
+    assert node is not None, "Pinned Node runtime required for JSON round-trip"
+    javascript = subprocess.run(
+        [
+            node,
+            "-e",
+            (
+                "const x=JSON.parse(require('node:fs').readFileSync(0,'utf8')); "
+                "process.stdout.write(JSON.stringify(x.data.config))"
+            ),
+        ],
+        input=raw,
+        capture_output=True,
+        check=True,
+    )
+    javascript_config = json.loads(javascript.stdout)
+    assert javascript_config["duration_minutes"] == duration
+
+    # A later unrelated edit must survive the browser's JSON parse/stringify path.
+    later_config = {
+        **javascript_config,
+        "no_show_cutoff": {"enabled": True, "local_time": "17:00"},
+    }
+    later_body = {
+        **body,
+        "expected_schedule_revision": 2,
+        "reason": "Synthetic later cutoff edit",
+        "config": later_config,
+    }
+    status, stage_again = _schedule_request(
+        clinic, clinic.owner, method="PATCH", body=later_body, key=str(uuid4())
+    )
+    assert status == 200 and stage_again["data"]["revisions"]["schedule"] == 2
+    status, preview_again = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/preview",
+        body=later_body,
+        key=str(uuid4()),
+    )
+    assert status == 200 and preview_again["data"]["affected"] == []
+    status, published_again = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/activate",
+        body={
+            "preview_id": preview_again["data"]["preview_id"],
+            "expected_schedule_revision": 2,
+            "expected_capacity_revision": 1,
+            "reason": "Synthetic later cutoff activation",
+        },
+        key=str(uuid4()),
+    )
+    assert status == 200 and published_again["data"]["schedule_revision"] == 3
+    assert published_again["data"]["config"] == later_config
+    assert _schedule_request(clinic, clinic.owner)[1]["data"]["config"] == later_config
+
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert connection.execute(
+            text("""
+            SELECT version, jsonb_typeof(payload->'duration_minutes'),
+                   payload->>'duration_minutes'
+            FROM public.clinic_policy_versions
+            WHERE kind='SCHEDULE' ORDER BY version
+        """)
+        ).all() == [
+            (1, "null", None),
+            (2, "number", duration),
+            (3, "number", duration),
+        ]
+
+
+@pytest.mark.parametrize("numeric", [30, 9007199254740993, 30.0])
+def test_schedule_patch_rejects_json_numeric_duration(patient_backend, numeric):
+    clinic = patient_backend
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    body = {
+        "expected_schedule_revision": 1,
+        "reason": "Synthetic numeric duration rejection",
+        "config": _config(duration_minutes=numeric),
+        "overlap_capacity_confirmation": None,
+    }
+    status, _ = _schedule_request(
+        clinic, clinic.owner, method="PATCH", body=body, key=str(uuid4())
+    )
+    assert status == 422
+    assert _schedule_request(clinic, clinic.owner)[1]["data"]["schedule_revision"] == 1
 
 
 @pytest.mark.parametrize(
@@ -429,7 +581,7 @@ def test_counted_waiting_examination_completed_peak_blocks_unchanged_overlap_lim
             for status in ("Waiting", "In Examination", "Completed")
         ]
         frozen = [_frozen(connection, row["id"]) for row in appointments]
-        preview = _stage(connection, owner, _config(duration_minutes=15), revision=2)
+        preview = _stage(connection, owner, _config(duration_minutes="15"), revision=2)
         affected = {row["appointment_id"]: row for row in preview["affected"]}
         assert set(affected) == {row["id"] for row in appointments}
         assert all(
@@ -466,7 +618,7 @@ def test_disjoint_over_limit_peaks_capture_every_contributor_and_block_activatio
                 text("SELECT id, revision FROM public.appointments")
             )
         }
-        preview = _stage(connection, owner, _config(duration_minutes=15), revision=2)
+        preview = _stage(connection, owner, _config(duration_minutes="15"), revision=2)
         affected = {entry["appointment_id"]: entry for entry in preview["affected"]}
         assert set(affected) == {booking["id"] for booking in bookings}
         assert all(
@@ -560,7 +712,7 @@ def test_mode_duration_and_manual_slot_changes_are_review_only_for_confirmed_tim
 @pytest.mark.parametrize(
     ("active", "candidate", "timed", "status", "effects"),
     [
-        (_config(), _config(duration_minutes=240), True, "Booked", ["SLOTS_CHANGED"]),
+        (_config(), _config(duration_minutes="240"), True, "Booked", ["SLOTS_CHANGED"]),
         (
             _config(
                 duration_minutes=None,
@@ -575,7 +727,7 @@ def test_mode_duration_and_manual_slot_changes_are_review_only_for_confirmed_tim
         ),
         (
             _config(mode="OPEN"),
-            _config(duration_minutes=240),
+            _config(duration_minutes="240"),
             False,
             "Waiting",
             ["MODE_CHANGED"],

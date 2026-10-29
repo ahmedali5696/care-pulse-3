@@ -70,7 +70,9 @@ class CutoffInput(StrictScheduleModel):
 
 class ScheduleConfigInput(StrictScheduleModel):
     booking_mode: Literal["OPEN", "EXACT_TIME"]
-    duration_minutes: Annotated[int, Field(strict=True, gt=0)] | None
+    duration_minutes: (
+        Annotated[str, Field(strict=True, pattern=r"^[1-9][0-9]*$")] | None
+    )
     holiday_booking_enabled: StrictBool
     allow_overlap: StrictBool
     no_show_cutoff: CutoffInput
