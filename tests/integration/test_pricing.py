@@ -4,6 +4,7 @@ import asyncio
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from hashlib import sha256
 from hmac import new
 from urllib.parse import urlencode
@@ -577,5 +578,5 @@ def test_quote_confirm_persist_and_read_preserves_full_percentage_and_service(
             {"appointment": saved["id"]},
         ).one()
         assert row[0] == service
-        assert row[1] == str(__import__("decimal").Decimal(discount))
+        assert Decimal(row[1]) == Decimal(discount)
         assert row[2] == quote.net_egp
