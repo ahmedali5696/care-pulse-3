@@ -667,11 +667,12 @@ def test_real_sql_error_at_each_write_stage_rolls_back_every_booking_effect(
         transaction(clinic.runtime, clinic.tenant) as connection,
     ):
 
-        @event.listens_for(connection, "before_cursor_execute")
-        def fail_sql_write(_connection, cursor, statement, _params, _context, _many):
+        @event.listens_for(connection, "before_cursor_execute", retval=True)
+        def fail_sql_write(_connection, _cursor, statement, params, _context, _many):
             if expected_sql in " ".join(statement.split()):
                 reached.append(failed_table)
-                cursor.execute("SELECT 1 / 0")
+                return "SELECT 1 / 0", ()
+            return statement, params
 
         book_appointment(connection, actor, command, key)
 
