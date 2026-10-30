@@ -611,11 +611,15 @@ BOOKING_WRITE_STAGES = (
 )
 
 
-def assert_tenant_context_cleared(clinic):
-    with clinic.runtime.connect() as connection:
-        assert connection.scalar(
-            text("SELECT current_setting('app.organization_id', true)")
-        ) in ("", None)
+def assert_tenant_context_cleared(connection, backend_pid, *, terminated=False):
+    current_pid, organization_id = connection.execute(
+        text("SELECT pg_backend_pid(), current_setting('app.organization_id', true)")
+    ).one()
+    if terminated:
+        assert current_pid != backend_pid
+    else:
+        assert current_pid == backend_pid
+    assert organization_id in ("", None)
 
 
 @pytest.mark.parametrize("blocked_table", BOOKING_WRITE_STAGES)
@@ -631,15 +635,18 @@ def test_postgres_lock_timeout_rolls_back_all_booking_writes_and_reuses_unassign
     before = booking_effects(clinic)
     with clinic.migration.begin() as holder:
         holder.execute(text(f"LOCK TABLE public.{blocked_table} IN SHARE MODE"))
-        with (
-            pytest.raises(DBAPIError) as blocked,
-            transaction(clinic.runtime, clinic.tenant) as connection,
-        ):
-            connection.execute(text("SET LOCAL lock_timeout = '300ms'"))
-            book_appointment(connection, actor, command, key)
-        assert blocked.value.orig.sqlstate == "55P03"
+        with clinic.runtime.connect() as connection:
+            with pytest.raises(DBAPIError) as blocked, connection.begin():
+                connection.execute(
+                    text("SELECT set_config('app.organization_id', :tenant, true)"),
+                    {"tenant": str(clinic.tenant)},
+                )
+                backend_pid = connection.scalar(text("SELECT pg_backend_pid()"))
+                connection.execute(text("SET LOCAL lock_timeout = '300ms'"))
+                book_appointment(connection, actor, command, key)
+            assert blocked.value.orig.sqlstate == "55P03"
+            assert_tenant_context_cleared(connection, backend_pid)
     assert booking_effects(clinic) == before
-    assert_tenant_context_cleared(clinic)
     status, saved = booking_request(
         clinic, clinic.owner, body=booking_body(patient), key=key
     )
@@ -661,24 +668,29 @@ def test_real_sql_error_at_each_write_stage_rolls_back_every_booking_effect(
     reached = []
     before = booking_effects(clinic)
 
-    with (
-        pytest.raises(DBAPIError) as failed,
-        transaction(clinic.runtime, clinic.tenant) as connection,
-    ):
+    with clinic.runtime.connect() as connection:
+        with pytest.raises(DBAPIError) as failed, connection.begin():
+            connection.execute(
+                text("SELECT set_config('app.organization_id', :tenant, true)"),
+                {"tenant": str(clinic.tenant)},
+            )
+            backend_pid = connection.scalar(text("SELECT pg_backend_pid()"))
 
-        @event.listens_for(connection, "before_cursor_execute", retval=True)
-        def fail_sql_write(_connection, _cursor, statement, params, _context, _many):
-            if expected_sql in " ".join(statement.split()):
-                reached.append(failed_table)
-                return "SELECT 1 / 0", ()
-            return statement, params
+            @event.listens_for(connection, "before_cursor_execute", retval=True)
+            def fail_sql_write(
+                _connection, _cursor, statement, params, _context, _many
+            ):
+                if expected_sql in " ".join(statement.split()):
+                    reached.append(failed_table)
+                    return "SELECT 1 / 0", ()
+                return statement, params
 
-        book_appointment(connection, actor, command, key)
+            book_appointment(connection, actor, command, key)
 
-    assert reached == [failed_table]
-    assert failed.value.orig.sqlstate == "22012"
+        assert reached == [failed_table]
+        assert failed.value.orig.sqlstate == "22012"
+        assert_tenant_context_cleared(connection, backend_pid)
     assert booking_effects(clinic) == before
-    assert_tenant_context_cleared(clinic)
     status, recovered = booking_request(
         clinic, clinic.owner, body=booking_body(patient), key=key
     )
@@ -724,7 +736,8 @@ def test_real_postgres_connection_loss_at_each_write_stage_rolls_back_receipt(
     assert terminated == [True]
     assert failed.value.connection_invalidated
     assert booking_effects(clinic) == before
-    assert_tenant_context_cleared(clinic)
+    with clinic.runtime.connect() as new_connection:
+        assert_tenant_context_cleared(new_connection, backend_pid, terminated=True)
     status, recovered = booking_request(
         clinic, clinic.owner, body=booking_body(patient), key=key
     )
