@@ -21,7 +21,7 @@ from carepulse.main import app
 from carepulse.policies.schedule_service import load_current_schedule
 from carepulse.policies.slots import candidates_for_date
 from carepulse.policies.versions import append_version
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _draft, _patient, _query
 from test_patients import create_patient
@@ -163,7 +163,8 @@ def booking_effects(clinic):
         "outbox_events": "event_type = 'APPOINTMENT_BOOKED'",
         "idempotency_receipts": "operation = 'appointments.book'",
     }
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    # Sensitive audits are intentionally hidden from unbound runtime SELECT by RLS.
+    with clinic.migration.connect() as connection:
         return tuple(
             connection.scalar(
                 text(
@@ -503,7 +504,9 @@ def test_withdrawn_live_authority_denies_even_valid_booking(
     with clinic.migration.begin() as connection:
         if authority == "disabled_staff":
             connection.execute(
-                text("UPDATE public.staff_accounts SET enabled=false WHERE id=:id"),
+                text(
+                    "UPDATE public.staff_accounts SET enabled=false, security_revision=security_revision+1 WHERE id=:id"
+                ),
                 {"id": UUID(clinic.receptionist.staff_id)},
             )
         else:
@@ -632,3 +635,92 @@ def test_postgres_lock_timeout_rolls_back_all_booking_writes_and_reuses_unassign
     assert status == 201, saved
     assert saved["data"]["number"] == 1
     assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
+
+
+@pytest.mark.parametrize(
+    "failed_table",
+    [
+        "appointment_day_counters",
+        "appointments",
+        "appointment_number_assignments",
+        "appointment_price_snapshots",
+        "appointment_history",
+        "sensitive_audit",
+        "outbox_events",
+        "idempotency_receipts",
+    ],
+)
+def test_real_sql_error_at_each_write_stage_rolls_back_every_booking_effect(
+    booking_clinic, failed_table
+):
+    clinic = booking_clinic
+    patient = new_patient(clinic)
+    command = BookAppointment.model_validate(booking_body(patient))
+    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+    key = str(uuid4())
+    expected_sql = f"INSERT INTO public.{failed_table} "
+    reached = []
+    before = booking_effects(clinic)
+
+    with (
+        pytest.raises(DBAPIError),
+        transaction(clinic.runtime, clinic.tenant) as connection,
+    ):
+
+        @event.listens_for(connection, "before_cursor_execute")
+        def fail_sql_write(_connection, cursor, statement, _params, _context, _many):
+            if expected_sql in " ".join(statement.split()):
+                reached.append(failed_table)
+                cursor.execute("SELECT 1 / 0")
+
+        book_appointment(connection, actor, command, key)
+
+    assert reached == [failed_table]
+    assert booking_effects(clinic) == before
+    status, recovered = booking_request(
+        clinic, clinic.owner, body=booking_body(patient), key=key
+    )
+    assert status == 201, recovered
+    assert recovered["data"]["number"] == 1
+    assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
+
+
+def test_real_postgres_connection_loss_after_booking_writes_rolls_back_receipt(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    patient = new_patient(clinic)
+    command = BookAppointment.model_validate(booking_body(patient))
+    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+    key = str(uuid4())
+    terminated = []
+    before = booking_effects(clinic)
+
+    with (
+        pytest.raises(DBAPIError),
+        transaction(clinic.runtime, clinic.tenant) as connection,
+    ):
+        backend_pid = connection.scalar(text("SELECT pg_backend_pid()"))
+
+        @event.listens_for(connection, "before_cursor_execute")
+        def terminate_before_receipt(
+            _connection, _cursor, statement, _params, _context, _many
+        ):
+            if "INSERT INTO public.idempotency_receipts " in statement:
+                with clinic.runtime.connect() as killer:
+                    terminated.append(
+                        killer.scalar(
+                            text("SELECT pg_terminate_backend(:pid, 5000)"),
+                            {"pid": backend_pid},
+                        )
+                    )
+
+        book_appointment(connection, actor, command, key)
+
+    assert terminated == [True]
+    assert booking_effects(clinic) == before
+    status, recovered = booking_request(
+        clinic, clinic.owner, body=booking_body(patient), key=key
+    )
+    assert status == 201, recovered
+    assert recovered["data"]["number"] == 1
