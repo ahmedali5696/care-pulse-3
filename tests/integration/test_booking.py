@@ -707,7 +707,9 @@ def test_real_postgres_connection_loss_after_booking_writes_rolls_back_receipt(
         def terminate_before_receipt(
             _connection, _cursor, statement, _params, _context, _many
         ):
-            if "INSERT INTO public.idempotency_receipts " in statement:
+            if "INSERT INTO public.idempotency_receipts " in " ".join(
+                statement.split()
+            ):
                 with clinic.runtime.connect() as killer:
                     terminated.append(
                         killer.scalar(
