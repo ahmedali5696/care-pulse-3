@@ -60,31 +60,16 @@ def allocate_day_number(
     return _allocate_number(connection, organization_id, service_date)
 
 
-def persist_appointment(
-    connection: Connection, draft: AppointmentDraft, query: TenantReceiptQuery
-) -> dict:
-    """Caller owns the live-authorized transaction and tenant SET LOCAL context.
-
-    A database failure rolls back the counter, appointment, immutable ledger,
-    audit, outbox and existing D-09 receipt in the *same* transaction.
-    """
-    if query.operation != "appointments.persist":
-        raise ValueError("Invalid appointment fixture operation")
-    actor = query.actor
+def insert_appointment_records(
+    connection: Connection, actor, draft: AppointmentDraft, number: int
+) -> tuple[UUID, dict]:
+    """Insert the numbered appointment, immutable price and initial history only."""
     frozen = validate_price_snapshot(draft.price_snapshot)
     if (frozen["service_type"], frozen["classification"]) != (
         draft.service_type,
         draft.classification,
     ):
         raise ValueError("Snapshot does not describe the appointment")
-    retained = resolve_tenant_receipt(connection, query)
-    if retained is not None:
-        return retained[0]
-
-    lock_patient_for_new_appointment(
-        connection, actor.organization_id, draft.patient_id
-    )
-    number = _allocate_number(connection, actor.organization_id, draft.service_date)
     appointment_id, assignment_id = uuid4(), uuid4()
     connection.execute(
         insert(appointments).values(
@@ -138,6 +123,35 @@ def persist_appointment(
             price_snapshot_appointment_id=appointment_id,
         )
     )
+    return appointment_id, frozen
+
+
+def persist_appointment(
+    connection: Connection, draft: AppointmentDraft, query: TenantReceiptQuery
+) -> dict:
+    """Caller owns the live-authorized transaction and tenant SET LOCAL context.
+
+    A database failure rolls back the counter, appointment, immutable ledger,
+    audit, outbox and existing D-09 receipt in the *same* transaction.
+    """
+    if query.operation != "appointments.persist":
+        raise ValueError("Invalid appointment fixture operation")
+    actor = query.actor
+    frozen = validate_price_snapshot(draft.price_snapshot)
+    if (frozen["service_type"], frozen["classification"]) != (
+        draft.service_type,
+        draft.classification,
+    ):
+        raise ValueError("Snapshot does not describe the appointment")
+    retained = resolve_tenant_receipt(connection, query)
+    if retained is not None:
+        return retained[0]
+
+    lock_patient_for_new_appointment(
+        connection, actor.organization_id, draft.patient_id
+    )
+    number = _allocate_number(connection, actor.organization_id, draft.service_date)
+    appointment_id, _ = insert_appointment_records(connection, actor, draft, number)
     projection = {
         "id": str(appointment_id),
         "service_date": draft.service_date.isoformat(),

@@ -122,7 +122,7 @@ expected_paths = {
     '/v1/patients/{patient_id}/archive', '/v1/patients/{patient_id}/unarchive',
     '/v1/settings/pricing', '/v1/settings/schedule',
     '/v1/settings/schedule/preview', '/v1/settings/schedule/activate',
-    '/v1/slots',
+    '/v1/slots', '/v1/appointments', '/v1/appointments/{appointment_id}',
 }
 assert set(app.openapi()['paths']) == expected_paths
 assert app.openapi_url is None and len(app.user_middleware) == 1
@@ -137,6 +137,8 @@ assert boundary.kwargs['routes'] == {
     ('POST', '/v1/staff/recovery/finalize'): 'OWNER_RECOVERY',
     ('GET', '/v1/patients'): 'PATIENT_REGISTRY',
     ('POST', '/v1/patients'): 'PATIENT_REGISTRY',
+    ('GET', '/v1/appointments'): 'APPOINTMENT_BOOKING',
+    ('POST', '/v1/appointments'): 'APPOINTMENT_BOOKING',
     ('GET', '/v1/settings/pricing'): 'SETTINGS_PRICING',
     ('PATCH', '/v1/settings/pricing'): 'SETTINGS_PRICING',
     ('GET', '/v1/settings/schedule'): 'SETTINGS_SCHEDULE',
@@ -149,6 +151,7 @@ uuid = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
 assert {(method, pattern.pattern, purpose) for method, pattern, purpose in boundary.kwargs['route_patterns']} == {
     ('GET', f'/v1/staff/receptionists/{uuid}', 'STAFF_MANAGEMENT'),
     ('GET', f'/v1/patients/{uuid}', 'PATIENT_REGISTRY'),
+    ('GET', f'/v1/appointments/{uuid}', 'APPOINTMENT_BOOKING'),
     ('PATCH', f'/v1/patients/{uuid}', 'PATIENT_REGISTRY'),
     ('POST', f'/v1/patients/{uuid}/(?:archive|unarchive)', 'PATIENT_REGISTRY'),
     ('POST', f'/v1/staff/receptionists/{uuid}/(?:enable|disable|invite|revoke-invite)', 'STAFF_MANAGEMENT'),
@@ -208,6 +211,9 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             }
             foreach ($suite in @('tests/integration/test_slots.py', 'tests/integration/test_slot_races.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-08 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_booking.py', 'tests/integration/test_booking_races.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-09 verification: $suite" }
             }
             # Linux CI retains the accepted Bash probes; PowerShell checks their exit immediately.
             $integration = @'
@@ -318,6 +324,17 @@ docker compose --profile test run --rm --no-deps \
   tests/integration/test_slots.py tests/integration/test_slot_races.py | tee "$private/b08-slots.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b08-slots.log"; then
   echo 'FAIL mandatory B-08 slot evidence skipped'; exit 1
+fi
+# B-09 confirms atomic Booked-only creation and real-PostgreSQL races.
+docker compose --profile test run --rm --no-deps \
+  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider \
+  tests/integration/test_booking.py tests/integration/test_booking_races.py | tee "$private/b09-booking.log"
+if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b09-booking.log"; then
+  echo 'FAIL mandatory B-09 booking evidence skipped'; exit 1
 fi
 # B-05 backend proof has no BFF/invitation prerequisite and cannot silently skip.
 docker compose --profile test run --rm --no-deps \

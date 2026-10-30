@@ -1,4 +1,4 @@
-"""Private API entrypoint; register no clinical routes until their owning tasks."""
+"""Private signed API entrypoint with explicit purpose-bound route registration."""
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
+from carepulse.appointments.routes import router as appointment_router
 from carepulse.config import load_config
 from carepulse.db import create_db_engine
 from carepulse.health import router as health_router
@@ -48,6 +49,7 @@ app.include_router(health_router)
 app.include_router(provisioning_router)
 app.include_router(staff_router)
 app.include_router(patient_router)
+app.include_router(appointment_router)
 app.include_router(pricing_router)
 app.include_router(schedule_router)
 app.include_router(slots_router)
@@ -71,6 +73,8 @@ app.add_middleware(
         ("POST", "/v1/staff/recovery/finalize"): "OWNER_RECOVERY",
         ("GET", "/v1/patients"): "PATIENT_REGISTRY",
         ("POST", "/v1/patients"): "PATIENT_REGISTRY",
+        ("GET", "/v1/appointments"): "APPOINTMENT_BOOKING",
+        ("POST", "/v1/appointments"): "APPOINTMENT_BOOKING",
         ("GET", "/v1/settings/pricing"): "SETTINGS_PRICING",
         ("PATCH", "/v1/settings/pricing"): "SETTINGS_PRICING",
         ("GET", "/v1/settings/schedule"): "SETTINGS_SCHEDULE",
@@ -80,6 +84,13 @@ app.add_middleware(
         ("GET", "/v1/slots"): "SLOTS",
     },
     route_patterns=(
+        (
+            "GET",
+            compile(
+                r"/v1/appointments/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+            ),
+            "APPOINTMENT_BOOKING",
+        ),
         (
             "GET",
             compile(
