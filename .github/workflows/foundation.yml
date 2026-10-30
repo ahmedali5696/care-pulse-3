@@ -2,7 +2,7 @@ name: Foundation
 
 on:
   push:
-    branches: [feature/wave-0-foundation, development]
+    branches: [development]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -10,6 +10,12 @@ on:
         description: Run the isolated Issue 7 adapter feasibility experiment
         type: boolean
         default: false
+
+# Cancel superseded PR/push checks and duplicate manual runs of the same SHA/mode.
+# Keep manual runs for different commits and spike modes independent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.sha || 'branch' }}-${{ inputs.b04_spike && 'spike' || 'standard' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
