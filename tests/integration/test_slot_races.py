@@ -1,7 +1,7 @@
 """B-08 serialized timed bookings on the real disposable PostgreSQL schema."""
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, time
 from threading import Barrier
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -219,8 +219,13 @@ def test_cairo_postgres_session_normalizes_confirmed_intervals_for_both_paths(
         stored = connection.execute(
             text("SELECT starts_at, ends_at FROM public.appointments LIMIT 1")
         ).one()
-        assert stored.starts_at.utcoffset() == timedelta(hours=2)
-        assert stored.ends_at.utcoffset() == timedelta(hours=2)
+        cairo_start = slots[0].starts_at.astimezone(CAIRO)
+        cairo_end = slots[0].ends_at.astimezone(CAIRO)
+        assert cairo_start.date() == cairo_end.date() == SERVICE_DAY
+        assert stored.starts_at.utcoffset() == cairo_start.utcoffset()
+        assert stored.ends_at.utcoffset() == cairo_end.utcoffset()
+        assert stored.starts_at.astimezone(UTC) == slots[0].starts_at
+        assert stored.ends_at.astimezone(UTC) == slots[0].ends_at
 
         projection = list_slots(connection, _actor(tenant, doctor), SERVICE_DAY)
         assert projection["candidates"][0]["available"] is False
