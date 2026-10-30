@@ -1,15 +1,25 @@
 """B-09 booking intent and no-authority projection boundaries."""
 
+import asyncio
+import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from urllib.parse import urlencode
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
 from carepulse.appointments.book import validate_booking_date
-from carepulse.appointments.booking_contracts import BookAppointment
+from carepulse.appointments.booking_contracts import AppointmentQuery, BookAppointment
 from carepulse.appointments.queries import _projection
-from carepulse.identity.contracts import ContractError
+from carepulse.appointments.routes import router as appointment_router
+from carepulse.identity.contracts import (
+    ContractError,
+    contract_exception_handler,
+    error_response,
+)
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
 CAIRO = ZoneInfo("Africa/Cairo")
@@ -62,6 +72,92 @@ def test_untimed_and_complete_timed_intents_have_distinct_fields():
         }
     )
     assert timed.starts_at is not None and timed.ends_at is not None
+
+
+@pytest.mark.parametrize(
+    "invalid_date",
+    [
+        "2026-11-01T00:00:00",
+        "2026-11-01T00:00:00+02:00",
+        1793491200,
+        "1793491200",
+        "2026-11-1",
+        "2026-02-30",
+        date(2026, 11, 1),
+    ],
+)
+def test_booking_and_appointment_query_reject_noncanonical_dates(invalid_date):
+    with pytest.raises(ValidationError):
+        BookAppointment.model_validate(
+            {**_valid_command(), "service_date": invalid_date}
+        )
+    with pytest.raises(ValidationError):
+        AppointmentQuery.model_validate({"service_date": invalid_date})
+
+
+@pytest.mark.parametrize(
+    "invalid_date",
+    ["2026-11-01T00:00:00", "2026-11-01T00:00:00+02:00", 1793491200, "2026-11-1"],
+)
+def test_booking_and_appointment_query_reject_noncanonical_dates_with_http_422(
+    invalid_date,
+):
+    app = FastAPI()
+    app.include_router(appointment_router)
+    app.add_exception_handler(ContractError, contract_exception_handler)
+    app.add_exception_handler(
+        RequestValidationError, lambda _request, _error: error_response(422)
+    )
+
+    def request(method, *, body=None, query=None):
+        payload = json.dumps(body).encode() if body is not None else b""
+        messages = []
+
+        async def receive():
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        async def send(message):
+            messages.append(message)
+
+        asyncio.run(
+            app(
+                {
+                    "type": "http",
+                    "asgi": {"version": "3.0"},
+                    "http_version": "1.1",
+                    "scheme": "http",
+                    "method": method,
+                    "path": "/v1/appointments",
+                    "raw_path": b"/v1/appointments",
+                    "query_string": urlencode(query or {}).encode(),
+                    "root_path": "",
+                    "headers": [(b"content-type", b"application/json")],
+                    "client": ("synthetic", 1),
+                    "server": ("api", 8000),
+                },
+                receive,
+                send,
+            )
+        )
+        return messages[0]["status"], json.loads(
+            b"".join(message.get("body", b"") for message in messages[1:])
+        )
+
+    for status, response in (
+        request("POST", body={**_valid_command(), "service_date": invalid_date}),
+        request("GET", query={"service_date": str(invalid_date)}),
+    ):
+        assert status == 422
+        assert response["error"]["code"] == "INVALID_INPUT"
+
+
+def test_booking_and_appointment_query_parse_canonical_date():
+    day = date(2026, 11, 1)
+    assert BookAppointment.model_validate(_valid_command()).service_date == day
+    assert (
+        AppointmentQuery.model_validate({"service_date": day.isoformat()}).service_date
+        == day
+    )
 
 
 def test_booking_date_has_no_arbitrary_future_horizon():

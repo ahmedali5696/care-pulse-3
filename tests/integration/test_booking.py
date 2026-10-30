@@ -599,10 +599,26 @@ def test_paused_doctor_and_disabled_walkin_do_not_block_ordinary_booking(
     assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
 
 
-@pytest.mark.parametrize(
-    "blocked_table",
-    ["appointment_price_snapshots", "sensitive_audit", "outbox_events"],
+BOOKING_WRITE_STAGES = (
+    "appointment_day_counters",
+    "appointments",
+    "appointment_number_assignments",
+    "appointment_price_snapshots",
+    "appointment_history",
+    "sensitive_audit",
+    "outbox_events",
+    "idempotency_receipts",
 )
+
+
+def assert_tenant_context_cleared(clinic):
+    with clinic.runtime.connect() as connection:
+        assert connection.scalar(
+            text("SELECT current_setting('app.organization_id', true)")
+        ) in ("", None)
+
+
+@pytest.mark.parametrize("blocked_table", BOOKING_WRITE_STAGES)
 def test_postgres_lock_timeout_rolls_back_all_booking_writes_and_reuses_unassigned_number(
     booking_clinic,
     blocked_table,
@@ -614,9 +630,7 @@ def test_postgres_lock_timeout_rolls_back_all_booking_writes_and_reuses_unassign
     key = str(uuid4())
     before = booking_effects(clinic)
     with clinic.migration.begin() as holder:
-        holder.execute(
-            text(f"LOCK TABLE public.{blocked_table} IN ACCESS EXCLUSIVE MODE")
-        )
+        holder.execute(text(f"LOCK TABLE public.{blocked_table} IN SHARE MODE"))
         with (
             pytest.raises(DBAPIError) as blocked,
             transaction(clinic.runtime, clinic.tenant) as connection,
@@ -625,10 +639,7 @@ def test_postgres_lock_timeout_rolls_back_all_booking_writes_and_reuses_unassign
             book_appointment(connection, actor, command, key)
         assert blocked.value.orig.sqlstate == "55P03"
     assert booking_effects(clinic) == before
-    with clinic.runtime.connect() as connection:
-        assert connection.scalar(
-            text("SELECT current_setting('app.organization_id', true)")
-        ) in ("", None)
+    assert_tenant_context_cleared(clinic)
     status, saved = booking_request(
         clinic, clinic.owner, body=booking_body(patient), key=key
     )
@@ -637,19 +648,7 @@ def test_postgres_lock_timeout_rolls_back_all_booking_writes_and_reuses_unassign
     assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
 
 
-@pytest.mark.parametrize(
-    "failed_table",
-    [
-        "appointment_day_counters",
-        "appointments",
-        "appointment_number_assignments",
-        "appointment_price_snapshots",
-        "appointment_history",
-        "sensitive_audit",
-        "outbox_events",
-        "idempotency_receipts",
-    ],
-)
+@pytest.mark.parametrize("failed_table", BOOKING_WRITE_STAGES)
 def test_real_sql_error_at_each_write_stage_rolls_back_every_booking_effect(
     booking_clinic, failed_table
 ):
@@ -663,7 +662,7 @@ def test_real_sql_error_at_each_write_stage_rolls_back_every_booking_effect(
     before = booking_effects(clinic)
 
     with (
-        pytest.raises(DBAPIError),
+        pytest.raises(DBAPIError) as failed,
         transaction(clinic.runtime, clinic.tenant) as connection,
     ):
 
@@ -677,7 +676,9 @@ def test_real_sql_error_at_each_write_stage_rolls_back_every_booking_effect(
         book_appointment(connection, actor, command, key)
 
     assert reached == [failed_table]
+    assert failed.value.orig.sqlstate == "22012"
     assert booking_effects(clinic) == before
+    assert_tenant_context_cleared(clinic)
     status, recovered = booking_request(
         clinic, clinic.owner, body=booking_body(patient), key=key
     )
@@ -686,8 +687,9 @@ def test_real_sql_error_at_each_write_stage_rolls_back_every_booking_effect(
     assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
 
 
-def test_real_postgres_connection_loss_after_booking_writes_rolls_back_receipt(
-    booking_clinic,
+@pytest.mark.parametrize("failed_table", BOOKING_WRITE_STAGES)
+def test_real_postgres_connection_loss_at_each_write_stage_rolls_back_receipt(
+    booking_clinic, failed_table
 ):
     clinic = booking_clinic
     patient = new_patient(clinic)
@@ -696,20 +698,19 @@ def test_real_postgres_connection_loss_after_booking_writes_rolls_back_receipt(
     key = str(uuid4())
     terminated = []
     before = booking_effects(clinic)
+    expected_sql = f"INSERT INTO public.{failed_table} "
 
     with (
-        pytest.raises(DBAPIError),
+        pytest.raises(DBAPIError) as failed,
         transaction(clinic.runtime, clinic.tenant) as connection,
     ):
         backend_pid = connection.scalar(text("SELECT pg_backend_pid()"))
 
         @event.listens_for(connection, "before_cursor_execute")
-        def terminate_before_receipt(
+        def terminate_before_write(
             _connection, _cursor, statement, _params, _context, _many
         ):
-            if "INSERT INTO public.idempotency_receipts " in " ".join(
-                statement.split()
-            ):
+            if expected_sql in " ".join(statement.split()):
                 with clinic.runtime.connect() as killer:
                     terminated.append(
                         killer.scalar(
@@ -721,9 +722,12 @@ def test_real_postgres_connection_loss_after_booking_writes_rolls_back_receipt(
         book_appointment(connection, actor, command, key)
 
     assert terminated == [True]
+    assert failed.value.connection_invalidated
     assert booking_effects(clinic) == before
+    assert_tenant_context_cleared(clinic)
     status, recovered = booking_request(
         clinic, clinic.owner, body=booking_body(patient), key=key
     )
     assert status == 201, recovered
     assert recovered["data"]["number"] == 1
+    assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)

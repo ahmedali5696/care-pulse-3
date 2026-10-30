@@ -1,11 +1,13 @@
 """Strict operational booking inputs; all appointment authority is server-derived."""
 
 from datetime import date
+from re import fullmatch
 from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     StrictStr,
@@ -19,11 +21,23 @@ from carepulse.policies.pricing_contracts import DiscountInput
 Revision = Annotated[int, Field(strict=True, ge=0)]
 
 
+def _canonical_service_date(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value) is None
+    ):
+        raise ValueError("Expected YYYY-MM-DD")
+    return value
+
+
+CanonicalServiceDate = Annotated[date, BeforeValidator(_canonical_service_date)]
+
+
 class BookAppointment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     patient_id: UUID
-    service_date: date
+    service_date: CanonicalServiceDate
     requested_service_type: Literal["NEW_EXAMINATION", "FOLLOW_UP"]
     source_visit_id: UUID | None = None
     starts_at: StrictStr | None = None
@@ -61,7 +75,7 @@ class AppointmentQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     patient_id: UUID | None = None
-    service_date: date | None = None
+    service_date: CanonicalServiceDate | None = None
     status: (
         Literal[
             "Booked", "Waiting", "In Examination", "Completed", "Cancelled", "No-show"
