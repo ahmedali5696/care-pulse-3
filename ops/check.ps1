@@ -227,7 +227,7 @@ cleanup() {
   trap - EXIT
   if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" ]]; then
     if ! docker compose --profile mail --profile test --profile sender --profile operator down --remove-orphans --volumes; then code=1; fi
-rm -f "$private"/{postgres-password,runtime-db-password,auth-db-password,migration-password,operator-password,operator-credential,sender-password,service-key,auth-secret,file-key,delivery-public.pem,delivery-private.pem,operator-id,invite-link,clinic-create.json,compose.json,roles.log,web-denial.log,worker-denial.log,denials.log,runtime-logs,canaries,old-worker-status.json,health-logs,auth-logs,mail-denial.log,b05-backend.log,b05-invited.log,b06-pricing.log,b07-schedule.log,b08-slots.log}
+rm -f "$private"/{postgres-password,runtime-db-password,auth-db-password,migration-password,operator-password,operator-credential,sender-password,service-key,auth-secret,file-key,delivery-public.pem,delivery-private.pem,operator-id,invite-link,clinic-create.json,compose.json,roles.log,web-denial.log,worker-denial.log,denials.log,runtime-logs,canaries,old-worker-status.json,health-logs,auth-logs,mail-denial.log,b05-backend.log,b05-invited.log,b06-pricing.log,b07-schedule.log,b08-slots.log,b09-booking.log}
     rm -rf "$private/image-scan"
     rmdir "$private" || code=1
   else
