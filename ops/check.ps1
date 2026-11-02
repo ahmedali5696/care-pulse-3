@@ -218,6 +218,9 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             foreach ($suite in @('tests/integration/test_visit_persistence.py', 'tests/integration/test_visit_revisions.py', 'tests/integration/test_visit_migration.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required D-07 verification: $suite" }
             }
+            foreach ($suite in @('tests/integration/test_followup_persistence.py', 'tests/integration/test_followup_races.py', 'tests/integration/test_followup_migration.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required D-08 verification: $suite" }
+            }
             # Linux CI retains the accepted Bash probes; PowerShell checks their exit immediately.
             $integration = @'
 set -euo pipefail
@@ -292,7 +295,10 @@ docker compose --profile test run --rm --no-deps \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_patient_persistence.py tests/integration/test_policy_persistence.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py tests/integration/test_appointment_persistence.py tests/integration/test_appointment_races.py tests/integration/test_visit_persistence.py tests/integration/test_visit_revisions.py tests/integration/test_visit_migration.py
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_patient_persistence.py tests/integration/test_policy_persistence.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py tests/integration/test_appointment_persistence.py tests/integration/test_appointment_races.py tests/integration/test_visit_persistence.py tests/integration/test_visit_revisions.py tests/integration/test_visit_migration.py tests/integration/test_followup_persistence.py tests/integration/test_followup_races.py tests/integration/test_followup_migration.py | tee "$private/d08-core.log"
+if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d08-core.log"; then
+  echo 'FAIL mandatory D-08 persistence evidence skipped'; exit 1
+fi
 # All B-06 suites run against disposable PostgreSQL; no silent skip counts.
 docker compose --profile test run --rm --no-deps \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
