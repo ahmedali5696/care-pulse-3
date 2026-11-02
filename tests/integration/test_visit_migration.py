@@ -125,6 +125,23 @@ def test_version_and_fresh_upgrade_preserve_predecessor_records(admin, empty_dat
                 """),
             ).all()
             assert len(before) == len(original) == 4
+            assignments = connection.execute(
+                text("""
+                    SELECT id, appointment_id, service_date, number
+                    FROM public.appointment_number_assignments
+                    ORDER BY number
+                """)
+            ).all()
+            receipts = connection.execute(
+                text("""
+                    SELECT id, operation, idempotency_key, request_digest,
+                           result_projection
+                    FROM public.idempotency_receipts
+                    WHERE organization_id=:tenant ORDER BY id
+                """),
+                {"tenant": tenant},
+            ).all()
+            assert len(assignments) == len(receipts) == 4
         _upgrade(migration, AFTER)
         _upgrade(migration, AFTER)
         with migration.connect() as connection:
@@ -148,6 +165,27 @@ def test_version_and_fresh_upgrade_preserve_predecessor_records(admin, empty_dat
                 """),
                 ).all()
                 == before
+            )
+            assert (
+                connection.execute(
+                    text("""
+                    SELECT id, appointment_id, service_date, number
+                    FROM public.appointment_number_assignments ORDER BY number
+                """)
+                ).all()
+                == assignments
+            )
+            assert (
+                connection.execute(
+                    text("""
+                    SELECT id, operation, idempotency_key, request_digest,
+                           result_projection
+                    FROM public.idempotency_receipts
+                    WHERE organization_id=:tenant ORDER BY id
+                """),
+                    {"tenant": tenant},
+                ).all()
+                == receipts
             )
             assert connection.scalar(text("SELECT count(*) FROM public.visits")) == 0
             assert (

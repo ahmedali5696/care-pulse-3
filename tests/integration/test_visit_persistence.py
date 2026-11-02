@@ -427,7 +427,11 @@ def test_tenant_rls_and_effective_permissions(appointment_storage):
             )
             is False
         )
-        for name in ("guard_visit()", "assert_visit_appointment_consistency()"):
+        for name, expected_definer in (
+            ("guard_visit()", True),
+            ("assert_visit_appointment_consistency()", True),
+            ("deny_clinical_revision_mutation()", False),
+        ):
             details = connection.execute(
                 text("""
                     SELECT p.prosecdef, p.proconfig,
@@ -441,7 +445,7 @@ def test_tenant_rls_and_effective_permissions(appointment_storage):
                 """),
                 {"routine": f"public.{name}"},
             ).one()
-            assert details[0] is True
+            assert details[0] is expected_definer
             assert "search_path=pg_catalog" in details[1]
             assert details[2:] == (False, False)
 

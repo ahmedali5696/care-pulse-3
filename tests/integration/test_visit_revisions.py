@@ -119,11 +119,14 @@ def test_unauthorized_or_unjustified_correction_denied(
     appointment_storage, actor_kind, reason, kind, expected_state
 ):
     runtime, migration, (tenant, _), (doctor, other_doctor) = appointment_storage
+    receptionist = (
+        _receptionist(migration, tenant) if actor_kind == "receptionist" else None
+    )
     with transaction(runtime, tenant) as connection:
         appointment = _seed(connection, tenant, doctor, complete=True)
         visit = _visit(connection, appointment)
         if actor_kind == "receptionist":
-            actor = _receptionist(migration, tenant)
+            actor = receptionist
         elif actor_kind == "foreign_doctor":
             actor = other_doctor
         else:
@@ -180,3 +183,42 @@ def test_default_decision_is_only_reasonless_revision(appointment_storage):
                 {"id": uuid4(), "tenant": tenant, "visit": visit.id, "doctor": doctor},
             )
         assert denied.value.orig.sqlstate == "42501"
+
+
+def test_disabled_doctor_cannot_edit_clinical_content(appointment_storage):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        appointment = _seed(connection, tenant, doctor, complete=True)
+        visit = _visit(connection, appointment)
+        _actor(connection, doctor, "Attempt during disable")
+        connection.execute(
+            text("""
+                UPDATE public.staff_accounts
+                SET enabled=false, security_revision=security_revision+1
+                WHERE id=:doctor
+            """),
+            {"doctor": doctor},
+        )
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(
+                text("UPDATE public.visits SET diagnosis='Denied' WHERE id=:id"),
+                {"id": visit.id},
+            )
+        assert denied.value.orig.sqlstate == "42501"
+        connection.execute(
+            text("""
+                UPDATE public.staff_accounts
+                SET enabled=true, security_revision=security_revision+1
+                WHERE id=:doctor
+            """),
+            {"doctor": doctor},
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinical_revisions WHERE visit_id=:id"
+                ),
+                {"id": visit.id},
+            )
+            == 0
+        )
