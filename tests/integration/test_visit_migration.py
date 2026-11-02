@@ -15,6 +15,7 @@ from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _activate_clinic, _draft, _patient, _query
 from test_database import _create_empty_database, _engine
 from test_database import admin as admin  # noqa: PLC0414 - fixture export
+from test_database import disposable_project as disposable_project  # noqa: PLC0414 - fixture export
 from test_database import empty_database as empty_database  # noqa: PLC0414
 
 ROOT = Path(__file__).resolve().parents[2]
