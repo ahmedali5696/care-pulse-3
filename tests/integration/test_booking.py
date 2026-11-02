@@ -14,7 +14,6 @@ from zoneinfo import ZoneInfo
 import pytest
 from carepulse.appointments.book import book_appointment
 from carepulse.appointments.booking_contracts import BookAppointment
-from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
 from carepulse.identity.signing import canonical_payload, canonical_query
 from carepulse.main import app
@@ -23,7 +22,7 @@ from carepulse.policies.slots import candidates_for_date
 from carepulse.policies.versions import append_version
 from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
-from test_appointment_persistence import _draft, _patient, _query
+from test_appointment_persistence import _patient, _persist_with_status
 from test_patients import create_patient
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _patch, pricing_request
@@ -325,15 +324,13 @@ def test_counted_patient_day_guard_preserves_terminal_old_number(
     clinic = booking_clinic
     patient = new_patient(clinic)
     with transaction(clinic.runtime, clinic.tenant) as connection:
-        previous = persist_appointment(
+        previous = _persist_with_status(
             connection,
-            _draft(
-                patient,
-                UUID(clinic.owner.staff_id),
-                status=existing_status,
-                service_date=SERVICE_DAY,
-            ),
-            _query(clinic.tenant, UUID(clinic.owner.staff_id)),
+            clinic.tenant,
+            patient,
+            UUID(clinic.owner.staff_id),
+            existing_status,
+            service_date=SERVICE_DAY,
         )
     before = booking_effects(clinic)
     status, result = booking_request(

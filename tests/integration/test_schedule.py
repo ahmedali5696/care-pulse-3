@@ -25,7 +25,7 @@ from carepulse.policies.schedule_service import (
     stage_or_preview,
 )
 from sqlalchemy import text
-from test_appointment_persistence import _draft, _patient, _query
+from test_appointment_persistence import _admit_saved, _draft, _patient, _query
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
@@ -128,18 +128,21 @@ def _booking(
         if timed
         else {}
     )
-    return persist_appointment(
+    saved = persist_appointment(
         connection,
         _draft(
             _patient(connection, tenant),
             doctor,
-            status=status,
+            status="Booked" if status in ("In Examination", "Completed") else status,
             service_date=day,
             booking_mode="EXACT_TIME" if timed else "OPEN",
             **bounds,
         ),
         _query(tenant, doctor),
     )
+    if status in ("In Examination", "Completed"):
+        _admit_saved(connection, tenant, doctor, saved, complete=status == "Completed")
+    return saved
 
 
 def _frozen(connection, appointment_id):

@@ -163,6 +163,102 @@ def _query(tenant, doctor):
     )
 
 
+def _admit_saved(
+    connection,
+    tenant,
+    doctor,
+    saved,
+    *,
+    complete=False,
+    actor=None,
+    role="DOCTOR_OWNER",
+    insert_visit=True,
+):
+    """Construct only genuine, history-backed synthetic admission evidence."""
+    appointment = UUID(saved["id"])
+    actor = actor or doctor
+    connection.execute(
+        text("SELECT set_config('app.staff_id', :actor, true)"),
+        {"actor": str(actor)},
+    )
+    current = "Booked"
+    for revision, status in enumerate(
+        ("Waiting", "In Examination", "Completed")
+        if complete
+        else ("Waiting", "In Examination"),
+        start=1,
+    ):
+        connection.execute(
+            text("""
+                UPDATE public.appointments SET status = :status, revision = :revision
+                WHERE organization_id = :tenant AND id = :id
+            """),
+            {
+                "status": status,
+                "revision": revision,
+                "tenant": tenant,
+                "id": appointment,
+            },
+        )
+        connection.execute(
+            text("""
+                INSERT INTO public.appointment_history (
+                    id, organization_id, appointment_id, appointment_revision,
+                    action, old_status, new_status, old_service_date, new_service_date,
+                    old_number, new_number, actor_staff_id, actor_role,
+                    reason, price_snapshot_appointment_id
+                )
+                SELECT :history, a.organization_id, a.id, :revision, 'STATUS',
+                       :old, :status, a.service_date, a.service_date,
+                       a.current_number, a.current_number, :actor, :role,
+                       'Synthetic lifecycle', a.id
+                FROM public.appointments a WHERE a.organization_id=:tenant AND a.id=:id
+            """),
+            {
+                "history": uuid4(),
+                "revision": revision,
+                "old": current,
+                "status": status,
+                "actor": actor,
+                "role": role,
+                "tenant": tenant,
+                "id": appointment,
+            },
+        )
+        if status == "In Examination" and insert_visit:
+            connection.execute(
+                text("""
+                    INSERT INTO public.visits
+                        (id, organization_id, appointment_id, patient_id,
+                         doctor_staff_id, service_date, admission_history_revision,
+                         admitted_at)
+                    SELECT :visit, a.organization_id, a.id, a.patient_id,
+                           a.doctor_staff_id, a.service_date, :revision, clock_timestamp()
+                    FROM public.appointments a
+                    WHERE a.organization_id=:tenant AND a.id=:id
+                """),
+                {
+                    "visit": uuid4(),
+                    "revision": revision,
+                    "tenant": tenant,
+                    "id": appointment,
+                },
+            )
+        current = status
+
+
+def _persist_with_status(connection, tenant, patient, doctor, status, **changes):
+    needs_visit = status in ("In Examination", "Completed")
+    saved = persist_appointment(
+        connection,
+        _draft(patient, doctor, status="Booked" if needs_visit else status, **changes),
+        _query(tenant, doctor),
+    )
+    if needs_visit:
+        _admit_saved(connection, tenant, doctor, saved, complete=status == "Completed")
+    return {**saved, "status": status}
+
+
 def _activate_clinic(connection, tenant, operator_id):
     doctor_id = uuid4()
     user_id = f"synthetic-{uuid4()}"
@@ -247,26 +343,43 @@ def test_six_approved_statuses_persist_with_frozen_creation_evidence(
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
         patient = _patient(connection, tenant)
-        created = persist_appointment(
-            connection, _draft(patient, doctor, status=status), _query(tenant, doctor)
-        )
+        created = _persist_with_status(connection, tenant, patient, doctor, status)
         appointment_id = created["id"]
         assert created["status"] == status
         assert created["number"] == 1
         assert created["net_egp"] == "100.00"
+        revision = {"In Examination": 2, "Completed": 3}.get(status, 0)
         assert connection.execute(
             text("""
                 SELECT a.status, a.current_number, a.revision, h.appointment_revision,
                        h.action, s.net_egp, s.is_free
                 FROM public.appointments a
                 JOIN public.appointment_history h
-                  ON h.organization_id = a.organization_id AND h.appointment_id = a.id
+                  ON h.organization_id = a.organization_id
+                 AND h.appointment_id = a.id AND h.appointment_revision = a.revision
                 JOIN public.appointment_price_snapshots s
                   ON s.organization_id = a.organization_id AND s.appointment_id = a.id
                 WHERE a.id = :id
             """),
             {"id": appointment_id},
-        ).one() == (status, 1, 0, 0, "CREATED", Decimal("100.00"), False)
+        ).one() == (
+            status,
+            1,
+            revision,
+            revision,
+            "STATUS" if revision else "CREATED",
+            Decimal("100.00"),
+            False,
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.appointment_history WHERE appointment_id = :id AND action = 'CREATED'"
+                ),
+                {"id": appointment_id},
+            )
+            == 1
+        )
 
 
 @pytest.mark.parametrize(
@@ -276,9 +389,7 @@ def test_counted_statuses_prevent_second_same_patient_day(appointment_storage, c
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
         patient = _patient(connection, tenant)
-        first = persist_appointment(
-            connection, _draft(patient, doctor, status=counted), _query(tenant, doctor)
-        )
+        first = _persist_with_status(connection, tenant, patient, doctor, counted)
         with pytest.raises(DBAPIError) as denied, connection.begin_nested():
             persist_appointment(
                 connection, _draft(patient, doctor), _query(tenant, doctor)
@@ -525,10 +636,8 @@ def test_terminal_records_and_frozen_snapshot_number_history_are_immutable(
 ):
     runtime, migration, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
-        created = persist_appointment(
-            connection,
-            _draft(_patient(connection, tenant), doctor, status="Completed"),
-            _query(tenant, doctor),
+        created = _persist_with_status(
+            connection, tenant, _patient(connection, tenant), doctor, "Completed"
         )
         with pytest.raises(DBAPIError) as update_denied, connection.begin_nested():
             connection.execute(
