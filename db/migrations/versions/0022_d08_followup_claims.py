@@ -110,6 +110,7 @@ def upgrade() -> None:
             target_row record;
             price_provenance jsonb;
             source_completion timestamptz;
+            booking_actor uuid;
         BEGIN
             IF TG_OP = 'DELETE' THEN
                 RAISE EXCEPTION 'Follow-up evidence cannot be deleted' USING ERRCODE = '23514';
@@ -164,10 +165,14 @@ def upgrade() -> None:
                 (source_completion AT TIME ZONE 'Africa/Cairo')::date THEN
                 RAISE EXCEPTION 'Incorrect Cairo completion day' USING ERRCODE = '23514';
             END IF;
+            SELECT h.actor_staff_id INTO booking_actor
+            FROM public.appointment_history h
+            WHERE h.organization_id = NEW.organization_id
+              AND h.appointment_id = NEW.appointment_id AND h.action = 'CREATED';
             IF (source_row.followup_decision ->> 'kind' = 'DEFAULT'
                 AND NEW.approved_deadline <> NEW.completion_local_date + 7)
                OR (source_row.followup_decision ->> 'kind' = 'DEADLINE'
-                   AND (COALESCE(source_row.followup_decision ->> 'reason', '') = ''
+                   AND (btrim(COALESCE(source_row.followup_decision ->> 'reason', '')) = ''
                         OR source_row.followup_decision ->> 'deadline_date'
                            IS DISTINCT FROM NEW.approved_deadline::text))
                OR NEW.policy_snapshot ->> 'source_visit_id'
@@ -175,7 +180,11 @@ def upgrade() -> None:
                OR NEW.policy_snapshot ->> 'doctor_staff_id'
                     IS DISTINCT FROM NEW.doctor_staff_id::text
                OR NEW.policy_snapshot ->> 'source_revision'
-                    IS DISTINCT FROM source_row.clinical_revision::text THEN
+                    IS DISTINCT FROM source_row.clinical_revision::text
+               OR NEW.policy_snapshot ->> 'actor_staff_id'
+                    IS DISTINCT FROM booking_actor::text
+               OR NEW.policy_snapshot -> 'authorized' IS DISTINCT FROM 'true'::jsonb
+               OR COALESCE((NEW.policy_snapshot ->> 'policy_revision') ~ '^[1-9][0-9]*$', false) = false THEN
                 RAISE EXCEPTION 'Follow-up authorization snapshot is inconsistent'
                     USING ERRCODE = '23514';
             END IF;
@@ -274,11 +283,15 @@ def upgrade() -> None:
             END IF;
             SELECT v.clinical_revision, v.doctor_staff_id,
                    r.id AS evidence_id, r.revision AS evidence_revision,
-                   r.change_kind, r.actor_staff_id
+                   r.change_kind, r.actor_staff_id, r.new_values,
+                   r.reason AS evidence_reason, r.occurred_at AS evidence_at
             INTO source_row FROM public.visits v
             JOIN public.clinical_revisions r ON r.organization_id = v.organization_id
                  AND r.visit_id = v.id AND r.id = NEW.clinical_revision_id
-            WHERE v.organization_id = NEW.organization_id AND v.id = NEW.source_visit_id;
+            JOIN public.appointments a ON a.organization_id = v.organization_id
+                                      AND a.id = v.appointment_id
+            WHERE v.organization_id = NEW.organization_id AND v.id = NEW.source_visit_id
+            FOR UPDATE OF a, v;
             SELECT c.state, c.revision, c.approved_deadline, c.doctor_staff_id,
                    c.id, c.appointment_id
             INTO claim_row FROM public.followup_claims c
@@ -297,6 +310,12 @@ def upgrade() -> None:
                OR source_row.change_kind <> 'EXTENSION'
                OR source_row.actor_staff_id <> NEW.issuing_doctor_staff_id
                OR source_row.doctor_staff_id <> NEW.issuing_doctor_staff_id
+               OR source_row.new_values -> 'followup_decision' ->> 'extension_claim_id'
+                    IS DISTINCT FROM NEW.claim_id::text
+               OR source_row.new_values -> 'followup_decision' ->> 'extension_deadline'
+                    IS DISTINCT FROM NEW.extended_deadline::text
+               OR source_row.evidence_reason IS DISTINCT FROM NEW.reason
+               OR source_row.evidence_at IS DISTINCT FROM NEW.issued_at
                OR claim_row.doctor_staff_id <> NEW.issuing_doctor_staff_id
                OR NOT EXISTS (
                    SELECT 1 FROM public.staff_accounts s
@@ -308,7 +327,8 @@ def upgrade() -> None:
                    WHERE a.id = NEW.clinical_audit_id
                      AND a.organization_id = NEW.organization_id
                      AND a.doctor_staff_id = NEW.issuing_doctor_staff_id
-                     AND a.clinical_revision = source_row.evidence_revision)
+                     AND a.clinical_revision = source_row.evidence_revision
+                     AND a.correlation_id = NEW.clinical_revision_id::text)
             THEN
                 RAISE EXCEPTION 'Invalid Doctor follow-up extension evidence'
                     USING ERRCODE = '23514';

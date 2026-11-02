@@ -1,5 +1,6 @@
 """D-08 real PostgreSQL writers contend for one preferential source."""
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from threading import Barrier, Event
@@ -177,7 +178,7 @@ def test_claim_first_holds_source_lock_before_terminal_transition(
     assert rows[0].state == ("CONSUMED" if status == "Completed" else "RELEASED")
 
 
-def _extend(connection, tenant, source, record):
+def _extend(connection, tenant, source, record, *, audit_correlation=None):
     connection.execute(
         text("SELECT set_config('app.staff_id', :doctor, true)"),
         {"doctor": str(source["doctor"])},
@@ -194,14 +195,23 @@ def _extend(connection, tenant, source, record):
             WHERE organization_id=:tenant AND id=:visit
         """),
         {
-            "decision": '{"kind":"DEFAULT","eligible":true,"extension_recorded":true}',
+            "decision": json.dumps(
+                {
+                    "kind": "DEFAULT",
+                    "eligible": True,
+                    "extension_claim_id": str(record["claim"]),
+                    "extension_deadline": (
+                        source["day"] + timedelta(days=8)
+                    ).isoformat(),
+                }
+            ),
             "tenant": tenant,
             "visit": source["visit"],
         },
     )
     revision = connection.execute(
         text("""
-            SELECT id, revision FROM public.clinical_revisions
+        SELECT id, revision, occurred_at FROM public.clinical_revisions
             WHERE organization_id=:tenant AND visit_id=:visit
             ORDER BY revision DESC LIMIT 1
         """),
@@ -219,7 +229,7 @@ def _extend(connection, tenant, source, record):
             "tenant": tenant,
             "doctor": source["doctor"],
             "revision": revision.revision,
-            "correlation": str(revision.id),
+            "correlation": audit_correlation or str(revision.id),
         },
     )
     connection.execute(
@@ -231,7 +241,7 @@ def _extend(connection, tenant, source, record):
                 clinical_revision_id, clinical_audit_id
             ) VALUES (
                 :id, :tenant, :visit, :claim, :appointment, :prior, :extended,
-                :doctor, 'Synthetic extension', clock_timestamp(),
+                :doctor, 'Synthetic extension', :issued_at,
                 :source_revision, 1, :clinical, :audit
             )
         """),
@@ -247,6 +257,7 @@ def _extend(connection, tenant, source, record):
             "source_revision": revision.revision - 1,
             "clinical": revision.id,
             "audit": audit_id,
+            "issued_at": revision.occurred_at,
         },
     )
 
@@ -297,6 +308,25 @@ def test_extension_and_competing_claim_serialize_without_new_reservation(
                 {"tenant": tenant, "claim": existing["claim"]},
             )
             == 1
+        )
+
+
+def test_extension_rejects_unrelated_clinical_audit_evidence(appointment_storage):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    source = _seed(runtime, tenant, doctor)
+    with transaction(runtime, tenant) as connection:
+        record = _claim(connection, tenant, source)
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            _extend(connection, tenant, source, record, audit_correlation=str(uuid4()))
+        assert denied.value.orig.sqlstate == "23514"
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.followup_extensions WHERE claim_id=:id"
+                ),
+                {"id": record["claim"]},
+            )
+            == 0
         )
 
 

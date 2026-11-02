@@ -468,6 +468,32 @@ def test_one_active_source_across_different_service_dates(appointment_storage):
         ).all() == [(first["claim"], "ACTIVE")]
 
 
+@pytest.mark.parametrize("tamper", ["actor", "approval", "policy_revision"])
+def test_claim_cannot_forge_frozen_authorization_evidence(appointment_storage, tamper):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        source = _source(connection, tenant, doctor)
+        provenance = _provenance(source)
+        if tamper == "actor":
+            provenance["actor_staff_id"] = str(uuid4())
+        elif tamper == "approval":
+            provenance["authorized"] = False
+        else:
+            provenance["policy_revision"] = "unapproved"
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            _claim(connection, tenant, source, provenance=provenance)
+        assert denied.value.orig.sqlstate == "23514"
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.followup_claims WHERE source_visit_id=:id"
+                ),
+                {"id": source["visit"]},
+            )
+            == 0
+        )
+
+
 def test_consumed_source_cannot_regain_active_or_second_consumed_claim(
     appointment_storage,
 ):
