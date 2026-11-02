@@ -22,6 +22,7 @@ from carepulse.policies.versions import (
 )
 from sqlalchemy import text
 from test_appointment_persistence import (
+    _admit_saved,
     _patient,
     _raw_appointment,
     _raw_snapshot,
@@ -112,6 +113,7 @@ def _confirmed_insert(
             "status": status,
         },
     )
+    return appointment
 
 
 def _compete(runtime, tenant, doctor, patients, bounds, *, revision=None):
@@ -274,7 +276,24 @@ def test_only_four_counted_statuses_reserve_timed_capacity(
             load_current_schedule(connection, tenant), SERVICE_DAY
         )[0]
         number = allocate_day_number(connection, tenant, SERVICE_DAY)
-        _confirmed_insert(connection, tenant, patient, doctor, slot, number, status)
+        admitted = status in ("In Examination", "Completed")
+        appointment = _confirmed_insert(
+            connection,
+            tenant,
+            patient,
+            doctor,
+            slot,
+            number,
+            "Booked" if admitted else status,
+        )
+        if admitted:
+            _admit_saved(
+                connection,
+                tenant,
+                doctor,
+                {"id": str(appointment)},
+                complete=status == "Completed",
+            )
     with transaction(runtime, tenant) as connection:
         if counts:
             with pytest.raises(ContractError) as denied:
