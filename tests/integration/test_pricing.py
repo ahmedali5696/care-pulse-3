@@ -3,7 +3,7 @@
 import asyncio
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from hmac import new
@@ -26,6 +26,7 @@ from test_appointment_persistence import (
 from test_appointment_persistence import (
     appointment_storage as appointment_storage,  # noqa: PLC0414 - fixture export
 )
+from test_followup_persistence import _insert_claim, _provenance, _source
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414 - fixture export
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414 - fixture export
 
@@ -979,10 +980,13 @@ def test_quote_confirm_persist_and_read_preserves_full_percentage_and_service(
     reason = "Approved discount"
     validate_discount_reason(kind, reason)
     with transaction(runtime, tenant) as conn:
+        source = _source(conn, tenant, doctor) if service == "FOLLOW_UP" else None
+        provenance = _provenance(source) if source else None
         draft = _draft(
-            _patient(conn, tenant),
+            source["patient"] if source else _patient(conn, tenant),
             doctor,
             service_type=service,
+            **({"service_date": source["day"] + timedelta(days=1)} if source else {}),
             price_snapshot={
                 "base_egp": base,
                 "creation_standard_base_egp": standard,
@@ -991,12 +995,12 @@ def test_quote_confirm_persist_and_read_preserves_full_percentage_and_service(
                 "discount_reason": reason,
                 "net_egp": format(quote.net_egp, ".2f"),
                 "is_free": quote.is_free,
-                "entitlement_provenance": {"synthetic_prior_completed": True}
-                if service == "FOLLOW_UP"
-                else None,
+                "entitlement_provenance": provenance,
             },
         )
         saved = persist_appointment(conn, draft, _query(tenant, doctor))
+        if source:
+            _insert_claim(conn, tenant, source, UUID(saved["id"]), provenance)
         assert saved["net_egp"] == format(quote.net_egp, ".2f")
     with transaction(runtime, tenant) as conn:
         row = conn.execute(
