@@ -241,6 +241,8 @@ def test_denied_routes_preserve_current_persistence_boundary():
             ("appointment_day_counters",),
             ("appointment_number_assignments",),
             ("appointment_history",),
+            ("visits",),
+            ("clinical_revisions",),
         }
         assert connection.execute(
             "SELECT version_num FROM public.alembic_version"
