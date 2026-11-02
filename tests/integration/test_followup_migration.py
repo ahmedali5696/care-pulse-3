@@ -3,7 +3,7 @@
 import runpy
 import shutil
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from carepulse.appointments.persistence import persist_appointment
@@ -38,6 +38,36 @@ def test_predecessor_data_and_security_survive_compatible_upgrade(
     try:
         with transaction(runtime, tenant) as connection:
             source = _seed(connection, tenant, doctor, complete=True)
+            cancelled = _seed(connection, tenant, doctor)
+            connection.execute(
+                text("""
+                    UPDATE public.appointments SET status='Cancelled', revision=3
+                    WHERE organization_id=:tenant AND id=:id
+                """),
+                {"tenant": tenant, "id": cancelled},
+            )
+            connection.execute(
+                text("""
+                    INSERT INTO public.appointment_history (
+                        id, organization_id, appointment_id, appointment_revision,
+                        action, old_status, new_status, old_service_date,
+                        new_service_date, old_number, new_number, actor_staff_id,
+                        actor_role, reason, price_snapshot_appointment_id
+                    )
+                    SELECT :history, organization_id, id, 3,
+                           'DOCTOR_EXCEPTION', 'In Examination', 'Cancelled',
+                           service_date, service_date, current_number,
+                           current_number, :doctor, 'DOCTOR_OWNER',
+                           'Synthetic exception retained', id
+                    FROM public.appointments WHERE organization_id=:tenant AND id=:id
+                """),
+                {
+                    "history": uuid4(),
+                    "doctor": doctor,
+                    "tenant": tenant,
+                    "id": cancelled,
+                },
+            )
             saved = persist_appointment(
                 connection,
                 _draft(_patient(connection, tenant), doctor),
@@ -53,9 +83,25 @@ def test_predecessor_data_and_security_survive_compatible_upgrade(
                       ON s.organization_id=a.organization_id AND s.appointment_id=a.id
                     LEFT JOIN public.visits v
                       ON v.organization_id=a.organization_id AND v.appointment_id=a.id
-                    WHERE a.id IN (:source, :pending) ORDER BY a.id
+                    WHERE a.id IN (:source, :cancelled, :pending) ORDER BY a.id
                 """),
-                {"source": source, "pending": pending},
+                {"source": source, "cancelled": cancelled, "pending": pending},
+            ).all()
+            assert any(
+                row.id == cancelled and row.status == "Cancelled" and row.visit_id
+                for row in before
+            )
+        with migration.connect() as connection:
+            predecessor_security = connection.execute(
+                text("""
+                    SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+                           has_table_privilege('carepulse_runtime', c.oid, 'SELECT'),
+                           has_table_privilege('carepulse_operator', c.oid, 'SELECT')
+                    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                    WHERE n.nspname='public' AND c.relname IN
+                        ('appointments','appointment_history','visits','clinical_revisions')
+                    ORDER BY c.relname
+                """)
             ).all()
         _upgrade(migration, AFTER)
         _upgrade(migration, AFTER)
@@ -69,9 +115,9 @@ def test_predecessor_data_and_security_survive_compatible_upgrade(
                       ON s.organization_id=a.organization_id AND s.appointment_id=a.id
                     LEFT JOIN public.visits v
                       ON v.organization_id=a.organization_id AND v.appointment_id=a.id
-                    WHERE a.id IN (:source, :pending) ORDER BY a.id
+                    WHERE a.id IN (:source, :cancelled, :pending) ORDER BY a.id
                 """),
-                {"source": source, "pending": pending},
+                {"source": source, "cancelled": cancelled, "pending": pending},
             ).all()
             assert after == before
             assert (
@@ -79,6 +125,20 @@ def test_predecessor_data_and_security_survive_compatible_upgrade(
                 == 0
             )
         with migration.connect() as connection:
+            assert (
+                connection.execute(
+                    text("""
+                    SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+                           has_table_privilege('carepulse_runtime', c.oid, 'SELECT'),
+                           has_table_privilege('carepulse_operator', c.oid, 'SELECT')
+                    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                    WHERE n.nspname='public' AND c.relname IN
+                        ('appointments','appointment_history','visits','clinical_revisions')
+                    ORDER BY c.relname
+                """)
+                ).all()
+                == predecessor_security
+            )
             assert (
                 connection.scalar(
                     text("SELECT version_num FROM public.alembic_version")
