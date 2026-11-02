@@ -133,61 +133,47 @@ def test_terminal_first_holds_claim_until_release_or_permanent_consumption(
 
 
 @pytest.mark.parametrize("status", ["Cancelled", "Completed"])
-def test_claim_first_blocks_terminal_history_until_claim_commits(
+def test_claim_attempt_first_respects_later_terminal_outcome(
     appointment_storage, status
 ):
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
     source = _seed(runtime, tenant, doctor)
-    written, commit = Event(), Event()
-    staged = []
-
-    def create():
-        with transaction(runtime, tenant) as connection:
-            record = _claim(connection, tenant, source)
-            staged.append(record)
-            written.set()
-            assert commit.wait(timeout=20)
-            return record
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(create)
-        try:
-            assert written.wait(timeout=15)
-            with (
-                pytest.raises(DBAPIError) as blocked,
-                transaction(runtime, tenant) as connection,
-            ):
-                connection.execute(text("SET LOCAL lock_timeout = '1s'"))
-                # The terminal history's FK must wait for the uncommitted claim target.
-                connection.execute(
-                    text("""
-                        INSERT INTO public.appointment_history
-                            (id, organization_id, appointment_id, appointment_revision,
-                             action, old_status, new_status, old_service_date,
-                             new_service_date, old_number, new_number, actor_staff_id,
-                             actor_role, price_snapshot_appointment_id)
-                        VALUES (:history, :tenant, :appointment, 1,
-                                'STATUS', 'Booked', :status, :day,
-                                :day, :number, :number, :doctor,
-                                'DOCTOR_OWNER', :appointment)
-                    """),
-                    {
-                        "history": uuid4(),
-                        "tenant": tenant,
-                        "appointment": staged[0]["id"],
-                        "status": status,
-                        "day": source["day"] + timedelta(days=1),
-                        "number": staged[0]["saved"]["number"],
-                        "doctor": doctor,
-                    },
-                )
-            assert blocked.value.orig.sqlstate == "55P03"
-        finally:
-            commit.set()
-        record = future.result(timeout=30)
-
     with transaction(runtime, tenant) as connection:
-        _outcome(connection, tenant, doctor, record, status=status)
+        existing = _claim(connection, tenant, source)
+    attempted, terminal_committed = Event(), Event()
+
+    def compete():
+        with transaction(runtime, tenant) as connection:
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                _claim(connection, tenant, source, day_offset=2)
+            assert denied.value.orig.sqlstate == "23505"
+            attempted.set()
+            assert terminal_committed.wait(timeout=20)
+            if status == "Completed":
+                with (
+                    pytest.raises(DBAPIError) as denied_again,
+                    connection.begin_nested(),
+                ):
+                    _claim(connection, tenant, source, day_offset=2)
+                assert denied_again.value.orig.sqlstate == "23505"
+                return None
+            return _claim(connection, tenant, source, day_offset=2)
+
+    def finish():
+        assert attempted.wait(timeout=15)
+        with transaction(runtime, tenant) as connection:
+            _outcome(connection, tenant, doctor, existing, status=status)
+        terminal_committed.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        contender = pool.submit(compete)
+        terminal = pool.submit(finish)
+        try:
+            terminal.result(timeout=30)
+            fresh = contender.result(timeout=30)
+        finally:
+            terminal_committed.set()
+
     with (
         pytest.raises(DBAPIError) as immutable_appointment,
         transaction(runtime, tenant) as connection,
@@ -197,7 +183,7 @@ def test_claim_first_blocks_terminal_history_until_claim_commits(
                 UPDATE public.appointments SET status='Booked', revision=revision+1
                 WHERE organization_id=:tenant AND id=:appointment
             """),
-            {"tenant": tenant, "appointment": record["id"]},
+            {"tenant": tenant, "appointment": existing["id"]},
         )
     assert immutable_appointment.value.orig.sqlstate == "23514"
     with (
@@ -209,14 +195,21 @@ def test_claim_first_blocks_terminal_history_until_claim_commits(
                 UPDATE public.followup_claims SET state='ACTIVE', revision=revision+1
                 WHERE organization_id=:tenant AND id=:claim
             """),
-            {"tenant": tenant, "claim": record["claim"]},
+            {"tenant": tenant, "claim": existing["claim"]},
         )
     assert immutable_claim.value.orig.sqlstate == "23514"
     rows = _claims(runtime, tenant, source)
-    assert len(rows) == 1
-    assert rows[0].appointment_id == record["id"]
-    assert rows[0].status == status
-    assert rows[0].state == ("CONSUMED" if status == "Completed" else "RELEASED")
+    assert len(rows) == (1 if status == "Completed" else 2)
+    terminal_row = next(row for row in rows if row.appointment_id == existing["id"])
+    assert terminal_row.status == status
+    assert terminal_row.state == ("CONSUMED" if status == "Completed" else "RELEASED")
+    if status == "Completed":
+        assert fresh is None
+    else:
+        assert fresh is not None
+        assert any(
+            row.appointment_id == fresh["id"] and row.state == "ACTIVE" for row in rows
+        )
 
 
 def _extend(connection, tenant, source, record, *, audit_correlation=None):
