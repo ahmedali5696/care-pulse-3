@@ -309,6 +309,9 @@ def test_failed_later_revision_rolls_back_and_keeps_d07(
         _upgrade(migration, AFTER)
         scripts = tmp_path / "migrations"
         shutil.copytree(ROOT / "db/migrations", scripts)
+        # This history test isolates D-07 -> a synthetic failing successor.
+        # Exclude the real later D-08 head from the temporary migration tree.
+        (scripts / "versions/0022_d08_followup_claims.py").unlink()
         (scripts / "versions/0022_d07_failure.py").write_text(
             'from alembic import op\nrevision = "0022_d07_failure"\n'
             'down_revision = "0021_d07_visits"\n'

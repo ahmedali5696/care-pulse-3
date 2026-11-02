@@ -268,32 +268,6 @@ def _outcome(
     return terminal_at, revision
 
 
-def _doctor(migration, tenant):
-    doctor, auth_user, email = (
-        uuid4(),
-        f"synthetic-followup-{uuid4()}",
-        f"{uuid4()}@example.invalid",
-    )
-    with migration.begin() as connection:
-        connection.execute(
-            text("""
-                INSERT INTO public."user"
-                    (id, name, email, "emailVerified", "createdAt", "updatedAt")
-                VALUES (:user, 'Synthetic second Doctor', :email, true, now(), now())
-            """),
-            {"user": auth_user, "email": email},
-        )
-        connection.execute(
-            text("""
-                INSERT INTO public.staff_accounts
-                    (id, organization_id, auth_user_id, verified_email, role, enabled, verified)
-                VALUES (:id, :tenant, :user, :email, 'DOCTOR_OWNER', true, true)
-            """),
-            {"id": doctor, "tenant": tenant, "user": auth_user, "email": email},
-        )
-    return doctor
-
-
 @pytest.mark.parametrize("classification", ["ROUTINE", "URGENT", "EMERGENCY"])
 def test_completed_new_examination_sources_create_active_claim(
     appointment_storage, classification
@@ -420,8 +394,10 @@ def test_nonqualifying_source_cannot_claim(appointment_storage, bad_source):
 def test_followup_target_must_match_source_tenant_patient_doctor(
     appointment_storage, wrong_relation
 ):
-    runtime, migration, (tenant, other), (doctor, foreign_doctor) = appointment_storage
-    second_doctor = _doctor(migration, tenant) if wrong_relation == "doctor" else None
+    runtime, _, (tenant, other), (doctor, foreign_doctor) = appointment_storage
+    # A second same-tenant Owner violates D-02. Use the foreign tenant's
+    # existing Doctor to prove that a forged target Doctor cannot be linked.
+    second_doctor = foreign_doctor if wrong_relation == "doctor" else None
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
     if wrong_relation == "clinic":
@@ -792,7 +768,8 @@ def test_completed_followup_consumes_once_and_retains_immutable_history(
                 """),
                 {"id": record["id"], "revision": revision},
             )
-        assert denied.value.orig.sqlstate == "23514"
+        # Runtime cannot mutate immutable history even before its guard fires.
+        assert denied.value.orig.sqlstate in ("23514", "42501")
     with migration.connect() as connection:
         assert (
             connection.scalar(
