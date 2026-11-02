@@ -18,7 +18,7 @@ from carepulse.policies.versions import append_version
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _activate_clinic, _draft, _patient, _query
-from test_database import ROOT, _create_empty_database, _engine, _upgrade
+from test_database import REVISION, ROOT, _create_empty_database, _engine, _upgrade
 from test_database import admin as admin  # noqa: PLC0414 - fixture export
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
@@ -231,8 +231,8 @@ def test_populated_predecessor_preserves_rows_security_and_grants(
             assert len(before[0]["appointments"]) == 4
             assert len(before[0]["clinic_policy_previews"]) == 4
             assert len(before[0]["clinic_schedule_intervals"]) == 16
-        _upgrade(migration)
-        _upgrade(migration)
+        _at_revision(migration, head)
+        _at_revision(migration, head)
         with migration.connect() as connection:
             assert (
                 connection.scalar(
@@ -403,12 +403,12 @@ def test_fresh_install_and_repeated_upgrade(admin, empty_database):
     _create_empty_database(admin, empty_database)
     migration = _engine("carepulse_migration", empty_database)
     try:
-        _upgrade(migration)
+        _at_revision(migration, head)
         with migration.connect() as connection:
             checks = _shape_checks(connection)
             assert len(checks) == 1
             assert checks[0].conname == "clinic_schedule_interval_shape"
-        _upgrade(migration)
+        _at_revision(migration, head)
         with migration.connect() as connection:
             assert _shape_checks(connection) == checks
             assert (
@@ -463,14 +463,13 @@ def test_unexpected_prior_shape_refuses_upgrade_without_changing_head(
 def test_failed_following_revision_rolls_back_objects_and_version(
     admin, empty_database, tmp_path
 ):
-    _, head = _revisions()
     _create_empty_database(admin, empty_database)
     migration = _engine("carepulse_migration", empty_database)
     scripts = tmp_path / "migrations"
     shutil.copytree(ROOT / "db/migrations", scripts)
     (scripts / "versions/9999_schedule_failure.py").write_text(
         'from alembic import op\nrevision = "9999_schedule_failure"\n'
-        f'down_revision = "{head}"\n'
+        f'down_revision = "{REVISION}"\n'
         "def upgrade():\n"
         '    op.execute("CREATE TABLE public.synthetic_schedule_partial (id integer)")\n'
         '    op.execute("SELECT 1 / 0")\n'
@@ -485,7 +484,7 @@ def test_failed_following_revision_rolls_back_objects_and_version(
                 connection.scalar(
                     text("SELECT version_num FROM public.alembic_version")
                 )
-                == head
+                == REVISION
             )
             assert (
                 connection.scalar(
