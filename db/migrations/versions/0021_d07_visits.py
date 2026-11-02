@@ -244,8 +244,9 @@ def upgrade() -> None:
             has_visit boolean;
         BEGIN
             org := NEW.organization_id;
-            appt := CASE WHEN TG_TABLE_NAME = 'visits'
-                         THEN NEW.appointment_id ELSE NEW.id END;
+            -- A shared trigger runs on two distinct row shapes. JSONB lookup
+            -- returns NULL for the absent field without dereferencing it.
+            appt := COALESCE((to_jsonb(NEW) ->> 'appointment_id')::uuid, NEW.id);
             SELECT a.status INTO current_status
             FROM public.appointments a
             WHERE a.organization_id = org AND a.id = appt;
