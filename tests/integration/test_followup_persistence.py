@@ -187,9 +187,10 @@ def _outcome(
     status,
     after_admission=False,
     update_claim=True,
+    pre_admitted=False,
 ):
     """Write a real terminal history; claim transition shares the transaction."""
-    if after_admission or status == "Completed":
+    if after_admission or (status == "Completed" and not pre_admitted):
         _admit_saved(
             connection,
             tenant,
@@ -200,10 +201,10 @@ def _outcome(
     previous = (
         "In Examination" if (after_admission or status == "Completed") else "Booked"
     )
-    if status == "Completed":
+    if status == "Completed" and not pre_admitted:
         revision = 3
     else:
-        revision = 3 if after_admission else 1
+        revision = 3 if (after_admission or pre_admitted) else 1
         connection.execute(
             text("""
                 UPDATE public.appointments

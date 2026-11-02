@@ -4,14 +4,22 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from threading import Barrier, Event
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
+from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
+from test_appointment_persistence import _admit_saved, _draft, _query
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
-from test_followup_persistence import _claim, _outcome, _source
+from test_followup_persistence import (
+    _claim,
+    _insert_claim,
+    _outcome,
+    _provenance,
+    _source,
+)
 
 
 def _seed(runtime, tenant, doctor):
@@ -210,6 +218,176 @@ def test_claim_attempt_first_respects_later_terminal_outcome(
         assert any(
             row.appointment_id == fresh["id"] and row.state == "ACTIVE" for row in rows
         )
+
+
+def _tentative_booking_evidence(connection, tenant, appointment, receipt_key):
+    return tuple(
+        connection.execute(
+            text("""
+                SELECT
+                    (SELECT count(*) FROM public.appointments
+                     WHERE organization_id=:tenant AND id=:appointment),
+                    (SELECT count(*) FROM public.appointment_number_assignments
+                     WHERE organization_id=:tenant AND appointment_id=:appointment),
+                    (SELECT count(*) FROM public.appointment_price_snapshots
+                     WHERE organization_id=:tenant AND appointment_id=:appointment),
+                    (SELECT count(*) FROM public.appointment_history
+                     WHERE organization_id=:tenant AND appointment_id=:appointment),
+                    (SELECT count(*) FROM public.sensitive_audit
+                     WHERE organization_id=:tenant AND correlation_id=:correlation),
+                    (SELECT count(*) FROM public.outbox_events
+                     WHERE organization_id=:tenant AND aggregate_id=:correlation),
+                    (SELECT count(*) FROM public.idempotency_receipts
+                     WHERE organization_id=:tenant AND idempotency_key=:receipt_key),
+                    (SELECT count(*) FROM public.followup_claims
+                     WHERE organization_id=:tenant AND appointment_id=:appointment)
+            """),
+            {
+                "tenant": tenant,
+                "appointment": appointment,
+                "correlation": str(appointment),
+                "receipt_key": receipt_key,
+            },
+        ).one()
+    )
+
+
+@pytest.mark.parametrize("status", ["Cancelled", "Completed"])
+def test_claim_first_staged_booking_contends_with_terminal_before_commit(
+    appointment_storage, status
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    source = _seed(runtime, tenant, doctor)
+    with transaction(runtime, tenant) as connection:
+        existing = _claim(connection, tenant, source)
+        if status == "Completed":
+            # The terminal writer must not need to insert a Visit while A holds
+            # the patient's natural new-booking lock.
+            _admit_saved(connection, tenant, doctor, existing["saved"])
+
+    target_day = source["day"] + timedelta(days=2)
+    with transaction(runtime, tenant) as connection:
+        counter_before = connection.scalar(
+            text("""
+                SELECT last_number FROM public.appointment_day_counters
+                WHERE organization_id=:tenant AND service_date=:day
+            """),
+            {"tenant": tenant, "day": target_day},
+        )
+
+    staged = {}
+    booking_written, terminal_written = Event(), Event()
+    release_terminal, terminal_committed = Event(), Event()
+
+    def compete():
+        with transaction(runtime, tenant) as connection:
+            provenance = _provenance(source)
+            query = _query(tenant, doctor)
+            saved = persist_appointment(
+                connection,
+                _draft(
+                    source["patient"],
+                    doctor,
+                    service_date=target_day,
+                    service_type="FOLLOW_UP",
+                    price_snapshot={
+                        "base_egp": "100.00",
+                        "net_egp": "100.00",
+                        "entitlement_provenance": provenance,
+                    },
+                ),
+                query,
+            )
+            appointment = UUID(saved["id"])
+            staged.update(appointment=appointment, receipt_key=query.idempotency_key)
+            expected_pending = (1, 1, 1, 1, 1, 1, 1, 0)
+            assert (
+                _tentative_booking_evidence(
+                    connection, tenant, appointment, query.idempotency_key
+                )
+                == expected_pending
+            )
+            booking_written.set()
+            try:
+                assert terminal_written.wait(timeout=20)
+                connection.execute(text("SET LOCAL lock_timeout = '1s'"))
+                with pytest.raises(DBAPIError) as blocked, connection.begin_nested():
+                    _insert_claim(connection, tenant, source, appointment, provenance)
+                assert blocked.value.orig.sqlstate == "55P03"
+                assert not release_terminal.is_set()
+                # Rolling back the claim INSERT savepoint must retain A's
+                # uncommitted booking, snapshot, history, audit and receipt.
+                assert (
+                    _tentative_booking_evidence(
+                        connection, tenant, appointment, query.idempotency_key
+                    )
+                    == expected_pending
+                )
+            finally:
+                release_terminal.set()
+
+            assert terminal_committed.wait(timeout=20)
+            if status == "Cancelled":
+                _insert_claim(connection, tenant, source, appointment, provenance)
+                return appointment
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                _insert_claim(connection, tenant, source, appointment, provenance)
+            assert denied.value.orig.sqlstate == "23505"
+            # Commit must reject the still-unpaired tentative Follow-up,
+            # rolling back all D-05 evidence rather than leaving an orphan.
+
+    def finish():
+        assert booking_written.wait(timeout=20)
+        with transaction(runtime, tenant) as connection:
+            _outcome(
+                connection,
+                tenant,
+                doctor,
+                existing,
+                status=status,
+                pre_admitted=status == "Completed",
+            )
+            terminal_written.set()
+            assert release_terminal.wait(timeout=20)
+        terminal_committed.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        contender = pool.submit(compete)
+        terminal = pool.submit(finish)
+        try:
+            terminal.result(timeout=35)
+            if status == "Completed":
+                failure = contender.exception(timeout=35)
+                assert isinstance(failure, DBAPIError)
+                assert failure.orig.sqlstate == "23514"
+            else:
+                assert contender.result(timeout=35) == staged["appointment"]
+        finally:
+            release_terminal.set()
+
+    rows = _claims(runtime, tenant, source)
+    assert sorted(row.state for row in rows) == (
+        ["CONSUMED"] if status == "Completed" else ["ACTIVE", "RELEASED"]
+    )
+    assert (
+        next(row for row in rows if row.appointment_id == existing["id"]).status
+        == status
+    )
+    with transaction(runtime, tenant) as connection:
+        assert _tentative_booking_evidence(
+            connection, tenant, staged["appointment"], staged["receipt_key"]
+        ) == ((0,) * 8 if status == "Completed" else (1,) * 8)
+        if status == "Completed":
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT last_number FROM public.appointment_day_counters
+                    WHERE organization_id=:tenant AND service_date=:day
+                """),
+                    {"tenant": tenant, "day": target_day},
+                )
+                == counter_before
+            )
 
 
 def _extend(connection, tenant, source, record, *, audit_correlation=None):
