@@ -22,6 +22,16 @@ ROOT = Path(__file__).resolve().parents[2]
 MIGRATION = ROOT / "db/migrations/versions/0021_d07_visits.py"
 BEFORE = "0020_b07_manual_slot_weekly"
 AFTER = "0021_d07_visits"
+PREDECESSOR_TABLES = (
+    "staff_accounts",
+    "patients",
+    "appointments",
+    "appointment_history",
+    "appointment_price_snapshots",
+    "appointment_number_assignments",
+    "appointment_day_counters",
+    "idempotency_receipts",
+)
 
 
 def _upgrade(engine, revision, scripts=None):
@@ -57,6 +67,30 @@ def _prepare(admin, database):
         doctor = _activate_clinic(connection, tenant, operator)
     runtime = _engine("carepulse_runtime", database)
     return migration, runtime, tenant, doctor
+
+
+def _predecessor_security(connection):
+    return connection.execute(
+        text("""
+            SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+                   r.rolname, a.attname, p.privilege,
+                   has_table_privilege(r.oid, c.oid, p.privilege),
+                   CASE WHEN p.privilege IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES')
+                        THEN has_column_privilege(r.oid, c.oid, a.attname, p.privilege)
+                   END
+            FROM pg_class c
+            JOIN pg_attribute a ON a.attrelid=c.oid
+                               AND a.attnum > 0 AND NOT a.attisdropped
+            CROSS JOIN pg_roles r
+            CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'),
+                               ('TRUNCATE'), ('REFERENCES'), ('TRIGGER')) p(privilege)
+            WHERE c.relnamespace = 'public'::regnamespace AND c.relkind='r'
+              AND c.relname = ANY(:tables)
+              AND r.rolname IN ('carepulse_runtime', 'carepulse_operator')
+            ORDER BY c.relname, r.rolname, a.attname, p.privilege
+        """),
+        {"tables": list(PREDECESSOR_TABLES)},
+    ).all()
 
 
 def _advance_without_visit(connection, saved, tenant, doctor, target):
@@ -143,9 +177,19 @@ def test_version_and_fresh_upgrade_preserve_predecessor_records(admin, empty_dat
                 {"tenant": tenant},
             ).all()
             assert len(assignments) == len(receipts) == 4
+        with migration.connect() as connection:
+            predecessor_security = _predecessor_security(connection)
+            assert {row.relname for row in predecessor_security} == set(
+                PREDECESSOR_TABLES
+            )
+            assert all(
+                row.relrowsecurity and row.relforcerowsecurity
+                for row in predecessor_security
+            )
         _upgrade(migration, AFTER)
         _upgrade(migration, AFTER)
         with migration.connect() as connection:
+            assert _predecessor_security(connection) == predecessor_security
             assert (
                 connection.scalar(
                     text("SELECT version_num FROM public.alembic_version")

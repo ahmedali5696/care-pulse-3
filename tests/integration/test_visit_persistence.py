@@ -394,15 +394,26 @@ def test_tenant_rls_and_effective_permissions(appointment_storage):
                 {"name": f"public.{name}"},
             ).one()
             assert row == (True, True)
-            assert (
-                connection.scalar(
-                    text(
-                        "SELECT has_table_privilege('carepulse_operator', :relation, 'SELECT')"
-                    ),
-                    {"relation": f"public.{name}"},
+            for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                assert (
+                    connection.scalar(
+                        text(
+                            "SELECT has_table_privilege('carepulse_operator', :relation, :privilege)"
+                        ),
+                        {"relation": f"public.{name}", "privilege": privilege},
+                    )
+                    is False
                 )
-                is False
-            )
+                if privilege != "DELETE":
+                    assert (
+                        connection.scalar(
+                            text(
+                                "SELECT has_any_column_privilege('carepulse_operator', :relation, :privilege)"
+                            ),
+                            {"relation": f"public.{name}", "privilege": privilege},
+                        )
+                        is False
+                    )
         assert (
             connection.scalar(
                 text(
@@ -448,6 +459,41 @@ def test_tenant_rls_and_effective_permissions(appointment_storage):
             assert details[0] is expected_definer
             assert "search_path=pg_catalog" in details[1]
             assert details[2:] == (False, False)
+
+
+def test_runtime_without_tenant_context_cannot_write_visit(appointment_storage):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        appointment = _seed(connection, tenant, doctor)
+        original = _visit(connection, appointment)
+
+    with transaction(runtime) as connection:
+        connection.execute(
+            text("SELECT set_config('app.staff_id', :actor, true)"),
+            {"actor": str(doctor)},
+        )
+        assert (
+            connection.execute(
+                text("""
+                    UPDATE public.visits SET diagnosis='No-tenant write'
+                    WHERE id=:visit RETURNING id
+                """),
+                {"visit": original.id},
+            ).all()
+            == []
+        )
+
+    with migration.connect() as connection:
+        assert _visit(connection, appointment) == original
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinical_revisions WHERE visit_id=:visit"
+                ),
+                {"visit": original.id},
+            )
+            == 0
+        )
 
 
 def test_visit_foundation_has_no_queue_dependencies():
