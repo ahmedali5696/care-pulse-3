@@ -133,7 +133,7 @@ def test_terminal_first_holds_claim_until_release_or_permanent_consumption(
 
 
 @pytest.mark.parametrize("status", ["Cancelled", "Completed"])
-def test_claim_first_holds_source_lock_before_terminal_transition(
+def test_claim_first_blocks_terminal_history_until_claim_commits(
     appointment_storage, status
 ):
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
@@ -158,14 +158,29 @@ def test_claim_first_holds_source_lock_before_terminal_transition(
                 transaction(runtime, tenant) as connection,
             ):
                 connection.execute(text("SET LOCAL lock_timeout = '1s'"))
+                # The terminal history's FK must wait for the uncommitted claim target.
                 connection.execute(
                     text("""
-                        SELECT id FROM public.appointments
-                        WHERE organization_id=:tenant AND id=:source FOR UPDATE
+                        INSERT INTO public.appointment_history
+                            (id, organization_id, appointment_id, appointment_revision,
+                             action, old_status, new_status, old_service_date,
+                             new_service_date, old_number, new_number, actor_staff_id,
+                             actor_role, price_snapshot_appointment_id)
+                        VALUES (:history, :tenant, :appointment, 1,
+                                'STATUS', 'Booked', :status, :day,
+                                :day, :number, :number, :doctor,
+                                'DOCTOR_OWNER', :appointment)
                     """),
-                    {"tenant": tenant, "source": source["appointment"]},
+                    {
+                        "history": uuid4(),
+                        "tenant": tenant,
+                        "appointment": staged[0]["id"],
+                        "status": status,
+                        "day": source["day"] + timedelta(days=1),
+                        "number": staged[0]["saved"]["number"],
+                        "doctor": doctor,
+                    },
                 )
-                _outcome(connection, tenant, doctor, staged[0], status=status)
             assert blocked.value.orig.sqlstate == "55P03"
         finally:
             commit.set()
@@ -173,8 +188,34 @@ def test_claim_first_holds_source_lock_before_terminal_transition(
 
     with transaction(runtime, tenant) as connection:
         _outcome(connection, tenant, doctor, record, status=status)
+    with (
+        pytest.raises(DBAPIError) as immutable_appointment,
+        transaction(runtime, tenant) as connection,
+    ):
+        connection.execute(
+            text("""
+                UPDATE public.appointments SET status='Booked', revision=revision+1
+                WHERE organization_id=:tenant AND id=:appointment
+            """),
+            {"tenant": tenant, "appointment": record["id"]},
+        )
+    assert immutable_appointment.value.orig.sqlstate == "23514"
+    with (
+        pytest.raises(DBAPIError) as immutable_claim,
+        transaction(runtime, tenant) as connection,
+    ):
+        connection.execute(
+            text("""
+                UPDATE public.followup_claims SET state='ACTIVE', revision=revision+1
+                WHERE organization_id=:tenant AND id=:claim
+            """),
+            {"tenant": tenant, "claim": record["claim"]},
+        )
+    assert immutable_claim.value.orig.sqlstate == "23514"
     rows = _claims(runtime, tenant, source)
     assert len(rows) == 1
+    assert rows[0].appointment_id == record["id"]
+    assert rows[0].status == status
     assert rows[0].state == ("CONSUMED" if status == "Completed" else "RELEASED")
 
 
