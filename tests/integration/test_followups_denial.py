@@ -9,7 +9,7 @@ from carepulse.db import transaction
 from sqlalchemy import text
 from test_booking import booking_body, booking_effects, booking_request, new_patient
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
-from test_followup_persistence import _claim, _source
+from test_followup_persistence import _claim, _outcome, _source
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 from test_schedule import SERVICE_DAY
@@ -294,3 +294,192 @@ def test_archived_patient_cannot_use_acknowledged_fallback(booking_clinic):
     )
     assert status == 409
     assert booking_effects(clinic) == before
+
+
+def _doctor_extend_to_booking_day(clinic, visit_id):
+    """Keep the selected source inside its clinical deadline for denial checks."""
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        connection.execute(
+            text("""
+                SELECT set_config('app.staff_id', :doctor, true),
+                       set_config('app.clinical_change_kind', 'DECISION_EXCEPTION', true),
+                       set_config('app.clinical_reason', 'Reviewed future visit', true)
+            """),
+            {"doctor": clinic.owner.staff_id},
+        )
+        connection.execute(
+            text("""
+                UPDATE public.visits
+                SET followup_decision=CAST(:decision AS jsonb)
+                WHERE organization_id=:tenant AND id=:visit
+            """),
+            {
+                "tenant": clinic.tenant,
+                "visit": visit_id,
+                "decision": json.dumps(
+                    {
+                        "kind": "DEADLINE",
+                        "deadline_date": SERVICE_DAY.isoformat(),
+                        "reason": "Reviewed future visit",
+                    }
+                ),
+            },
+        )
+        return connection.scalar(
+            text("""
+                SELECT clinical_revision FROM public.visits
+                WHERE organization_id=:tenant AND id=:visit
+            """),
+            {"tenant": clinic.tenant, "visit": visit_id},
+        )
+
+
+def test_consumed_source_cannot_book_second_preferential_followup(booking_clinic):
+    clinic = booking_clinic
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        source = _source(connection, clinic.tenant, UUID(clinic.owner.staff_id))
+        first = _claim(connection, clinic.tenant, source)
+        _outcome(
+            connection,
+            clinic.tenant,
+            UUID(clinic.owner.staff_id),
+            first,
+            status="Completed",
+        )
+    revision = _doctor_extend_to_booking_day(clinic, source["visit"])
+    assert revision == 2
+    body = _followup_body(source, expected_source_revision=revision)
+    before = booking_effects(clinic)
+    denied, response = booking_request(
+        clinic,
+        clinic.receptionist,
+        body={**body, "fallback_acknowledgment": None},
+        key=str(uuid4()),
+    )
+    assert denied == 409, response
+    assert booking_effects(clinic) == before
+    status, response = booking_request(
+        clinic, clinic.receptionist, body=body, key=str(uuid4())
+    )
+    assert status == 201, response
+    assert response["data"]["service_type"] == "NEW_EXAMINATION"
+    assert response["data"]["net_egp"] == "100.00"
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert connection.execute(
+            text("""
+                SELECT state, count(*) FROM public.followup_claims
+                WHERE organization_id=:tenant AND source_visit_id=:visit
+                GROUP BY state
+            """),
+            {"tenant": clinic.tenant, "visit": source["visit"]},
+        ).all() == [("CONSUMED", 1)]
+
+
+def test_completed_followup_visit_cannot_be_recursive_preferential_source(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        original = _source(connection, clinic.tenant, UUID(clinic.owner.staff_id))
+        first = _claim(connection, clinic.tenant, original)
+        _outcome(
+            connection,
+            clinic.tenant,
+            UUID(clinic.owner.staff_id),
+            first,
+            status="Completed",
+        )
+        recursive_visit = connection.scalar(
+            text("""
+                SELECT id FROM public.visits
+                WHERE organization_id=:tenant AND appointment_id=:appointment
+            """),
+            {"tenant": clinic.tenant, "appointment": first["id"]},
+        )
+        assert recursive_visit is not None
+    revision = _doctor_extend_to_booking_day(clinic, recursive_visit)
+    assert revision == 1
+    candidate = {**original, "visit": recursive_visit}
+    body = _followup_body(candidate, expected_source_revision=revision)
+    before = booking_effects(clinic)
+    denied, response = booking_request(
+        clinic,
+        clinic.receptionist,
+        body={**body, "fallback_acknowledgment": None},
+        key=str(uuid4()),
+    )
+    assert denied == 409, response
+    assert booking_effects(clinic) == before
+    status, response = booking_request(
+        clinic, clinic.receptionist, body=body, key=str(uuid4())
+    )
+    assert status == 201, response
+    assert response["data"]["service_type"] == "NEW_EXAMINATION"
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert (
+            connection.scalar(
+                text("""
+                SELECT count(*) FROM public.followup_claims
+                WHERE organization_id=:tenant AND source_visit_id=:visit
+            """),
+                {"tenant": clinic.tenant, "visit": recursive_visit},
+            )
+            == 0
+        )
+
+
+@pytest.mark.parametrize(
+    ("discount_type", "discount_value", "net"),
+    [("FIXED", "12.50", "87.50"), ("PERCENT", "12.345", "87.66")],
+)
+def test_acknowledged_ordinary_fallback_reaffirms_discretionary_discount(
+    booking_clinic, discount_type, discount_value, net
+):
+    clinic = booking_clinic
+    patient = new_patient(clinic)
+    body = booking_body(
+        patient,
+        requested_service_type="FOLLOW_UP",
+        discount={
+            "discount_type": discount_type,
+            "discount_value": discount_value,
+            "discount_reason": "Synthetic authorized discretionary discount",
+        },
+        expected_net_egp=net,
+        fallback_acknowledgment={
+            "service_type": "NEW_EXAMINATION",
+            "discount_reaffirmed": True,
+        },
+    )
+    before = booking_effects(clinic)
+    denied, response = booking_request(
+        clinic,
+        clinic.receptionist,
+        body={**body, "fallback_acknowledgment": None},
+        key=str(uuid4()),
+    )
+    assert denied == 409, response
+    assert booking_effects(clinic) == before
+    status, response = booking_request(
+        clinic, clinic.receptionist, body=body, key=str(uuid4())
+    )
+    assert status == 201, response
+    booked = response["data"]
+    assert (
+        booked["service_type"],
+        booked["base_egp"],
+        booked["net_egp"],
+        booked["discount_type"],
+        booked["discount_value"],
+    ) == ("NEW_EXAMINATION", "100.00", net, discount_type, discount_value)
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert (
+            connection.scalar(
+                text("""
+                SELECT count(*) FROM public.followup_claims
+                WHERE organization_id=:tenant AND appointment_id=:appointment
+            """),
+                {"tenant": clinic.tenant, "appointment": UUID(booked["id"])},
+            )
+            == 0
+        )

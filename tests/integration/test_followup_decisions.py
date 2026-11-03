@@ -1,13 +1,20 @@
 """B-10 Doctor decisions and exact confirmed-claim extensions on real PostgreSQL."""
 
-from datetime import timedelta
-from uuid import uuid4
+import asyncio
+import json
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+from hmac import new
+from uuid import UUID, uuid4
 
 import pytest
 from carepulse.db import transaction
 from carepulse.identity.authorization import AuthorizedStaff
 from carepulse.identity.contracts import ContractError
 from carepulse.identity.receipts import ReceiptConflict
+from carepulse.identity.signing import canonical_payload
+from carepulse.main import app
 from carepulse.visits.eligibility import extend_followup, record_followup_decision
 from carepulse.visits.eligibility_contracts import ExtendFollowup, FollowupDecisionPatch
 from pydantic import ValidationError
@@ -15,6 +22,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_followup_persistence import _claim, _outcome, _source
+from test_patients import patient_backend as patient_backend  # noqa: PLC0414
+from test_pricing import _patch, pricing_request
+from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 from test_visit_persistence import _receptionist, _seed, _visit
 
 
@@ -52,6 +62,117 @@ def _extension(source, target, *, revision=1, claim_revision=1, deadline=None):
             "expected_claim_revision": claim_revision,
         }
     )
+
+
+def _signed_visit_request(
+    clinic,
+    actor,
+    *,
+    path,
+    method,
+    body,
+    key,
+    omit_key_header=False,
+    purpose="VISIT_FOLLOWUP",
+):
+    """Exercise the actual API boundary with a fresh signed nonce per request."""
+    encoded = json.dumps(body, separators=(",", ":")).encode()
+    envelope = replace(
+        actor,
+        method=method,
+        path=path,
+        query="",
+        body_sha256=sha256(encoded).hexdigest(),
+        purpose=purpose,
+        timestamp=str(int(datetime.now(UTC).timestamp() * 1000)),
+        nonce=f"synthetic_{uuid4().hex}",
+        idempotency_key=key,
+    )
+    fields = (
+        "protocol_version",
+        "key_id",
+        "service",
+        "organization_id",
+        "staff_id",
+        "session_id",
+        "role",
+        "security_revision",
+        "timestamp",
+        "nonce",
+        "purpose",
+        "idempotency_key",
+    )
+    headers = [
+        (
+            f"x-carepulse-{field.replace('_', '-')}".encode(),
+            str(getattr(envelope, field)).encode(),
+        )
+        for field in fields
+        if not (omit_key_header and field == "idempotency_key")
+    ]
+    headers.extend(
+        (
+            (b"content-type", b"application/json"),
+            (b"x-carepulse-service-key", clinic.config.service_key.encode()),
+            (
+                b"x-carepulse-signature",
+                new(
+                    clinic.config.service_key.encode(),
+                    canonical_payload(envelope),
+                    sha256,
+                )
+                .hexdigest()
+                .encode(),
+            ),
+        )
+    )
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "scheme": "http",
+        "method": method,
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": headers,
+        "client": ("synthetic", 1),
+        "server": ("api", 8000),
+    }
+    messages = []
+
+    async def receive():
+        return {"type": "http.request", "body": encoded, "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    return messages[0]["status"], json.loads(
+        b"".join(message.get("body", b"") for message in messages[1:])
+    )
+
+
+def _visit_effects(clinic, visit_id, operation):
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        return connection.execute(
+            text("""
+                SELECT
+                    (SELECT count(*) FROM public.clinical_revisions
+                      WHERE organization_id=:tenant AND visit_id=:visit),
+                    (SELECT count(*) FROM public.clinical_audit a
+                      JOIN public.clinical_revisions r
+                        ON r.id::text=a.correlation_id
+                       AND r.organization_id=a.organization_id
+                      WHERE a.organization_id=:tenant AND r.visit_id=:visit),
+                    (SELECT count(*) FROM public.followup_extensions
+                      WHERE organization_id=:tenant AND source_visit_id=:visit),
+                    (SELECT count(*) FROM public.idempotency_receipts
+                      WHERE organization_id=:tenant AND operation=:operation)
+            """),
+            {"tenant": clinic.tenant, "visit": visit_id, "operation": operation},
+        ).one()
 
 
 @pytest.mark.parametrize("kind", ["DEFAULT", "OPTED_OUT", "DEADLINE"])
@@ -149,7 +270,11 @@ def test_invalid_or_unauthorized_decision_rolls_back_all_evidence(
         _doctor_context(connection, acting_staff)
         if case == "disabled":
             connection.execute(
-                text("UPDATE public.staff_accounts SET enabled=false WHERE id=:id"),
+                text("""
+                    UPDATE public.staff_accounts
+                    SET enabled=false, security_revision=security_revision+1
+                    WHERE id=:id
+                """),
                 {"id": doctor},
             )
         failure_type = DBAPIError if case == "disabled" else ContractError
@@ -222,6 +347,110 @@ def test_strict_decision_input_excludes_clinical_edit_and_missing_reason():
                 "expected_claim_revision": 1,
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("operation", "method", "success_status"),
+    [
+        ("decision", "PATCH", 200),
+        ("extension", "POST", 201),
+    ],
+)
+def test_signed_doctor_followup_receipt_recovery_and_revocation(
+    patient_backend, operation, method, success_status
+):
+    clinic = patient_backend
+    doctor = UUID(clinic.owner.staff_id)
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        source = _source(connection, clinic.tenant, doctor)
+        confirmed = _claim(connection, clinic.tenant, source)
+    visit_id = source["visit"]
+    path = f"/v1/visits/{visit_id}"
+    if operation == "decision":
+        body = _decision(
+            "OPTED_OUT", 1, reason="Synthetic revised Doctor decision"
+        ).model_dump(mode="json")
+        changed = {
+            **body,
+            "followup_decision": {
+                "kind": "OPTED_OUT",
+                "reason": "Different clinical reason",
+            },
+        }
+        receipt_operation = "visits.followup_decision"
+    else:
+        path += "/extend-followup"
+        body = _extension(source, confirmed["id"]).model_dump(mode="json")
+        changed = {**body, "reason": "Different clinical reason"}
+        receipt_operation = "visits.extend_followup"
+    before = _visit_effects(clinic, visit_id, receipt_operation)
+    assert before == (1, 0, 0, 0)
+
+    for missing in ({"key": ""}, {"key": str(uuid4()), "omit_key_header": True}):
+        status, refused = _signed_visit_request(
+            clinic, clinic.owner, path=path, method=method, body=body, **missing
+        )
+        assert status == (401 if missing.get("omit_key_header") else 422), refused
+        assert "data" not in refused
+    for actor, wrong_method, wrong_purpose in (
+        (clinic.receptionist, method, "VISIT_FOLLOWUP"),
+        (clinic.owner, "GET", "VISIT_FOLLOWUP"),
+        (clinic.owner, method, "APPOINTMENT_BOOKING"),
+    ):
+        status, refused = _signed_visit_request(
+            clinic,
+            actor,
+            path=path,
+            method=wrong_method,
+            body=body,
+            key=str(uuid4()),
+            purpose=wrong_purpose,
+        )
+        assert status == 403, refused
+        assert "data" not in refused
+    assert _visit_effects(clinic, visit_id, receipt_operation) == before
+
+    key = str(uuid4())
+    status, accepted = _signed_visit_request(
+        clinic, clinic.owner, path=path, method=method, body=body, key=key
+    )
+    assert status == success_status, accepted
+    assert accepted["revision"] == 2
+    assert accepted["data"]["visit_id"] == str(visit_id)
+    assert accepted["data"]["revision"] == 2
+    after = _visit_effects(clinic, visit_id, receipt_operation)
+    assert after == (2, 1, int(operation == "extension"), 1)
+
+    price_status, price = pricing_request(
+        clinic,
+        clinic.owner,
+        method="PATCH",
+        body=_patch(standard_new_exam_egp="125.00"),
+        key=str(uuid4()),
+    )
+    assert price_status == 200, price
+    assert _signed_visit_request(
+        clinic, clinic.owner, path=path, method=method, body=body, key=key
+    ) == (success_status, accepted)
+    conflict, denied = _signed_visit_request(
+        clinic, clinic.owner, path=path, method=method, body=changed, key=key
+    )
+    assert conflict == 409
+    assert denied["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert "data" not in denied
+    assert _visit_effects(clinic, visit_id, receipt_operation) == after
+
+    with clinic.migration.begin() as connection:
+        connection.execute(
+            text('DELETE FROM public."session" WHERE id=:id'),
+            {"id": clinic.owner.session_id},
+        )
+    revoked, denied = _signed_visit_request(
+        clinic, clinic.owner, path=path, method=method, body=body, key=key
+    )
+    assert revoked in (401, 403), denied
+    assert "data" not in denied
+    assert _visit_effects(clinic, visit_id, receipt_operation) == after
 
 
 def test_source_decision_edit_preserves_confirmed_claim_and_replays_receipt(
