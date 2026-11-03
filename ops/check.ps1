@@ -123,6 +123,7 @@ expected_paths = {
     '/v1/settings/pricing', '/v1/settings/schedule',
     '/v1/settings/schedule/preview', '/v1/settings/schedule/activate',
     '/v1/slots', '/v1/appointments', '/v1/appointments/{appointment_id}',
+    '/v1/visits/{visit_id}', '/v1/visits/{visit_id}/extend-followup',
 }
 assert set(app.openapi()['paths']) == expected_paths
 assert app.openapi_url is None and len(app.user_middleware) == 1
@@ -152,6 +153,8 @@ assert {(method, pattern.pattern, purpose) for method, pattern, purpose in bound
     ('GET', f'/v1/staff/receptionists/{uuid}', 'STAFF_MANAGEMENT'),
     ('GET', f'/v1/patients/{uuid}', 'PATIENT_REGISTRY'),
     ('GET', f'/v1/appointments/{uuid}', 'APPOINTMENT_BOOKING'),
+    ('PATCH', f'/v1/visits/{uuid}', 'VISIT_FOLLOWUP'),
+    ('POST', f'/v1/visits/{uuid}/extend-followup', 'VISIT_FOLLOWUP'),
     ('PATCH', f'/v1/patients/{uuid}', 'PATIENT_REGISTRY'),
     ('POST', f'/v1/patients/{uuid}/(?:archive|unarchive)', 'PATIENT_REGISTRY'),
     ('POST', f'/v1/staff/receptionists/{uuid}/(?:enable|disable|invite|revoke-invite)', 'STAFF_MANAGEMENT'),
@@ -214,6 +217,9 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             }
             foreach ($suite in @('tests/integration/test_booking.py', 'tests/integration/test_booking_races.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-09 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_followups.py', 'tests/integration/test_followups_denial.py', 'tests/integration/test_followup_decisions.py', 'tests/integration/test_followups_races.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-10 verification: $suite" }
             }
             foreach ($suite in @('tests/integration/test_visit_persistence.py', 'tests/integration/test_visit_revisions.py', 'tests/integration/test_visit_migration.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required D-07 verification: $suite" }
@@ -342,6 +348,18 @@ docker compose --profile test run --rm --no-deps \
   tests/integration/test_booking.py tests/integration/test_booking_races.py | tee "$private/b09-booking.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b09-booking.log"; then
   echo 'FAIL mandatory B-09 booking evidence skipped'; exit 1
+fi
+# B-10 confirms Doctor decisions, exact extensions, bookings and denial/race evidence.
+docker compose --profile test run --rm --no-deps \
+  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider \
+  tests/integration/test_followups.py tests/integration/test_followups_denial.py \
+  tests/integration/test_followup_decisions.py tests/integration/test_followups_races.py | tee "$private/b10-followups.log"
+if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b10-followups.log"; then
+  echo 'FAIL mandatory B-10 follow-up evidence skipped'; exit 1
 fi
 # B-05 backend proof has no BFF/invitation prerequisite and cannot silently skip.
 docker compose --profile test run --rm --no-deps \
@@ -772,6 +790,7 @@ fi
   echo '- D-01 tenant/role isolation and migration rollback/privilege cases: passed'
   echo '- D-02 PostgreSQL identity races, immutable session authority, Better Auth migration compatibility and ephemeral native hashed reset-proof issuance: passed'
   echo '- D-07 admission-linked Visit, immutable clinical revisions, and safe predecessor migration checks: passed'
+  echo '- B-10 Doctor Follow-up decisions, confirmed extensions, receipt recovery and booking races: passed'
   echo '- B-01 signed request, durable nonce replay, live authority/revocation, RLS and idempotent receipt boundary tests: passed'
   echo '- B-03 restricted operator and owner activation, separate committed sender and real Playwright invite/login: passed'
   echo '- Synthetic development only; production and later Waves remain closed'

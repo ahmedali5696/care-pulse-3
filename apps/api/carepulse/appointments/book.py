@@ -1,13 +1,16 @@
-"""B-09 transactionally confirmed Routine New Examination booking."""
+"""One atomic Routine booking engine for New Examinations and preferential care."""
 
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from uuid import uuid4
 
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, insert, text
 from sqlalchemy.exc import IntegrityError
 
 from carepulse.appointments.booking_contracts import BookAppointment
+from carepulse.appointments.followup_tables import followup_claims
+from carepulse.appointments.followups import qualify_followup
 from carepulse.appointments.persistence import (
     AppointmentDraft,
     allocate_day_number,
@@ -44,7 +47,7 @@ from carepulse.policies.versions import StalePolicyRevision, lock_policy_heads
 @dataclass(frozen=True)
 class BookingPlan:
     draft: AppointmentDraft
-    claim: None = None
+    claim: dict | None = None
 
 
 def _doctor_id(connection: Connection, tenant):
@@ -61,7 +64,13 @@ def _doctor_id(connection: Connection, tenant):
     return doctor
 
 
-def _snapshot(connection: Connection, actor: AuthorizedStaff, command: BookAppointment):
+def _snapshot(
+    connection: Connection,
+    actor: AuthorizedStaff,
+    command: BookAppointment,
+    service_type: str,
+    provenance: dict | None,
+):
     state = current_price_state(connection, actor.organization_id)
     require_matching_revision(
         command.expected_price_revision, state["PRICE"]["revision"]
@@ -70,16 +79,23 @@ def _snapshot(connection: Connection, actor: AuthorizedStaff, command: BookAppoi
         require_matching_revision(
             command.expected_followup_revision, state["FOLLOWUP"]["revision"]
         )
-    base = _money_output(state["PRICE"]["payload"]["standard_new_exam_egp"])
-    if base is None:
+    standard_base = _money_output(state["PRICE"]["payload"]["standard_new_exam_egp"])
+    base = _money_output(
+        state["PRICE"]["payload"][
+            "preferential_followup_egp"
+            if service_type == "FOLLOW_UP"
+            else "standard_new_exam_egp"
+        ]
+    )
+    if base is None or standard_base is None:
         raise ContractError(409)
     discount = command.discount
     try:
         validate_discount_reason(discount.discount_type, discount.discount_reason)
         quote = quote_price(
             base,
-            base,
-            "NEW_EXAMINATION",
+            standard_base,
+            service_type,
             "ROUTINE",
             discount.discount_type,
             discount.discount_value,
@@ -91,7 +107,7 @@ def _snapshot(connection: Connection, actor: AuthorizedStaff, command: BookAppoi
     ) or quote.net_egp != parse_money(command.expected_net_egp):
         raise ContractError(409, "STALE_REVISION")
     return {
-        "service_type": "NEW_EXAMINATION",
+        "service_type": service_type,
         "classification": "ROUTINE",
         "base_egp": quote.base_egp,
         "discount_type": quote.discount_type,
@@ -100,8 +116,8 @@ def _snapshot(connection: Connection, actor: AuthorizedStaff, command: BookAppoi
         "is_free": quote.is_free,
         "net_egp": quote.net_egp,
         "pricing_version": state["PRICE"]["version"],
-        "creation_standard_base_egp": quote.base_egp,
-        "entitlement_provenance": None,
+        "creation_standard_base_egp": parse_money(standard_base),
+        "entitlement_provenance": provenance,
     }
 
 
@@ -144,20 +160,65 @@ def _booking_plan(connection: Connection, actor, command, now):
     if not date_rules(schedule, command.service_date).eligible:
         raise ContractError(409)
     start, end = _timed_interval(connection, actor, command, schedule.booking_mode, now)
+    doctor_id = _doctor_id(connection, actor.organization_id)
+    claim = None
+    service_type = "NEW_EXAMINATION"
+    if command.requested_service_type == "FOLLOW_UP":
+        qualification = qualify_followup(
+            connection,
+            actor.organization_id,
+            command.patient_id,
+            command.service_date,
+            command.source_visit_id,
+            command.expected_source_revision,
+            now,
+        )
+        if qualification.outcome == "NOT_FOUND":
+            raise ContractError(404)
+        if qualification.outcome == "BUSY":
+            raise ContractError(409)
+        if qualification.outcome == "PREFERENTIAL":
+            if command.fallback_acknowledgment is not None:
+                raise ContractError(409, "STALE_REVISION")
+            service_type = "FOLLOW_UP"
+            state = current_price_state(connection, actor.organization_id)
+            claim = {
+                "source_visit_id": qualification.source_visit_id,
+                "source_appointment_id": qualification.source_appointment_id,
+                "completion_local_date": qualification.completion_local_date,
+                "approved_deadline": qualification.approved_deadline,
+                "policy_snapshot": {
+                    "source_visit_id": str(qualification.source_visit_id),
+                    "source_revision": qualification.source_revision,
+                    "doctor_staff_id": str(doctor_id),
+                    "actor_staff_id": str(actor.staff_id),
+                    "authorized": True,
+                    "policy_revision": state["FOLLOWUP"]["version"],
+                },
+            }
+        elif command.fallback_acknowledgment is None:
+            raise ContractError(409)
     return BookingPlan(
         AppointmentDraft(
             patient_id=command.patient_id,
-            doctor_staff_id=_doctor_id(connection, actor.organization_id),
+            doctor_staff_id=doctor_id,
             service_date=command.service_date,
             status="Booked",
-            service_type="NEW_EXAMINATION",
+            service_type=service_type,
             classification="ROUTINE",
             lane="MAIN",
             booking_mode=schedule.booking_mode,
             starts_at=start,
             ends_at=end,
-            price_snapshot=_snapshot(connection, actor, command),
-        )
+            price_snapshot=_snapshot(
+                connection,
+                actor,
+                command,
+                service_type,
+                claim["policy_snapshot"] if claim else None,
+            ),
+        ),
+        claim,
     )
 
 
@@ -208,6 +269,18 @@ def book_appointment(
         if invalid.orig.sqlstate == "23505":
             raise ContractError(409) from invalid
         raise
+    if plan.claim is not None:
+        connection.execute(
+            insert(followup_claims).values(
+                id=uuid4(),
+                organization_id=actor.organization_id,
+                appointment_id=appointment_id,
+                patient_id=command.patient_id,
+                doctor_staff_id=plan.draft.doctor_staff_id,
+                **plan.claim,
+                state="ACTIVE",
+            )
+        )
     projection = appointment_detail(connection, actor, appointment_id)
     append_sensitive_audit(
         connection,

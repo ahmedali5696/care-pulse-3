@@ -5,11 +5,15 @@ import binascii
 import hashlib
 import hmac
 import json
+from datetime import date
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import Connection, select
+from sqlalchemy import Connection, select, text
 
 from carepulse.appointments.booking_contracts import AppointmentQuery
+from carepulse.appointments.followup_rules import intended_date_allowed
+from carepulse.appointments.followups import _approved_deadline
 from carepulse.appointments.tables import (
     appointment_history,
     appointment_price_snapshots,
@@ -17,6 +21,9 @@ from carepulse.appointments.tables import (
 )
 from carepulse.identity.authorization import AuthorizedStaff
 from carepulse.identity.contracts import ContractError
+from carepulse.policies.pricing import quote_price
+from carepulse.policies.pricing_service import _money_output, current_price_state
+from carepulse.policies.schedule_service import _schedule_head
 
 READ_FIELDS = (
     "id",
@@ -128,6 +135,121 @@ def appointment_detail(
             for entry in history
         ],
     }
+
+
+def followup_qualification(
+    connection: Connection,
+    actor: AuthorizedStaff,
+    appointment_id: UUID,
+    intended_date: date,
+) -> dict:
+    """Operational qualification of a selected source appointment, without Visit narrative."""
+    source = appointment_detail(connection, actor, appointment_id)
+    evidence = (
+        connection.execute(
+            text("""
+            SELECT v.id, v.patient_id, v.doctor_staff_id,
+                   v.clinical_revision, v.followup_decision,
+                (SELECT h.occurred_at FROM public.appointment_history h
+                 WHERE h.organization_id = v.organization_id
+                   AND h.appointment_id = v.appointment_id
+                   AND h.new_status = 'Completed'
+                 ORDER BY h.appointment_revision DESC LIMIT 1) AS completed_at
+            FROM public.visits v
+            WHERE v.organization_id = :tenant AND v.appointment_id = :appointment
+        """),
+            {"tenant": actor.organization_id, "appointment": appointment_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    eligible = False
+    if (
+        source["status"] == "Completed"
+        and source["service_type"] == "NEW_EXAMINATION"
+        and source["classification"] in ("ROUTINE", "URGENT", "EMERGENCY")
+        and evidence
+        and evidence["completed_at"] is not None
+    ):
+        decision = evidence["followup_decision"] or {}
+        completed = evidence["completed_at"].astimezone(ZoneInfo("Africa/Cairo")).date()
+        deadline = _approved_deadline(completed, decision)
+        claim_state = connection.scalar(
+            text("""
+                    SELECT state FROM public.followup_claims
+                    WHERE organization_id = :tenant AND source_visit_id = :visit
+                      AND state IN ('ACTIVE','CONSUMED')
+                    LIMIT 1
+                """),
+            {"tenant": actor.organization_id, "visit": evidence["id"]},
+        )
+        if claim_state == "ACTIVE":
+            raise ContractError(409)
+        if deadline is not None and evidence["clinical_revision"] >= 1:
+            decision_actor = connection.scalar(
+                text("""
+                    SELECT actor_staff_id FROM public.clinical_revisions
+                    WHERE organization_id = :tenant AND visit_id = :visit
+                      AND change_kind IN ('DECISION_DEFAULT','DECISION_EXCEPTION')
+                    ORDER BY revision DESC LIMIT 1
+                """),
+                {"tenant": actor.organization_id, "visit": evidence["id"]},
+            )
+            active_doctor = connection.scalar(
+                text("""
+                    SELECT id FROM public.staff_accounts
+                    WHERE organization_id = :tenant AND role='DOCTOR_OWNER'
+                      AND enabled AND verified
+                """),
+                {"tenant": actor.organization_id},
+            )
+            eligible = (
+                claim_state != "CONSUMED"
+                and evidence["patient_id"] == UUID(source["patient_id"])
+                and evidence["doctor_staff_id"] == UUID(source["doctor_staff_id"])
+                and evidence["doctor_staff_id"] == active_doctor
+                and decision_actor == active_doctor
+                and intended_date_allowed(completed, intended_date, deadline)
+            )
+    service_type = "FOLLOW_UP" if eligible else "NEW_EXAMINATION"
+    pricing = current_price_state(connection, actor.organization_id)
+    standard = _money_output(pricing["PRICE"]["payload"]["standard_new_exam_egp"])
+    base = _money_output(
+        pricing["PRICE"]["payload"][
+            "preferential_followup_egp" if eligible else "standard_new_exam_egp"
+        ]
+    )
+    price_quote = None
+    if base is not None and standard is not None:
+        quote = quote_price(base, standard, service_type, "ROUTINE", "NONE", "0")
+        price_quote = {
+            "service_type": quote.service_type,
+            "base_egp": format(quote.base_egp, ".2f"),
+            "discount_type": "NONE",
+            "discount_value": "0.00",
+            "is_free": quote.is_free,
+            "net_egp": format(quote.net_egp, ".2f"),
+            "price_revision": pricing["PRICE"]["revision"],
+            "followup_revision": pricing["FOLLOWUP"]["revision"],
+        }
+    qualification = {
+        "patient_id": source["patient_id"],
+        "intended_service_date": intended_date.isoformat(),
+        "requested_service_type": "FOLLOW_UP",
+        "actual_service_type": service_type,
+        "preferential_available": eligible,
+        "source_visit_id": str(evidence["id"]) if evidence else None,
+        "source_revision": evidence["clinical_revision"] if evidence else None,
+        "price_revision": pricing["PRICE"]["revision"],
+        "followup_revision": pricing["FOLLOWUP"]["revision"],
+        "schedule_revision": _schedule_head(connection, actor.organization_id)[
+            "revision"
+        ],
+        "price_quote": price_quote,
+    }
+    if actor.role == "DOCTOR_OWNER" and evidence:
+        qualification["doctor_followup_decision"] = evidence["followup_decision"]
+    return qualification
 
 
 def _cursor_signature(secret: str, scope: bytes, identifier: bytes) -> bytes:

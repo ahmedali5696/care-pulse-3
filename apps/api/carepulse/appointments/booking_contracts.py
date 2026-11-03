@@ -33,6 +33,13 @@ def _canonical_service_date(value: object) -> str:
 CanonicalServiceDate = Annotated[date, BeforeValidator(_canonical_service_date)]
 
 
+class FallbackAcknowledgment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    service_type: Literal["NEW_EXAMINATION"]
+    discount_reaffirmed: Literal[True]
+
+
 class BookAppointment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -50,6 +57,7 @@ class BookAppointment(BaseModel):
     expected_schedule_revision: Revision
     expected_capacity_revision: Revision | None = None
     expected_source_revision: Revision | None = None
+    fallback_acknowledgment: FallbackAcknowledgment | None = None
 
     @field_validator("expected_base_egp", "expected_net_egp")
     @classmethod
@@ -59,13 +67,21 @@ class BookAppointment(BaseModel):
 
     @model_validator(mode="after")
     def booking_intent(self):
-        if self.requested_service_type != "NEW_EXAMINATION":
-            raise ValueError("Follow-up booking requires B-10 qualification")
-        if (
+        if self.requested_service_type == "NEW_EXAMINATION" and (
             self.source_visit_id is not None
             or self.expected_source_revision is not None
+            or self.fallback_acknowledgment is not None
         ):
             raise ValueError("New Examination cannot claim a source Visit")
+        if self.requested_service_type == "FOLLOW_UP":
+            if (self.source_visit_id is None) != (
+                self.expected_source_revision is None
+            ):
+                raise ValueError(
+                    "Referenced source and revision must be supplied together"
+                )
+            if self.expected_followup_revision is None:
+                raise ValueError("Follow-up policy revision is required")
         if (self.starts_at is None) != (self.ends_at is None):
             raise ValueError("Both timed endpoints are required together")
         return self
@@ -85,3 +101,8 @@ class AppointmentQuery(BaseModel):
     lane: Literal["MAIN", "EMERGENCY"] | None = None
     limit: Annotated[int, Field(ge=1, le=100)] = 25
     cursor: StrictStr | None = None
+
+
+class FollowupPreviewQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    intended_service_date: CanonicalServiceDate

@@ -6,8 +6,16 @@ from fastapi import APIRouter, Request
 from pydantic import ValidationError
 
 from carepulse.appointments.book import book_appointment
-from carepulse.appointments.booking_contracts import AppointmentQuery, BookAppointment
-from carepulse.appointments.queries import appointment_detail, list_appointments
+from carepulse.appointments.booking_contracts import (
+    AppointmentQuery,
+    BookAppointment,
+    FollowupPreviewQuery,
+)
+from carepulse.appointments.queries import (
+    appointment_detail,
+    followup_qualification,
+    list_appointments,
+)
 from carepulse.identity.authorization import protected_transaction
 from carepulse.identity.contracts import ContractError, success_response
 
@@ -62,8 +70,17 @@ def get_appointments(request: Request):
 
 @router.get("/{appointment_id}")
 def get_appointment(appointment_id: UUID, request: Request):
-    if request.query_params:
+    params = request.query_params
+    if len(params.multi_items()) != len(params):
         raise ContractError(422)
+    try:
+        preview = FollowupPreviewQuery.model_validate(dict(params)) if params else None
+    except ValidationError as invalid:
+        raise ContractError(422) from invalid
     with _transaction(request) as (connection, actor):
         projection = appointment_detail(connection, actor, appointment_id)
+        if preview is not None:
+            projection["followup_qualification"] = followup_qualification(
+                connection, actor, appointment_id, preview.intended_service_date
+            )
         return success_response(projection, projection["revision"])

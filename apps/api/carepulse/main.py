@@ -25,6 +25,7 @@ from carepulse.policies.pricing_routes import router as pricing_router
 from carepulse.policies.schedule_routes import router as schedule_router
 from carepulse.policies.slots_routes import router as slots_router
 from carepulse.provisioning.routes import router as provisioning_router
+from carepulse.visits.routes import router as visit_router
 
 
 @asynccontextmanager
@@ -50,6 +51,7 @@ app.include_router(provisioning_router)
 app.include_router(staff_router)
 app.include_router(patient_router)
 app.include_router(appointment_router)
+app.include_router(visit_router)
 app.include_router(pricing_router)
 app.include_router(schedule_router)
 app.include_router(slots_router)
@@ -84,6 +86,18 @@ app.add_middleware(
         ("GET", "/v1/slots"): "SLOTS",
     },
     route_patterns=(
+        (
+            "PATCH",
+            compile(r"/v1/visits/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"),
+            "VISIT_FOLLOWUP",
+        ),
+        (
+            "POST",
+            compile(
+                r"/v1/visits/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/extend-followup"
+            ),
+            "VISIT_FOLLOWUP",
+        ),
         (
             "GET",
             compile(
