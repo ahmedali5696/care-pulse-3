@@ -5,6 +5,7 @@
 **Approved by:** Product Owner — explicit approval on 19 October 2026.  
 **Effective date:** 19 October 2026.  
 **Document language:** English (workbook decision notes retained in Arabic in the decision appendix).  
+**Approved product amendment (3 November 2026):** The Product Owner approved the configurable Follow-up window and role-scoped, date-specific out-of-window booking authorization in FR-009a/c, BR-002a/c and AC-06/27 below. This amendment does not itself authorize implementation, migration or release.
 **Authority:** This is the CURRENT Product Owner-approved, self-contained CarePulse MVP Product Contract, effective 19 October 2026. It incorporates the 47 completed workbook choices and explicit owner clarifications of 19 October 2026. It prospectively supersedes approved CarePulse PRD v0.5; preceding documents remain historical and are not needed to interpret this standalone contract. Product approval grants NO implementation, migration, payment integration, deployment or production permission.  
 **Scope warning:** clinic Emergency lanes, deferred SaaS features, flexible day reconciliation and Bulk-only cancellation deferral are now resolved product scope choices. Production safety and future paid-platform commercialization still have separate gates (see §12).  
 **Reference conventions:** FR = functional requirement; BR = canonical behavior; AC = acceptance criterion. Existing retained IDs remain stable; added IDs start FR-090 / BR-032 / AC-18. Revised clarifications add FR-106–108, BR-047–049 and AC-38–43 without renumbering prior identifiers.
@@ -111,7 +112,7 @@ Patient WhatsApp/SMS, customer reminders/outbound vendor integration and deliver
 
 ### 4.4 Follow-up entitlement and days
 
-A qualifying Completed New Examination on 1 November has day zero on 1 November and default last day 8 November, ending at the end of 8 November in Africa/Cairo, inclusive. Doctor Visit decision authorizes ordinary defaults; exceptions require reasoned Doctor approval. Only one active preferential claim per original across Booked/Waiting/In Examination and one Completed use ever. Cancelled or No-show does not consume. A confirmed claim retains its then-authorized deadline and price if future policy is shortened/opted out; moves beyond frozen deadline require a distinct Doctor extension before move. After use or nonqualification the request is New Examination.
+A qualifying Completed New Examination on 1 November has day zero on 1 November. **Under the initial seven-day clinic FOLLOWUP setting**, its default last day is 8 November, ending at the end of 8 November in Africa/Cairo, inclusive; Owner changes to that setting govern subsequent **new claims**, including after release. The Doctor's source Visit decision remains required. A specific out-of-window **new-booking** date may be authorized by the Doctor with reason, or independently by an enabled Receptionist with optional reason; **both require immutable authorization audit** and neither may override a Doctor opt-out or the source's other eligibility constraints. Only one active preferential claim per original across Booked/Waiting/In Examination and one Completed use ever. Cancelled or No-show does not consume. A confirmed claim retains its then-authorized deadline and price if future policy is shortened/opted out; moves beyond its frozen deadline require a distinct Doctor extension before move. After use or nonqualification the request is New Examination.
 
 ### 4.5 Exact-time interval behavior and configuration changes
 
@@ -145,11 +146,11 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 
 **FR-009** — Offer New Examination and preferential qualifying Follow-up/Consultation. A nonqualifying or already consumed Follow-up claim must be booked as a standard New Examination; no standalone standard-price Follow-up in MVP.
 
-**FR-009a** — Use calendar-local date of original Completed examination as day zero; the standard entitlement lasts through end of clinic-local day seven (inclusive). The Doctor may record a justified examination-specific deadline or opt out. Future-only policy edits cannot invalidate a confirmed preferential booking.
+**FR-009a** — Use the Cairo-local date of the original Completed examination as day zero. The clinic's Owner-configurable FOLLOWUP window determines the inclusive default last eligible day for **new claims**, initially day seven; fresh booking after release uses current effective policy and price. The Doctor alone may record a justified source-Visit-specific deadline or opt out. A confirmed preferential booking retains its frozen entitlement and price despite later policy changes.
 
 **FR-009b** — Enforce at most one Completed discounted/free Follow-up per qualifying original Completed examination; Cancelled and No-show Follow-ups consume none, and multiple concurrent active preferential claims are prohibited (BR-002b).
 
-**FR-009c** — Preferential Follow-up requires an original Completed Routine, Medical Emergency or Paid Urgent New Examination, the same patient/clinic/Doctor and intended service date within the confirmed approved deadline. Routine entitlement is recorded in the originating Visit; justified exceptions need express Doctor authorization. Out-of-deadline reschedule requires a prior Doctor-audited extension.
+**FR-009c** — Preferential Follow-up requires an original Completed Routine, Medical Emergency or Paid Urgent New Examination for the same patient/clinic/Doctor, a recorded Doctor source-Visit eligibility decision, and an eligible intended service date. For a new booking outside the effective clinic-default window, the Doctor may approve a justified date-specific exception; an authorized Receptionist may **independently approve that specific date** without Doctor co-approval and with an **optional** reason. Both must create mandatory immutable, role-attributed authorization audit evidence before/with confirmation. Receptionist authorization is an operational booking exception, **not** permission to edit the Doctor's clinical Visit decision, override Doctor opt-out, or read clinical narrative. No selected date precedes Cairo-local completion; no exception defeats single-use, patient/day, slot or other ordinary booking guards. Moving an already confirmed claim beyond its frozen deadline remains subject to the distinct prior Doctor-audited extension rule.
 
 **FR-010** — Maintain distinct Appointment (operational booking) and Visit (clinical encounter) records per BR-001.
 
@@ -269,7 +270,7 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 
 **FR-066** — Owner sets EGP standard New Examination and preferential Follow-up prices, and optionally an enabled Urgent fixed premium above standard Examination price. Do not expose configurable multi-currency settings in MVP.
 
-**FR-067** — Preferential reduced/free Follow-up is eligible only from qualifying Completed New Examination (Routine, Emergency or Urgent), Doctor Visit policy/deadline, and at most one Completed preferential use; subsequent nonqualifying treatment is New Examination.
+**FR-067** — Preferential reduced/free Follow-up is eligible only from a qualifying Completed New Examination (Routine, Emergency or Urgent), a recorded Doctor Visit eligibility decision, and the effective clinic window or an authorized date-specific exception under FR-009c; at most one Completed preferential use is allowed. Subsequent nonqualifying treatment is New Examination.
 
 **FR-069** — Apply resource- and field-level Doctor/Receptionist tenant authorization. Receptionists may enter allowed intake data and attach report/image of a handwritten prescription as designated attachment; may not author/edit Doctor diagnosis, clinical notes or structured prescriptions.
 
@@ -360,11 +361,11 @@ These rules are normative. A product question marked OPEN cannot be answered by 
 
 **BR-002** — MVP bookable types are New Examination and qualifying preferential Follow-up. Nonqualifying requests use New Examination, rather than a standard-price unqualified Follow-up.
 
-**BR-002a** — A Completed Routine, Medical Emergency or Paid Urgent New Examination can qualify a discounted/free Follow-up through clinic-local calendar day seven inclusive (completion day zero). Doctor recommendation/eligibility settings stored on source Visit suffice within normal default policy; exceptional expiry changes or opt-out overrides require explicit justified Doctor decision. Confirmed claims are never invalidated retroactively.
+**BR-002a** — A Completed Routine, Medical Emergency or Paid Urgent New Examination can qualify a discounted/free Follow-up from Cairo-local completion day zero through the **current clinic FOLLOWUP policy's inclusive last day** (initially day seven). The Owner may change that default duration for **future new claims**; it is re-evaluated after a released claim. A recorded Doctor eligibility decision on the source Visit is required. Doctor-specific clinical deadline and opt-out decisions remain Doctor-controlled and require justification when exceptional. For a particular new Follow-up date outside the clinic-default window, the Doctor may provide a reasoned exception or the authorized Receptionist may approve it independently with an **optional** reason; **both actions require an immutable audit event** recording the actor/role, source, date, policy and authorization evidence. The Receptionist cannot alter or override the Doctor's recorded clinical decision/opt-out. Previously confirmed claims are never invalidated retroactively.
 
 **BR-002b** — One original Completed qualifying New Examination may support no more than one Completed preferential Follow-up. Active preferred claims across Booked/Waiting/In Examination are mutually exclusive. Cancelled/No-show claims release entitlement; after consumption further care is a New Examination at its appropriate standard rate.
 
-**BR-002c** — Confirmed preferential Follow-up freezes source Visit, policy snapshot/actor, last permissible service day, price and doctor authorization. A move beyond its preserved deadline requires prior Doctor-audited justified extension; new booking after cancellation follows current policy and fresh price.
+**BR-002c** — Confirmed preferential Follow-up freezes the source Visit, applicable versioned clinic policy, Doctor source eligibility, any separately authorized date-specific booking exception (including Receptionist actor/role and optional reason), approved service day/deadline, price and audit provenance. A move of an **already confirmed** claim beyond its preserved deadline requires prior Doctor-audited justified extension (the Receptionist's new-booking exception does not authorize rescheduling). A distinct new booking after cancellation/no-show follows current policy and fresh price.
 
 **BR-003** — Appointment statuses are Booked, Waiting, In Examination (stakeholder In-Progress), Completed, Cancelled and No-show. No seventh status is introduced.
 
@@ -414,7 +415,7 @@ These rules are normative. A product question marked OPEN cannot be answered by 
 
 **BR-024a** — Only Owner may enable Urgent after configuring standard base, strictly greater Urgent base and valid operating periods. Server ensures discounted Urgent net remains strictly above standard base, refuses free Urgent, invalid periods and invalid premium; snapshots remain frozen after configuration edits. Changes to standard base that break premium are REJECTED until owner corrects/disables Urgent expressly.
 
-**BR-025** — All confirmation-time prices are immutable EGP decimal snapshots. Monetary operations use a consistent final-net rounding rule, with no floating-point arithmetic, no negative or above-base discounts; reject unsafe invalid requests. Confirmed preferential Follow-up freezes Doctor source Visit authorization and deadline, which cannot be retroactively shortened; permitted extensions require reasoned audit.
+**BR-025** — All confirmation-time prices are immutable EGP decimal snapshots. Monetary operations use a consistent final-net rounding rule, with no floating-point arithmetic, no negative or above-base discounts; reject unsafe invalid requests. Confirmed preferential Follow-up freezes Doctor source Visit eligibility, effective policy and any authorized role-attributed new-booking date exception with its deadline, which cannot be retroactively shortened; subsequent reschedule extensions remain Doctor-reasoned and audited.
 
 **BR-026** — Clinic service value is NOT payment collection. Patient/clinic payment collection, status, receipts and payment gateways are excluded. SaaS tenant subscriptions, paid self-registration and checkout are independently DEFERRED; no subscription revenue or pilot payment status appears in completed examination value.
 
@@ -485,7 +486,7 @@ These rules are normative. A product question marked OPEN cannot be answered by 
 | Late depth | Five Routine Waiting patients | Configurable; manual justified placement within Routine |
 | Admission actors | Doctor + Receptionist (Both) | Current role/permission and live queue head |
 | Concurrent examination capacity | One | Doctor per-case confirmation beyond one |
-| Follow-up default | Completion day zero + seven clinic-local days, inclusive | Doctor Visit exceptions with justification |
+| Follow-up default | Owner-configurable inclusive clinic-local duration, initially completion day zero through day seven | Doctor-controlled Visit decisions; Doctor reasoned or Receptionist independently authorized date-specific new-booking exception (Receptionist reason optional); audit mandatory |
 | Medical record currency | EGP service value only | Not collected money |
 | Receptionist bulk permission | False unless Owner enables per user | Only bulk_reschedule; no bulk cancel MVP |
 | Browser push | Opt-in on Doctor device | At most patient name; in-app richer authorized detail |
@@ -519,7 +520,7 @@ Legacy scenarios are rewritten to reflect the completed workbook plus the four e
 
 **AC-05** — terminal cases Given an In Examination Appointment, only its Doctor may exceptionally cancel with a reason; attempts by Receptionist or other unauthorized actors fail. After that cancellation, Booked/Waiting rollback, rescheduling, reopening and completion all fail; any later care requires a new Appointment. Existing Visit and clinical/audit history survive, and a later Doctor correction records old/new values, actor and timestamp immutably. Other Cancelled/No-show appointments remain terminal; Completed cannot transition.
 
-**AC-06** — Completed Routine, Medical Emergency or Paid Urgent New Examination can qualify preferential Follow-up through clinic-local day seven inclusive. An ordinary original Visit eligibility decision suffices within default policy; justified exceptions require Doctor approval. Confirmed preferential claim survives later prospective policy change, max one active/one Completed; moved beyond frozen deadline only after Doctor-audited extension.
+**AC-06** — Completed Routine, Medical Emergency or Paid Urgent New Examination can qualify preferential Follow-up through the clinic's current inclusive default window (initially day seven), with a recorded Doctor source Visit eligibility decision. Beyond the clinic-default window, an authorized Doctor may approve a reasoned date-specific exception, or an authorized Receptionist may independently approve the selected new-booking date with optional reason; both require immutable actor/role/date/policy/source audit. A Receptionist cannot modify Doctor clinical decisions or override opt-out. Confirmed claims survive later prospective policy change; at most one active and one Completed; an already-confirmed booking moved beyond its frozen deadline still requires prior Doctor-audited extension.
 
 **AC-07** — Reject forged/negative money, Free Urgent or Urgent discounted net less than/equal standard base. EGP immutable price snaps survive setting changes; invalid standard price change that breaks enabled Urgent is rejected. Completed Examination Value includes only Completed service snapshots and never implies patient collection or SaaS subscription revenue.
 
@@ -563,7 +564,7 @@ Legacy scenarios are rewritten to reflect the completed workbook plus the four e
 
 **AC-26** — Under Receptionist-only admission and increased examination capacity, extra admission fails without individual Doctor confirmation and succeeds only after fresh approval plus head/Pause/revision/capacity check.
 
-**AC-27** — Reject a Follow-up on day eight absent explicit Doctor extension, with completion day counted day zero. Day-seven booking may be confirmed through end of that clinic-local calendar day.
+**AC-27** — With the initial seven-day clinic policy, permit day seven and reject day eight **unless** an authorized date-specific new-booking exception from Doctor or Receptionist is committed with mandatory audit. When the Owner changes the clinic duration, use that effective inclusive last day for new claims, including after a release, rather than always day seven. Completion day is day zero; a selected date before completion is never eligible. A Receptionist's exception reason may be absent without suppressing audit; no exception bypasses a recorded Doctor opt-out or a consumed source.
 
 **AC-28** — If Follow-up claim is unavailable, service is booked as New Examination; the app cannot create an independent standard-price nonqualifying Follow-up.
 

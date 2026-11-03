@@ -260,6 +260,8 @@ Wave 0/1 prerequisites that already exist and are **not** tasks here: D-04, D-05
 
 **Checkpoint**: User Story 4 independently verifiable; ordinary booking (US1) still passes unchanged.
 
+**Approved product change, 2026-11-03 — NOT IMPLEMENTED (Issue #24):** T078–T093 remain checked `[X]` **only for their previous executable B-10 contract**, proven by CI #41675394638 at `8956e6dd4dbffdc4bc940cca3a1bab8ed04ff4b2`. That coverage assumes fixed seven-day DEFAULT and Doctor-only out-of-window exception. The Product Owner subsequently approved (a) the current Owner-configured clinic FOLLOWUP inclusive day count (initially 7) for each **new** claim, including after release; and (b) Doctor reasoned **or independently Receptionist-authorized** exception for a **specific new-booking date** outside that default, Receptionist reason optional, **immutable audit mandatory**. The Doctor source-Visit clinical decision/opt-out and confirmed-claim extension remain Doctor-controlled; preserve frozen confirmed claims, RLS and claim uniqueness. Before implementing, separately authorize/update Spec Kit task scope and dependency/verification plan, review any new forward-only D-08 guard migration and B-06/B-10 read/booking/receipt changes, then collect real-PostgreSQL positive, denial, concurrency, no-reason audit and exact-SHA CI evidence. Do not retroactively check off this **new** requirement using historical task markers, alter published migrations, invent task IDs, or start another Master/Wave without authorization.
+
 ---
 
 ## Phase 7: User Story 5 — Retain trustworthy foundations for later care (Priority: P2)

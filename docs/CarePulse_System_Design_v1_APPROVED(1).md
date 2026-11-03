@@ -3,6 +3,7 @@
 **Version:** v1.0  
 **Approval status:** APPROVED — Product Owner confirmation.  
 **Approving authority / approval date:** Product Owner / 2026-10-21.  
+**Approved product-alignment amendment:** 2026-11-03 — the Follow-up policy/role authorization boundary below reflects amended PRD and Domain Model; this does not authorize code, migration, deployment or release.
 **Higher-priority authorities (in order):** `CarePulse_PRD_v1_APPROVED.md` (approved PRD v1); `CarePulse_Domain_Model_State_Machines_v1_2_APPROVED.md` (approved Domain Model v1.2).
 
 ## 1. Architecture & Stack
@@ -36,6 +37,7 @@
 - Bulk rescheduling is atomic (**All-or-Nothing**). Booking numbers are unique and never reused within each clinic/day.
 - EGP monetary values are stored using `NUMERIC`, with immutable price snapshots.
 - Append-only audit records capture all sensitive events and clinical modifications.
+- **Follow-up authorization boundary (2026-11-03):** The Owner-versioned FOLLOWUP policy governs the default new-claim window (initially seven Cairo-local days after completion, inclusive); claims freeze effective eligibility/price evidence. Doctor source-Visit clinical eligibility and opt-out stay Doctor-owned. For a selected new-booking date outside the clinic window, an authorized Receptionist may independently approve an operational **date-specific** exception, with optional reason but mandatory immutable actor/role/source/date/policy audit; the Doctor may approve an exception with required justification. These approvals must pass live role/tenant checks, optimistic revision checks and serialized claim booking in the existing backend transaction. Never disclose Doctor narrative or clinical audit to Receptionist, bypass RLS or conflate this new-booking exception with later Doctor-only extensions/rescheduling. Any change to the published D-08 database guard must use a reviewed forward-only migration.
 
 ## 4. Realtime & Background Processing
 
@@ -62,7 +64,7 @@
 
 ## 7. Scope & Release Gates
 
-- Full compliance with **PRD v1** and **Domain Model v1.2**, without modifying business rules or introducing additional features.
+- Full compliance with **PRD v1** and **Domain Model v1.2**, including their explicitly Product Owner-approved 2026-11-03 Follow-up amendments; no **unapproved** business-rule changes or additional features.
 - **Excluded from MVP:** SaaS billing, public signup, a full administrative dashboard, patient payments, bulk cancellation, and e-prescription generation.
 - Before production deployment, **OPEN-OPS-01/02/03** and **OPEN-FILES-01** must be resolved, together with a documented Egyptian legal and regulatory review.
 - Approval of this System Design does not constitute approval of implementation or production readiness.
