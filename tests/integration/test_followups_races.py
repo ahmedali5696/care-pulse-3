@@ -10,8 +10,8 @@ from carepulse.appointments.book import book_appointment
 from carepulse.appointments.booking_contracts import BookAppointment
 from carepulse.db import transaction
 from carepulse.identity.contracts import ContractError
-from carepulse.visits.eligibility import extend_followup
-from carepulse.visits.eligibility_contracts import ExtendFollowup
+from carepulse.visits.eligibility import extend_followup, record_followup_decision
+from carepulse.visits.eligibility_contracts import ExtendFollowup, FollowupDecisionPatch
 from sqlalchemy import text
 from test_booking import booking_body, booking_effects
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
@@ -113,25 +113,28 @@ def test_doctor_edit_first_makes_reviewed_source_stale_without_booking_writes(
     clinic = followup_clinic
     source = _source_for(clinic)
     requested = _command(source)
-    next_decision = '{"kind":"OPTED_OUT","reason":"Corrected recommendation"}'
-    next_change_kind = "DECISION_EXCEPTION"
+    next_decision = {"kind": "OPTED_OUT", "reason": "Corrected recommendation"}
+    expected_revision = 1
     if acknowledged_fallback:
         with transaction(clinic.runtime, clinic.tenant) as connection:
             connection.execute(
-                text("""
-                    SELECT set_config('app.staff_id', :actor, true),
-                           set_config('app.clinical_change_kind', 'DECISION_EXCEPTION', true),
-                           set_config('app.clinical_reason', 'Prior opt-out', true)
-                """),
+                text("SELECT set_config('app.staff_id', :actor, true)"),
                 {"actor": clinic.owner.staff_id},
             )
-            connection.execute(
-                text("""
-                    UPDATE public.visits
-                    SET followup_decision='{"kind":"OPTED_OUT","reason":"Prior opt-out"}'::jsonb
-                    WHERE organization_id=:tenant AND id=:visit
-                """),
-                {"tenant": clinic.tenant, "visit": source["visit"]},
+            record_followup_decision(
+                connection,
+                _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
+                source["visit"],
+                FollowupDecisionPatch.model_validate(
+                    {
+                        "followup_decision": {
+                            "kind": "OPTED_OUT",
+                            "reason": "Prior opt-out",
+                        },
+                        "expected_visit_revision": 1,
+                    }
+                ),
+                str(uuid4()),
             )
         requested = _command(
             source,
@@ -143,42 +146,54 @@ def test_doctor_edit_first_makes_reviewed_source_stale_without_booking_writes(
                 "discount_reaffirmed": True,
             },
         )
-        next_decision = '{"kind":"DEFAULT"}'
-        next_change_kind = "DECISION_DEFAULT"
+        next_decision = {"kind": "DEFAULT"}
+        expected_revision = 2
     changed = Event()
     permit_commit = Event()
+    booking_started = Event()
+    edit_pid = []
+    booking_pid = []
+    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
 
     def edit():
         with transaction(clinic.runtime, clinic.tenant) as connection:
+            edit_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             connection.execute(
-                text("""
-                    SELECT set_config('app.staff_id', :actor, true),
-                           set_config('app.clinical_change_kind', :change_kind, true),
-                           set_config('app.clinical_reason', 'Corrected recommendation', true)
-                """),
-                {"actor": clinic.owner.staff_id, "change_kind": next_change_kind},
+                text("SELECT set_config('app.staff_id', :actor, true)"),
+                {"actor": clinic.owner.staff_id},
             )
-            connection.execute(
-                text("""
-                    UPDATE public.visits SET followup_decision =
-                        CAST(:decision AS jsonb)
-                    WHERE organization_id=:tenant AND id=:visit
-                """),
-                {
-                    "tenant": clinic.tenant,
-                    "visit": source["visit"],
-                    "decision": next_decision,
-                },
+            record_followup_decision(
+                connection,
+                actor,
+                source["visit"],
+                FollowupDecisionPatch.model_validate(
+                    {
+                        "followup_decision": next_decision,
+                        "expected_visit_revision": expected_revision,
+                    }
+                ),
+                str(uuid4()),
             )
             changed.set()
             assert permit_commit.wait(timeout=20)
+
+    def book():
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            booking_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            booking_started.set()
+            return book_appointment(connection, actor, requested, str(uuid4()))
 
     before = booking_effects(clinic)
     with ThreadPoolExecutor(max_workers=2) as pool:
         editor = pool.submit(edit)
         assert changed.wait(timeout=15)
-        booking = pool.submit(_attempt, clinic, requested)
-        permit_commit.set()
+        booking = pool.submit(book)
+        try:
+            assert booking_started.wait(timeout=15)
+            with transaction(clinic.runtime, clinic.tenant) as observer:
+                _wait_for_postgres_lock(observer, booking_pid[0], edit_pid[0])
+        finally:
+            permit_commit.set()
         editor.result(timeout=30)
         with pytest.raises(ContractError) as denied:
             booking.result(timeout=30)
@@ -211,20 +226,23 @@ def test_confirmation_first_freezes_claim_before_doctor_opt_out(followup_clinic)
             edit_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             edit_started.set()
             connection.execute(
-                text("""
-                    SELECT set_config('app.staff_id', :doctor, true),
-                           set_config('app.clinical_change_kind', 'DECISION_EXCEPTION', true),
-                           set_config('app.clinical_reason', 'Later assessment', true)
-                """),
+                text("SELECT set_config('app.staff_id', :doctor, true)"),
                 {"doctor": clinic.owner.staff_id},
             )
-            connection.execute(
-                text("""
-                    UPDATE public.visits
-                    SET followup_decision='{"kind":"OPTED_OUT","reason":"Later assessment"}'::jsonb
-                    WHERE organization_id=:tenant AND id=:visit
-                """),
-                {"tenant": clinic.tenant, "visit": source["visit"]},
+            return record_followup_decision(
+                connection,
+                actor,
+                source["visit"],
+                FollowupDecisionPatch.model_validate(
+                    {
+                        "followup_decision": {
+                            "kind": "OPTED_OUT",
+                            "reason": "Later assessment",
+                        },
+                        "expected_visit_revision": 1,
+                    }
+                ),
+                str(uuid4()),
             )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -233,12 +251,12 @@ def test_confirmation_first_freezes_claim_before_doctor_opt_out(followup_clinic)
         edited = pool.submit(update_decision)
         try:
             assert edit_started.wait(timeout=15)
-            with clinic.migration.connect() as observer:
+            with transaction(clinic.runtime, clinic.tenant) as observer:
                 _wait_for_postgres_lock(observer, edit_pid[0], confirmation_pid[0])
         finally:
             commit_booking.set()
         saved = confirmed.result(timeout=30)
-        edited.result(timeout=30)
+        assert edited.result(timeout=30)["revision"] == 2
 
     assert saved["service_type"] == "FOLLOW_UP"
     assert _claim_count(clinic, source) == 1
@@ -269,9 +287,13 @@ def test_release_or_consume_races_fresh_claim_without_double_use(
         )
     changed = Event()
     finish = Event()
+    replacement_started = Event()
+    terminal_pid = []
+    replacement_pid = []
 
     def terminate():
         with transaction(clinic.runtime, clinic.tenant) as connection:
+            terminal_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             _outcome(
                 connection,
                 clinic.tenant,
@@ -282,11 +304,32 @@ def test_release_or_consume_races_fresh_claim_without_double_use(
             changed.set()
             assert finish.wait(timeout=20)
 
+    def book_replacement():
+        actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            replacement_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            replacement_started.set()
+            return book_appointment(
+                connection,
+                actor,
+                _command(source, 3),
+                str(uuid4()),
+            )
+
     with ThreadPoolExecutor(max_workers=2) as pool:
         terminal_future = pool.submit(terminate)
         assert changed.wait(timeout=15)
-        replacement = pool.submit(_attempt, clinic, _command(source, 3))
-        finish.set()
+        replacement = pool.submit(book_replacement)
+        try:
+            assert replacement_started.wait(timeout=15)
+            with transaction(clinic.runtime, clinic.tenant) as observer:
+                _wait_for_postgres_lock(
+                    observer,
+                    replacement_pid[0],
+                    terminal_pid[0],
+                )
+        finally:
+            finish.set()
         terminal_future.result(timeout=30)
         if terminal == "Cancelled":
             assert replacement.result(timeout=30)["service_type"] == "FOLLOW_UP"
@@ -311,37 +354,57 @@ def test_doctor_extension_and_new_claim_compete_for_same_source(followup_clinic)
             "expected_claim_revision": 1,
         }
     )
+    extension_written = Event()
+    release_extension = Event()
+    booking_started = Event()
+    extension_pid = []
+    booking_pid = []
 
     def doctor_extend():
         with transaction(clinic.runtime, clinic.tenant) as connection:
+            extension_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             connection.execute(
                 text("SELECT set_config('app.staff_id', :doctor, true)"),
                 {"doctor": clinic.owner.staff_id},
             )
-            return extend_followup(
+            result = extend_followup(
                 connection,
                 _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
                 source["visit"],
                 extension,
                 str(uuid4()),
             )
+            extension_written.set()
+            assert release_extension.wait(timeout=20)
+            return result
 
-    outcomes = _concurrent(
-        doctor_extend,
-        lambda: _attempt(clinic, _command(source, 3)),
-    )
-    assert any(
-        isinstance(value, dict)
-        and value["extended_deadline"] == extension.extended_deadline.isoformat()
-        for value in outcomes
-    )
-    assert (
-        sum(
-            isinstance(value, ContractError) and value.status_code == 409
-            for value in outcomes
-        )
-        == 1
-    )
+    def booking_attempt():
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            booking_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            booking_started.set()
+            return book_appointment(
+                connection,
+                _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
+                _command(source, 3),
+                str(uuid4()),
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        extending = pool.submit(doctor_extend)
+        assert extension_written.wait(timeout=15)
+        competing = pool.submit(booking_attempt)
+        try:
+            assert booking_started.wait(timeout=15)
+            with transaction(clinic.runtime, clinic.tenant) as observer:
+                _wait_for_postgres_lock(observer, booking_pid[0], extension_pid[0])
+        finally:
+            release_extension.set()
+        extended = extending.result(timeout=30)
+        assert extended["extended_deadline"] == extension.extended_deadline.isoformat()
+        with pytest.raises(ContractError) as denied:
+            competing.result(timeout=30)
+        assert denied.value.status_code == 409
+        assert denied.value.code == "STALE_REVISION"
     assert _claim_count(clinic, source) == 1
 
 

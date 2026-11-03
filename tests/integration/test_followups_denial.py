@@ -483,3 +483,94 @@ def test_acknowledged_ordinary_fallback_reaffirms_discretionary_discount(
             )
             == 0
         )
+
+
+def test_in_examination_source_requires_acknowledgment_to_book_ordinary(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        source = _source(
+            connection, clinic.tenant, UUID(clinic.owner.staff_id), complete=False
+        )
+        assert (
+            connection.scalar(
+                text("""
+                SELECT status FROM public.appointments
+                WHERE organization_id=:tenant AND id=:appointment
+            """),
+                {"tenant": clinic.tenant, "appointment": source["appointment"]},
+            )
+            == "In Examination"
+        )
+    revision = _doctor_extend_to_booking_day(clinic, source["visit"])
+    assert revision == 2
+    body = _followup_body(source, expected_source_revision=revision)
+    before = booking_effects(clinic)
+    denied, response = booking_request(
+        clinic,
+        clinic.receptionist,
+        body={**body, "fallback_acknowledgment": None},
+        key=str(uuid4()),
+    )
+    assert denied == 409, response
+    assert booking_effects(clinic) == before
+
+    status, response = booking_request(
+        clinic, clinic.receptionist, body=body, key=str(uuid4())
+    )
+    assert status == 201, response
+    assert response["data"]["service_type"] == "NEW_EXAMINATION"
+    assert response["data"]["net_egp"] == "100.00"
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert (
+            connection.scalar(
+                text("""
+                SELECT count(*) FROM public.followup_claims
+                WHERE organization_id=:tenant AND source_visit_id=:visit
+            """),
+                {"tenant": clinic.tenant, "visit": source["visit"]},
+            )
+            == 0
+        )
+
+
+def test_acknowledged_fallback_still_denied_on_closed_day_and_counted_day(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    patient = new_patient(clinic)
+    fallback = booking_body(
+        patient,
+        requested_service_type="FOLLOW_UP",
+        fallback_acknowledgment={
+            "service_type": "NEW_EXAMINATION",
+            "discount_reaffirmed": True,
+        },
+    )
+    # booking_clinic publishes OPEN mode only for SERVICE_DAY's weekday.
+    closed_day = SERVICE_DAY + timedelta(days=1)
+    assert closed_day.isoweekday() != SERVICE_DAY.isoweekday()
+    before = booking_effects(clinic)
+    status, response = booking_request(
+        clinic,
+        clinic.receptionist,
+        body={**fallback, "service_date": closed_day.isoformat()},
+        key=str(uuid4()),
+    )
+    assert status == 409, response
+    assert booking_effects(clinic) == before
+
+    status, response = booking_request(
+        clinic,
+        clinic.receptionist,
+        body=booking_body(patient),
+        key=str(uuid4()),
+    )
+    assert status == 201, response
+    before = booking_effects(clinic)
+    status, response = booking_request(
+        clinic, clinic.receptionist, body=fallback, key=str(uuid4())
+    )
+    assert status == 409, response
+    assert booking_effects(clinic) == before

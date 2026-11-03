@@ -156,6 +156,7 @@ def _signed_visit_request(
 
 def _visit_effects(clinic, visit_id, operation):
     with transaction(clinic.runtime, clinic.tenant) as connection:
+        _doctor_context(connection, UUID(clinic.owner.staff_id))
         return connection.execute(
             text("""
                 SELECT
@@ -293,6 +294,17 @@ def test_invalid_or_unauthorized_decision_rolls_back_all_evidence(
                 else 409
                 if case == "stale"
                 else 422
+            )
+        if case == "disabled":
+            # Restore the clinic's sole Owner before the deferred ACTIVE-tenant
+            # invariant is checked at commit; the denied write stays rolled back.
+            connection.execute(
+                text("""
+                    UPDATE public.staff_accounts
+                    SET enabled=true, security_revision=security_revision+1
+                    WHERE id=:id
+                """),
+                {"id": doctor},
             )
         assert (
             connection.scalar(
