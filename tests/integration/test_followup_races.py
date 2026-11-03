@@ -281,6 +281,10 @@ def test_claim_first_staged_booking_contends_with_terminal_before_commit(
 
     def compete():
         with transaction(runtime, tenant) as connection:
+            connection.execute(
+                text("SELECT set_config('app.staff_id', :doctor, true)"),
+                {"doctor": str(doctor)},
+            )
             provenance = _provenance(source)
             query = _query(tenant, doctor)
             saved = persist_appointment(
@@ -355,9 +359,16 @@ def test_claim_first_staged_booking_contends_with_terminal_before_commit(
         contender = pool.submit(compete)
         terminal = pool.submit(finish)
         try:
-            terminal.result(timeout=35)
+            try:
+                terminal.result(timeout=35)
+            except AssertionError:
+                if not booking_written.is_set():
+                    contender.result(timeout=35)
+                raise
             if status == "Completed":
                 failure = contender.exception(timeout=35)
+                if failure is not None and not isinstance(failure, DBAPIError):
+                    raise failure
                 assert isinstance(failure, DBAPIError)
                 assert failure.orig.sqlstate == "23514"
             else:
@@ -374,6 +385,10 @@ def test_claim_first_staged_booking_contends_with_terminal_before_commit(
         == status
     )
     with transaction(runtime, tenant) as connection:
+        connection.execute(
+            text("SELECT set_config('app.staff_id', :doctor, true)"),
+            {"doctor": str(doctor)},
+        )
         assert _tentative_booking_evidence(
             connection, tenant, staged["appointment"], staged["receipt_key"]
         ) == ((0,) * 8 if status == "Completed" else (1,) * 8)
