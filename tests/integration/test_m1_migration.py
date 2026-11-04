@@ -376,32 +376,42 @@ def test_populated_predecessor_and_runtime_privilege_matrix(
         assert _sqlstate(direct_denied) == "42501"
 
         # Insertion of a pre-granted Receptionist is blocked even though
-        # legacy table-wide INSERT privilege remains necessary for invitations.
-        with (
-            pytest.raises(DBAPIError) as pregranted,
-            transaction(runtime, tenant_a) as connection,
-        ):
-            user = f"synthetic-m1-new-{uuid4()}"
+        # legacy table-wide staff INSERT is used for invitations. The runtime
+        # cannot INSERT native auth users, so seed that prerequisite separately.
+        user = f"synthetic-m1-new-{uuid4()}"
+        email = f"synthetic-m1-{uuid4()}@example.invalid"
+        with migration.begin() as connection:
             connection.execute(
                 text("""
                 INSERT INTO public."user"
                     (id,name,email,"emailVerified","createdAt","updatedAt")
-                VALUES (:id,'M1 new','new@example.invalid',true,
+                VALUES (:id,'M1 new',:email,true,
                         clock_timestamp(),clock_timestamp())
             """),
-                {"id": user},
+                {"id": user, "email": email},
             )
+        with (
+            pytest.raises(DBAPIError) as pregranted,
+            transaction(runtime, tenant_a) as connection,
+        ):
             connection.execute(
                 text("""
                 INSERT INTO public.staff_accounts
                     (id,organization_id,auth_user_id,verified_email,role,
                      enabled,verified,operational_manager)
-                VALUES (:id,:tenant,:user,'new@example.invalid',
+                VALUES (:id,:tenant,:user,:email,
                         'RECEPTIONIST',true,true,true)
             """),
-                {"id": uuid4(), "tenant": tenant_a, "user": user},
+                {"id": uuid4(), "tenant": tenant_a, "user": user, "email": email},
             )
         assert _sqlstate(pregranted) == "23514"
+        with migration.connect() as connection:
+            assert not connection.scalar(
+                text(
+                    "SELECT EXISTS(SELECT 1 FROM public.staff_accounts WHERE auth_user_id=:user)"
+                ),
+                {"user": user},
+            )
 
         with (
             pytest.raises(DBAPIError) as missing_preview_revision,
