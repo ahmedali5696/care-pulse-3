@@ -1,4 +1,4 @@
-"""B-06 tenant-authorized pricing reads and atomic Owner policy publication."""
+"""B-06 tenant-authorized pricing reads and atomic delegated policy publication."""
 
 import json
 import re
@@ -7,7 +7,10 @@ from uuid import uuid4
 
 from sqlalchemy import Connection, text
 
-from carepulse.identity.authorization import AuthorizedStaff
+from carepulse.identity.authorization import (
+    AuthorizedStaff,
+    can_manage_operational_settings,
+)
 from carepulse.identity.contracts import (
     ContractError,
     normalized_request_digest,
@@ -115,7 +118,7 @@ def _price_payload_json(value: object) -> str:
     return json.dumps(value, allow_nan=False)
 
 
-def _projection(state: dict, owner: bool) -> dict:
+def _projection(state: dict, settings_access: bool, owner: bool) -> dict:
     pricing, followup = state["PRICE"], state["FOLLOWUP"]
     price = pricing["payload"]
     values = {}
@@ -138,15 +141,15 @@ def _projection(state: dict, owner: bool) -> dict:
         "price_revision": pricing["revision"],
         "followup_revision": followup["revision"],
     }
-    if owner:
+    if settings_access:
         result.update(
             urgent_base_egp=values["urgent_base_egp"],
             urgent_enabled=price["urgent_enabled"],
             completion_day_zero=followup["payload"]["completion_day_zero"],
             followup_last_day_inclusive=int(followup["payload"]["last_day_inclusive"]),
         )
-        if remediation:
-            result["legacy_price_remediation"] = remediation
+    if owner and remediation:
+        result["legacy_price_remediation"] = remediation
     return result
 
 
@@ -156,7 +159,9 @@ def read_pricing(
     if actor.role not in ("DOCTOR_OWNER", "RECEPTIONIST"):
         raise ContractError(403)
     state = current_price_state(connection, actor.organization_id)
-    result = _projection(state, actor.role == "DOCTOR_OWNER")
+    result = _projection(
+        state, can_manage_operational_settings(actor), actor.role == "DOCTOR_OWNER"
+    )
     if quote_query.service_type is not None:
         base_key = (
             "standard_new_exam_egp"
@@ -222,7 +227,7 @@ def update_pricing(
     command: PricingPatch,
     idempotency_key: str,
 ) -> dict:
-    if actor.role != "DOCTOR_OWNER":
+    if not can_manage_operational_settings(actor):
         raise ContractError(403)
     if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", idempotency_key):
         raise ContractError(422)
@@ -250,6 +255,17 @@ def update_pricing(
         command.expected_price_revision, state["PRICE"]["revision"]
     )
     provided = command.model_fields_set
+    if actor.role != "DOCTOR_OWNER" and any(
+        field in provided
+        and _noncanonical_legacy_money(state["PRICE"]["payload"][field]) is not None
+        for field in (
+            "standard_new_exam_egp",
+            "preferential_followup_egp",
+            "urgent_base_egp",
+        )
+    ):
+        # Correcting noncanonical historical money is an Owner-only operation.
+        raise ContractError(403)
     if "followup_last_day_inclusive" in provided:
         require_matching_revision(
             command.expected_followup_revision, state["FOLLOWUP"]["revision"]
@@ -338,7 +354,7 @@ def update_pricing(
     if not changed_price and not changed_followup:
         raise ContractError(422)
     updated = current_price_state(connection, tenant)
-    result = _projection(updated, True)
+    result = _projection(updated, True, actor.role == "DOCTOR_OWNER")
     append_sensitive_audit(
         connection,
         {

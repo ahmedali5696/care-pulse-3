@@ -19,7 +19,6 @@ from carepulse.identity.authorization import (
     can_manage_operational_settings,
     protected_transaction,
 )
-from carepulse.identity.contracts import ContractError
 from carepulse.identity.signing import canonical_payload, canonical_query
 from carepulse.main import app
 from carepulse.policies.pricing import quote_price, validate_discount_reason
@@ -209,7 +208,7 @@ def _blocked_by(clinic, holder):
     pytest.fail("Expected PostgreSQL blocking order was not observed")
 
 
-def test_manager_grant_does_not_enable_pricing_or_legacy_bulk(patient_backend):
+def test_manager_grant_enables_pricing_but_not_legacy_bulk(patient_backend):
     clinic = patient_backend
     change = _patch(standard_new_exam_egp="100.00")
     assert (
@@ -244,15 +243,18 @@ def test_manager_grant_does_not_enable_pricing_or_legacy_bulk(patient_backend):
     assert pricing_request(clinic, ordinary)[0] == 401
     status, read = pricing_request(clinic, manager)
     assert status == 200, read
-    assert "urgent_enabled" not in read["data"]
+    assert read["data"]["urgent_enabled"] is False
     assert "legacy_price_remediation" not in read["data"]
     key = str(uuid4())
-    status, denied = pricing_request(
+    status, applied = pricing_request(
         clinic, manager, method="PATCH", body=change, key=key
     )
-    assert status == 403, denied
-    assert (
-        pricing_request(clinic, manager, method="PATCH", body=change, key=key)[0] == 403
+    assert status == 200, applied
+    assert applied["data"]["price_revision"] == 2
+    assert "legacy_price_remediation" not in applied["data"]
+    assert pricing_request(clinic, manager, method="PATCH", body=change, key=key) == (
+        status,
+        applied,
     )
 
     _owner_changes_manager(clinic, False, 2)
@@ -288,9 +290,9 @@ def test_manager_grant_does_not_enable_pricing_or_legacy_bulk(patient_backend):
     _owner_changes_manager(clinic, True, 3)
     regranted = _fresh_receptionist_session(clinic, 4)
     assert pricing_request(clinic, regranted)[0] == 200
-    assert (
-        pricing_request(clinic, regranted, method="PATCH", body=change, key=key)[0]
-        == 403
+    assert pricing_request(clinic, regranted, method="PATCH", body=change, key=key) == (
+        status,
+        applied,
     )
     with transaction(clinic.runtime, clinic.tenant) as connection:
         assert (
@@ -301,7 +303,7 @@ def test_manager_grant_does_not_enable_pricing_or_legacy_bulk(patient_backend):
             """),
                 {"tenant": clinic.tenant},
             )
-            == 1
+            == 2
         )
         assert (
             connection.scalar(
@@ -311,8 +313,77 @@ def test_manager_grant_does_not_enable_pricing_or_legacy_bulk(patient_backend):
             """),
                 {"tenant": clinic.tenant},
             )
-            == 0
+            == 1
         )
+    with clinic.migration.connect() as connection:
+        audit = connection.execute(
+            text("""
+                SELECT actor_staff_id, actor_role FROM public.sensitive_audit
+                WHERE organization_id = :tenant AND action = 'settings.pricing.update'
+            """),
+            {"tenant": clinic.tenant},
+        ).all()
+        assert audit == [(UUID(manager.staff_id), "RECEPTIONIST")]
+
+
+def test_manager_can_publish_pricing_and_followup_policy_in_one_transaction(
+    patient_backend,
+):
+    clinic = patient_backend
+    _owner_changes_manager(clinic, True, 0)
+    manager = _fresh_receptionist_session(clinic, 1)
+    change = {
+        **_patch(
+            standard_new_exam_egp="100.00",
+            preferential_followup_egp="30.00",
+            urgent_base_egp="150.00",
+            followup_last_day_inclusive=10,
+        ),
+        "expected_followup_revision": 1,
+    }
+    key = str(uuid4())
+    status, published = pricing_request(
+        clinic, manager, method="PATCH", body=change, key=key
+    )
+    assert status == 200, published
+    assert published["data"]["price_revision"] == 2
+    assert published["data"]["followup_revision"] == 2
+    assert published["data"]["followup_last_day_inclusive"] == 10
+    assert published["data"]["urgent_base_egp"] == "150.00"
+    assert "legacy_price_remediation" not in published["data"]
+    assert pricing_request(clinic, manager, method="PATCH", body=change, key=key) == (
+        status,
+        published,
+    )
+    assert pricing_request(clinic, manager)[1]["data"] == published["data"]
+    assert (
+        pricing_request(
+            clinic,
+            manager,
+            method="PATCH",
+            body={**_patch(urgent_enabled=True), "expected_price_revision": 2},
+            key=str(uuid4()),
+        )[0]
+        == 422
+    ), "Urgent cannot be enabled without operating periods"
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert connection.execute(
+            text("""
+                SELECT kind, revision FROM public.clinic_policy_heads
+                WHERE organization_id = :tenant AND kind IN ('PRICE', 'FOLLOWUP')
+                ORDER BY kind
+            """),
+            {"tenant": clinic.tenant},
+        ).all() == [("FOLLOWUP", 2), ("PRICE", 2)]
+    with clinic.migration.connect() as connection:
+        audits = connection.execute(
+            text("""
+                SELECT actor_staff_id, actor_role FROM public.sensitive_audit
+                WHERE organization_id = :tenant AND action = 'settings.pricing.update'
+            """),
+            {"tenant": clinic.tenant},
+        ).all()
+        assert audits == [(UUID(manager.staff_id), "RECEPTIONIST")]
 
 
 def test_manager_cannot_remediate_noncanonical_legacy_price(patient_backend):
@@ -387,15 +458,11 @@ def test_manager_revoke_and_live_authorization_serialize_both_orders(
                 holder = connection.scalar(text("SELECT pg_backend_pid()"))
                 revoke_future = pool.submit(_owner_changes_manager, clinic, False, 1)
                 _blocked_by(clinic, holder)
-                # M1 capability is observable live; B-06 pricing mutation remains Owner-only.
-                with pytest.raises(ContractError) as denied:
-                    update_pricing(
-                        connection,
-                        actor,
-                        PricingPatch.model_validate(body),
-                        str(uuid4()),
-                    )
-                assert denied.value.status_code == 403
+                # A checked mutation commits before a waiting revoke.
+                changed = update_pricing(
+                    connection, actor, PricingPatch.model_validate(body), str(uuid4())
+                )
+                assert changed["price_revision"] == 2
             revoke_future.result(timeout=30)
 
     assert pricing_request(clinic, manager)[0] == 401
@@ -419,11 +486,7 @@ def test_manager_revoke_and_live_authorization_serialize_both_orders(
             """),
             {"tenant": clinic.tenant, "staff": UUID(manager.staff_id)},
         ).one()
-    assert actual == (
-        1,
-        2,
-        0,
-    )
+    assert actual == (1 if winner == "revoke" else 2, 2, 0 if winner == "revoke" else 1)
 
 
 def test_owner_patch_replays_receipt_without_leaking_revoked_session(patient_backend):
