@@ -24,11 +24,19 @@ COMPLETION = date(2026, 11, 1)
     ],
 )
 def test_default_followup_window_is_inclusive_calendar_days(intended, allowed):
-    assert default_deadline(COMPLETION) == date(2026, 11, 8)
+    assert default_deadline(COMPLETION, 7) == date(2026, 11, 8)
     assert (
-        intended_date_allowed(COMPLETION, intended, default_deadline(COMPLETION))
+        intended_date_allowed(COMPLETION, intended, default_deadline(COMPLETION, 7))
         is allowed
     )
+
+
+@pytest.mark.parametrize("last_day_inclusive", [0, 10, 365])
+def test_default_deadline_uses_configured_inclusive_window(last_day_inclusive):
+    deadline = COMPLETION + timedelta(days=last_day_inclusive)
+    assert default_deadline(COMPLETION, last_day_inclusive) == deadline
+    assert intended_date_allowed(COMPLETION, deadline, deadline)
+    assert not intended_date_allowed(COMPLETION, deadline + timedelta(days=1), deadline)
 
 
 @pytest.mark.parametrize(
@@ -69,7 +77,7 @@ def test_cairo_completion_day_uses_history_instant_after_midnight():
     completed_at = datetime(2026, 10, 31, 22, 30, tzinfo=UTC)
     assert original_service_day != cairo_completion_date(completed_at)
     assert cairo_completion_date(completed_at) == COMPLETION
-    assert default_deadline(cairo_completion_date(completed_at)) == date(2026, 11, 8)
+    assert default_deadline(cairo_completion_date(completed_at), 7) == date(2026, 11, 8)
 
 
 def test_naive_completion_instant_is_not_assumed_to_be_cairo_time():

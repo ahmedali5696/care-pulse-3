@@ -1,12 +1,14 @@
 """D-08 durable preferential claims, lifecycle, tenant isolation and grants."""
 
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
+from carepulse.appointments.followups import qualify_followup
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
+from carepulse.policies.versions import append_version
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import (
@@ -601,7 +603,28 @@ def test_released_history_allows_fresh_eligibility_and_price_snapshot(
                 "visit": source["visit"],
             },
         )
+        assert (
+            append_version(
+                connection,
+                tenant,
+                "FOLLOWUP",
+                {"completion_day_zero": True, "last_day_inclusive": 7},
+                1,
+                actor_staff_id=str(doctor),
+            )
+            == 2
+        )
         fresh_provenance = {**_provenance(source, version=2), "source_revision": 2}
+        with pytest.raises(DBAPIError) as stale_policy, connection.begin_nested():
+            _claim(
+                connection,
+                tenant,
+                source,
+                day_offset=2,
+                provenance={**fresh_provenance, "policy_revision": 1},
+                price="125.00",
+            )
+        assert stale_policy.value.orig.sqlstate == "23514"
         fresh = _claim(
             connection,
             tenant,
@@ -632,6 +655,209 @@ def test_released_history_allows_fresh_eligibility_and_price_snapshot(
             next(row.policy_snapshot for row in rows if row.id == fresh["claim"])
             == fresh_provenance
         )
+
+
+def test_default_claim_uses_live_followup_window_and_rebook_freezes_new_policy(
+    appointment_storage,
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        assert (
+            append_version(
+                connection,
+                tenant,
+                "FOLLOWUP",
+                {"completion_day_zero": True, "last_day_inclusive": 10},
+                1,
+                actor_staff_id=str(doctor),
+            )
+            == 2
+        )
+        source = _source(connection, tenant, doctor)
+        original_provenance = _provenance(source, version=2)
+        current_time = datetime.now(UTC) + timedelta(seconds=2)
+        assert (
+            qualify_followup(
+                connection,
+                tenant,
+                source["patient"],
+                source["day"] + timedelta(days=10),
+                source["visit"],
+                1,
+                current_time,
+            ).outcome
+            == "PREFERENTIAL"
+        )
+        assert (
+            qualify_followup(
+                connection,
+                tenant,
+                source["patient"],
+                source["day"] + timedelta(days=11),
+                source["visit"],
+                1,
+                current_time,
+            ).outcome
+            == "FALLBACK"
+        )
+        # Even a current ten-day deadline cannot use a superseded policy head.
+        with pytest.raises(DBAPIError) as mismatched, connection.begin_nested():
+            _claim(
+                connection,
+                tenant,
+                source,
+                day_offset=10,
+                deadline=source["day"] + timedelta(days=10),
+                provenance=_provenance(source, version=1),
+            )
+        assert mismatched.value.orig.sqlstate == "23514"
+        # A forged deadline cannot authorize day eleven under the ten-day policy.
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            _claim(
+                connection,
+                tenant,
+                source,
+                day_offset=11,
+                deadline=source["day"] + timedelta(days=11),
+                provenance=original_provenance,
+            )
+        assert denied.value.orig.sqlstate == "23514"
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.followup_claims WHERE source_visit_id=:visit"
+                ),
+                {"visit": source["visit"]},
+            )
+            == 0
+        )
+
+        original = _claim(
+            connection,
+            tenant,
+            source,
+            day_offset=10,
+            deadline=source["day"] + timedelta(days=10),
+            provenance=original_provenance,
+            price="100.00",
+        )
+        _outcome(connection, tenant, doctor, original, status="Cancelled")
+
+    with transaction(runtime, tenant) as connection:
+        assert (
+            append_version(
+                connection,
+                tenant,
+                "FOLLOWUP",
+                {"completion_day_zero": True, "last_day_inclusive": 2},
+                2,
+                actor_staff_id=str(doctor),
+            )
+            == 3
+        )
+        fresh_provenance = _provenance(source, version=3)
+        current_time = datetime.now(UTC) + timedelta(seconds=2)
+        assert (
+            qualify_followup(
+                connection,
+                tenant,
+                source["patient"],
+                source["day"] + timedelta(days=10),
+                source["visit"],
+                1,
+                current_time,
+            ).outcome
+            == "FALLBACK"
+        )
+        assert (
+            qualify_followup(
+                connection,
+                tenant,
+                source["patient"],
+                source["day"] + timedelta(days=2),
+                source["visit"],
+                1,
+                current_time,
+            ).outcome
+            == "PREFERENTIAL"
+        )
+        fresh = _claim(
+            connection,
+            tenant,
+            source,
+            day_offset=2,
+            deadline=source["day"] + timedelta(days=2),
+            provenance=fresh_provenance,
+            price="125.00",
+        )
+        rows = connection.execute(
+            text("""
+                SELECT c.id, c.state, c.approved_deadline, c.policy_snapshot,
+                       s.net_egp
+                FROM public.followup_claims c
+                JOIN public.appointment_price_snapshots s
+                  ON (s.organization_id, s.appointment_id) =
+                     (c.organization_id, c.appointment_id)
+                WHERE c.organization_id=:tenant AND c.source_visit_id=:visit
+            """),
+            {"tenant": tenant, "visit": source["visit"]},
+        ).all()
+        by_id = {row.id: row for row in rows}
+        assert set(by_id) == {original["claim"], fresh["claim"]}
+        old = by_id[original["claim"]]
+        new = by_id[fresh["claim"]]
+        assert (old.state, old.approved_deadline, old.policy_snapshot, old.net_egp) == (
+            "RELEASED",
+            source["day"] + timedelta(days=10),
+            original_provenance,
+            100,
+        )
+        assert (new.state, new.approved_deadline, new.policy_snapshot, new.net_egp) == (
+            "ACTIVE",
+            source["day"] + timedelta(days=2),
+            fresh_provenance,
+            125,
+        )
+
+
+def test_integral_decimal_followup_policy_payload_is_accepted(appointment_storage):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        assert (
+            append_version(
+                connection,
+                tenant,
+                "FOLLOWUP",
+                '{"completion_day_zero":true,"last_day_inclusive":7.00}',
+                1,
+                actor_staff_id=str(doctor),
+            )
+            == 2
+        )
+        source = _source(connection, tenant, doctor)
+        assert (
+            qualify_followup(
+                connection,
+                tenant,
+                source["patient"],
+                source["day"] + timedelta(days=7),
+                source["visit"],
+                1,
+                datetime.now(UTC) + timedelta(seconds=2),
+            ).outcome
+            == "PREFERENTIAL"
+        )
+        record = _claim(
+            connection,
+            tenant,
+            source,
+            day_offset=7,
+            provenance=_provenance(source, version=2),
+        )
+        assert connection.scalar(
+            text("SELECT approved_deadline FROM public.followup_claims WHERE id=:id"),
+            {"id": record["claim"]},
+        ) == source["day"] + timedelta(days=7)
 
 
 def test_claim_and_preferential_appointment_must_both_exist_at_commit(

@@ -1,6 +1,7 @@
 """Calendar-day qualification rules for Doctor-authorized follow-up care."""
 
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 CAIRO = ZoneInfo("Africa/Cairo")
@@ -12,8 +13,22 @@ def cairo_completion_date(completed_at: datetime) -> date:
     return completed_at.astimezone(CAIRO).date()
 
 
-def default_deadline(completion_date: date) -> date:
-    return completion_date + timedelta(days=7)
+def current_last_day_inclusive(policy: dict) -> int:
+    """Read the persisted clinic window; reject corrupt policy instead of guessing."""
+    value = policy.get("last_day_inclusive")
+    if isinstance(value, bool) or not isinstance(value, (int, Decimal)):
+        raise TypeError("Invalid FOLLOWUP last-day policy")
+    if isinstance(value, Decimal) and not value.is_finite():
+        raise ValueError("Invalid FOLLOWUP last-day policy")
+    if not 0 <= value <= 365 or value != int(value):
+        raise ValueError("Invalid FOLLOWUP last-day policy")
+    return int(value)
+
+
+def default_deadline(completion_date: date, last_day_inclusive: int) -> date:
+    if not 0 <= last_day_inclusive <= 365:
+        raise ValueError("Invalid FOLLOWUP last-day policy")
+    return completion_date + timedelta(days=last_day_inclusive)
 
 
 def intended_date_allowed(completion: date, intended: date, deadline: date) -> bool:

@@ -549,8 +549,9 @@ def test_fresh_install_repeat_and_no_direct_owner_capability(admin, empty_databa
     _create_empty_database(admin, empty_database)
     migration = _engine("carepulse_migration", empty_database)
     try:
-        _at_revision(migration, "head")
-        _at_revision(migration, "head")
+        # Exercise M1 at its exact immutable revision, independent of later heads.
+        _at_revision(migration, "0023_m1_operational_manager")
+        _at_revision(migration, "0023_m1_operational_manager")
         with migration.connect() as connection:
             assert (
                 connection.scalar(

@@ -9,11 +9,13 @@ from sqlalchemy import Connection, text
 
 from carepulse.appointments.followup_rules import (
     cairo_completion_date,
+    current_last_day_inclusive,
     default_deadline,
     intended_date_allowed,
     validate_exception_deadline,
 )
-from carepulse.identity.contracts import require_matching_revision
+from carepulse.identity.contracts import ContractError, require_matching_revision
+from carepulse.policies.pricing_service import current_price_state
 
 
 @dataclass(frozen=True)
@@ -73,11 +75,13 @@ def _locked_source(connection: Connection, tenant: UUID, source_visit_id: UUID):
     return source_appointment, source_visit
 
 
-def _approved_deadline(completion: date, decision: object) -> date | None:
+def _approved_deadline(
+    completion: date, decision: object, last_day_inclusive: int
+) -> date | None:
     if not isinstance(decision, dict):
         return None
     if decision.get("kind") == "DEFAULT":
-        return default_deadline(completion)
+        return default_deadline(completion, last_day_inclusive)
     if decision.get("kind") != "DEADLINE":
         return None
     stated_date = decision.get("deadline_date")
@@ -168,7 +172,13 @@ def qualify_followup(
         return qualification
     completion = cairo_completion_date(completed_at)
     decision = visit["followup_decision"]
-    deadline = _approved_deadline(completion, decision)
+    try:
+        last_day = current_last_day_inclusive(
+            current_price_state(connection, tenant)["FOLLOWUP"]["payload"]
+        )
+    except (TypeError, ValueError) as invalid:
+        raise ContractError(409) from invalid
+    deadline = _approved_deadline(completion, decision, last_day)
     if deadline is None or not intended_date_allowed(
         completion, intended_date, deadline
     ):

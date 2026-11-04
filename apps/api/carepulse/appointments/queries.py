@@ -12,7 +12,10 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import Connection, select, text
 
 from carepulse.appointments.booking_contracts import AppointmentQuery
-from carepulse.appointments.followup_rules import intended_date_allowed
+from carepulse.appointments.followup_rules import (
+    current_last_day_inclusive,
+    intended_date_allowed,
+)
 from carepulse.appointments.followups import _approved_deadline
 from carepulse.appointments.tables import (
     appointment_history,
@@ -163,6 +166,11 @@ def followup_qualification(
         .mappings()
         .one_or_none()
     )
+    pricing = current_price_state(connection, actor.organization_id)
+    try:
+        last_day = current_last_day_inclusive(pricing["FOLLOWUP"]["payload"])
+    except (TypeError, ValueError) as invalid:
+        raise ContractError(409) from invalid
     eligible = False
     if (
         source["status"] == "Completed"
@@ -173,7 +181,7 @@ def followup_qualification(
     ):
         decision = evidence["followup_decision"] or {}
         completed = evidence["completed_at"].astimezone(ZoneInfo("Africa/Cairo")).date()
-        deadline = _approved_deadline(completed, decision)
+        deadline = _approved_deadline(completed, decision, last_day)
         claim_state = connection.scalar(
             text("""
                     SELECT state FROM public.followup_claims
@@ -212,7 +220,6 @@ def followup_qualification(
                 and intended_date_allowed(completed, intended_date, deadline)
             )
     service_type = "FOLLOW_UP" if eligible else "NEW_EXAMINATION"
-    pricing = current_price_state(connection, actor.organization_id)
     standard = _money_output(pricing["PRICE"]["payload"]["standard_new_exam_egp"])
     base = _money_output(
         pricing["PRICE"]["payload"][
