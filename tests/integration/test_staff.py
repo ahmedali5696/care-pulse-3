@@ -824,6 +824,12 @@ def test_signed_manager_cannot_manage_staff_even_after_regrant(owner_session):
     assert status == 200, regranted
     assert regranted["data"]["security_revision"] == 3
     assert _request("/api/session", cookie=ordinary_cookie)[0] == 401
+    with _database() as connection:
+        # Synthetic CI shares one ingress source across the Owner and Manager.
+        # Keep the real login throttle intact while isolating this authz test.
+        connection.execute(
+            "DELETE FROM public.auth_login_attempts WHERE dimension='source'"
+        )
     regranted_cookie = _login(manager)
     assert (
         _staff_command("/api/staff/receptionists", regranted_cookie, method="GET")[0]
