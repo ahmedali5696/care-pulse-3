@@ -28,7 +28,7 @@ class CreateReceptionist(BaseModel):
 
 
 class SetReceptionistGrant(StaffCommand):
-    bulk_reschedule: bool = Field(strict=True)
+    operational_manager: bool = Field(strict=True)
 
 
 class AcceptReceptionist(BaseModel):

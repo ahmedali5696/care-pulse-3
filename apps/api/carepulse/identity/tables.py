@@ -45,6 +45,9 @@ staff_accounts = Table(
     Column("enabled", Boolean, nullable=False, server_default=text("false")),
     Column("verified", Boolean, nullable=False, server_default=text("false")),
     Column("bulk_reschedule", Boolean, nullable=False, server_default=text("false")),
+    Column(
+        "operational_manager", Boolean, nullable=False, server_default=text("false")
+    ),
     Column("revision", BigInteger, nullable=False, server_default=text("0")),
     Column("security_revision", BigInteger, nullable=False, server_default=text("0")),
     Column("reset_block_operation_id", UUID(as_uuid=True)),
@@ -54,6 +57,7 @@ staff_accounts = Table(
     UniqueConstraint("organization_id", "id", "auth_user_id"),
     CheckConstraint("role IN ('DOCTOR_OWNER', 'RECEPTIONIST')"),
     CheckConstraint("role <> 'DOCTOR_OWNER' OR NOT bulk_reschedule"),
+    CheckConstraint("NOT operational_manager OR role = 'RECEPTIONIST'"),
 )
 Index(
     "staff_one_doctor_per_tenant",

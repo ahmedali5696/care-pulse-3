@@ -2,20 +2,29 @@
 
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from hmac import new
+from time import monotonic, sleep
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 import pytest
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
+from carepulse.identity.authorization import (
+    can_manage_operational_settings,
+    protected_transaction,
+)
+from carepulse.identity.contracts import ContractError
 from carepulse.identity.signing import canonical_payload, canonical_query
 from carepulse.main import app
 from carepulse.policies.pricing import quote_price, validate_discount_reason
+from carepulse.policies.pricing_contracts import PricingPatch
+from carepulse.policies.pricing_service import update_pricing
 from carepulse.policies.versions import append_version
 from sqlalchemy import text
 from test_appointment_persistence import (
@@ -117,6 +126,304 @@ def _patch(**changes):
         "reason": "Synthetic approved pricing change",
         **changes,
     }
+
+
+def _manager_change(connection, clinic, enabled, revision):
+    connection.execute(
+        text("""
+            SELECT public.set_receptionist_operational_manager(
+                :tenant, :owner, :staff, :enabled,
+                :revision, :revision, :reason, :correlation
+            )
+        """),
+        {
+            "tenant": clinic.tenant,
+            "owner": UUID(clinic.owner.staff_id),
+            "staff": UUID(clinic.receptionist.staff_id),
+            "enabled": enabled,
+            "revision": revision,
+            "reason": "Synthetic Owner operational Manager grant",
+            "correlation": uuid4(),
+        },
+    )
+
+
+def _owner_changes_manager(clinic, enabled, revision):
+    with protected_transaction(
+        clinic.runtime, clinic.owner, clinic.config.policy.session_idle_minutes
+    ) as (connection, actor):
+        assert actor.role == "DOCTOR_OWNER"
+        _manager_change(connection, clinic, enabled, revision)
+
+
+def _fresh_receptionist_session(clinic, revision):
+    session = f"synthetic-m1-pricing-{uuid4()}"
+    with clinic.migration.begin() as connection:
+        user = connection.scalar(
+            text("""
+                SELECT auth_user_id FROM public.staff_accounts
+                 WHERE organization_id = :tenant AND id = :staff
+            """),
+            {"tenant": clinic.tenant, "staff": UUID(clinic.receptionist.staff_id)},
+        )
+        assert user
+        connection.execute(
+            text("""
+                INSERT INTO public."session"
+                    (id, "userId", token, "expiresAt", "createdAt", "updatedAt",
+                     "securityRevision", "absoluteDeadline", "lastActivity")
+                VALUES (:session, :user, :token,
+                    clock_timestamp() + interval '1 hour',
+                    clock_timestamp(), clock_timestamp(), :revision,
+                    clock_timestamp() + interval '1 hour', clock_timestamp())
+            """),
+            {
+                "session": session,
+                "user": user,
+                "token": f"synthetic-{uuid4()}",
+                "revision": revision,
+            },
+        )
+    return replace(
+        clinic.receptionist, session_id=session, security_revision=str(revision)
+    )
+
+
+def _blocked_by(clinic, holder):
+    deadline = monotonic() + 12
+    with clinic.runtime.connect() as observer:
+        while monotonic() < deadline:
+            observer.execute(text("SELECT pg_stat_clear_snapshot()"))
+            blocked = observer.scalar(
+                text("""
+                    SELECT pid FROM pg_stat_activity
+                     WHERE wait_event_type = 'Lock'
+                       AND :holder = ANY(pg_blocking_pids(pid))
+                     LIMIT 1
+                """),
+                {"holder": holder},
+            )
+            if blocked is not None:
+                return blocked
+            sleep(0.02)
+    pytest.fail("Expected PostgreSQL blocking order was not observed")
+
+
+def test_manager_grant_does_not_enable_pricing_or_legacy_bulk(patient_backend):
+    clinic = patient_backend
+    change = _patch(standard_new_exam_egp="100.00")
+    assert (
+        pricing_request(
+            clinic, clinic.receptionist, method="PATCH", body=change, key=str(uuid4())
+        )[0]
+        == 403
+    )
+
+    # Historical true survives the upgrade but cannot confer operational authority.
+    with clinic.migration.begin() as connection:
+        connection.execute(
+            text("""
+                UPDATE public.staff_accounts
+                   SET bulk_reschedule = true, security_revision = security_revision + 1
+                 WHERE organization_id = :tenant AND id = :staff
+            """),
+            {"tenant": clinic.tenant, "staff": UUID(clinic.receptionist.staff_id)},
+        )
+    ordinary = _fresh_receptionist_session(clinic, 1)
+    assert (
+        pricing_request(
+            clinic, ordinary, method="PATCH", body=change, key=str(uuid4())
+        )[0]
+        == 403
+    )
+    assert pricing_request(clinic, ordinary)[0] == 200
+    assert "urgent_enabled" not in pricing_request(clinic, ordinary)[1]["data"]
+
+    _owner_changes_manager(clinic, True, 1)
+    manager = _fresh_receptionist_session(clinic, 2)
+    assert pricing_request(clinic, ordinary)[0] == 401
+    status, read = pricing_request(clinic, manager)
+    assert status == 200, read
+    assert "urgent_enabled" not in read["data"]
+    assert "legacy_price_remediation" not in read["data"]
+    key = str(uuid4())
+    status, denied = pricing_request(
+        clinic, manager, method="PATCH", body=change, key=key
+    )
+    assert status == 403, denied
+    assert (
+        pricing_request(clinic, manager, method="PATCH", body=change, key=key)[0] == 403
+    )
+
+    _owner_changes_manager(clinic, False, 2)
+    assert (
+        pricing_request(clinic, manager, method="PATCH", body=change, key=key)[0] == 401
+    )
+    assert (
+        pricing_request(
+            clinic,
+            manager,
+            method="PATCH",
+            body={
+                **change,
+                "standard_new_exam_egp": "110.00",
+            },
+            key=str(uuid4()),
+        )[0]
+        == 401
+    )
+    assert pricing_request(clinic, manager)[0] == 401
+    refreshed = _fresh_receptionist_session(clinic, 3)
+    assert (
+        pricing_request(
+            clinic,
+            refreshed,
+            method="PATCH",
+            body=change,
+            key=key,
+        )[0]
+        == 403
+    )
+    assert pricing_request(clinic, refreshed)[0] == 200
+    _owner_changes_manager(clinic, True, 3)
+    regranted = _fresh_receptionist_session(clinic, 4)
+    assert pricing_request(clinic, regranted)[0] == 200
+    assert (
+        pricing_request(clinic, regranted, method="PATCH", body=change, key=key)[0]
+        == 403
+    )
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert (
+            connection.scalar(
+                text("""
+                SELECT revision FROM public.clinic_policy_heads
+                 WHERE organization_id = :tenant AND kind = 'PRICE'
+            """),
+                {"tenant": clinic.tenant},
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text("""
+                SELECT count(*) FROM public.idempotency_receipts
+                 WHERE organization_id=:tenant AND operation='settings.pricing.update'
+            """),
+                {"tenant": clinic.tenant},
+            )
+            == 0
+        )
+
+
+def test_manager_cannot_remediate_noncanonical_legacy_price(patient_backend):
+    clinic = patient_backend
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        append_version(
+            connection,
+            str(clinic.tenant),
+            "PRICE",
+            '{"standard_new_exam_egp":100.123,"preferential_followup_egp":30,'
+            '"urgent_base_egp":null,"urgent_enabled":false}',
+            1,
+        )
+    _owner_changes_manager(clinic, True, 0)
+    manager = _fresh_receptionist_session(clinic, 1)
+    owner_status, owner_view = pricing_request(clinic, clinic.owner)
+    manager_status, manager_view = pricing_request(clinic, manager)
+    assert owner_status == manager_status == 200
+    assert owner_view["data"]["legacy_price_remediation"] == {
+        "standard_new_exam_egp": "100.123"
+    }
+    assert "legacy_price_remediation" not in manager_view["data"]
+    correction = {
+        **_patch(standard_new_exam_egp="100.12"),
+        "expected_price_revision": 2,
+    }
+    assert (
+        pricing_request(
+            clinic, manager, method="PATCH", body=correction, key=str(uuid4())
+        )[0]
+        == 403
+    )
+    status, repaired = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=correction, key=str(uuid4())
+    )
+    assert status == 200, repaired
+    assert repaired["data"]["standard_new_exam_egp"] == "100.12"
+
+
+@pytest.mark.parametrize("winner", ["revoke", "authorize"])
+def test_manager_revoke_and_live_authorization_serialize_both_orders(
+    patient_backend, winner
+):
+    clinic = patient_backend
+    _owner_changes_manager(clinic, True, 0)
+    manager = _fresh_receptionist_session(clinic, 1)
+    body = _patch(standard_new_exam_egp="100.00")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        if winner == "revoke":
+            with protected_transaction(
+                clinic.runtime, clinic.owner, clinic.config.policy.session_idle_minutes
+            ) as (connection, _):
+                holder = connection.scalar(text("SELECT pg_backend_pid()"))
+                _manager_change(connection, clinic, False, 1)
+                pricing_future = pool.submit(
+                    pricing_request,
+                    clinic,
+                    manager,
+                    method="PATCH",
+                    body=body,
+                    key=str(uuid4()),
+                )
+                _blocked_by(clinic, holder)
+            status, response = pricing_future.result(timeout=30)
+            assert status == 401, response
+        else:
+            with protected_transaction(
+                clinic.runtime, manager, clinic.config.policy.session_idle_minutes
+            ) as (connection, actor):
+                assert actor.role == "RECEPTIONIST"
+                assert can_manage_operational_settings(actor)
+                holder = connection.scalar(text("SELECT pg_backend_pid()"))
+                revoke_future = pool.submit(_owner_changes_manager, clinic, False, 1)
+                _blocked_by(clinic, holder)
+                # M1 capability is observable live; B-06 pricing mutation remains Owner-only.
+                with pytest.raises(ContractError) as denied:
+                    update_pricing(
+                        connection,
+                        actor,
+                        PricingPatch.model_validate(body),
+                        str(uuid4()),
+                    )
+                assert denied.value.status_code == 403
+            revoke_future.result(timeout=30)
+
+    assert pricing_request(clinic, manager)[0] == 401
+    ordinary = _fresh_receptionist_session(clinic, 2)
+    assert (
+        pricing_request(clinic, ordinary, method="PATCH", body=body, key=str(uuid4()))[
+            0
+        ]
+        == 403
+    )
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        actual = connection.execute(
+            text("""
+                SELECT (SELECT revision FROM public.clinic_policy_heads
+                         WHERE organization_id = :tenant AND kind = 'PRICE'),
+                       (SELECT security_revision FROM public.staff_accounts
+                         WHERE organization_id = :tenant AND id = :staff),
+                       (SELECT count(*) FROM public.idempotency_receipts
+                         WHERE organization_id = :tenant
+                           AND operation = 'settings.pricing.update')
+            """),
+            {"tenant": clinic.tenant, "staff": UUID(manager.staff_id)},
+        ).one()
+    assert actual == (
+        1,
+        2,
+        0,
+    )
 
 
 def test_owner_patch_replays_receipt_without_leaking_revoked_session(patient_backend):

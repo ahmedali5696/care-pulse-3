@@ -166,6 +166,12 @@ def _login(owner):
     assert status == 200, body
     assert headers["Cache-Control"] == "no-store"
     assert b"token" not in body.lower() and b"password" not in body.lower()
+    assert set(json.loads(body)["data"]) == {
+        "id",
+        "organization_id",
+        "role",
+        "revision",
+    }
     cookies = headers.get_all("Set-Cookie") or []
     native = next(
         header for header in cookies if header.startswith("better-auth.session_token=")
@@ -202,7 +208,6 @@ def test_verified_login_session_and_logout_revoke_native_row(owner):
         "id": str(owner.staff),
         "organization_id": str(owner.clinic),
         "role": "DOCTOR_OWNER",
-        "bulk_reschedule": False,
         "revision": 0,
     }
     with _database() as connection:
@@ -218,6 +223,60 @@ def test_verified_login_session_and_logout_revoke_native_row(owner):
     with _database() as connection:
         assert _session_token(connection, owner.user) is None
     _denied(_request("/api/session", cookie=cookie), 401, "UNAUTHENTICATED")
+
+
+def test_legacy_bulk_true_is_absent_from_receptionist_login_and_session(owner):
+    receptionist = SimpleNamespace(
+        staff=uuid4(),
+        clinic=owner.clinic,
+        user=f"synthetic-b02-receptionist-{uuid4()}",
+        email=f"{uuid4()}@example.invalid",
+        password=f"Synthetic-B02-{uuid4()}!",
+    )
+    with _database() as connection:
+        connection.execute(
+            'INSERT INTO public."user" '
+            '(id, name, email, "emailVerified", "createdAt", "updatedAt") '
+            "VALUES (%s, 'Synthetic Receptionist', %s, true, clock_timestamp(), clock_timestamp())",
+            (receptionist.user, receptionist.email),
+        )
+        connection.execute(
+            'INSERT INTO public."account" '
+            '(id, "accountId", "providerId", "userId", password, "createdAt", "updatedAt") '
+            "VALUES (%s, %s, 'credential', %s, %s, clock_timestamp(), clock_timestamp())",
+            (
+                f"synthetic-b02-account-{uuid4()}",
+                receptionist.user,
+                receptionist.user,
+                _password_hash(receptionist.password),
+            ),
+        )
+        connection.execute(
+            """INSERT INTO public.staff_accounts
+                 (id, organization_id, auth_user_id, verified_email, role,
+                  enabled, verified, bulk_reschedule)
+               VALUES (%s, %s, %s, %s, 'RECEPTIONIST', true, true, true)""",
+            (
+                receptionist.staff,
+                receptionist.clinic,
+                receptionist.user,
+                receptionist.email,
+            ),
+        )
+        assert connection.execute(
+            "SELECT bulk_reschedule FROM public.staff_accounts WHERE id=%s",
+            (receptionist.staff,),
+        ).fetchone() == (True,)
+
+    cookie = _login(receptionist)
+    status, _, body = _request("/api/session", cookie=cookie)
+    assert status == 200, body
+    assert json.loads(body)["data"] == {
+        "id": str(receptionist.staff),
+        "organization_id": str(owner.clinic),
+        "role": "RECEPTIONIST",
+        "revision": 0,
+    }
 
 
 def test_anonymous_session_and_event_stream_remain_closed(disposable_project):
@@ -408,7 +467,6 @@ def test_two_valid_signins_share_bounded_web_pool_without_leaking_tenant(owner):
             "id": str(actor.staff),
             "organization_id": str(actor.clinic),
             "role": "DOCTOR_OWNER",
-            "bulk_reschedule": False,
             "revision": 0,
         }
     with _database() as connection:

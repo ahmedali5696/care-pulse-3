@@ -85,7 +85,7 @@ def test_receptionist_listing_paginates_full_projection_in_one_query(
                 "email": email,
                 "enabled": enabled,
                 "verified": verified,
-                "bulk_reschedule": bulk,
+                "operational_manager": False,
                 "revision": 0,
                 "security_revision": 0,
                 "invitation_state": None,
@@ -166,7 +166,8 @@ def test_owner_creates_invites_and_revokes_without_partial_sender_job(owner_sess
     assert staff["email"] == email
     assert staff["enabled"] is True
     assert staff["verified"] is False
-    assert staff["bulk_reschedule"] is False
+    assert staff["operational_manager"] is False
+    assert "bulk_reschedule" not in staff
     assert staff["revision"] == 0
     assert staff["security_revision"] == 0
 
@@ -266,6 +267,40 @@ def test_owner_creates_invites_and_revokes_without_partial_sender_job(owner_sess
         ).fetchone()[0]
     assert [state for (state,) in states] == ["REVOKED", "ISSUED"]
     assert jobs == 2
+
+
+def test_invited_receptionist_cannot_receive_manager_grant(owner_session):
+    _, cookie = owner_session
+    status, created = _staff_command(
+        "/api/staff/receptionists",
+        cookie,
+        {
+            "email": f"synthetic-pending-{uuid4()}@example.invalid",
+            "name": "Pending receptionist",
+            "reason": "Hire",
+        },
+        key=str(uuid4()),
+    )
+    assert status == 201, created
+    staff = created["data"]
+    path = f"/api/staff/receptionists/{staff['id']}"
+    manager_change = {**_changes(staff), "operational_manager": True}
+    status, _ = _staff_command(
+        f"{path}/permissions", cookie, manager_change, method="PATCH"
+    )
+    assert status == 403
+    status, issued = _staff_command(f"{path}/invite", cookie, _changes(staff))
+    assert status == 200, issued
+    status, _ = _staff_command(
+        f"{path}/permissions",
+        cookie,
+        {**_changes(issued["data"]), "operational_manager": True},
+        method="PATCH",
+    )
+    assert status == 403
+    status, current = _staff_command(path, cookie, method="GET")
+    assert status == 200
+    assert current["data"]["operational_manager"] is False
 
 
 def test_parallel_same_key_receptionist_creation_reuses_receipt(owner_session):
@@ -451,6 +486,18 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
     )
     assert status == 404
     status, _ = _staff_command(
+        f"/api/staff/receptionists/{owner.staff}/permissions",
+        owner_cookie,
+        {
+            "reason": "Owner cannot become Manager",
+            "expected_revision": 0,
+            "expected_security_revision": 0,
+            "operational_manager": True,
+        },
+        method="PATCH",
+    )
+    assert status == 404
+    status, _ = _staff_command(
         f"{staff_path}/permissions",
         owner_cookie,
         {
@@ -458,11 +505,23 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
             "expected_revision": 0,
             "expected_security_revision": 0,
             "role": "DOCTOR_OWNER",
-            "bulk_reschedule": True,
+            "operational_manager": True,
         },
         method="PATCH",
     )
     assert status == 422
+    status, legacy = _staff_command(
+        f"{staff_path}/permissions",
+        owner_cookie,
+        {
+            "reason": "Legacy grant must fail",
+            "expected_revision": 0,
+            "expected_security_revision": 0,
+            "bulk_reschedule": True,
+        },
+        method="PATCH",
+    )
+    assert status == 422, legacy
 
     status, restricted = _staff_command(
         f"{staff_path}/permissions",
@@ -471,7 +530,7 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
             "reason": "Self escalation",
             "expected_revision": 0,
             "expected_security_revision": 0,
-            "bulk_reschedule": True,
+            "operational_manager": True,
         },
         method="PATCH",
     )
@@ -481,16 +540,34 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
         f"{staff_path}/permissions",
         owner_cookie,
         {
-            "reason": "Authorize bulk reschedule",
+            "reason": "Delegate operational management",
             "expected_revision": 0,
             "expected_security_revision": 0,
-            "bulk_reschedule": True,
+            "operational_manager": True,
         },
         method="PATCH",
     )
     assert status == 200, granted
-    assert granted["data"]["bulk_reschedule"] is True
+    assert granted["data"]["operational_manager"] is True
+    assert "bulk_reschedule" not in granted["data"]
+    assert granted["data"]["revision"] == 1
     assert granted["data"]["security_revision"] == 1
+    with _database() as connection:
+        recorded = connection.execute(
+            """
+            SELECT actor_staff_id, actor_role, reason, before_state, after_state
+              FROM public.sensitive_audit
+             WHERE organization_id = %s AND action = 'RECEPTIONIST_PERMISSIONS'
+             ORDER BY occurred_at DESC LIMIT 1
+            """,
+            (owner.clinic,),
+        ).fetchone()
+    assert recorded is not None
+    assert recorded[0] == owner.staff
+    assert recorded[1] == "DOCTOR_OWNER"
+    assert recorded[2] == "Delegate operational management"
+    assert recorded[3]["operational_manager"] is False
+    assert recorded[4]["operational_manager"] is True
     status, stale = _staff_command(
         f"{staff_path}/permissions",
         owner_cookie,
@@ -498,7 +575,7 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
             "reason": "Stale competing edit",
             "expected_revision": 0,
             "expected_security_revision": 0,
-            "bulk_reschedule": False,
+            "operational_manager": False,
         },
         method="PATCH",
     )
@@ -517,7 +594,7 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
         status, withdrawn = _staff_command(
             f"{staff_path}/permissions",
             owner_cookie,
-            {**_changes(granted["data"]), "bulk_reschedule": False},
+            {**_changes(granted["data"]), "operational_manager": False},
             method="PATCH",
         )
         assert status == 200, withdrawn
@@ -536,7 +613,12 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
                 "TO carepulse_runtime"
             )
     assert status == 200, withdrawn
-    assert withdrawn["data"]["bulk_reschedule"] is False
+    assert withdrawn["data"]["operational_manager"] is False
+    assert withdrawn["data"]["revision"] == granted["data"]["revision"] + 1
+    assert (
+        withdrawn["data"]["security_revision"]
+        == granted["data"]["security_revision"] + 1
+    )
     status, _, _ = _request("/api/session", cookie=refreshed_cookie)
     assert status == 401
 
@@ -547,6 +629,13 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
     )
     assert status == 200, disabled
     assert disabled["data"]["enabled"] is False
+    status, _ = _staff_command(
+        f"{staff_path}/permissions",
+        owner_cookie,
+        {**_changes(disabled["data"]), "operational_manager": True},
+        method="PATCH",
+    )
+    assert status == 403
     status, enabled = _staff_command(
         f"{staff_path}/enable",
         owner_cookie,
@@ -563,6 +652,192 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
             "DELETE FROM public.auth_login_attempts WHERE dimension='source'"
         )
     assert _login(recipient)
+
+
+def test_signed_manager_cannot_manage_staff_even_after_regrant(owner_session):
+    owner, owner_cookie = owner_session
+    receptionists = []
+    with _database() as connection:
+        for _ in range(3):
+            receptionist = SimpleNamespace(
+                staff=uuid4(),
+                user=f"synthetic-m1-{uuid4()}",
+                email=f"synthetic-m1-{uuid4()}@example.invalid",
+                password=f"Synthetic-M1-{uuid4()}!",
+            )
+            connection.execute(
+                'INSERT INTO public."user" '
+                '(id, name, email, "emailVerified", "createdAt", "updatedAt") '
+                "VALUES (%s, 'Synthetic M1 receptionist', %s, true, "
+                "clock_timestamp(), clock_timestamp())",
+                (receptionist.user, receptionist.email),
+            )
+            connection.execute(
+                'INSERT INTO public."account" '
+                '(id, "accountId", "providerId", "userId", password, "createdAt", "updatedAt") '
+                "VALUES (%s, %s, 'credential', %s, %s, "
+                "clock_timestamp(), clock_timestamp())",
+                (
+                    f"synthetic-m1-account-{uuid4()}",
+                    receptionist.user,
+                    receptionist.user,
+                    _password_hash(receptionist.password),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO public.staff_accounts
+                       (id, organization_id, auth_user_id, verified_email,
+                        role, enabled, verified)
+                     VALUES (%s, %s, %s, %s, 'RECEPTIONIST', true, true)""",
+                (
+                    receptionist.staff,
+                    owner.clinic,
+                    receptionist.user,
+                    receptionist.email,
+                ),
+            )
+            receptionists.append(receptionist)
+
+    manager, plain, delegated = receptionists
+    manager_path = f"/api/staff/receptionists/{manager.staff}"
+    plain_path = f"/api/staff/receptionists/{plain.staff}"
+    delegated_path = f"/api/staff/receptionists/{delegated.staff}"
+    initial = {"revision": 0, "security_revision": 0}
+    original_cookie = _login(manager)
+    assert _request("/api/session", cookie=original_cookie)[0] == 200
+
+    status, granted_manager = _staff_command(
+        f"{manager_path}/permissions",
+        owner_cookie,
+        {**_changes(initial), "operational_manager": True},
+        method="PATCH",
+    )
+    assert status == 200, granted_manager
+    assert granted_manager["data"]["operational_manager"] is True
+    assert _request("/api/session", cookie=original_cookie)[0] == 401
+    manager_cookie = _login(manager)
+    status, _, session_body = _request("/api/session", cookie=manager_cookie)
+    assert status == 200, session_body
+    assert json.loads(session_body)["data"] == {
+        "id": str(manager.staff),
+        "organization_id": str(owner.clinic),
+        "role": "RECEPTIONIST",
+        "revision": 1,
+    }
+
+    status, granted_delegated = _staff_command(
+        f"{delegated_path}/permissions",
+        owner_cookie,
+        {**_changes(initial), "operational_manager": True},
+        method="PATCH",
+    )
+    assert status == 200, granted_delegated
+    unapproved_email = f"synthetic-m1-denied-{uuid4()}@example.invalid"
+    denied_actions = (
+        ("/api/staff/receptionists", "GET", None, None),
+        (plain_path, "GET", None, None),
+        (
+            "/api/staff/receptionists",
+            "POST",
+            {
+                "email": unapproved_email,
+                "name": "Denied hire",
+                "reason": "No authority",
+            },
+            str(uuid4()),
+        ),
+        (f"{plain_path}/disable", "POST", _changes(initial), None),
+        (f"{plain_path}/enable", "POST", _changes(initial), None),
+        (
+            f"{plain_path}/permissions",
+            "PATCH",
+            {**_changes(initial), "operational_manager": True},
+            None,
+        ),
+        (
+            f"{delegated_path}/permissions",
+            "PATCH",
+            {**_changes(granted_delegated["data"]), "operational_manager": False},
+            None,
+        ),
+    )
+    for path, method, payload, key in denied_actions:
+        status, response = _staff_command(
+            path, manager_cookie, payload, method=method, key=key
+        )
+        assert status == 403, (method, path, response)
+    with _database() as connection:
+        assert (
+            connection.execute(
+                'SELECT count(*) FROM public."user" WHERE email = %s',
+                (unapproved_email,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert connection.execute(
+            "SELECT enabled, operational_manager FROM public.staff_accounts WHERE id = %s",
+            (plain.staff,),
+        ).fetchone() == (True, False)
+        assert connection.execute(
+            "SELECT operational_manager FROM public.staff_accounts WHERE id = %s",
+            (delegated.staff,),
+        ).fetchone() == (True,)
+
+    status, revoked_delegated = _staff_command(
+        f"{delegated_path}/permissions",
+        owner_cookie,
+        {**_changes(granted_delegated["data"]), "operational_manager": False},
+        method="PATCH",
+    )
+    assert status == 200, revoked_delegated
+    assert revoked_delegated["data"]["operational_manager"] is False
+    status, disabled = _staff_command(
+        f"{plain_path}/disable", owner_cookie, _changes(initial)
+    )
+    assert status == 200, disabled
+    assert disabled["data"]["enabled"] is False
+    status, enabled = _staff_command(
+        f"{plain_path}/enable", owner_cookie, _changes(disabled["data"])
+    )
+    assert status == 200, enabled
+    assert enabled["data"]["enabled"] is True
+
+    status, revoked_manager = _staff_command(
+        f"{manager_path}/permissions",
+        owner_cookie,
+        {**_changes(granted_manager["data"]), "operational_manager": False},
+        method="PATCH",
+    )
+    assert status == 200, revoked_manager
+    assert _request("/api/session", cookie=manager_cookie)[0] == 401
+    ordinary_cookie = _login(manager)
+    assert (
+        _staff_command("/api/staff/receptionists", ordinary_cookie, method="GET")[0]
+        == 403
+    )
+    status, regranted = _staff_command(
+        f"{manager_path}/permissions",
+        owner_cookie,
+        {**_changes(revoked_manager["data"]), "operational_manager": True},
+        method="PATCH",
+    )
+    assert status == 200, regranted
+    assert regranted["data"]["security_revision"] == 3
+    assert _request("/api/session", cookie=ordinary_cookie)[0] == 401
+    regranted_cookie = _login(manager)
+    assert (
+        _staff_command("/api/staff/receptionists", regranted_cookie, method="GET")[0]
+        == 403
+    )
+    assert (
+        _staff_command(
+            f"{plain_path}/permissions",
+            regranted_cookie,
+            {**_changes(enabled["data"]), "operational_manager": True},
+            method="PATCH",
+        )[0]
+        == 403
+    )
 
 
 def test_foreign_owner_cannot_discover_staff_or_delegate_receptionist(owner_session):
@@ -602,7 +877,7 @@ def test_foreign_owner_cannot_discover_staff_or_delegate_receptionist(owner_sess
             "reason": "Cross clinic",
             "expected_revision": 0,
             "expected_security_revision": 0,
-            "bulk_reschedule": True,
+            "operational_manager": True,
         },
         method="PATCH",
     )
@@ -671,7 +946,7 @@ def test_receptionist_invite_acceptance_single_use_with_real_bff(owner_session):
     assert accepted["data"]["id"] == staff["id"]
     assert accepted["data"]["enabled"] is True
     assert accepted["data"]["verified"] is True
-    assert accepted["data"]["bulk_reschedule"] is False
+    assert accepted["data"]["operational_manager"] is False
     assert accepted["data"]["security_revision"] == 1
     status, denied = _staff_command("/api/auth/invite-accept", None, acceptance)
     assert status == 403, denied
@@ -698,6 +973,121 @@ def test_receptionist_invite_acceptance_single_use_with_real_bff(owner_session):
         "/api/staff/receptionists", receptionist_cookie, method="GET"
     )
     assert status == 403, denial
+
+
+def test_owner_create_receipt_preserves_original_after_acceptance_and_manager_grant(
+    owner_session,
+):
+    owner, owner_cookie = owner_session
+    email = f"synthetic-replay-{uuid4()}@example.invalid"
+    command = {"email": email, "name": "Synthetic replay staff", "reason": "Hire"}
+    key = str(uuid4())
+    status, created = _staff_command(
+        "/api/staff/receptionists", owner_cookie, command, key=key
+    )
+    assert status == 201, created
+    staff = created["data"]
+    assert created["revision"] == staff["revision"] == 0
+    assert staff["operational_manager"] is False
+
+    path = f"/api/staff/receptionists/{staff['id']}"
+    status, invited = _staff_command(f"{path}/invite", owner_cookie, _changes(staff))
+    assert status == 200, invited
+    status, revoked = _staff_command(
+        f"{path}/revoke-invite", owner_cookie, _changes(invited["data"])
+    )
+    assert status == 200, revoked
+
+    proof = secrets.token_urlsafe(32)
+    invitation = uuid4()
+    with _database() as connection:
+        connection.execute(
+            """INSERT INTO public.invitations
+                 (id, organization_id, staff_id, purpose, target_email,
+                  proof_digest, expires_at, issued_by_staff_id)
+               VALUES (%s, %s, %s, 'RECEPTIONIST', %s, %s,
+                       clock_timestamp() + interval '20 minutes', %s)""",
+            (
+                invitation,
+                owner.clinic,
+                staff["id"],
+                email,
+                sha256(proof.encode()).hexdigest(),
+                owner.staff,
+            ),
+        )
+    status, accepted = _staff_command(
+        "/api/auth/invite-accept",
+        None,
+        {
+            "organization_id": str(owner.clinic),
+            "invitation_id": str(invitation),
+            "proof": proof,
+            "name": command["name"],
+            "password": f"Synthetic-Replay-{uuid4()}!",
+        },
+    )
+    assert status == 200, accepted
+    assert accepted["data"]["verified"] is True
+    assert accepted["data"]["security_revision"] > staff["security_revision"]
+
+    status, granted = _staff_command(
+        f"{path}/permissions",
+        owner_cookie,
+        {**_changes(accepted["data"]), "operational_manager": True},
+        method="PATCH",
+    )
+    assert status == 200, granted
+    assert granted["data"]["operational_manager"] is True
+    assert granted["data"]["security_revision"] > accepted["data"]["security_revision"]
+    status, current = _staff_command(path, owner_cookie, method="GET")
+    assert status == 200, current
+    assert current["data"] == granted["data"]
+    assert current["revision"] == granted["revision"] == granted["data"]["revision"]
+    assert current["data"]["invitation_state"] == "ACCEPTED"
+
+    def counts():
+        with _database() as connection:
+            return connection.execute(
+                """SELECT
+                    (SELECT count(*) FROM public."user" WHERE email = %s),
+                    (SELECT count(*) FROM public.staff_accounts
+                     WHERE organization_id = %s AND verified_email = %s),
+                    (SELECT count(*) FROM public.invitations
+                     WHERE organization_id = %s AND staff_id = %s),
+                    (SELECT count(*) FROM public.delivery_jobs
+                     WHERE organization_id = %s AND staff_id = %s),
+                    (SELECT count(*) FROM public.sensitive_audit
+                     WHERE organization_id = %s),
+                    (SELECT count(*) FROM public.idempotency_receipts
+                     WHERE organization_id = %s AND idempotency_key = %s)""",
+                (
+                    email,
+                    owner.clinic,
+                    email,
+                    owner.clinic,
+                    staff["id"],
+                    owner.clinic,
+                    staff["id"],
+                    owner.clinic,
+                    owner.clinic,
+                    key,
+                ),
+            ).fetchone()
+
+    before_replay = counts()
+    assert before_replay[:4] == (1, 1, 2, 1)
+    assert before_replay[5] == 1
+    status, replay = _staff_command(
+        "/api/staff/receptionists", owner_cookie, command, key=key
+    )
+    assert status == 201, replay
+    assert replay == created
+    assert replay["data"]["operational_manager"] is False
+    assert replay["data"]["verified"] is False
+    assert replay["data"]["security_revision"] == 0
+    assert replay["revision"] == 0
+    assert counts() == before_replay
 
 
 def test_competing_receptionist_acceptance_cannot_attach_two_credentials(owner_session):

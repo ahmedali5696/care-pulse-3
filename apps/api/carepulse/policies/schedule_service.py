@@ -643,9 +643,9 @@ def stage_or_preview(
         text("""
             INSERT INTO public.clinic_policy_previews
                 (id, organization_id, policy_kind, policy_version, policy_revision,
-                 service_day_revision, actor_staff_id, selected_refs, affected_refs,
-                 record_revisions, candidate_payload)
-            VALUES (:id, :tenant, 'SCHEDULE', :version, :revision, 0, :actor,
+                 service_day_revision, actor_staff_id, actor_security_revision,
+                 selected_refs, affected_refs, record_revisions, candidate_payload)
+            VALUES (:id, :tenant, 'SCHEDULE', :version, :revision, 0, :actor, :security_revision,
                     CAST(:selected AS jsonb), CAST(:affected AS jsonb),
                     CAST(:records AS jsonb), CAST(:candidate AS jsonb))
         """),
@@ -655,6 +655,7 @@ def stage_or_preview(
             "version": head["current_version"],
             "revision": head["revision"],
             "actor": actor.staff_id,
+            "security_revision": actor.security_revision,
             "selected": "[]",
             "affected": json.dumps(effects),
             "records": json.dumps(records),
@@ -693,7 +694,8 @@ def activate(
     preview = (
         connection.execute(
             text("""
-            SELECT policy_version, policy_revision, actor_staff_id, affected_refs,
+            SELECT policy_version, policy_revision, actor_staff_id, actor_security_revision,
+                   affected_refs,
                    record_revisions, candidate_payload
             FROM public.clinic_policy_previews
             WHERE organization_id=:tenant AND policy_kind='SCHEDULE' AND id=:id
@@ -705,6 +707,11 @@ def activate(
     )
     if preview is None or preview["actor_staff_id"] != actor.staff_id:
         raise ContractError(404)
+    if preview["actor_security_revision"] is None:
+        raise ContractError(409, "STALE_REVISION")
+    require_matching_revision(
+        preview["actor_security_revision"], actor.security_revision
+    )
     head = _schedule_head(connection, tenant)
     require_matching_revision(command.expected_schedule_revision, head["revision"])
     require_matching_revision(preview["policy_revision"], head["revision"])

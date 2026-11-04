@@ -2,7 +2,7 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -25,10 +25,18 @@ class AuthorizedStaff:
     organization_id: UUID
     staff_id: UUID
     role: str
-    bulk_reschedule: bool
+    _legacy_bulk_reschedule: InitVar[bool]
     staff_revision: int
     security_revision: int
     lifecycle_revision: int
+    operational_manager: bool = False
+
+
+def can_manage_operational_settings(actor: AuthorizedStaff) -> bool:
+    """Live delegated Manager capability; business settings remain Owner-only in M1."""
+    return actor.role == "DOCTOR_OWNER" or (
+        actor.role == "RECEPTIONIST" and actor.operational_manager
+    )
 
 
 def _signed_actor(identity: "CanonicalEnvelope") -> tuple[UUID, UUID, int]:
@@ -77,7 +85,7 @@ def _current_staff(connection: Connection, tenant: UUID, staff: UUID):
     return (
         connection.execute(
             text("""
-            SELECT s.auth_user_id, s.role, s.bulk_reschedule, s.revision,
+            SELECT s.auth_user_id, s.role, s.operational_manager, s.revision,
                    s.security_revision, s.enabled, s.verified,
                    s.reset_block_operation_id, o.state, o.lifecycle_revision,
                    u.email, u."emailVerified", s.verified_email
@@ -166,9 +174,10 @@ def protected_transaction(
                 tenant,
                 staff_id,
                 staff["role"],
-                staff["bulk_reschedule"],
+                False,
                 staff["revision"],
                 staff["security_revision"],
                 staff["lifecycle_revision"],
+                staff["operational_manager"],
             ),
         )

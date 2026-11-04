@@ -20,7 +20,7 @@ from sqlalchemy import URL, create_engine, text
 from sqlalchemy.exc import DBAPIError
 
 ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0022_d08_followup_claims"
+REVISION = "0023_m1_operational_manager"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -239,9 +239,9 @@ def test_failed_isolated_migration_rolls_back_objects_and_version(
     _create_empty_database(admin, empty_database)
     scripts = tmp_path / "migrations"
     shutil.copytree(ROOT / "db/migrations", scripts)
-    (scripts / "versions/0023_failure.py").write_text(
-        'from alembic import op\nrevision = "0023_failure"\n'
-        'down_revision = "0022_d08_followup_claims"\n'
+    (scripts / "versions/0024_failure.py").write_text(
+        'from alembic import op\nrevision = "0024_failure"\n'
+        'down_revision = "0023_m1_operational_manager"\n'
         "def upgrade():\n"
         '    op.execute("CREATE TABLE public.synthetic_partial (value integer)")\n'
         '    op.execute("SELECT 1 / 0")\n'

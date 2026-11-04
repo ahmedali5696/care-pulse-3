@@ -12,7 +12,6 @@ type Authority = {
   role: "DOCTOR_OWNER" | "RECEPTIONIST";
   securityRevision: number;
   staffRevision: number;
-  bulkReschedule: boolean;
 };
 
 export type CurrentActor = Authority & { sessionId: string };
@@ -55,7 +54,7 @@ async function inTenant<T>(tenant: string, action: (client: PoolClient) => Promi
 const liveStaff = `
   SELECT s.id AS "staffId", s.organization_id AS "organizationId",
          s.auth_user_id AS "userId", s.role, s.security_revision::integer AS "securityRevision",
-         s.revision::integer AS "staffRevision", s.bulk_reschedule AS "bulkReschedule"
+         s.revision::integer AS "staffRevision"
     FROM public.staff_accounts s
     JOIN public.organizations o ON o.id = s.organization_id
     JOIN public."user" u ON u.id = s.auth_user_id

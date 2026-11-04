@@ -58,7 +58,7 @@ def _staff(
             text(
                 """
             SELECT s.id, s.organization_id, s.auth_user_id, s.verified_email,
-                   s.enabled, s.verified, s.bulk_reschedule, s.revision,
+                   s.enabled, s.verified, s.operational_manager, s.revision,
                    s.security_revision,
                    (SELECT i.state FROM public.invitations i
                      WHERE i.organization_id = s.organization_id AND i.staff_id = s.id
@@ -85,7 +85,7 @@ def _projection(row) -> dict:
         "email": row["verified_email"],
         "enabled": row["enabled"],
         "verified": row["verified"],
-        "bulk_reschedule": row["bulk_reschedule"],
+        "operational_manager": row["operational_manager"],
         "revision": row["revision"],
         "security_revision": row["security_revision"],
         "invitation_state": row["invitation_state"],
@@ -126,7 +126,7 @@ def list_receptionists(
         connection.execute(
             text("""
             SELECT s.id, s.verified_email, s.enabled, s.verified,
-                   s.bulk_reschedule, s.revision, s.security_revision,
+                   s.operational_manager, s.revision, s.security_revision,
                    (SELECT i.state FROM public.invitations i
                      WHERE i.organization_id = s.organization_id AND i.staff_id = s.id
                      ORDER BY i.issued_at DESC, i.id DESC LIMIT 1) AS invitation_state
@@ -168,7 +168,22 @@ def create_receptionist(
         connection, TenantReceiptQuery(actor, "staff.create", key, digest)
     )
     if cached is not None:
-        return cached
+        projection, revision = cached
+        _staff(connection, actor, UUID(projection["id"]))
+        visible = {
+            key: projection[key]
+            for key in (
+                "id",
+                "email",
+                "enabled",
+                "verified",
+                "revision",
+                "security_revision",
+                "invitation_state",
+            )
+        }
+        visible["operational_manager"] = projection.get("operational_manager", False)
+        return visible, revision
     address = _email(command.email)
     prepared = connection.execute(
         text("""
@@ -193,8 +208,8 @@ def create_receptionist(
             text("""
             INSERT INTO public.staff_accounts
                 (id, organization_id, auth_user_id, verified_email, role,
-                 enabled, verified, bulk_reschedule)
-            VALUES (:id, :tenant, :user, :email, 'RECEPTIONIST', true, false, false)
+                 enabled, verified)
+            VALUES (:id, :tenant, :user, :email, 'RECEPTIONIST', true, false)
         """),
             {
                 "id": staff_id,
@@ -287,37 +302,27 @@ def change_receptionist(
     connection: Connection,
     actor: AuthorizedStaff,
     staff_id: UUID,
-    command: StaffCommand | SetReceptionistGrant,
+    command: StaffCommand,
     action: str,
 ) -> tuple[dict, int, str | None]:
     before = _lock_target(connection, actor, staff_id, command)
-    if action == "permissions":
-        if not isinstance(command, SetReceptionistGrant):
-            raise ContractError(422)
-        changed = before["bulk_reschedule"] != command.bulk_reschedule
-        withdrawn = before["bulk_reschedule"] and not command.bulk_reschedule
-        column = "bulk_reschedule"
-        enabled = None
-    elif action in ("enable", "disable"):
+    if action in ("enable", "disable"):
         enabled = action == "enable"
         changed = before["enabled"] != enabled
         withdrawn = not enabled
-        column = "enabled"
     else:
         raise ContractError(403)
     if not changed:
         raise ContractError(409)
     correlation = uuid4()
     connection.execute(
-        text(f"""
-            UPDATE public.staff_accounts SET {column} = :new_state,
+        text("""
+            UPDATE public.staff_accounts SET enabled = :new_state,
                 security_revision = security_revision + 1
              WHERE id = :staff AND organization_id = :tenant
         """),
         {
-            "new_state": command.bulk_reschedule
-            if column == "bulk_reschedule"
-            else enabled,
+            "new_state": enabled,
             "staff": staff_id,
             "tenant": actor.organization_id,
         },
@@ -331,13 +336,55 @@ def change_receptionist(
         f"RECEPTIONIST_{action.upper()}",
         command.reason,
         correlation,
-        {"id": str(staff_id), column: before[column]},
-        {"id": str(staff_id), column: after[column]},
+        {"id": str(staff_id), "enabled": before["enabled"]},
+        {"id": str(staff_id), "enabled": after["enabled"]},
     )
     return (
         _projection(after),
         after["revision"],
         before["auth_user_id"] if withdrawn else None,
+    )
+
+
+def change_receptionist_manager(
+    connection: Connection,
+    actor: AuthorizedStaff,
+    staff_id: UUID,
+    command: SetReceptionistGrant,
+) -> tuple[dict, int, str | None]:
+    before = _lock_target(connection, actor, staff_id, command)
+    if (
+        not before["enabled"]
+        or not before["verified"]
+        or before["invitation_state"] == "ISSUED"
+    ):
+        raise ContractError(403)
+    if before["operational_manager"] == command.operational_manager:
+        raise ContractError(409)
+    connection.execute(
+        text("""
+            SELECT public.set_receptionist_operational_manager(
+                :tenant, :actor, :staff, :enabled,
+                :expected_revision, :expected_security_revision,
+                :reason, :correlation
+            )
+        """),
+        {
+            "tenant": actor.organization_id,
+            "actor": actor.staff_id,
+            "staff": staff_id,
+            "enabled": command.operational_manager,
+            "expected_revision": command.expected_revision,
+            "expected_security_revision": command.expected_security_revision,
+            "reason": command.reason,
+            "correlation": uuid4(),
+        },
+    )
+    after = _staff(connection, actor, staff_id)
+    return (
+        _projection(after),
+        after["revision"],
+        before["auth_user_id"] if not command.operational_manager else None,
     )
 
 

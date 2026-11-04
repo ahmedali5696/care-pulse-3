@@ -55,7 +55,7 @@ export async function sessionResponse(request: Request): Promise<Response> {
   if (actor instanceof Response) return actor;
   return json({
     id: actor.staffId, organization_id: actor.organizationId,
-    role: actor.role, bulk_reschedule: actor.bulkReschedule,
+    role: actor.role,
     revision: actor.staffRevision,
   });
 }
@@ -96,7 +96,7 @@ export async function loginResponse(request: Request): Promise<Response> {
       return failure(401);
     }
     const reply = json({ id: actor.staffId, organization_id: actor.organizationId,
-      role: actor.role, bulk_reschedule: actor.bulkReschedule, revision: actor.staffRevision });
+      role: actor.role, revision: actor.staffRevision });
     for (const setCookie of cookies) reply.headers.append("Set-Cookie", setCookie);
     return reply;
   } catch (error) {

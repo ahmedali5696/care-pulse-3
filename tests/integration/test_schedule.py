@@ -4,6 +4,7 @@ import asyncio
 import json
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
 from hashlib import sha256
@@ -14,8 +15,9 @@ from zoneinfo import ZoneInfo
 import pytest
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
-from carepulse.identity.authorization import AuthorizedStaff
-from carepulse.identity.contracts import ContractError
+from carepulse.identity.authorization import AuthorizedStaff, protected_transaction
+from carepulse.identity.contracts import ContractError, normalized_request_digest
+from carepulse.identity.receipts import Receipt, insert_tenant_receipt
 from carepulse.identity.signing import canonical_payload
 from carepulse.main import app
 from carepulse.policies.schedule_contracts import ScheduleActivate, SchedulePatch
@@ -28,6 +30,12 @@ from sqlalchemy import text
 from test_appointment_persistence import _admit_saved, _draft, _patient, _query
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
+from test_pricing import (
+    _blocked_by,
+    _fresh_receptionist_session,
+    _manager_change,
+    _owner_changes_manager,
+)
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 
 CAIRO = ZoneInfo("Africa/Cairo")
@@ -976,3 +984,305 @@ def test_preview_scoped_to_original_tenant_and_stale_after_schedule_change(
             _activate(connection, owner_b, preview)
         assert missing.value.status_code == 404
         assert read_schedule(connection, owner_b)["schedule_revision"] == 1
+
+
+def test_owner_preview_captures_revision_and_legacy_null_cannot_activate(
+    patient_backend,
+):
+    clinic = patient_backend
+    body = _patch(_config(mode="OPEN")).model_dump(mode="json")
+    status, prepared = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/preview",
+        body=body,
+        key=str(uuid4()),
+    )
+    assert status == 200, prepared
+    preview_id = UUID(prepared["data"]["preview_id"])
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        captured = connection.execute(
+            text("""
+                SELECT actor_staff_id, actor_security_revision
+                FROM public.clinic_policy_previews
+                WHERE organization_id = :tenant AND id = :preview
+            """),
+            {"tenant": clinic.tenant, "preview": preview_id},
+        ).one()
+        assert captured == (UUID(clinic.owner.staff_id), 0)
+
+    # Simulate a preview left by the pre-M1 schema; new inserts forbid NULL.
+    with clinic.migration.begin() as connection:
+        assert (
+            connection.execute(
+                text("""
+                UPDATE public.clinic_policy_previews
+                   SET actor_security_revision = NULL
+                 WHERE organization_id = :tenant AND id = :preview
+            """),
+                {"tenant": clinic.tenant, "preview": preview_id},
+            ).rowcount
+            == 1
+        )
+
+    activation = {
+        "preview_id": str(preview_id),
+        "expected_schedule_revision": 1,
+        "expected_capacity_revision": 1,
+        "reason": "Synthetic legacy preview activation",
+    }
+    status, denied = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/activate",
+        body=activation,
+        key=str(uuid4()),
+    )
+    assert status == 409 and denied["error"]["code"] == "STALE_REVISION"
+    assert _schedule_request(clinic, clinic.owner)[1]["data"]["schedule_revision"] == 1
+
+    status, fresh = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/preview",
+        body=body,
+        key=str(uuid4()),
+    )
+    assert status == 200, fresh
+    activation["preview_id"] = fresh["data"]["preview_id"]
+    status, published = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/activate",
+        body=activation,
+        key=str(uuid4()),
+    )
+    assert status == 200 and published["data"]["schedule_revision"] == 2
+
+
+def test_signed_manager_cannot_change_schedule_or_replay_denied_receipts(
+    patient_backend,
+):
+    clinic = patient_backend
+    body = _patch(_config(mode="OPEN")).model_dump(mode="json")
+    status, prepared = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/preview",
+        body=body,
+        key=str(uuid4()),
+    )
+    assert status == 200, prepared
+    activation = {
+        "preview_id": prepared["data"]["preview_id"],
+        "expected_schedule_revision": 1,
+        "expected_capacity_revision": 1,
+        "reason": "Synthetic Owner-only activation",
+    }
+    assert _schedule_request(clinic, clinic.receptionist)[0] == 403
+    _owner_changes_manager(clinic, True, 0)
+    manager = _fresh_receptionist_session(clinic, 1)
+    preview_key = str(uuid4())
+    # Model a committed receipt from before schedule settings became Owner-only.
+    with protected_transaction(
+        clinic.runtime, manager, clinic.config.policy.session_idle_minutes
+    ) as (connection, actor):
+        insert_tenant_receipt(
+            connection,
+            Receipt(
+                actor_id=actor.staff_id,
+                operation="settings.schedule.preview",
+                idempotency_key=preview_key,
+                request_digest=normalized_request_digest(
+                    SchedulePatch.model_validate(body)
+                ),
+                result_projection={
+                    "preview_id": str(uuid4()),
+                    "affected": [],
+                    "excluded": [],
+                    "revisions": {"schedule": 1, "capacity": 1},
+                },
+                result_revision=1,
+                organization_id=actor.organization_id,
+                staff_id=actor.staff_id,
+            ),
+        )
+    operations = (
+        ("GET", "", None, ""),
+        ("PATCH", "", body, str(uuid4())),
+        ("POST", "/preview", body, preview_key),
+        ("POST", "/activate", activation, str(uuid4())),
+    )
+    for method, suffix, payload, key in operations:
+        status, response = _schedule_request(
+            clinic,
+            manager,
+            method=method,
+            suffix=suffix,
+            body=payload,
+            key=key,
+        )
+        assert status == 403, (method, suffix, response)
+    assert (
+        _schedule_request(
+            clinic,
+            manager,
+            method="POST",
+            suffix="/preview",
+            body=body,
+            key=preview_key,
+        )[0]
+        == 403
+    )
+
+    _owner_changes_manager(clinic, False, 1)
+    assert (
+        _schedule_request(
+            clinic,
+            manager,
+            method="POST",
+            suffix="/preview",
+            body=body,
+            key=preview_key,
+        )[0]
+        == 401
+    )
+    ordinary = _fresh_receptionist_session(clinic, 2)
+    assert (
+        _schedule_request(
+            clinic,
+            ordinary,
+            method="POST",
+            suffix="/activate",
+            body=activation,
+            key=str(uuid4()),
+        )[0]
+        == 403
+    )
+    _owner_changes_manager(clinic, True, 2)
+    regranted = _fresh_receptionist_session(clinic, 3)
+    assert (
+        _schedule_request(
+            clinic,
+            regranted,
+            method="POST",
+            suffix="/preview",
+            body=body,
+            key=preview_key,
+        )[0]
+        == 403
+    )
+    assert _schedule_request(clinic, regranted)[0] == 403
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert (
+            connection.scalar(
+                text("""
+                SELECT count(*) FROM public.clinic_policy_previews
+                 WHERE organization_id=:tenant AND actor_staff_id=:staff
+            """),
+                {"tenant": clinic.tenant, "staff": UUID(manager.staff_id)},
+            )
+            == 0
+        )
+        assert (
+            connection.scalar(
+                text("""
+                SELECT count(*) FROM public.idempotency_receipts
+                 WHERE organization_id=:tenant AND actor_id=:staff
+                   AND operation IN ('settings.schedule.stage',
+                                     'settings.schedule.preview',
+                                     'settings.schedule.activate')
+            """),
+                {"tenant": clinic.tenant, "staff": UUID(manager.staff_id)},
+            )
+            == 1
+        )
+
+    status, published = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/activate",
+        body=activation,
+        key=str(uuid4()),
+    )
+    assert status == 200 and published["data"]["schedule_revision"] == 2
+
+
+@pytest.mark.parametrize("winner", ["revoke", "authorize"])
+def test_manager_revoke_and_schedule_preview_serialize_without_grant(
+    patient_backend,
+    winner,
+):
+    clinic = patient_backend
+    _owner_changes_manager(clinic, True, 0)
+    manager = _fresh_receptionist_session(clinic, 1)
+    body = _patch(_config(mode="OPEN")).model_dump(mode="json")
+    key = str(uuid4())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        if winner == "revoke":
+            with protected_transaction(
+                clinic.runtime, clinic.owner, clinic.config.policy.session_idle_minutes
+            ) as (connection, _):
+                holder = connection.scalar(text("SELECT pg_backend_pid()"))
+                _manager_change(connection, clinic, False, 1)
+                preview_future = pool.submit(
+                    _schedule_request,
+                    clinic,
+                    manager,
+                    method="POST",
+                    suffix="/preview",
+                    body=body,
+                    key=key,
+                )
+                _blocked_by(clinic, holder)
+            status, denied = preview_future.result(timeout=30)
+            assert status == 401, denied
+        else:
+            with protected_transaction(
+                clinic.runtime, manager, clinic.config.policy.session_idle_minutes
+            ) as (connection, actor):
+                holder = connection.scalar(text("SELECT pg_backend_pid()"))
+                revoke_future = pool.submit(_owner_changes_manager, clinic, False, 1)
+                _blocked_by(clinic, holder)
+                with pytest.raises(ContractError) as denied:
+                    _stage(connection, actor, _config(mode="OPEN"), key=key)
+                assert denied.value.status_code == 403
+            revoke_future.result(timeout=30)
+
+    assert (
+        _schedule_request(
+            clinic, manager, method="POST", suffix="/preview", body=body, key=key
+        )[0]
+        == 401
+    )
+    refreshed = _fresh_receptionist_session(clinic, 2)
+    assert (
+        _schedule_request(
+            clinic, refreshed, method="POST", suffix="/preview", body=body, key=key
+        )[0]
+        == 403
+    )
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert (
+            connection.scalar(
+                text("""
+                SELECT count(*) FROM public.idempotency_receipts
+                 WHERE organization_id=:tenant AND actor_id=:staff
+                   AND operation='settings.schedule.preview'
+            """),
+                {"tenant": clinic.tenant, "staff": UUID(manager.staff_id)},
+            )
+            == 0
+        )
+        assert (
+            read_schedule(
+                connection, _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+            )["schedule_revision"]
+            == 1
+        )

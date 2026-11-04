@@ -23,6 +23,7 @@ from carepulse.identity.staff import (
     _staff,
     accept_receptionist,
     change_receptionist,
+    change_receptionist_manager,
     change_staff_invitation,
     cleanup_native_sessions,
     create_receptionist,
@@ -145,12 +146,11 @@ def set_staff_permissions(
     staff_id: UUID, command: SetReceptionistGrant, request: Request
 ):
     with _actor_transaction(request) as (connection, actor):
-        projection, revision, native_user = change_receptionist(
+        projection, revision, native_user = change_receptionist_manager(
             connection,
             actor,
             staff_id,
             command,
-            "permissions",
         )
         tenant = actor.organization_id
     if native_user:

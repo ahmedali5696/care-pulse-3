@@ -717,9 +717,10 @@ def _preview(connection, tenant, staff, *, preview_id=None):
         text("""
         INSERT INTO public.clinic_policy_previews
             (id, organization_id, policy_kind, policy_version,
-             policy_revision, service_day_revision, actor_staff_id, service_date,
+             policy_revision, service_day_revision, actor_staff_id,
+             actor_security_revision, service_date,
              selected_refs, affected_refs, record_revisions, candidate_payload)
-        VALUES (:id, :tenant, 'SCHEDULE', 1, 1, 3, :staff, DATE '2026-10-30',
+        VALUES (:id, :tenant, 'SCHEDULE', 1, 1, 3, :staff, 0, DATE '2026-10-30',
                 CAST(:selected AS jsonb), CAST(:affected AS jsonb),
                 CAST(:captured AS jsonb), CAST(:candidate AS jsonb))
     """),
@@ -745,7 +746,8 @@ def test_preview_retains_actor_refs_and_captured_revisions_immutably(policy_stor
         preview, selected, affected, captured = _preview(connection, tenant_a, actor_a)
         record = connection.execute(
             text("""
-            SELECT actor_staff_id, policy_kind, policy_version, policy_revision,
+            SELECT actor_staff_id, actor_security_revision, policy_kind,
+                   policy_version, policy_revision,
                    service_day_revision, service_date,
                    selected_refs, affected_refs, record_revisions,
                    candidate_payload
@@ -755,6 +757,7 @@ def test_preview_retains_actor_refs_and_captured_revisions_immutably(policy_stor
         ).one()
         assert record == (
             actor_a,
+            0,
             "SCHEDULE",
             1,
             1,
@@ -773,9 +776,9 @@ def test_preview_retains_actor_refs_and_captured_revisions_immutably(policy_stor
                 text("""
                 INSERT INTO public.clinic_policy_previews
                     (id, organization_id, policy_kind, policy_version,
-                     policy_revision, actor_staff_id, selected_refs,
+                     policy_revision, actor_staff_id, actor_security_revision, selected_refs,
                      affected_refs, record_revisions, candidate_payload)
-                VALUES (:id, :tenant, 'SCHEDULE', 1, 1, :actor,
+                VALUES (:id, :tenant, 'SCHEDULE', 1, 1, :actor, 0,
                         '{}'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb)
             """),
                 {"id": uuid4(), "tenant": tenant_a, "actor": actor_a},
