@@ -2,13 +2,16 @@
 
 import json
 import runpy
+from dataclasses import replace
 from hashlib import sha256
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from carepulse.db import transaction
+from carepulse.main import app
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _activate_clinic
@@ -16,6 +19,9 @@ from test_database import ROOT, _create_empty_database, _engine
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
+from test_request_boundary import _signed
+from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
+from test_schedule import _schedule_request
 
 MIGRATION = ROOT / "db/migrations/versions/0023_m1_operational_manager.py"
 SCHEDULE = {
@@ -108,7 +114,9 @@ def _sqlstate(error):
     return error.value.orig.sqlstate
 
 
-def test_populated_predecessor_and_runtime_privilege_matrix(admin, empty_database):
+def test_populated_predecessor_and_runtime_privilege_matrix(
+    admin, empty_database, boundary_data, monkeypatch
+):
     migration_details = runpy.run_path(str(MIGRATION))
     predecessor, head = (
         migration_details["down_revision"],
@@ -213,6 +221,74 @@ def test_populated_predecessor_and_runtime_privilege_matrix(admin, empty_databas
                 )
                 is None
             )
+
+        # The pre-0023 preview is genuinely historical: neither its immutable
+        # row nor the post-0023 INSERT guard is bypassed to manufacture NULL.
+        legacy_session = f"synthetic-m1-legacy-{uuid4()}"
+        with migration.begin() as connection:
+            owner_user = connection.scalar(
+                text("SELECT auth_user_id FROM public.staff_accounts WHERE id=:owner"),
+                {"owner": owner_a},
+            )
+            connection.execute(
+                text("""
+                    INSERT INTO public."session"
+                        (id, "userId", token, "expiresAt", "createdAt", "updatedAt",
+                         "securityRevision", "absoluteDeadline", "lastActivity")
+                    VALUES (:id, :user, :token, clock_timestamp() + interval '1 hour',
+                            clock_timestamp(), clock_timestamp(), 0,
+                            clock_timestamp() + interval '1 hour', clock_timestamp())
+                """),
+                {"id": legacy_session, "user": owner_user, "token": str(uuid4())},
+            )
+        legacy_actor = replace(
+            _signed(boundary_data)[0],
+            organization_id=str(tenant_a),
+            staff_id=str(owner_a),
+            session_id=legacy_session,
+        )
+        legacy_clinic = SimpleNamespace(config=boundary_data.config, tenant=tenant_a)
+        monkeypatch.setattr(
+            app.state, "service_config", boundary_data.config, raising=False
+        )
+        monkeypatch.setattr(app.state, "db_engine", runtime, raising=False)
+        status, denied = _schedule_request(
+            legacy_clinic,
+            legacy_actor,
+            method="POST",
+            suffix="/activate",
+            body={
+                "preview_id": str(preview),
+                "expected_schedule_revision": 1,
+                "expected_capacity_revision": 1,
+                "reason": "Synthetic pre-M1 preview activation",
+            },
+            key=str(uuid4()),
+        )
+        assert status == 409 and denied["error"]["code"] == "STALE_REVISION"
+        with transaction(runtime, tenant_a) as connection:
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT revision FROM public.clinic_policy_heads
+                    WHERE organization_id=:tenant AND kind='SCHEDULE'
+                """),
+                    {"tenant": tenant_a},
+                )
+                == 1
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT count(*) FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant AND kind='SCHEDULE'
+                """),
+                    {"tenant": tenant_a},
+                )
+                == 1
+            )
+
+        with migration.connect() as connection:
             assert connection.scalar(
                 text("""
                 SELECT relforcerowsecurity

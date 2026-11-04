@@ -986,7 +986,7 @@ def test_preview_scoped_to_original_tenant_and_stale_after_schedule_change(
         assert read_schedule(connection, owner_b)["schedule_revision"] == 1
 
 
-def test_owner_preview_captures_revision_and_legacy_null_cannot_activate(
+def test_owner_preview_captures_revision_and_can_activate(
     patient_backend,
 ):
     clinic = patient_backend
@@ -1012,47 +1012,12 @@ def test_owner_preview_captures_revision_and_legacy_null_cannot_activate(
         ).one()
         assert captured == (UUID(clinic.owner.staff_id), 0)
 
-    # Simulate a preview left by the pre-M1 schema; new inserts forbid NULL.
-    with clinic.migration.begin() as connection:
-        assert (
-            connection.execute(
-                text("""
-                UPDATE public.clinic_policy_previews
-                   SET actor_security_revision = NULL
-                 WHERE organization_id = :tenant AND id = :preview
-            """),
-                {"tenant": clinic.tenant, "preview": preview_id},
-            ).rowcount
-            == 1
-        )
-
     activation = {
         "preview_id": str(preview_id),
         "expected_schedule_revision": 1,
         "expected_capacity_revision": 1,
-        "reason": "Synthetic legacy preview activation",
+        "reason": "Synthetic captured-revision preview activation",
     }
-    status, denied = _schedule_request(
-        clinic,
-        clinic.owner,
-        method="POST",
-        suffix="/activate",
-        body=activation,
-        key=str(uuid4()),
-    )
-    assert status == 409 and denied["error"]["code"] == "STALE_REVISION"
-    assert _schedule_request(clinic, clinic.owner)[1]["data"]["schedule_revision"] == 1
-
-    status, fresh = _schedule_request(
-        clinic,
-        clinic.owner,
-        method="POST",
-        suffix="/preview",
-        body=body,
-        key=str(uuid4()),
-    )
-    assert status == 200, fresh
-    activation["preview_id"] = fresh["data"]["preview_id"]
     status, published = _schedule_request(
         clinic,
         clinic.owner,
