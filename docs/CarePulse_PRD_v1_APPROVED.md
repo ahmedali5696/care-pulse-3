@@ -6,6 +6,7 @@
 **Effective date:** 19 October 2026.  
 **Document language:** English (workbook decision notes retained in Arabic in the decision appendix).  
 **Approved product amendment (3 November 2026):** The Product Owner approved the configurable Follow-up window and role-scoped, date-specific out-of-window booking authorization in FR-009a/c, BR-002a/c and AC-06/27 below. This amendment does not itself authorize implementation, migration or release.
+**Approved product reconciliation (4 November 2026):** The latest Product Owner decisions in [Issue #24](https://github.com/ahmedali5696/care-pulse-3/issues/24) and [Issue #25](https://github.com/ahmedali5696/care-pulse-3/issues/25) supersede older conflicting role, completion, Follow-up and export rules. The present authorization covers edits to the four authoritative documents only; implementation, downstream Spec Kit changes, migration, merge and release remain separately gated. Unapproved delegation details and evidence contracts remain explicit in §12.3.
 **Authority:** This is the CURRENT Product Owner-approved, self-contained CarePulse MVP Product Contract, effective 19 October 2026. It incorporates the 47 completed workbook choices and explicit owner clarifications of 19 October 2026. It prospectively supersedes approved CarePulse PRD v0.5; preceding documents remain historical and are not needed to interpret this standalone contract. Product approval grants NO implementation, migration, payment integration, deployment or production permission.  
 **Scope warning:** clinic Emergency lanes, deferred SaaS features, flexible day reconciliation and Bulk-only cancellation deferral are now resolved product scope choices. Production safety and future paid-platform commercialization still have separate gates (see §12).  
 **Reference conventions:** FR = functional requirement; BR = canonical behavior; AC = acceptance criterion. Existing retained IDs remain stable; added IDs start FR-090 / BR-032 / AC-18. Revised clarifications add FR-106–108, BR-047–049 and AC-38–43 without renumbering prior identifiers.
@@ -16,7 +17,7 @@ CarePulse is a multi-tenant clinic SaaS product aimed initially at Egypt. Each i
 
 ### 1.1 Clinic product scope
 
-Patient and family registration, routine day-only or explicitly timed bookings, check-in and queueing, separate Medical Emergency presentation, Paid Urgent new examinations, permitted follow-up claims, individual cancellation/reschedule, eligible **bulk rescheduling** (not bulk cancellation), Visit documentation, handwritten-prescription photos as attachments, searches, receptionist management, privacy, audit, operational reports, staff-only realtime and consent-based Doctor browser push, one-patient Owner export, archive, and backup/restore production readiness.
+Patient and family registration, routine day-only or explicitly timed bookings, check-in and queueing, separate Medical Emergency presentation, Paid Urgent new examinations, permitted follow-up claims, individual cancellation/reschedule, eligible **bulk rescheduling** (not bulk cancellation), Visit documentation, handwritten-prescription photos as attachments, searches, receptionist management, privacy, audit, operational reports, staff-only realtime and consent-based Doctor browser push, full one-patient authorized-staff export, archive, and backup/restore production readiness.
 
 **Service-money boundary:** Every Appointment has a frozen EGP **service value**. CarePulse clinic operations do **not** collect patient payment, track paid/unpaid status, generate clinic receipts, or assert settled revenue. Paid Urgent is a PREMIUM SERVICE LABEL, not confirmed payment. Medical Emergency is a clinical priority, never a price multiplier.
 
@@ -24,7 +25,7 @@ Patient and family registration, routine day-only or explicitly timed bookings, 
 
 **Approved scope deferral (owner clarification, 19 October 2026):** self-service Organization registration, customer checkout, platform subscription/payment collection, plan catalogs/renewals/trials/discounts, and a full browser-based SaaS Administration Dashboard are **all OUTSIDE MVP**. Deferring them does not block the clinic domain provided that MVP has secure, audited, minimal **administrative tenant provisioning**: an authorized platform operator can create a clinic Organization, assign the first Doctor/Owner via expiring invitation, list minimal nonclinical tenant metadata, and suspend/reactivate tenant access safely. This may be delivered via a tightly controlled operations CLI/internal administrative API and runbook, not a customer-facing portal or full administration dashboard. Do not expose the provisioning interface to ordinary clinic users. A tenant's Organization ID is stable; staff, patient and Appointment references remain tenant-scoped. The platform operator does not gain clinical access.
 
-**Pilot operation:** clinics may be manually invited and activated as non-billed pilot tenants under an explicit operator decision; no automated subscription/trial expiry, payment status, plan limit or billing assumption shall control clinical access in MVP. Paid SaaS launch requires separately approved subscription policies, billing/security/legal specifications and product scope; subscription policy remains unchosen now. The above does not defer tenant isolation, clinic staff authentication, protected recovery, suspension or security audit.
+**Pilot operation:** clinics may be manually invited and activated as non-billed pilot tenants under an explicit operator decision and verified first Doctor/Owner acceptance; no automated subscription/trial expiry, payment status, plan limit or billing assumption shall control clinical access in MVP. Paid SaaS launch requires separately approved subscription policies, billing/security/legal specifications and product scope; subscription policy remains unchosen now. Future subscription ownership/renewal remains with the Doctor/Owner, not a delegated Receptionist. The above does not defer tenant isolation, clinic staff authentication, protected recovery, suspension or security audit.
 
 ### 1.3 MVP exclusions
 
@@ -33,7 +34,7 @@ Patient WhatsApp/SMS, customer reminders/outbound vendor integration and deliver
 ### 1.4 Authority of resolved product decisions
 
 - The completed workbook selection and its written qualifications govern the retained product decisions. The explicit 19 October 2026 owner clarifications settle four subsequent questions; they supersede earlier *provisional* assumptions about Emergency, SaaS scope, day closure and Bulk Cancellation only.
-- **Emergency independence:** Medical Emergency has its own FIFO waiting/admission lane. There is **no global precedence** between the Emergency lane and the main Urgent/Routine lane. Permitted staff choose which lane to serve; the ordinary admission target must be its server-verified head. No cross-lane choice advances or reorders the other lane. Both lanes share the **same single Doctor's Pause, active examination capacity and Doctor per-case confirmation**. An exceptional Doctor selection may bypass the head inside a lane only with reason and audit.
+- **Emergency independence:** Medical Emergency has its own FIFO waiting/admission lane. There is **no global precedence** between the Emergency lane and the main Urgent/Routine lane. Permitted staff choose which lane to serve; the ordinary admission target must be its server-verified head. No cross-lane choice advances or reorders the other lane. Both lanes share the **same single Doctor's Pause, active examination capacity and Doctor per-case confirmation**. An exceptional selection by any admission-authorized clinic staff may bypass the head inside a lane only with explicit justification and audit under the same safeguards.
 - **Day flexibility:** default no closing time and no automatic No-show cutoff. Service-day queues remain date-scoped and do not silently migrate at midnight. Explicit administrative reconciliation is available for overdue Booked/Waiting; an optional guided closing and No-show cutoff may be enabled.
 - **SaaS boundary:** minimum secure administrative tenant provisioning is mandatory; customer-facing registration, subscriptions, payment and full SaaS dashboard are post-MVP. Subscription commercial policy is reserved for readiness to offer paid SaaS, not invented now.
 - **Bulk boundary:** bulk cancellation alone is deferred. Atomic eligible-only bulk rescheduling remains active MVP.
@@ -42,7 +43,7 @@ Patient WhatsApp/SMS, customer reminders/outbound vendor integration and deliver
 
 - **Organization / Clinic:** tenant data boundary, one Doctor/Owner, one branch; region Egypt, clinic local timezone Africa/Cairo and EGP currency fixed in MVP.
 - **Platform provisioning operator:** authorized operational identity for minimal tenant provisioning, first Doctor/Owner invitations and tenant suspension/reactivation. No clinical or billing privileges and no required full SaaS UI in MVP.
-- **Staff User:** Doctor/Owner or Receptionist, authenticated, clinic-scoped, with granular per-Receptionist optional bulk reschedule flag; Doctor only owns clinical authored fields and exceptional cancellation/queue override.
+- **Staff User:** Doctor/Owner or Receptionist, authenticated and clinic-scoped. A delegated Receptionist Manager is an existing Receptionist with explicit Owner-issued, auditable, revocable operational administration grants, not a new role or Owner. The five universally allowed operations in §3 require no managerial delegation or separate bulk_reschedule flag. Doctor alone owns clinical authored fields and exceptional In Examination cancellation.
 - **Patient:** independent clinic patient ID; optional raw and normalized phone may match family members; can be Archived but cannot be generally deleted/merged.
 - **Appointment:** operational booking with one of six statuses, service type, queue classification, clinic-local service date, preliminary booking number, immutable EGP price/entitlement snapshot, histories and links to cancel-and-replace.
 - **Visit:** associated with actual admission and clinical care, never assumed from simple booking/attendance. May survive exceptionally cancelled In Examination appointment.
@@ -52,23 +53,30 @@ Patient WhatsApp/SMS, customer reminders/outbound vendor integration and deliver
 
 ## 3. Actor roles and access matrix
 
-| Operation / data | Doctor = clinic Owner/Admin | Receptionist | Provisioning operator (limited MVP) |
-|---|---|---|---|
-| Clinic settings, clinical pricing, Urgent enablement, staff | Allow | Deny | No clinical setting privilege |
-| Patient demographic search/intake/update | Allow own tenant | Allow own tenant and fields | Deny clinical data |
-| Book, check-in, eligible individual cancel/reschedule | Allow | Allow subject to policies | Deny |
-| Same-day eligible bulk RESCHEDULE | Allow | Only per-user explicit bulk_reschedule flag | Deny |
-| Bulk CANCEL | Deferred | Deferred | Deferred |
-| Medical Emergency and Paid Urgent intake | Allow operationally if authorized; Urgent creation governed by Receptionist-only policy | Allow prescribed intake | Deny |
-| Ordinary admission | When admission mode permits, server-verified eligible head | When admission mode permits, server-verified eligible head only | Deny |
-| Exceptional non-head admission (with justification) | Doctor only when admission mode permits | Deny | Deny |
-| Doctor clinical notes/diagnosis/treatment, later audited edits | Doctor authority only | Deny | Deny |
-| Preliminary history / tests / handwritten prescription-image upload | Allow | Allow only fields/attachments in explicit allowlist | Deny |
-| Clinical history read | Doctor / Owner | Approved preliminary subsets only | Deny |
-| Patient archive and one-patient PDF/CSV export | Owner allow | Deny | Deny |
-| Minimal tenant bootstrap/invite/suspend and nonclinical identifiers | No clinic-owner cross-tenant privilege | Deny | Allow to specifically authorized provisioning operator only; event audit and no clinical access |
-| SaaS trial, subscription, commercial discount, checkout and customer self-registration | Deferred | Deferred | Deferred until post-MVP commercial approval |
-| Data of another Organization | Deny | Deny | Clinical data DENY; metadata-only gated |
+| Operation / data | Doctor = clinic Owner/Admin | Delegated Receptionist Manager | Ordinary authorized Receptionist | Provisioning operator (limited MVP) |
+|---|---|---|---|---|
+| Owner activation/initial Receptionist creation; grant/revoke delegation; ultimate ownership | Owner-controlled after verified invitation | Deny | Deny | Initial Owner invitation only; no clinic ownership |
+| Daily operational administration / clinic settings / subsequent staff management | Allow | Only specifically approved settings/actions explicitly granted by Owner; unresolved allowlist in §12.3, otherwise deny | No delegated settings/staff administration | No clinical setting privilege |
+| Patient demographic search/intake/update | Allow own tenant | Allow own tenant and fields | Allow own tenant and fields | Deny clinical data |
+| Book, check-in, eligible individual cancel/reschedule | Allow | Allow subject to policies | Allow subject to policies | Deny |
+| Same-day eligible bulk RESCHEDULE | Allow | Allow; no separate bulk_reschedule grant | Allow; no separate bulk_reschedule grant | Deny |
+| Bulk CANCEL | Deferred | Deferred | Deferred | Deferred |
+| Medical Emergency / Paid Urgent intake | Emergency allowed; Paid Urgent creation remains Receptionist-only | Allow prescribed intake | Allow prescribed intake | Deny |
+| Ordinary admission | Current mode permits; server-verified eligible head | Same | Same | Deny |
+| Exceptional non-head admission | Allow when current mode permits; justification/audit and all safeguards | Same | Same | Deny |
+| Follow-up source decision / confirmed-claim extension | Allow with actual actor/role audit | Allow subject to explicit Doctor OPTED_OUT/DEADLINE precedence | Same | Deny |
+| Administrative completion after examination actually occurred | Allow completion | Allow attestation; no clinical authorship | Same | Deny |
+| Doctor Pause / per-case extra-capacity confirmation / exceptional In Examination cancel | Doctor only | Deny | Deny | Deny |
+| Doctor clinical notes/diagnosis/treatment, later audited edits | Doctor authority only | Deny | Deny | Deny |
+| Preliminary history / tests / handwritten prescription-image upload | Allow | Explicit field/attachment allowlist only | Same | Deny |
+| General in-app clinical history read | Doctor / Owner | Approved preliminary subsets and operational evidence only | Same | Deny |
+| Patient archive/unarchive | Allow | Allow | Allow | Deny |
+| FULL one-patient PDF/CSV medical export + separate attachment manifest | Allow under BR-040 | Allow under BR-040; exporter can read full downloaded record | Same | Deny |
+| Minimal tenant bootstrap/invite/suspend and nonclinical identifiers | No cross-tenant privilege | Deny | Deny | Specifically authorized metadata-only operation; audit, no clinical access |
+| SaaS trial, subscription, commercial discount, checkout and customer self-registration | Deferred; future subscription ownership/renewal retained by Owner | Deferred; no ownership transfer | Same | Deferred |
+| Data of another Organization | Deny | Deny | Deny | Clinical data DENY; metadata-only gated |
+
+Manager delegation is optional and does not gate the five all-staff grants (non-head admission, Follow-up decisions/extensions, archive/unarchive, single-patient export and eligible bulk reschedule). It never transfers ownership, Doctor identity or clinical authorship. Routine operation without Doctor login starts only **after** secure Owner activation, initial Receptionist account creation and any explicit delegation. It cannot bypass Doctor Pause or per-case extra-capacity confirmation. Full export is an operation-specific disclosure exception, not unrestricted in-app clinical browsing or editing.
 
 **Session control:** strong verified-email recovery for Doctor/Owner, idle/absolute expiry, failed-login throttling and immediate server access invalidation after account disable or permissions removal. Clinical files and attached prescriptions never become public by exposing a URL.
 
@@ -80,7 +88,7 @@ Patient WhatsApp/SMS, customer reminders/outbound vendor integration and deliver
 2. Receptionist confirms **physical presence**; Booked → Waiting creates main-lane membership and internal Doctor alert. No Visit is created at booking/check-in.
 3. Receptionist may add distinct immediately present **Medical Emergency New Examination** into a separate emergency lane at ordinary examination pricing; may add **Paid Urgent New Examination** in the main lane only when enabled, valid premium and strictly inside configured clinic operating period (not breaks/holidays). Urgent intake atomically creates Appointment + Waiting.
 4. Staff permitted by the current admission mode explicitly choose the **Emergency lane** or **main lane**. Each ordinary admission selects only that lane's latest server-verified eligible head; choosing a lane is NOT an exceptional bypass. Emergency FIFO determines its own head; main lane uses Urgent FIFO then Routine policy. There is no cross-lane priority rule. One transaction enforces tenant/role/mode, target lane and appointment, head/revision, Doctor Pause, **shared Doctor capacity**, and case-specific Doctor confirmation. Successful Waiting → In Examination creates exactly one Visit.
-5. Doctor alone completes In Examination → Completed, or exceptionally cancels In Examination → Cancelled with reason and retained Visit/clinical audit. Terminal cannot reopen or reschedule. Doctor may later amend retained clinical documentation with old/new immutable audit.
+5. Doctor may complete In Examination → Completed; an authorized Receptionist may attest administrative completion **only after examination actually occurred**, recording actual actor/role/time/tenant and immutable audit without asserting Doctor-authored notes. Only Doctor may exceptionally cancel In Examination → Cancelled with reason and retained Visit/clinical audit. Terminal cannot reopen or reschedule. Doctor alone may later amend retained clinical documentation with old/new immutable audit.
 
 ### 4.2 Appointment state transition table
 
@@ -90,7 +98,7 @@ Patient WhatsApp/SMS, customer reminders/outbound vendor integration and deliver
 | None | Present authorized Urgent/Emergency quick intake | Waiting (via immediate create+check-in) | New Appointment and immutable Waiting lane; no Visit |
 | Booked | Receptionist attendance confirmation | Waiting | Queue entry; in-app Doctor event |
 | Waiting | Authorized server-validated admission | In Examination | Create one Visit, respect Pause/capacity/head/exceptions |
-| In Examination | Doctor completion | Completed | Terminal; service value counts |
+| In Examination | Doctor completion or authorized Receptionist administrative attestation after actual examination | Completed | Terminal; retain Visit and actual completion actor/role/time/tenant audit; service value counts |
 | In Examination | Doctor exceptional cancel with reason | Cancelled | Terminal; keep Visit and audit, no completed value/follow-up eligibility |
 | Booked / Waiting | Authorized reasoned individual cancel | Cancelled | Terminal, preserve old record |
 | Booked / Waiting | Valid individual or bulk cross-day reschedule | Booked on new date | Detach old queue, preserve attendance history, new booked sequence/availability check |
@@ -108,11 +116,11 @@ Patient WhatsApp/SMS, customer reminders/outbound vendor integration and deliver
 | Nonqualifying follow-up request | New Examination instead | Current standard New Exam price | If Completed New Exam, normal eligibility rules apply |
 | Urgent Follow-up / Emergency Follow-up | NOT allowed as separate product combination | N/A | N/A |
 
-**Binding independent-lane admission rule:** choosing which lane to admit from does not let Receptionist skip a Waiting patient **within that lane**, but Emergency does not globally block main-lane admission and main-lane patients do not block Emergency admission. Emergency E1 precedes E2 by server-recorded Emergency FIFO. In one shared capacity slot, only one admission may commit; Doctor Pause disables admissions on BOTH lanes. Emergency intake/admission does not change main-lane positions, Urgent arrival order or routine missed-turn cursor. A justified Doctor head override is an explicit exception within the chosen lane, never implied by switching lanes.
+**Binding independent-lane admission rule:** lane choice alone never bypasses its head; an admission-authorized Doctor or Receptionist may explicitly select a non-head Waiting patient in that lane only with justification and immutable audit. Emergency does not globally block main-lane admission and vice versa. Emergency FIFO remains the ordinary order. In one shared capacity slot, only one admission may commit; Doctor Pause disables admissions on BOTH lanes. Emergency activity does not change main-lane positions, Urgent arrival order or Routine cursor. A non-head exception never advances that cursor and never bypasses lane/day, state, presence, revision or Doctor extra-capacity safeguards.
 
 ### 4.4 Follow-up entitlement and days
 
-A qualifying Completed New Examination on 1 November has day zero on 1 November. **Under the initial seven-day clinic FOLLOWUP setting**, its default last day is 8 November, ending at the end of 8 November in Africa/Cairo, inclusive; Owner changes to that setting govern subsequent **new claims**, including after release. The Doctor's source Visit decision remains required. A specific out-of-window **new-booking** date may be authorized by the Doctor with reason, or independently by an enabled Receptionist with optional reason; **both require immutable authorization audit** and neither may override a Doctor opt-out or the source's other eligibility constraints. Only one active preferential claim per original across Booked/Waiting/In Examination and one Completed use ever. Cancelled or No-show does not consume. A confirmed claim retains its then-authorized deadline and price if future policy is shortened/opted out; moves beyond its frozen deadline require a distinct Doctor extension before move. After use or nonqualification the request is New Examination.
+A qualifying Completed New Examination on 1 November has day zero on 1 November. **Under the initial seven-day clinic FOLLOWUP setting**, its default last day is 8 November, ending at the end of 8 November in Africa/Cairo, inclusive; current Owner-configured policy governs new claims, including after release and when no explicit Doctor decision exists. Doctor, delegated Manager and ordinary authorized Receptionist may record a source eligibility decision or approve a distinct extension of an already-confirmed claim, with actual actor/role provenance. An existing explicit Doctor `OPTED_OUT` or `DEADLINE` cannot be replaced, overridden, bypassed or extended beyond by any Receptionist through any path; only the authenticated Doctor may revise it. A separate out-of-window **new-booking** date exception is allowed to Doctor with reason or independently to Receptionist with optional reason; immutable audit is mandatory. Only one active preferential claim per original across Booked/Waiting/In Examination and one Completed use ever. Cancellation/No-show releases without consumption; a fresh booking requalifies at current policy/price. Confirmed evidence and price never silently change: a later extension is separately appended, justified and audited before an outside-deadline move, preserving the original snapshot. A later Doctor restriction does not retroactively cancel a confirmed claim but constrains subsequent Receptionist decisions, exceptions and extensions. After use or nonqualification the request is New Examination.
 
 ### 4.5 Exact-time interval behavior and configuration changes
 
@@ -126,11 +134,11 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 
 **FR-001** — Maintain distinct clinic Organizations with one physical branch and one Doctor each in the MVP; data must be scoped to its Organization.
 
-**FR-002** — Operate as a single-doctor clinic; its Doctor is also its Owner/Admin.
+**FR-002** — Operate as a single-doctor clinic; its Doctor remains Owner/default Administrator. Optional daily administration delegation to an existing Receptionist never transfers ownership, Doctor identity, clinical authorship or future subscription ownership/renewal.
 
 **FR-003** — Enforce the operation and field-level permissions in §3 for Doctor/Owner, Receptionist and restricted internal tenant-provisioning operators. Provisioning operators never gain clinical-record access by virtue of platform role.
 
-**FR-005** — Allow the Doctor acting as Owner/Admin to create and manage clinic Receptionist accounts.
+**FR-005** — Doctor/Owner controls secure activation, initial Receptionist creation and delegation grant/revocation, retaining ultimate clinic control and staff management. A Manager may perform only specifically approved and Owner-granted operational settings/staff actions; the exact settings and subsequent-account-management scope remains unapproved (§12.3). Ordinary Receptionists do not inherit it; no self-delegation or platform-operator bypass.
 
 **FR-006** — Register patients with a three- or four-part name, contact phone, and either date of birth or declared age with its entry/reference date. Do not fabricate a date of birth from an approximate age. Complaint Summary is not required for quick booking.
 
@@ -146,11 +154,11 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 
 **FR-009** — Offer New Examination and preferential qualifying Follow-up/Consultation. A nonqualifying or already consumed Follow-up claim must be booked as a standard New Examination; no standalone standard-price Follow-up in MVP.
 
-**FR-009a** — Use the Cairo-local date of the original Completed examination as day zero. The clinic's Owner-configurable FOLLOWUP window determines the inclusive default last eligible day for **new claims**, initially day seven; fresh booking after release uses current effective policy and price. The Doctor alone may record a justified source-Visit-specific deadline or opt out. A confirmed preferential booking retains its frozen entitlement and price despite later policy changes.
+**FR-009a** — Use the Cairo-local date of the original Completed examination as day zero. Current Owner-configured FOLLOWUP policy determines the inclusive default new-claim window (initially day seven), including after release and absent an explicit Doctor decision. All authorized clinic staff may record a source eligibility decision with actual actor/role and immutable operational provenance for Receptionist actions, separate from Doctor clinical revisions. `DEFAULT` uses current policy unless constrained by an explicit Doctor decision. If Doctor previously explicitly recorded `OPTED_OUT` or `DEADLINE`, no Receptionist may replace, modify, override, bypass or extend beyond it through source decision, date exception or confirmed-claim extension; only a genuinely Doctor-authenticated, revision-checked, immutably audited revision may change it. Confirmed entitlement/price is not retroactively rewritten.
 
 **FR-009b** — Enforce at most one Completed discounted/free Follow-up per qualifying original Completed examination; Cancelled and No-show Follow-ups consume none, and multiple concurrent active preferential claims are prohibited (BR-002b).
 
-**FR-009c** — Preferential Follow-up requires an original Completed Routine, Medical Emergency or Paid Urgent New Examination for the same patient/clinic/Doctor, a recorded Doctor source-Visit eligibility decision, and an eligible intended service date. For a new booking outside the effective clinic-default window, the Doctor may approve a justified date-specific exception; an authorized Receptionist may **independently approve that specific date** without Doctor co-approval and with an **optional** reason. Both must create mandatory immutable, role-attributed authorization audit evidence before/with confirmation. Receptionist authorization is an operational booking exception, **not** permission to edit the Doctor's clinical Visit decision, override Doctor opt-out, or read clinical narrative. No selected date precedes Cairo-local completion; no exception defeats single-use, patient/day, slot or other ordinary booking guards. Moving an already confirmed claim beyond its frozen deadline remains subject to the distinct prior Doctor-audited extension rule.
+**FR-009c** — Preferential Follow-up requires an original Completed Routine, Medical Emergency or Paid Urgent New Examination for the same patient/clinic/Doctor and an eligible service date under FR-009a, not a fabricated Doctor source decision. For a **new booking** outside the effective clinic-default window, Doctor may approve a justified date-specific exception; an authorized Receptionist may independently approve that specific date without Doctor coapproval and with optional reason. Both require immutable actor/role/source/date/policy/revision audit linked to the confirmed claim. This is distinct from source eligibility and from a justified, audited **already-confirmed-claim extension**, which all authorized clinic staff may approve before an outside-frozen-deadline move. No Receptionist action may defeat an explicit Doctor OPTED_OUT/DEADLINE. No selected date precedes Cairo-local completion or bypasses single-use, patient/day, slot, capacity or other ordinary guards. These permissions confer no diagnosis/treatment/note editing or unrestricted in-app clinical read. Minimum source-decision/extension evidence rules remain §12.3 contract work; optional Receptionist new-date reason is already approved.
 
 **FR-010** — Maintain distinct Appointment (operational booking) and Visit (clinical encounter) records per BR-001.
 
@@ -182,7 +190,7 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 
 **FR-021a** — Receptionist may create an immediate Medical Emergency New Examination with standard New Examination price (or authorized non-Urgent discount/free), Waiting entry in a separate emergency lane, and internal Doctor alert. A Completed Emergency New Examination may qualify for preferential Follow-up. The emergency label is clinical priority, never inferred from payment or Urgent premium.
 
-**FR-021b** — Only actual ordinary Routine-head admissions advance the routine missed-turn cursor. Emergency-lane activity, paid Urgent admission, and Doctor exceptional admission do not progress Routine missed turns; late Routine check-in goes after configured number of Routine Waiting (default five), with justified reception manual placement inside Routine only.
+**FR-021b** — Only actual ordinary Routine-head admissions advance the routine missed-turn cursor. Emergency-lane activity, paid Urgent admission, and exceptional admission by any actor do not progress Routine missed turns; late Routine check-in goes after configured number of Routine Waiting (default five), with justified reception manual placement inside Routine only.
 
 **FR-021c** — Offer Receptionist-authorized physically-present same-day Paid Urgent New Examination intake, with a server-created new Appointment, immutable EGP premium snapshot, booking number and instant main-lane Waiting entry in one transaction. Urgent is neither an emergency diagnosis nor a Follow-up.
 
@@ -192,13 +200,13 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 
 **FR-025** — Provide authenticated in-app Doctor alerts with authorized queue details; optional browser push to an explicitly opted-in Doctor device may display patient NAME ONLY, not age, diagnosis or notes, and must be revoked on loss of access. Push content is separate from protected in-app detail.
 
-**FR-026** — Admission-authorized Doctor may choose the Emergency lane or main lane. Ordinary admission admits the server-verified head OF THE CHOSEN LANE. An exceptional Doctor-only non-head selection inside that lane requires reason and immutable audit. Switching lanes is not exceptional. Always check current role/tenant/admission mode, queue revision, Pause, shared capacity and case-specific additional-capacity approval.
+**FR-026** — Any admission-authorized Doctor/Owner, delegated Manager or ordinary Receptionist may choose Emergency or main lane. Ordinary admission admits its server-verified head; explicit non-head selection within it requires justification and immutable actual-actor/role audit. Switching lanes is not exceptional. Recheck role/tenant/current admission mode, lane/day, Waiting state, presence, queue/Appointment revisions, Doctor Pause, shared capacity and case-specific Doctor additional-capacity approval. No exception bypasses these safeguards or advances Routine cursor.
 
 **FR-027** — Reflect Doctor admission and examination state changes to Receptionist in realtime.
 
 **FR-028** — Notify Receptionist in-app when Doctor admits a patient.
 
-**FR-029** — Receptionist authorized by admission mode may select Emergency or main lane independently. Within the selected lane, the server transaction MUST admit only that lane's current highest eligible Waiting head; deny non-head/forged/stale IDs and any exceptional flag. Neither lane globally blocks the other, but Doctor Pause and shared capacity block both. Lane choice never advances another lane's sequence or Routine missed-turn cursor.
+**FR-029** — Receptionist authorized by current admission mode may select either lane independently and admit its current eligible head ordinarily, or a non-head Waiting patient only through FR-026's justified audited exception. Deny unreasoned, forged, stale, wrong-lane/day or otherwise ineligible targets. Neither lane globally blocks the other; Doctor Pause/shared capacity constrain both. Lane choice and exceptional admissions never advance another lane's sequence or Routine missed-turn cursor.
 
 **FR-030** — Allow Doctor to pause or resume examination admission without pausing queue check-in or future bookings.
 
@@ -206,13 +214,13 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 
 ### 5.39 Clinical encounter and audit
 
-**FR-032** — Store Visit examination, diagnosis, clinical notes, treatment, test results, Doctor follow-up recommendation and eligibility decision, and authorized medical attachments including a scanned/photo handwritten prescription. Structured electronic prescription composition, printing and PDF generation are out of MVP. A recommended follow-up date is not an automatic booking.
+**FR-032** — Store Visit examination, diagnosis, clinical notes, treatment, test results, Doctor follow-up recommendation and any genuine Doctor eligibility decision, and authorized medical attachments including scanned/photo handwritten prescriptions. Store Receptionist completion/Follow-up operational evidence separately with actual actor/role, never as Doctor-authored clinical content. Structured electronic prescription composition, printing and PDF generation are out of MVP. A recommended follow-up date is not an automatic booking.
 
 **FR-033** — Allow the Doctor to add/edit clinical documentation after Completed or after an In Examination Appointment is exceptionally cancelled by the Doctor, without reopening the terminal Appointment or changing its outcome.
 
 **FR-033a** — On every Doctor clinical correction after Completed or exceptional In Examination cancellation, create immutable audit evidence of previous and new values, modifying actor identity/role and timestamp accurate to seconds.
 
-**FR-034** — Allow the Doctor to complete In Examination as Completed, retaining the clinical record and audit history.
+**FR-034** — Allow Doctor completion or authorized Receptionist administrative attestation of In Examination → Completed only after examination actually occurred. Preserve the admission-created Visit, actual actor/role/time/tenant and immutable completion evidence/audit; never fabricate Doctor clinical authorship or require invented notes. No seventh Appointment status or terminal reopening.
 
 **FR-035** — Default no closing time and no automatic No-show conversion. If the Owner explicitly configures/enables an automatic clinic-local day cutoff, transition only still-Booked unattended appointments for THAT service day atomically to No-show, safely racing check-in. Without a cutoff, overdue Booked remains Booked and appears in an authorized review list, from which authorized staff may mark verified absence as No-show with actor/reason/time; never infer patient absence from calendar date alone.
 
@@ -226,7 +234,7 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 
 **FR-039** — Display realtime updates of queue, attendance, admission, completion and Doctor pause status.
 
-**FR-041a** — Support typed-confirmation eligible-only atomic SAME-DAY BULK RESCHEDULING for existing Routine Booked/Waiting appointments to a valid new local day. Exclude In Examination, terminal, Urgent Waiting and other ineligible items with preview counts and reasons. ALL eligible selected changes commit or none. Bulk Cancellation is DEFERRED from MVP per decision note; authorized individual cancellation remains.
+**FR-041a** — Allow all active authorized clinic staff typed-confirmation eligible-only atomic SAME-DAY BULK RESCHEDULING for existing Routine Booked/Waiting appointments to a valid new local day, without a separate per-Receptionist bulk_reschedule grant. Exclude In Examination, terminal, Urgent Waiting and other ineligible items with preview counts/reasons. ALL eligible selected changes commit or none with fresh authorization/revisions and scheduling/claim guards. Bulk Cancellation remains DEFERRED.
 
 **FR-048** — Provide today’s booked total, completed, cancelled and remaining Waiting KPIs; weekly/monthly booking trends and daily patient throughput charts.
 
@@ -241,6 +249,8 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 **FR-053** — In Exact-Time mode default to no overlapping appointment intervals for the one Doctor; explicit overlap enablement is available only when exact times have been configured and must obey saved examination-capacity policy. Open date-only booking has no hidden hourly or daily cap.
 
 ### 5.54 Clinic settings
+
+Owner-controlled settings below may be delegated only where the specific setting/action is expressly approved and Owner-granted under FR-071/BR-036. Manager designation alone is insufficient; exact allowlist remains §12.3. Doctor Pause and per-case confirmation are never delegated.
 
 **FR-054** — Examination duration defaults to Open (no inferred clock time). An explicit positive duration can generate timed slots from configured working periods excluding breaks. Explicit manual slots are independently configurable.
 
@@ -270,13 +280,13 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 
 **FR-066** — Owner sets EGP standard New Examination and preferential Follow-up prices, and optionally an enabled Urgent fixed premium above standard Examination price. Do not expose configurable multi-currency settings in MVP.
 
-**FR-067** — Preferential reduced/free Follow-up is eligible only from a qualifying Completed New Examination (Routine, Emergency or Urgent), a recorded Doctor Visit eligibility decision, and the effective clinic window or an authorized date-specific exception under FR-009c; at most one Completed preferential use is allowed. Subsequent nonqualifying treatment is New Examination.
+**FR-067** — Preferential reduced/free Follow-up is eligible only from a qualifying Completed New Examination (Routine, Emergency or Urgent), effective source/policy eligibility and valid date or specific exception under FR-009a/c. Administrative completion is sufficient service evidence without inventing a Doctor decision; explicit Doctor OPTED_OUT/DEADLINE takes precedence over every Receptionist path. At most one Completed preferential use; nonqualifying treatment is New Examination.
 
 **FR-069** — Apply resource- and field-level Doctor/Receptionist tenant authorization. Receptionists may enter allowed intake data and attach report/image of a handwritten prescription as designated attachment; may not author/edit Doctor diagnosis, clinical notes or structured prescriptions.
 
 **FR-070** — Require authenticated identity for clinic and platform protected screens; safe self-service password reset via verified registered email, with abuse limits and audit. Platform account recovery and subscription setup belong to the separately gated SaaS platform scope.
 
-**FR-071** — Enforce granular per-Receptionist Owner-managed permission flags for optional bulk_reschedule (and any expressly approved operations); do not delegate administrative settings in MVP. Revoke account permissions immediately at authorization checks, invalidating active access.
+**FR-071** — Support explicit Owner-managed, audited, revocable operational administration delegation to an existing Receptionist, limited to specifically approved settings/actions (§12.3). No new roles framework, self-grants, ownership or clinical-authoring transfer. Ordinary Receptionists lack delegated settings/staff privileges. The five all-staff grants in §3 require no such delegation or optional bulk_reschedule flag. Live checks enforce immediate revocation across sessions and downloads.
 
 ### 5.72 Authentication, privacy and records
 
@@ -290,9 +300,9 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 
 **FR-076** — Periodically back up operational/clinical data and attachments. Frequency, retention, tested restore, RPO/RTO and Egypt legal compliance constraints are OPEN-OPS release gates and may not be assumed from a daily-backup default.
 
-**FR-079** — Permit Owner-only export of ONE patient file in readable PDF and structured CSV with authorized clinical history and attachment manifest; download attachments separately under protected access. Bulk patient export is deferred.
+**FR-079** — Permit all active authorized clinic staff a FULL single-patient medical-record export in readable PDF and structured CSV, including permitted clinical history, with a separate attachment manifest. The exporter can read the downloaded full record; it is not a redacted receptionist projection. Require a specified legitimate purpose, recipient identity/authority verification at handoff, immutable sensitive-operation audit, private server-created encrypted output and protected bounded single-use download with live authorization recheck. Attachments remain separately access-controlled downloads. Bulk patient export is out of scope; Egypt-specific disclosure/legal review remains OPEN-OPS-03.
 
-**FR-080** — Enforce Doctor-only clinical authored fields and later audited correction; Receptionist may access approved preliminary intake and upload attachments including handwritten prescription photos without changing Doctor-authored content; Owner may read/archive/export one patient. No general clinical deletion.
+**FR-080** — Enforce Doctor-only clinical authored fields and later audited correction. Receptionist may access approved preliminary/operational projections and upload permitted attachments without changing Doctor content. All authorized staff may archive/unarchive and perform FR-079 full export; the export-specific full-file read does not confer unrestricted in-app clinical browsing, original attachment downloads or clinical editing. No general clinical deletion.
 
 **FR-081** — Show Visit details with patient, diagnosis, medical notes, findings, tests and permitted attachments, including uploaded photo/scan of a handwritten prescription. No native E-Prescription editor or generated e-prescription PDF/print template in MVP.
 
@@ -316,7 +326,7 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 
 **FR-090** — Clinic Owner may update authorized demographics with sensitive-event audit; all patient records use stable internal IDs, no general patient merge capability in MVP.
 
-**FR-091** — Expose a per-Receptionist permission control for bulk_reschedule. Changing/withdrawing permissions immediately blocks new protected operations and invalidates related active access; clinic administrative setting grants are not delegated.
+**FR-091** — Expose Owner-controlled grant/revoke of specifically approved operational administration delegation, with immutable actor/role/tenant/scope/time audit and live security revision. Do not expose a separate bulk_reschedule opt-in gate; both ordinary and Manager Receptionists have the five approved operations. Initial Receptionist creation, delegation control and ultimate ownership remain Owner-only; unresolved subsequent-staff/settings scope is not implicitly granted.
 
 **FR-092** — Offer OPTIONAL guided close/review for a selected Cairo service day. Show all unresolved Booked, Waiting and In Examination; on finalizing an explicit day close, all Waiting for that service day must first be intentionally admitted, reason-cancelled or rescheduled by authorized staff. Existing In Examination may continue across midnight and remains linked to original date. Manual close does not alter other states, trigger No-show without the separately enabled cutoff, or prevent continuing an in-progress Visit. Without chosen close, no forced day-end occurs; older pending items stay flagged for review.
 
@@ -342,7 +352,7 @@ All numbered FR below are applicable MVP requirements; FR-100–102 were revised
 
 **FR-103** — Restore Doctor/Owner login through verified registered email with single-use expiring token, rate limits, active-session revocation after credential changes and audit; do not require a new broad platform super-user role for password recovery.
 
-**FR-104** — Allow one-patient Owner-only PDF/CSV export with a separate attachment manifest; no bulk file export or raw public object-store links in MVP.
+**FR-104** — Allow FR-079 full one-patient PDF/CSV export to Doctor/Owner, delegated Manager and ordinary authorized Receptionist under BR-040's purpose, handoff verification, immutable audit and private retrieval controls. No bulk export, public object links, operator clinical export or inferred legal compliance.
 
 **FR-105** — Treat back-up retention, RPO, RTO, restore test, medical data residency, access and retention policy as mandatory documented production readiness gates, with Egypt launch as target and legal validation prior to production.
 
@@ -361,11 +371,13 @@ These rules are normative. A product question marked OPEN cannot be answered by 
 
 **BR-002** — MVP bookable types are New Examination and qualifying preferential Follow-up. Nonqualifying requests use New Examination, rather than a standard-price unqualified Follow-up.
 
-**BR-002a** — A Completed Routine, Medical Emergency or Paid Urgent New Examination can qualify a discounted/free Follow-up from Cairo-local completion day zero through the **current clinic FOLLOWUP policy's inclusive last day** (initially day seven). The Owner may change that default duration for **future new claims**; it is re-evaluated after a released claim. A recorded Doctor eligibility decision on the source Visit is required. Doctor-specific clinical deadline and opt-out decisions remain Doctor-controlled and require justification when exceptional. For a particular new Follow-up date outside the clinic-default window, the Doctor may provide a reasoned exception or the authorized Receptionist may approve it independently with an **optional** reason; **both actions require an immutable audit event** recording the actor/role, source, date, policy and authorization evidence. The Receptionist cannot alter or override the Doctor's recorded clinical decision/opt-out. Previously confirmed claims are never invalidated retroactively.
+**BR-002a** — A qualifying Completed New Examination uses Cairo-local completion day zero and current Owner-configured inclusive FOLLOWUP policy (initially day seven) for fresh claims, including after release. No explicit Doctor decision is required; `DEFAULT` uses policy unless constrained by a distinct explicit Doctor decision. All authorized clinic staff may record source eligibility with actual actor/role and immutable provenance; Receptionist evidence is operational, not a Doctor clinical revision. A previously explicit Doctor `OPTED_OUT` or `DEADLINE` cannot be replaced, overridden, modified, bypassed or extended beyond by Receptionist source decision, booking exception or confirmed-claim extension. Only authenticated Doctor revision with concurrency checks and immutable provenance may change it. Doctor may justify a specific out-of-window new-booking date; Receptionist may independently authorize that date with optional reason, mandatory immutable audit and no Doctor restriction bypass. Previously confirmed claims are not retroactively invalidated.
 
 **BR-002b** — One original Completed qualifying New Examination may support no more than one Completed preferential Follow-up. Active preferred claims across Booked/Waiting/In Examination are mutually exclusive. Cancelled/No-show claims release entitlement; after consumption further care is a New Examination at its appropriate standard rate.
 
-**BR-002c** — Confirmed preferential Follow-up freezes the source Visit, applicable versioned clinic policy, Doctor source eligibility, any separately authorized date-specific booking exception (including Receptionist actor/role and optional reason), approved service day/deadline, price and audit provenance. A move of an **already confirmed** claim beyond its preserved deadline requires prior Doctor-audited justified extension (the Receptionist's new-booking exception does not authorize rescheduling). A distinct new booking after cancellation/no-show follows current policy and fresh price.
+**Source/deadline distinction (BR-002a–c):** A justified explicit Doctor `DEADLINE` defines the source's inclusive eligibility deadline instead of the clinic default, whether shorter or longer; it is not merely a selected NEW-booking date exception. Receptionists may act only without modifying or exceeding that Doctor decision. Confirmed-claim extensions must be non-shortening, separately authorized and appended; neither a source decision nor a new-date exception silently rewrites an existing frozen claim.
+
+**BR-002c** — Confirmation freezes source Visit, policy revision, source decision or policy-derived eligibility, actual source actor/role if any, date-specific booking exception if any, approved service day/deadline, price and provenance. Doctor, Manager or ordinary authorized Receptionist may approve a distinct justified audited extension of an **already-confirmed** claim before an outside-deadline move, preserving original frozen evidence and price through append-only extension evidence. Every Receptionist path respects BR-002a's explicit Doctor OPTED_OUT/DEADLINE precedence, including restrictions recorded after confirmation; a new-booking date exception is not a confirmed-claim extension. Audit binds tenant/patient/source/claim, requested date, actor/role/time, policy/source/claim revisions and prior/new extension evidence. Minimum evidence/reason contract details remain §12.3; no implication that implementation exists. A new booking after release requalifies using current policy and price, not an old claim's extension.
 
 **BR-003** — Appointment statuses are Booked, Waiting, In Examination (stakeholder In-Progress), Completed, Cancelled and No-show. No seventh status is introduced.
 
@@ -375,7 +387,7 @@ These rules are normative. A product question marked OPEN cannot be answered by 
 
 **BR-006** — Individual rescheduling must preserve actor/reason, validated new service day and exact time if configured. A cross-day Waiting reschedule atomically detaches old lane membership, returns status to Booked on the new day, records old check-in as historical only, assigns new-day booking sequence and requires fresh attendance. Terminal/In Examination cannot reschedule; Urgent cannot carry its on-site premium priority into another day. Follow-up and day uniqueness revalidated.
 
-**BR-007** — Only Doctor completion may set Completed from In Examination. Doctor cancellation of In Examination is not completion; it never contributes to Completed Examination Value or a qualifying initial examination for Follow-up. Completed and Cancelled never reopen; Doctor clinical corrections on their retained Visits remain immutable-audited.
+**BR-007** — In Examination → Completed requires examination actually occurred: Doctor completion or authorized Receptionist administrative attestation, with actual actor/role/time/tenant and immutable evidence/audit. Retain Visit and Doctor-only clinical authorship/correction; operational completion never fabricates Doctor notes or a clinical decision. Completed service counts for value and a qualifying New Examination may source Follow-up. Doctor exceptional cancellation is not completion/value/eligibility. Terminal states never reopen; six Appointment statuses remain unchanged.
 
 **BR-008** — Receptionist check-in changes Booked to Waiting upon confirmed physical attendance.
 
@@ -387,9 +399,9 @@ These rules are normative. A product question marked OPEN cannot be answered by 
 
 **BR-011a** — Medical Emergency is a separate prominently displayed lane; quick intake is immediate same-day New Examination and Waiting. It uses standard New Examination pricing unless authorized non-Urgent discount/free and may create Follow-up eligibility after Completed. Emergency E1 precedes E2 under immutable-in-history server-arrival FIFO. It does not mutate main-lane position, priority or Routine cursor.
 
-**BR-011b** — Missed Routine turns advance only on successful ordinary Routine-head admission, never Emergency, Urgent or Doctor exceptional admission. Late Routine checks in after first min(lateDepth, routineWaitingCount) active Routine entries; manual receptionist placement requires reason/audit and stays within Routine. Policy changes apply next local working day, not mid-queue.
+**BR-011b** — Missed Routine turns advance only on successful ordinary Routine-head admission, never Emergency, Urgent or exceptional admission by any actor. Late Routine checks in after first min(lateDepth, routineWaitingCount) active Routine entries; manual receptionist placement requires reason/audit and stays within Routine. Policy changes apply next local working day, not mid-queue.
 
-**BR-011c** — SERVER-ENFORCED independent-lane admission: an authorized Doctor or Receptionist explicitly selects Emergency or main lane. Inside protected tenant/Doctor/service-day transaction, recompute THAT lane's current eligible head, check queue revision, role/mode, target Waiting, Doctor Pause and SHARED examination capacity. The selected lane head may be admitted ordinarily regardless of Waiting in the other lane. Receptionist has no within-lane bypass. Doctor-only explicitly reasoned and audited non-head selection WITHIN the selected lane is exceptional, cannot bypass any other checks and never advances Routine cursor. Ordinary Routine-head admission alone advances Routine missed turns. Serialize arrivals and admissions across BOTH lanes against the same Doctor capacity; reject stale/forged lane or IDs and duplicate Visit. All priority remains lane-scoped.
+**BR-011c** — SERVER-ENFORCED independent-lane admission: any admission-authorized Doctor/Owner, Manager or ordinary Receptionist explicitly selects lane/day/target. Recompute that lane's eligible head and validate role/current mode, tenant, Waiting/presence, revisions, Doctor Pause, shared capacity and fresh Doctor per-case extra-admission confirmation. Admit the head ordinarily, or permit an explicit justified immutable-audited non-head exception WITHIN that lane for any of these staff. No exception waives other guards, changes another lane or advances Routine cursor. Serialize both lanes against shared Doctor capacity and each dated lane revision; reject stale/forged targets and duplicate Visit.
 
 **BR-013** — Capacity is one In Examination by default; when owner enables more, the Doctor must issue a distinct confirmation for each additional admission above one. A receptionist can perform permitted admission only after that Doctor confirmation and fresh transactional validation.
 
@@ -397,11 +409,11 @@ These rules are normative. A product question marked OPEN cannot be answered by 
 
 **BR-015** — Doctor Pause blocks admission by both Doctor and Receptionist but permits check-in, Waiting entries and future bookings; Receptionist sees paused state.
 
-**BR-016** — Receptionist handles approved patient/family preliminary intake and allowed uploads (including a handwritten prescription scan), booking/check-in/individual cancellation, separate Emergency New Examination and enabled Paid Urgent physical intake, and only explicitly granted per-user bulk_reschedule. Receptionist cannot edit Doctor clinical fields or clinic administrative settings.
+**BR-016** — Receptionist handles permitted intake/uploads, booking/check-in/individual cancellation, Emergency and enabled Paid Urgent physical intake, administrative completion after actual examination and the five all-staff operations in §3. These require no managerial delegation or separate bulk_reschedule grant. Settings/staff administration requires specifically approved Owner delegation; ordinary Receptionists have none. No Receptionist may author/edit Doctor clinical fields, control Doctor Pause/case confirmation or exceptionally cancel In Examination.
 
 **BR-016a** — Paid Urgent is Receptionist-authorized physical SAME-DAY walk-in only during configured clinic operation, when separately enabled with valid premium; patient selection/registration and presence attestation precede transactionally consistent new Urgent Appointment+Waiting entry. A patient with counted Routine Booked/Waiting needs an explicit authorized cancel-and-replace, with typed/clear confirmation and both original terminal cancel/history and new Urgent booking/price/Waiting creation in ONE transaction: on failure rollback both, not a silent status/price conversion. Completed or In Examination existing same-day appointments BLOCK a new Urgent; terminal Cancelled/No-show permit a NEW ID. Visit only on admission, no staff remote Urgent booking, no client-set priority/price.
 
-**BR-017** — Doctor controls the own examination workflow (admit, complete, pause/resume) and alone may exceptionally cancel an In Examination Appointment with a recorded reason; this preserves its Visit and terminal status under BR-005.
+**BR-017** — Doctor retains own clinical workflow and sole Pause/resume, per-case extra-capacity confirmation and exceptional In Examination cancellation authority. Authorized Receptionist admission and administrative completion follow FR-026/034 without Doctor impersonation. Exceptional cancellation preserves Visit/terminal status under BR-005; it is not delegated by routine operational authority.
 
 **BR-018** — Doctor cancellation records its reason and notifies clinic Receptionist in-app; it never sends a patient WhatsApp/SMS message.
 
@@ -413,9 +425,9 @@ These rules are normative. A product question marked OPEN cannot be answered by 
 
 **BR-024** — All MVP clinic prices use EGP. Emergency is a New Examination at standard base (except authorized non-Urgent reasoned discount/free). Urgent is a separately enabled fixed premium, with neither base nor final net at/below standard New Examination base. Only non-Urgent may be Free. Monetary calculations use decimal, currency precision and final-net rounding, with valid discounts not negative nor above base.
 
-**BR-024a** — Only Owner may enable Urgent after configuring standard base, strictly greater Urgent base and valid operating periods. Server ensures discounted Urgent net remains strictly above standard base, refuses free Urgent, invalid periods and invalid premium; snapshots remain frozen after configuration edits. Changes to standard base that break premium are REJECTED until owner corrects/disables Urgent expressly.
+**BR-024a** — Owner controls Urgent enablement after valid standard/premium base and operating-period configuration; Manager settings access requires specifically approved Owner delegation under BR-036, not an automatic grant. Server ensures discounted Urgent net remains strictly above standard base, refuses free Urgent, invalid periods and invalid premium; snapshots remain frozen. Invalidating standard-base edits are rejected until an authorized explicit premium correction/disablement.
 
-**BR-025** — All confirmation-time prices are immutable EGP decimal snapshots. Monetary operations use a consistent final-net rounding rule, with no floating-point arithmetic, no negative or above-base discounts; reject unsafe invalid requests. Confirmed preferential Follow-up freezes Doctor source Visit eligibility, effective policy and any authorized role-attributed new-booking date exception with its deadline, which cannot be retroactively shortened; subsequent reschedule extensions remain Doctor-reasoned and audited.
+**BR-025** — All confirmation-time prices are immutable EGP decimal snapshots. Use consistent final-net rounding, no floating-point, negative or above-base discounts. Follow-up freezes effective source/policy eligibility and any actual-actor date exception/deadline; never retroactively shorten/reprice it. Later justified audited extensions are separate append-only evidence, available to all authorized staff subject to BR-002a/c's Doctor precedence, not a rewrite of the frozen snapshot.
 
 **BR-026** — Clinic service value is NOT payment collection. Patient/clinic payment collection, status, receipts and payment gateways are excluded. SaaS tenant subscriptions, paid self-registration and checkout are independently DEFERRED; no subscription revenue or pilot payment status appears in completed examination value.
 
@@ -437,15 +449,15 @@ These rules are normative. A product question marked OPEN cannot be answered by 
 
 **BR-035** — User accounts must be checked at operation time; account disable or permission revocation immediately prevents protected operations and invalidates active access. Password reset requires verified primary email, single-use expiring reset link and abuse throttling.
 
-**BR-036** — Owner manages opt-in privileges per Receptionist for bulk_reschedule. Default no special bulk grant; do not implicitly inherit from ordinary booking or cancel rights. No reception admin-settings delegation in MVP.
+**BR-036** — Doctor remains Owner/default Administrator and alone grants/revokes explicit audited operational administration delegation to an existing Receptionist. Manager may exercise only specifically approved Owner-granted settings/actions; exact allowlist and subsequent-staff-management scope await §12.3 approval. Ownership, initial staff creation, delegation control, clinical authorship, Doctor Pause/case confirmations and future subscription ownership never transfer. Five universal operations are independent of delegation; no separate bulk_reschedule permission. Check live grants and invalidate access immediately on revocation.
 
 **BR-037** — Patient identity uses stable unique record IDs; both raw and normalized phone variants may be stored. Egypt is default country for parse. Duplicate patient matches alert but do not force merge; update one selected patient only unless each other update is separately confirmed.
 
-**BR-038** — Archived patient is hidden from the default active directory, can be read/exported by authorized Owner and cannot be given a new appointment until authorized unarchive; previous medical history cannot be generally deleted.
+**BR-038** — All active authorized clinic staff may archive/unarchive with actor/role/tenant/time audit and Patient lifecycle serialization. Archive hides from default active directory and blocks new Appointment IDs, including replacements, until unarchive; never deletes history or implicitly cancels existing appointments. Previously confirmed check-in/admission/same-ID reschedule remain eligible under ordinary guards. In-app reads remain role-filtered; full single-patient export follows BR-040, including archived patients.
 
-**BR-039** — Attachment access must check authenticated tenant + resource + field role before upload, preview or download. Allowed MIME, size and malware scanning are enforced; links short lived and private. Allowed type/size numbers are part of a security-release configuration, not free-form user-supplied.
+**BR-039** — Attachment access checks live authenticated tenant + resource + field role at upload, preview and retrieval; full medical export does not authorize unrestricted original-attachment downloads. Allowed MIME/size and malware scanning apply; links private, bounded and protected. Export includes a separate manifest, not embedded attachment files. Limits remain security-release decisions, not user-supplied or invented values.
 
-**BR-040** — An Owner patient export covers ONE patient only, includes structured authorized history in PDF/CSV and an attachment manifest; original attachments remain a separate protected download. Every export produces sensitive-event audit.
+**BR-040** — All active authorized clinic staff may export ONE patient's FULL medical record (permitted clinical history, readable PDF/structured CSV) plus separate attachment manifest, with no other patient/tenant data or bulk mode. Exporter necessarily can read the downloaded full record; never label it redacted or extend that permission to general clinical UI/editing. Require specified legitimate purpose, intended recipient and identity/authority verification evidence at handoff; internal Owner permission alone is not patient consent/legal basis. Immutable sensitive audit records tenant/patient, actual actor/role/time, purpose, recipient/verification evidence and action/result linkage without unnecessary PHI duplication. Create server-side private encrypted output; escape CSV formulas; require protected bounded single-use retrieval with live staff/tenant/resource recheck, including disablement/revocation. Attachment originals retain separate class/access checks. OPEN-OPS-03 requires written Egypt-specific disclosure/privacy/legal review before production; no unverified HIPAA or Egyptian compliance claim, mandated consent format, document retention or numerical timeout.
 
 **BR-041** — A Receptionist can upload handwritten prescription photos as authorized attachment, with linked patient and visit; cannot edit Doctor-authored diagnosis/prescription instructions. No native E-Prescription or generated standalone digital prescription in MVP.
 
@@ -459,7 +471,7 @@ These rules are normative. A product question marked OPEN cannot be answered by 
 
 **BR-046** — Bulk Cancellation ONLY is deferred. Bulk Reschedule uses preview with live server version, typed confirmation and all-or-none commit for eligible selected. If Bulk Cancellation is later introduced, revision mismatch requires new preview and confirmation (recorded deferred policy P1-14-C).
 
-**BR-047** — Queue lane independence: lane choice itself does not require Doctor exceptional-admission permission; ordinary selected-lane head admission is valid even if the other lane has higher apparent clinical urgency. Receptionist cannot skip an eligible head WITHIN either lane. Emergency within-lane FIFO is server-issued and authoritative. One Doctor Pause, one configured In Examination capacity, and one shared admission concurrency boundary govern both lanes.
+**BR-047** — Lane choice itself is not an exception: either lane head may be admitted independently of the other lane. Emergency FIFO remains server-authoritative ordinary ordering; all admission-authorized staff may explicitly justify/audit a within-lane non-head exception under BR-011c. Doctor Pause, shared capacity and Doctor per-case extra-admission confirmation remain binding across both lanes.
 
 **BR-048** — Flexible calendar rollover: Cairo midnight never automatically ends service for a still-Waiting patient or an In Examination Visit, nor pushes them into a fresh date lane. Display older Waiting as dated carry-over requiring review and explicit lane/service-day selection; if attendance is no longer valid, staff must reason-cancel or cross-day reschedule, with new check-in on the new date. Where actual physical attendance continues into the next calendar day, authorized staff may admit from the original dated lane after explicit presence reconfirmation, preserving original service date and shared Doctor capacity. No invisible queue carry-over or implicit change to today's Routine positions.
 
@@ -484,11 +496,11 @@ These rules are normative. A product question marked OPEN cannot be answered by 
 | Paid Urgent | OFF pending valid fixed premium/working periods | Premium base and net > standard New Examination |
 | Routine Waiting order | Preliminary booked-number default, or check-in FIFO | Applied next operating day on edits |
 | Late depth | Five Routine Waiting patients | Configurable; manual justified placement within Routine |
-| Admission actors | Doctor + Receptionist (Both) | Current role/permission and live queue head |
+| Admission actors | Doctor + Receptionist (Both) | Current mode/authorization, live lane head or explicit justified audited exception |
 | Concurrent examination capacity | One | Doctor per-case confirmation beyond one |
-| Follow-up default | Owner-configurable inclusive clinic-local duration, initially completion day zero through day seven | Doctor-controlled Visit decisions; Doctor reasoned or Receptionist independently authorized date-specific new-booking exception (Receptionist reason optional); audit mandatory |
+| Follow-up default | Owner-configured inclusive duration, initially completion day zero through seven; no Doctor decision required | All-staff decisions/extensions and separate new-date exceptions; explicit Doctor OPTED_OUT/DEADLINE precedence, actual-actor audit and frozen claims |
 | Medical record currency | EGP service value only | Not collected money |
-| Receptionist bulk permission | False unless Owner enables per user | Only bulk_reschedule; no bulk cancel MVP |
+| Receptionist operational delegation | None unless explicitly Owner-granted within approved scope | Does not gate five all-staff operations; no separate bulk_reschedule flag; bulk cancel remains deferred |
 | Browser push | Opt-in on Doctor device | At most patient name; in-app richer authorized detail |
 | Clinic tenant provisioning | Restricted audited internal CLI/API + first-owner invitation | MVP, no full SaaS admin dashboard |
 | SaaS self-registration/subscriptions/trials/discounts | All post-MVP | Commercial policy adopted before paid SaaS launch |
@@ -500,7 +512,7 @@ These rules are normative. A product question marked OPEN cannot be answered by 
 3. **Live Reception / Queue** — main Paid Urgent/Routine and visibly separate Emergency lane, true waiting positions vs booking numbers, late-depth, Doctor Pause/capacity, authorized admission, Doctor alert.
 4. **Visit Detail / Clinical Documents** — Doctor examination, diagnosis and notes, findings, report and handwritten-prescription image attachments; no structured E-Prescription composition/print/PDF.
 5. **Patients Directory / Patient Detail** — normalized phone family chooser, independent medical history, archived filter and attachment access based on field-level grants.
-6. **Reception Staff Management** — Owner manages Receptionist identities, disables/reset permissions, optional per-user bulk reschedule permission.
+6. **Reception Staff Management** — Owner manages Receptionist identities and explicit operational delegation; Manager settings/subsequent staff controls require the approved allowlist, not self-grants. No optional bulk permission.
 7. **Clinic Settings** — working calendar/time, booking mode, price/discount, Urgent, priority, follow-up and operational controls within a single Doctor/branch; fixed EGP/Cairo displayed read-only.
 8. **Tenant bootstrap (internal operations; NOT a clinic UI view)** — authenticated operator CLI/internal admin API with secure first-Owner invitation, tenant suspension/reactivation and reasoned audit; no SaaS Admin Dashboard, signup or billing screens in MVP.
 
@@ -508,29 +520,29 @@ All clinic-owned text supports Arabic/RTL and English/LTR, including validation,
 
 ## 9. Acceptance criteria — regression and new decisions
 
-Legacy scenarios are rewritten to reflect the completed workbook plus the four explicit 19 October decisions. Every active FR/BR needs positive/negative tests and concurrency/security tests where applicable. Only defined production-readiness numerical/legal gates remain open; no unresolved Emergency/SaaS/Bulk/day-close product interpretation blocks MVP design.
+Legacy scenarios reflect the workbook and approved October/November decisions. Every active FR/BR needs positive/negative and applicable race/security tests for Doctor, Manager and ordinary Receptionist. Product grants are settled except the bounded contract questions in §12.3; production numerical/legal gates remain open. Historical CI proves only the implemented baseline, not this amendment.
 
 **AC-01** — tenant isolation Given separate Organizations A and B and an authenticated A clinic user, when B patient IDs, documents, search, export or bookings are requested, then no B information is disclosed or changed. Authorized within-A access still works.
 
-**AC-02** — combined role / clinical restriction Given the single Doctor+Owner/Admin, clinical edit and Owner export/archive succeed within clinic after authorization. Only Doctor authority can cancel an In Examination Appointment or later correct its retained Visit. A Receptionist attempting either action, changing diagnosis/prescription or exporting receives denial; allowed preliminary intake/upload succeeds.
+**AC-02** — Doctor clinical editing succeeds; both Manager and ordinary authorized Receptionist succeed at the five §3 operations and administrative completion after actual examination. Archive/export need no managerial delegation; full export requires BR-040 purpose/handoff verification. Receptionist diagnosis/treatment/notes editing, exceptional In Examination cancel, Doctor impersonation, Pause/case-approval changes and ungranted settings/staff administration fail. Initial creation and delegation control remain Owner-only; revoke/disable is effective immediately.
 
 **AC-03** — Given two distinct patients with the same normalized Egyptian family phone, search shows both without merging histories. Age-only registration saves declared age and its reference date, not an invented DOB; duplicate names warn without blocking.
 
 **AC-04** — appointment vs Visit Given a Booked then Waiting patient, the system keeps an Appointment and queue status without treating an examination as completed. Admission begins a clinical Visit; if the Doctor then cancels In Examination, the Visit, documentation and audit remain available for authorized read/Doctor correction without converting the Appointment to Completed. A Completed Appointment cannot reopen; later Doctor clinical edits remain audited.
 
-**AC-05** — terminal cases Given an In Examination Appointment, only its Doctor may exceptionally cancel with a reason; attempts by Receptionist or other unauthorized actors fail. After that cancellation, Booked/Waiting rollback, rescheduling, reopening and completion all fail; any later care requires a new Appointment. Existing Visit and clinical/audit history survive, and a later Doctor correction records old/new values, actor and timestamp immutably. Other Cancelled/No-show appointments remain terminal; Completed cannot transition.
+**AC-05** — Doctor completion or authorized Receptionist administrative attestation after actual examination sets In Examination → Completed with retained Visit and actual actor/role/time/tenant audit, no fabricated clinical notes/Doctor decision and no seventh state. False/stale/wrong-state completion and completion-vs-cancel/duplicate races cannot commit twice. Only Doctor may exceptionally cancel with reason; Receptionist attempts fail. Cancelled and Completed never reopen/reschedule; retained Visit Doctor corrections preserve immutable old/new actor/time audit.
 
-**AC-06** — Completed Routine, Medical Emergency or Paid Urgent New Examination can qualify preferential Follow-up through the clinic's current inclusive default window (initially day seven), with a recorded Doctor source Visit eligibility decision. Beyond the clinic-default window, an authorized Doctor may approve a reasoned date-specific exception, or an authorized Receptionist may independently approve the selected new-booking date with optional reason; both require immutable actor/role/date/policy/source audit. A Receptionist cannot modify Doctor clinical decisions or override opt-out. Confirmed claims survive later prospective policy change; at most one active and one Completed; an already-confirmed booking moved beyond its frozen deadline still requires prior Doctor-audited extension.
+**AC-06** — Completed qualifying New Examination, including administratively attested completion without a Doctor decision, uses current clinic policy for fresh eligibility. Doctor, Manager and ordinary Receptionist source decisions and distinct confirmed-claim extensions record actual actor/role audit, never forged Doctor authorship. Doctor reasoned or independent Receptionist optional-reason new-date exception succeeds only without a conflicting explicit Doctor decision. Each Receptionist path attempting to replace/override/bypass Doctor OPTED_OUT/DEADLINE or extend beyond it fails; authenticated Doctor revision succeeds with provenance/concurrency checks. Confirmed evidence/price survives prospective change; separate justified extension precedes an outside-deadline move. Single-use, release/rebook current policy/price and races remain enforced.
 
 **AC-07** — Reject forged/negative money, Free Urgent or Urgent discounted net less than/equal standard base. EGP immutable price snaps survive setting changes; invalid standard price change that breaks enabled Urgent is rejected. Completed Examination Value includes only Completed service snapshots and never implies patient collection or SaaS subscription revenue.
 
-**AC-08** — Routine booked-turn progression is advanced only by ordinary Routine-head admission. Separate Emergency activity and Paid Urgent admission do not change main-lane order or routine cursor; Doctor exceptional non-head admissions are audited and do not penalize still-Waiting lower-number Routine patients. With E1 waiting in Emergency and U1/R1 in main, Receptionist can lawfully admit either E1 or the MAIN lane head U1 (when capacity permits), but cannot choose E2 before E1 or R1 before U1.
+**AC-08** — Only ordinary MAIN Routine-head admission advances Routine cursor. Emergency/Urgent or any actor's exceptional admission does not. Doctor, Manager and ordinary Receptionist may admit E1 or U1 ordinarily, or E2/R1 as explicit justified audited non-head exceptions in the chosen lane when current mode and all safeguards permit. Missing justification, stale revisions or wrong lane/day fail without Visit/cursor mutation.
 
 **AC-09** — For selected same-day Booked/Waiting Routine and excluded In Examination/Urgent/terminal records, bulk RESCHEDULE shows eligible/excluded with reasons and commits all eligible selected changes or none on conflict/staleness. Bulk Cancellation is absent from MVP UI and APIs; authorized individual cancel remains.
 
 **AC-10** — Dashboard clinic-local service-day KPIs, trends, patient throughput and EGP Completed Examination Value derive from a defined Metric Dictionary. Service-date and activity-date measures are separately labeled; no cross-tenant or cross-currency aggregation.
 
-**AC-11** — Cross-tenant patient and file access and unauthorized PDF/CSV export fail. Owner can export one patient, with PDF/CSV structured info and attachment manifest; attachments require separate protected links. All Doctor clinical corrections and sensitive operations preserve appropriate audit. Backup and restore gates are enforced before production.
+**AC-11** — Doctor, Manager and ordinary authorized Receptionist may export one patient's full PDF/CSV medical file plus separate manifest under BR-040. Wrong-tenant, disabled, missing specified purpose or missing recipient/authority verification at handoff fail; revoked/expired/replayed retrieval fails. Full clinical history is present in downloaded output, not redacted to intake; general in-app Doctor narrative and original attachments remain independently restricted. Immutable sensitive audit, safe CSV and private delivery are verified; production legal/backup gates remain OPEN until evidence.
 
 **AC-12** — Authenticated in-app events contain authorized operational detail and are emitted post-commit only. Browser push on an opted-in Doctor device may contain patient NAME only, never age/diagnosis; disabled accounts lose ability to receive current protected details and subscriptions are revoked. No patient WhatsApp/SMS.
 
@@ -538,11 +550,11 @@ Legacy scenarios are rewritten to reflect the completed workbook plus the four e
 
 **AC-14** — Default Open day-only without set closing time, exact-time only when configured; Egypt/Cairo fixed clinic local time and EGP fixed currency. Routine walk-in OFF, Urgent OFF until valid premium/working period, independent Emergency FIFO lane, admission actors Both, capacity one. No auto No-show without explicit cutoff, but dated overdue review and audited manual verified-absence No-show are available.
 
-**AC-15** — E1 then E2 in Emergency uses FIFO; U1 before R1 in main. Authorized Receptionist may select Emergency head E1 or main head U1; denies E2 while E1 waits or R1 while U1 waits. Choosing main does not reorder Emergency and choosing Emergency does not change Urgent/Routine. Doctor explicit within-lane non-head override records justification, and both lanes obey shared Pause/capacity.
+**AC-15** — Emergency FIFO E1/E2 and main U1/R1 remain ordinary order; either head can be chosen without affecting the other lane. All admission-authorized staff may select E2/R1 exceptionally only with explicit justification and immutable actual-actor audit. Both ordinary and exceptional paths enforce selected lane/day, Waiting/presence, current mode/revisions, Doctor Pause/shared capacity and per-case extra-capacity confirmation.
 
 **AC-16** — A physically present enabled paid Urgent uses new same-day Appointment, immutable EGP premium and Waiting entry atomically. Existing counted Routine Booked/Waiting requires explicit atomic cancel-and-replace; failures rollback. Emergency is a separate standard-price New Examination, and completed New Examinations in either lane may be Follow-up sources.
 
-**AC-17** — Denial/race tests reject cross-tenant IDs, forged lane/priority, unauthorized Receptionist Doctor-exception, stale lane revisions and duplicate Visit/capacity bypass. Simultaneous E1 admission and U1 admission from independent lanes serialize against the SAME Doctor capacity; only one can succeed when capacity is one. Arrivals and admissions in each lane rederive that lane head and never reorder the other lane.
+**AC-17** — Deny cross-tenant/forged lane or priority, missing non-head justification, false Doctor actor, stale revisions and duplicate Visit/capacity bypass. Simultaneous ordinary/exceptional admissions by any staff across both lanes serialize against SAME Doctor capacity; one succeeds at capacity one. Recompute lane head and audit any justified exception; no other lane reorder or exceptional Routine-cursor advancement.
 
 ### 9.1 Additional acceptance cases from owner decisions
 
@@ -550,7 +562,7 @@ Legacy scenarios are rewritten to reflect the completed workbook plus the four e
 
 **AC-19** — An optional staff-initiated guided close for a selected service date previews Booked, Waiting and In Examination. Closing cannot finalize while Waiting remains on that date; each Waiting must be admitted, cancelled with reason or cross-day rescheduled. In Examination continues with original service date and clinical history. By default no configured closing time exists, and midnight alone changes no status.
 
-**AC-20** — An Emergency New Examination receives standard EGP pricing; its independent FIFO lane does not change the main Routine/Urgent positions or routine cursor. Either lane may be selected for ordinary admission without global priority; its server-validated head and shared Pause/capacity are always enforced.
+**AC-20** — Emergency New Examination uses standard EGP pricing; independent FIFO activity does not alter main positions/cursor. Either lane's server-validated head may be admitted ordinarily without global priority, or authorized staff may explicitly justify/audit a within-lane non-head exception. Shared Pause/capacity and all FR-026 safeguards remain enforced.
 
 **AC-21** — A restricted platform provisioning operator creates a clinic tenant and sends an expiring, single-use verified-email invitation to its first Doctor/Owner. Without that invitation and successful acceptance there is no self-registration path or paid activation; authorized pilot tenant access requires no subscription plan, gateway or checkout. Platform operator access to patient clinical data is DENIED.
 
@@ -562,23 +574,23 @@ Legacy scenarios are rewritten to reflect the completed workbook plus the four e
 
 **AC-25** — When user changes Routine priority or late-depth during active day, current positions do not change; new policy applies from next Cairo clinic service day with both versions audit-visible.
 
-**AC-26** — Under Receptionist-only admission and increased examination capacity, extra admission fails without individual Doctor confirmation and succeeds only after fresh approval plus head/Pause/revision/capacity check.
+**AC-26** — Under Receptionist-only admission and increased capacity, extra admission fails without individual Doctor-issued confirmation. Success needs fresh approval plus selected lane/day head or justified audited exception, Waiting/presence, current mode/revisions/Pause/capacity checks; Manager authority cannot substitute for Doctor confirmation.
 
-**AC-27** — With the initial seven-day clinic policy, permit day seven and reject day eight **unless** an authorized date-specific new-booking exception from Doctor or Receptionist is committed with mandatory audit. When the Owner changes the clinic duration, use that effective inclusive last day for new claims, including after a release, rather than always day seven. Completion day is day zero; a selected date before completion is never eligible. A Receptionist's exception reason may be absent without suppressing audit; no exception bypasses a recorded Doctor opt-out or a consumed source.
+**AC-27** — Initial policy allows day seven, denies day eight absent authorized new-date exception; current clinic duration applies to fresh claims including after release. Completion is Cairo day zero; pre-completion dates fail. No Doctor decision/DEFAULT uses policy; explicit Doctor OPTED_OUT/DEADLINE wins over all Receptionist decisions, exceptions and extensions, including a concurrent Doctor revision. Test a date inside and beyond Doctor deadline, opt-out, stale policy/source/claim revision, optional Receptionist new-date reason with mandatory audit, actual actor, frozen price/deadline, and release/rebook without carrying old extensions. Only authenticated Doctor may revise their restriction.
 
 **AC-28** — If Follow-up claim is unavailable, service is booked as New Examination; the app cannot create an independent standard-price nonqualifying Follow-up.
 
 **AC-29** — A receptionist editing diagnosis/prescription text is denied, but permitted upload of scanned handwritten prescription attached to authorized patient/visit works with malware/MIME/size checks and tenant access.
 
-**AC-30** — Owner archives patient, default active directory hides patient, subsequent booking is rejected until unarchive. No merge/deletion of clinical history; same-name separate records remain separate.
+**AC-30** — Doctor, Manager and ordinary authorized Receptionist archive/unarchive with immutable audit and lifecycle locks. Archive hides active directory entry and blocks new Appointment IDs/replacements; it neither deletes history nor implicitly cancels/blocks valid existing check-in, admission or same-ID reschedule. Test archive-vs-new-booking/existing-operation races and wrong-tenant/disabled denial.
 
-**AC-31** — Owner export for exactly one patient yields a private PDF/CSV plus manifest; exporting all clinic patients or downloading unscoped attachments is unavailable; sensitive audit is recorded.
+**AC-31** — Each active authorized clinic staff variant exports exactly one patient's FULL medical PDF/CSV and separate attachment manifest with specified purpose and recipient identity/authority verification at handoff. Audit actor/role/patient/time/purpose/verification/action immutably without excess PHI. Formula-safe CSV, encrypted private bounded single-use retrieval and authorization recheck pass; disabled/revoked/wrong-tenant, missing purpose/verification, bulk/unscoped attachment and public URL paths fail. Export exposes full downloaded clinical record, not general UI/edit rights. OPEN-OPS-03 legal/privacy release signoff remains unverified.
 
 **AC-32** — All monetary calculations avoid binary floating-point, apply consistent EGP precision and final net rounding. Discount negative, >base, free Urgent and loss of premium fail server validation.
 
 **AC-33** — At default configuration no closing time or automatic No-show is active. After explicit cutoff, unarrived Booked may become No-show and concurrent check-in wins or fails atomically, never both.
 
-**AC-34** — Receptionist with no bulk_reschedule grant is denied; authorized eligible same-day bulk reschedule is atomic. No bulk cancellation UI/API is exposed in MVP.
+**AC-34** — Doctor, Manager and ordinary authorized Receptionist may execute eligible same-day bulk reschedule without separate bulk_reschedule grant. Disabled/wrong-tenant, stale preview, ineligible state or destination conflict denies all selected moves; typed confirmation and live authorization remain required. Bulk cancellation UI/API stays absent.
 
 **AC-35** — Doctor push contains at most name and is never sent without active device opt-in; age and diagnosis remain available only in authorized in-app view. Withdrawal disables future protected notification delivery.
 
@@ -587,7 +599,7 @@ Legacy scenarios are rewritten to reflect the completed workbook plus the four e
 **AC-37** — Dashboard booked/cancelled service-date count is distinct from cancellation activity by event date; original cancelled/replaced bookings are counted per Metric Dictionary, and value never includes uncompleted services.
 
 
-**AC-38** — Independence of admission lanes: with E1/E2 Waiting in Emergency and U1/R1 Waiting in main, admitting U1 is allowed (subject to Pause/capacity) even if E1 waits; admitting E1 is allowed even if U1 waits. E2/R1 attempted as ordinary Receptionist admissions fail until their own lane head is removed. Main dynamic ranks and routine cursor do not change when an Emergency admission succeeds. The Doctor can explicitly justify a within-lane exceptional non-head admission, but lane selection never requires an exception.
+**AC-38** — Either lane head may be admitted while the other waits. E2/R1 attempted as ordinary admissions fail; Doctor, Manager or ordinary Receptionist explicit justified non-head exceptions may succeed only inside chosen lane under all FR-026 guards. Emergency leaves main ranks/cursor unchanged; all exceptional admissions leave Routine cursor unchanged. Lane choice alone never requires exception; Pause/capacity/presence/concurrency denials apply to every actor.
 
 **AC-39** — A uniquely authorized provisioning operator invokes an authenticated internal bootstrap flow, creates tenant Organization and first Doctor/Owner invitation once, records actor/time/reason, and establishes access only after secure expiring invitation acceptance. A clinic staff user or unauthenticated caller cannot invoke tenant bootstrap. A provisioning operator cannot read patient, Visit or attachments in any tenant. Duplicate/replayed invites fail safely.
 
@@ -647,15 +659,26 @@ Operational+clinical database and medical attachments must be backed up and reco
 |---|---|---|
 | OPEN-OPS-01 | Approved numeric database/attachment backup schedule, retention, test restore evidence, owner and procedure | Production with patient data |
 | OPEN-OPS-02 | Approved numeric RPO/RTO and demonstrated recovery | Production with patient data |
-| OPEN-OPS-03 | Egypt healthcare/privacy/legal review: medical data residency, retention/access requirements and documented authorization | Production with patient data |
+| OPEN-OPS-03 | Written Egypt healthcare/privacy/legal review: residency, retention/access/disclosure basis, full staff medical exports, legitimate purpose and recipient/authority verification process; internal Owner permission is not consent or legal certification | Production with patient data; no unverified HIPAA/Egypt compliance claim |
 | OPEN-FILES-01 | Approved MIME extensions, per-file/count/size limits, malware scan failure policy and storage quotas | Production medical attachment upload |
 | FUTURE-SAAS-COMMERCE | Approve SaaS subscription models, trials, platform discounts, pricing, invoicing, gateway/provider, taxes, payment failure/grace/cancel and legal obligations | First paid SaaS subscription launch, NOT non-billed MVP clinic deployment |
 
 These are separate production/commercial release gates, not instructions to invent numeric policies. This v1.0 Product Contract is **approved as of 19 October 2026**; its approval does not waive any remaining gate or authorize implementation.
 
+### 12.3 Bounded amendment contract work — Issues #24 / #25 remain OPEN
+
+| Unresolved detail | Safe boundary pending approval / review | Owner, trigger and closure |
+|---|---|---|
+| Exact Manager settings allowlist and management of subsequent Receptionist accounts | Delegation model approved, but no blanket settings/staff/finance/privacy grant; initial staff creation and delegation control remain Owner-only. Existing Owner-only setting wording is the fallback until that specific setting is approved for delegation | Product Owner + Security/domain review before delegation implementation; close with explicit operation/field matrix, revocation and escalation-denial acceptance |
+| Source-decision / confirmed-extension minimum reason/evidence and DTO/storage migration contracts; actual-examination attestation evidence | All-staff permissions and Doctor precedence are approved. Retain justified immutable extension audit; do not infer that optional Receptionist **new-booking** reason applies to these distinct actions, forge clinical revisions or rewrite published migrations | Product Owner for minimum evidence/reason approval; domain/security/database engineering for contract/forward-only migration review before affected D-07/D-08/B-10/B-16/B-18 work. Close with reviewed actor/source/policy/claim/revision contracts and positive/denial/race proof |
+
+Existing Doctor non-default source-decision justification requirements are retained; only Receptionist **NEW-booking date exception** reason is expressly optional. The remaining contract review must preserve those established Doctor safeguards rather than infer their removal from the permission expansion.
+
+These bounded questions block the affected implementation contracts, not the approved five-operation grants. No exceptional Receptionist In Examination cancellation, Doctor capacity-confirmation delegation or Owner-activation bypass has been approved. Issues #24/#25 require downstream alignment, separately authorized implementation, exact-SHA PostgreSQL evidence, independent review and PO acceptance; this documentation action does not close them. Production-only gates remain tracked by Issue #18.
+
 ## 13. Decision register — all 47 completed workbook choices
 
-This register is included directly in the self-contained document. `Owner note` text is preserved from the filled workbook, but the four explicit follow-up clarifications of 19 October 2026 take precedence where they resolve previous conflicts. Selection letters alone do not authorize implementation.
+This is historical workbook evidence, not a second active requirement register. Verbatim selections/Owner notes are preserved; explicit 19 October and 3–4 November 2026 amendments above take precedence. In particular, older Doctor-only source/extension/non-head, Owner-only archive/export and optional bulk/no-delegation interpretations are superseded. Selection letters alone do not authorize implementation.
 
 ### P0-01 — سياسة تغيير العملة ومجموع القيمة المالية
 
@@ -693,6 +716,7 @@ This register is included directly in the self-contained document. `Owner note` 
 ### P1-02 — تفويض Bulk والإعدادات التشغيلية للاستقبال
 
 - **Selected option:** A. A — أعلام صلاحية لكل موظف يضبطها Owner مثل bulk_cancel/bulk_reschedule؛ لا تفويض للإعدادات الإدارية في MVP.
+- **Superseded (4 November 2026, #25):** no separate bulk_reschedule grant; optional explicit Owner delegation of approved operational settings is allowed under BR-036/§12.3. Bulk cancel remains deferred.
 
 ### P1-03 — سحب صلاحيات الجلسات والسياسات الأمنية
 
@@ -724,10 +748,12 @@ This register is included directly in the self-contained document. `Owner note` 
 ### P1-09 — متى وكيف تُسجّل موافقة الطبيب على خصم المتابعة؟
 
 - **Selected option:** C. C — قرار Visit يكفي ضمن المهلة الافتراضية؛ الحالات الاستثنائية تحتاج موافقة منفردة.
+- **Superseded in part (3–4 November 2026, #24/#25):** no mandatory Doctor source decision; current policy and all-staff source/date/extension authorities follow BR-002a/c with explicit Doctor precedence and actual actor audit.
 
 ### P1-10 — حدود السبعة أيام واحتساب تاريخ التأهيل
 
 - **Selected option:** A. A — تاريخ إكمال الكشف = اليوم 0، وآخر يوم مسموح نهاية اليوم المحلي السابع.
+- **Superseded in part (3 November 2026, #24):** day zero/Cairo inclusivity retained; seven is the initial Owner-configurable default, not a permanent limit.
 
 ### P1-11 — تأكيد الطبيب لإدخال مريض ثانٍ
 
@@ -740,6 +766,7 @@ This register is included directly in the self-contained document. `Owner note` 
 ### P1-13 — هل يسمح Doctor Exception بتجاوز Emergency؟
 
 - **Selected option:** A. A — نعم، وفق سياسة BR-011c الحالية وبسبب إلزامي وسجل أولوية وقت القرار.
+- **Current interpretation (4 November 2026, #25):** independent lanes have no global precedence; justified within-lane exceptions are available to all admission-authorized clinic staff, not Doctor-only.
 
 ### P1-14 — ذرّية Bulk Cancellation عند تغيّر الأهلية
 
@@ -787,6 +814,7 @@ This register is included directly in the self-contained document. `Owner note` 
 ### DATA-08 — سلوك أرشفة ملف المريض
 
 - **Selected option:** A. A — إخفاء من القائمة التشغيلية الافتراضية، منع حجز جديد حتى إعادة التنشيط، والسماح بالقراءة/التصدير للمالك.
+- **Superseded access scope (4 November 2026, #25):** all authorized staff may archive/unarchive and export a full single-patient record under BR-038/040; general clinical UI reads remain restricted and existing bookings are not cancelled.
 
 ### DATA-09 — تدقيق العمليات الطبية والعمليات الحساسة
 
