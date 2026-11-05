@@ -2,6 +2,7 @@
 
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
@@ -817,6 +818,87 @@ def test_default_claim_uses_live_followup_window_and_rebook_freezes_new_policy(
             source["day"] + timedelta(days=2),
             fresh_provenance,
             125,
+        )
+
+
+def test_zero_day_followup_policy_qualifies_and_confirms_only_completion_day(
+    appointment_storage,
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        assert (
+            append_version(
+                connection,
+                tenant,
+                "FOLLOWUP",
+                {"completion_day_zero": True, "last_day_inclusive": 0},
+                1,
+                actor_staff_id=str(doctor),
+            )
+            == 2
+        )
+        source = _source(connection, tenant, doctor)
+        provenance = _provenance(source, version=2)
+        now = datetime.now(UTC) + timedelta(seconds=2)
+        today = qualify_followup(
+            connection,
+            tenant,
+            source["patient"],
+            source["day"],
+            source["visit"],
+            1,
+            now,
+        )
+        assert today.outcome == "PREFERENTIAL"
+        assert today.approved_deadline == source["day"]
+        assert (
+            qualify_followup(
+                connection,
+                tenant,
+                source["patient"],
+                source["day"] + timedelta(days=1),
+                source["visit"],
+                1,
+                now,
+            ).outcome
+            == "FALLBACK"
+        )
+        with pytest.raises(DBAPIError) as rejected, connection.begin_nested():
+            _claim(
+                connection,
+                tenant,
+                source,
+                day_offset=1,
+                deadline=source["day"] + timedelta(days=1),
+                provenance=provenance,
+            )
+        assert rejected.value.orig.sqlstate == "23514"
+        accepted = _claim(
+            connection,
+            tenant,
+            source,
+            day_offset=0,
+            deadline=source["day"],
+            provenance=provenance,
+            price="45.00",
+        )
+        saved = connection.execute(
+            text("""
+                SELECT c.approved_deadline, c.completion_local_date,
+                       c.policy_snapshot, s.net_egp
+                FROM public.followup_claims c
+                JOIN public.appointment_price_snapshots s
+                  ON (s.organization_id, s.appointment_id) =
+                     (c.organization_id, c.appointment_id)
+                WHERE c.id=:claim AND c.organization_id=:tenant
+            """),
+            {"claim": accepted["claim"], "tenant": tenant},
+        ).one()
+        assert tuple(saved) == (
+            source["day"],
+            source["day"],
+            provenance,
+            Decimal("45.00"),
         )
 
 

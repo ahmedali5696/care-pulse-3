@@ -1,11 +1,12 @@
 """B-06 conflicting pricing transactions and immutable frozen-price evidence."""
 
-from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor
+from uuid import UUID, uuid4
 
 import pytest
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
-from carepulse.identity.authorization import AuthorizedStaff
+from carepulse.identity.authorization import AuthorizedStaff, protected_transaction
 from carepulse.identity.contracts import ContractError
 from carepulse.policies.pricing_contracts import PricingPatch
 from carepulse.policies.pricing_service import current_price_state, update_pricing
@@ -20,6 +21,16 @@ from test_appointment_persistence import (
 from test_appointment_persistence import (
     appointment_storage as appointment_storage,  # noqa: PLC0414 - fixture export
 )
+from test_patients import patient_backend as patient_backend  # noqa: PLC0414
+from test_pricing import (
+    _blocked_by,
+    _fresh_receptionist_session,
+    _owner_changes_manager,
+    _patch,
+    _pricing_evidence,
+    pricing_request,
+)
+from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 
 
 def _owner(tenant, staff):
@@ -72,6 +83,75 @@ def test_concurrent_owner_writes_same_revision_have_one_serial_winner(
             )
             == 2
         )
+
+
+@pytest.mark.parametrize("first", ["owner", "manager"])
+def test_live_owner_manager_followup_publication_serializes_stale_revision(
+    patient_backend, first
+):
+    clinic = patient_backend
+    _owner_changes_manager(clinic, True, 0)
+    manager = _fresh_receptionist_session(clinic, 1)
+    before = _pricing_evidence(clinic)
+    actors = {"owner": clinic.owner, "manager": manager}
+    first_body = {
+        **_patch(followup_last_day_inclusive=3),
+        "expected_followup_revision": 1,
+    }
+    second_body = {
+        **_patch(followup_last_day_inclusive=10),
+        "expected_followup_revision": 1,
+    }
+    second = "manager" if first == "owner" else "owner"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        with protected_transaction(
+            clinic.runtime,
+            actors[first],
+            clinic.config.policy.session_idle_minutes,
+        ) as (connection, live_actor):
+            published = update_pricing(
+                connection,
+                live_actor,
+                PricingPatch.model_validate(first_body),
+                str(uuid4()),
+            )
+            assert published["followup_revision"] == 2
+            holder = connection.scalar(text("SELECT pg_backend_pid()"))
+            future = pool.submit(
+                pricing_request,
+                clinic,
+                actors[second],
+                method="PATCH",
+                body=second_body,
+                key=str(uuid4()),
+            )
+            _blocked_by(clinic, holder)
+        status, response = future.result(timeout=30)
+    assert status == 409 and response["error"]["code"] == "STALE_REVISION"
+    after = _pricing_evidence(clinic)
+    assert after[0] == (("FOLLOWUP", 2, 2), ("PRICE", 1, 1))
+    assert after[1] == {
+        **before[1],
+        "versions": before[1]["versions"] + 1,
+        "audit": before[1]["audit"] + 1,
+        "receipts": before[1]["receipts"] + 1,
+    }
+    with clinic.migration.connect() as connection:
+        evidence = connection.execute(
+            text("""
+                SELECT actor_staff_id, actor_role
+                FROM public.sensitive_audit
+                WHERE organization_id=:tenant AND action='settings.pricing.update'
+            """),
+            {"tenant": clinic.tenant},
+        ).all()
+    assert evidence == [
+        (
+            UUID(actors[first].staff_id),
+            "DOCTOR_OWNER" if first == "owner" else "RECEPTIONIST",
+        )
+    ]
 
 
 def test_standard_raise_and_urgent_enable_cannot_publish_invalid_mixed_state(

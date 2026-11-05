@@ -188,6 +188,46 @@ def _fresh_receptionist_session(clinic, revision):
     )
 
 
+def _pricing_evidence(clinic):
+    """Inspect committed settings effects without role-filtered projections."""
+    with clinic.migration.connect() as connection:
+        heads = tuple(
+            connection.execute(
+                text("""
+                    SELECT kind, current_version, revision
+                    FROM public.clinic_policy_heads
+                    WHERE organization_id=:tenant AND kind IN ('PRICE', 'FOLLOWUP')
+                    ORDER BY kind
+                """),
+                {"tenant": clinic.tenant},
+            ).all()
+        )
+        counts = {
+            label: connection.scalar(
+                text(
+                    f"SELECT count(*) FROM public.{table} "
+                    f"WHERE organization_id=:tenant {condition}"
+                ),
+                {"tenant": clinic.tenant},
+            )
+            for label, table, condition in (
+                (
+                    "versions",
+                    "clinic_policy_versions",
+                    "AND kind IN ('PRICE', 'FOLLOWUP')",
+                ),
+                ("audit", "sensitive_audit", "AND action='settings.pricing.update'"),
+                ("outbox", "outbox_events", ""),
+                (
+                    "receipts",
+                    "idempotency_receipts",
+                    "AND operation='settings.pricing.update'",
+                ),
+            )
+        }
+    return heads, counts
+
+
 def _blocked_by(clinic, holder):
     deadline = monotonic() + 12
     with clinic.runtime.connect() as observer:
@@ -386,6 +426,126 @@ def test_manager_can_publish_pricing_and_followup_policy_in_one_transaction(
         assert audits == [(UUID(manager.staff_id), "RECEPTIONIST")]
 
 
+def test_owner_and_manager_followup_only_publications_enforce_both_revisions(
+    patient_backend,
+):
+    clinic = patient_backend
+    _owner_changes_manager(clinic, True, 0)
+    manager = _fresh_receptionist_session(clinic, 1)
+    initial, before = _pricing_evidence(clinic)
+    assert initial == (("FOLLOWUP", 1, 1), ("PRICE", 1, 1))
+
+    owner_body = {
+        **_patch(followup_last_day_inclusive=0),
+        "expected_followup_revision": 1,
+    }
+    status, owner_result = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=owner_body, key=str(uuid4())
+    )
+    assert status == 200, owner_result
+    assert (
+        owner_result["data"]["price_revision"],
+        owner_result["data"]["followup_revision"],
+        owner_result["data"]["followup_last_day_inclusive"],
+    ) == (1, 2, 0)
+
+    manager_body = {
+        **_patch(followup_last_day_inclusive=3),
+        "expected_followup_revision": 2,
+    }
+    key = str(uuid4())
+    status, manager_result = pricing_request(
+        clinic, manager, method="PATCH", body=manager_body, key=key
+    )
+    assert status == 200, manager_result
+    assert manager_result["data"]["followup_revision"] == 3
+    assert manager_result["data"]["followup_last_day_inclusive"] == 3
+    assert pricing_request(
+        clinic, manager, method="PATCH", body=manager_body, key=key
+    ) == (status, manager_result)
+
+    committed = _pricing_evidence(clinic)
+    assert committed[0] == (("FOLLOWUP", 3, 3), ("PRICE", 1, 1))
+    assert committed[1] == {
+        **before,
+        "versions": before["versions"] + 2,
+        "audit": before["audit"] + 2,
+        "receipts": before["receipts"] + 2,
+    }
+    for actor, payload in (
+        (
+            clinic.owner,
+            {
+                **manager_body,
+                "expected_price_revision": 0,
+                "expected_followup_revision": 3,
+            },
+        ),
+        (manager, {**manager_body, "expected_followup_revision": 2}),
+    ):
+        denied, response = pricing_request(
+            clinic, actor, method="PATCH", body=payload, key=str(uuid4())
+        )
+        assert denied == 409 and response["error"]["code"] == "STALE_REVISION"
+    assert (
+        pricing_request(
+            clinic,
+            manager,
+            method="PATCH",
+            body={**manager_body, "followup_last_day_inclusive": 4},
+            key=key,
+        )[0]
+        == 409
+    )
+    assert _pricing_evidence(clinic) == committed
+    with clinic.migration.connect() as connection:
+        actors = connection.execute(
+            text("""
+                SELECT actor_staff_id, actor_role
+                FROM public.sensitive_audit
+                WHERE organization_id=:tenant AND action='settings.pricing.update'
+                ORDER BY occurred_at, id
+            """),
+            {"tenant": clinic.tenant},
+        ).all()
+    assert set(actors) == {
+        (UUID(clinic.owner.staff_id), "DOCTOR_OWNER"),
+        (UUID(manager.staff_id), "RECEPTIONIST"),
+    }
+    assert len(actors) == 2
+
+
+def test_disabled_manager_cannot_recover_prior_followup_receipt(patient_backend):
+    clinic = patient_backend
+    _owner_changes_manager(clinic, True, 0)
+    manager = _fresh_receptionist_session(clinic, 1)
+    body = {
+        **_patch(followup_last_day_inclusive=5),
+        "expected_followup_revision": 1,
+    }
+    key = str(uuid4())
+    status, original = pricing_request(
+        clinic, manager, method="PATCH", body=body, key=key
+    )
+    assert status == 200, original
+    before = _pricing_evidence(clinic)
+    with clinic.migration.begin() as connection:
+        connection.execute(
+            text("""
+                UPDATE public.staff_accounts
+                   SET enabled=false, security_revision=security_revision+1
+                 WHERE organization_id=:tenant AND id=:staff
+            """),
+            {"tenant": clinic.tenant, "staff": UUID(manager.staff_id)},
+        )
+    for actor in (manager, _fresh_receptionist_session(clinic, 2)):
+        assert pricing_request(clinic, actor)[0] in (401, 403)
+        assert pricing_request(clinic, actor, method="PATCH", body=body, key=key)[
+            0
+        ] in (401, 403)
+    assert _pricing_evidence(clinic) == before
+
+
 def test_manager_cannot_remediate_noncanonical_legacy_price(patient_backend):
     clinic = patient_backend
     with transaction(clinic.runtime, clinic.tenant) as connection:
@@ -421,6 +581,125 @@ def test_manager_cannot_remediate_noncanonical_legacy_price(patient_backend):
     )
     assert status == 200, repaired
     assert repaired["data"]["standard_new_exam_egp"] == "100.12"
+
+
+@pytest.mark.parametrize("first", ["revoke", "receipt"])
+def test_manager_receipt_recovery_serializes_with_revoke(patient_backend, first):
+    clinic = patient_backend
+    _owner_changes_manager(clinic, True, 0)
+    manager = _fresh_receptionist_session(clinic, 1)
+    body = {
+        **_patch(followup_last_day_inclusive=6),
+        "expected_followup_revision": 1,
+    }
+    key = str(uuid4())
+    status, original = pricing_request(
+        clinic, manager, method="PATCH", body=body, key=key
+    )
+    assert status == 200, original
+    before = _pricing_evidence(clinic)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        if first == "revoke":
+            with protected_transaction(
+                clinic.runtime, clinic.owner, clinic.config.policy.session_idle_minutes
+            ) as (connection, _):
+                holder = connection.scalar(text("SELECT pg_backend_pid()"))
+                _manager_change(connection, clinic, False, 1)
+                future = pool.submit(
+                    pricing_request,
+                    clinic,
+                    manager,
+                    method="PATCH",
+                    body=body,
+                    key=key,
+                )
+                _blocked_by(clinic, holder)
+            denied, response = future.result(timeout=30)
+            assert denied == 401, response
+        else:
+            with protected_transaction(
+                clinic.runtime, manager, clinic.config.policy.session_idle_minutes
+            ) as (connection, live_actor):
+                holder = connection.scalar(text("SELECT pg_backend_pid()"))
+                future = pool.submit(_owner_changes_manager, clinic, False, 1)
+                _blocked_by(clinic, holder)
+                assert (
+                    update_pricing(
+                        connection, live_actor, PricingPatch.model_validate(body), key
+                    )
+                    == original["data"]
+                )
+            future.result(timeout=30)
+
+    assert (
+        pricing_request(clinic, manager, method="PATCH", body=body, key=key)[0] == 401
+    )
+    ordinary = _fresh_receptionist_session(clinic, 2)
+    assert (
+        pricing_request(clinic, ordinary, method="PATCH", body=body, key=key)[0] == 403
+    )
+    assert _pricing_evidence(clinic) == before
+
+
+@pytest.mark.parametrize(
+    "change, operation",
+    [("grant", "quote"), ("grant", "write"), ("revoke", "quote")],
+)
+def test_manager_grant_revoke_serializes_signed_pricing_operations(
+    patient_backend, change, operation
+):
+    clinic = patient_backend
+    body = _patch(standard_new_exam_egp="100.00")
+    assert (
+        pricing_request(
+            clinic, clinic.owner, method="PATCH", body=body, key=str(uuid4())
+        )[0]
+        == 200
+    )
+    if change == "revoke":
+        _owner_changes_manager(clinic, True, 0)
+        reader = _fresh_receptionist_session(clinic, 1)
+    else:
+        reader = clinic.receptionist
+    before = _pricing_evidence(clinic)
+    quote = {
+        "service_type": "NEW_EXAMINATION",
+        "discount_type": "NONE",
+        "discount_value": "0",
+    }
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        with protected_transaction(
+            clinic.runtime, clinic.owner, clinic.config.policy.session_idle_minutes
+        ) as (connection, _):
+            holder = connection.scalar(text("SELECT pg_backend_pid()"))
+            _manager_change(
+                connection, clinic, change == "grant", 0 if change == "grant" else 1
+            )
+            request = (
+                {"query": quote}
+                if operation == "quote"
+                else {
+                    "method": "PATCH",
+                    "body": {
+                        **_patch(followup_last_day_inclusive=5),
+                        "expected_price_revision": 2,
+                        "expected_followup_revision": 1,
+                    },
+                    "key": str(uuid4()),
+                }
+            )
+            future = pool.submit(pricing_request, clinic, reader, **request)
+            _blocked_by(clinic, holder)
+        status, response = future.result(timeout=30)
+    assert status == 401, response  # Signed session revision is stale after the change.
+    assert _pricing_evidence(clinic) == before
+
+    refreshed = _fresh_receptionist_session(clinic, 1 if change == "grant" else 2)
+    status, response = pricing_request(clinic, refreshed, query=quote)
+    assert status == 200, response
+    assert response["data"]["price_quote"]["net_egp"] == "100.00"
+    assert ("urgent_enabled" in response["data"]) is (change == "grant")
 
 
 @pytest.mark.parametrize("winner", ["revoke", "authorize"])
@@ -631,10 +910,14 @@ def test_unset_price_denies_quote_and_receptionist_cannot_patch(patient_backend)
 
 def test_operator_and_foreign_tenant_cannot_read_or_update_pricing(patient_backend):
     clinic = patient_backend
+    _owner_changes_manager(clinic, True, 0)
+    manager = _fresh_receptionist_session(clinic, 1)
+    before = _pricing_evidence(clinic)
     for forged_actor in (
         replace(clinic.owner, role="OPERATOR"),
         replace(clinic.owner, organization_id=str(clinic.other)),
         replace(clinic.receptionist, organization_id=str(clinic.other)),
+        replace(manager, organization_id=str(clinic.other)),
     ):
         for method, body in (
             ("GET", None),
@@ -647,6 +930,7 @@ def test_operator_and_foreign_tenant_cannot_read_or_update_pricing(patient_backe
                 body=body,
                 key=str(uuid4()) if method == "PATCH" else "",
             )[0] in (401, 403)
+    assert _pricing_evidence(clinic) == before
     with transaction(clinic.runtime, clinic.tenant) as conn:
         assert (
             conn.scalar(
