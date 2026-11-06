@@ -4,7 +4,7 @@
 
 **Created**: 2026-10-28
 
-**Status**: Planning baseline aligned on 2026-11-04 with current working-tree authorities and latest approved decisions in Issues #24/#25; awaiting independent review. The 2026-10-28 43/43 booking and 16/16 quality results and subsequent checked tasks/CI are historical evidence for their original contracts. Amended acceptance is UNVERIFIED; no implementation, commit or release is authorized by this alignment.
+**Status (2026-11-06):** Approved product rules remain unchanged. The completed 13-decision review is historical; the [final proposed M2/M3 engineering baseline and G1–G5 proof gates](m1-m3-technical-design-proposal.md#current-decision-baseline--final-proposed-engineering-disposition-2026-11-06) resolve current documentation choices. This is not independent Security/Clinical acceptance, verified DDL, implementation approval or proven populated migration. T121–T124 retain verified evidence in [quickstart](quickstart.md); T125–T139 and executable acceptance remain pending. The 2026-10-28 review/checked-task/CI evidence keeps its original scope. #13/#24/#25/#26 remain OPEN; no implementation or release authority follows.
 
 **Input**: User description: "Specify CarePulse 3 Wave 2 — Booking & Scheduling, as defined in docs/implementation-plan.md §7. Scope: D-06, D-07, D-08, D-11, and B-06 through B-10. Cover the approved pricing, work calendar, exact-time booking, routine booking, and preferential follow-up requirements, including the persistence foundations needed for later queue, admission, and clinical workflows. Preserve the approved Wave boundaries, Master Task IDs, dependencies, and business rules. Do not introduce unapproved requirements or policy decisions."
 
