@@ -12,6 +12,7 @@ from test_appointment_persistence import (
     _persist_with_status,
 )
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
+from test_identity_persistence import _staff, _user
 
 DAY = date(2026, 10, 27)
 NEXT_DAY = date(2026, 10, 28)
@@ -279,6 +280,68 @@ def test_review_amendments_append_history_and_stale_revision_cannot_overwrite(
                 {"tenant": tenant, "review": first.day_review_id},
             )
         assert immutable.value.orig.sqlstate == "23514"
+
+
+def test_verified_receptionist_can_record_initial_day_reviews_but_cannot_amend(
+    appointment_storage,
+):
+    runtime, migration, (tenant, _), _ = appointment_storage
+    with migration.begin() as connection:
+        user_id, email = _user(connection)
+        receptionist = _staff(connection, tenant, user_id, email, "RECEPTIONIST")
+
+    with transaction(runtime, tenant) as connection:
+        _as_actor(connection, receptionist)
+        reviewed = _review(connection, tenant, DAY, 0, "REVIEWED", "Initial review")
+        closed = _review(
+            connection, tenant, NEXT_DAY, 0, "FINAL_CLOSED", "Initial close"
+        )
+        assert reviewed.revision == closed.revision == 1
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            _review(
+                connection, tenant, DAY, 1, "FINAL_CLOSED", "Unauthorized amendment"
+            )
+        assert denied.value.orig.sqlstate == "42501"
+
+    with migration.connect() as connection:
+        evidence = connection.execute(
+            text("""
+                SELECT r.service_date, r.disposition, r.revision, r.actor_staff_id,
+                       r.occurred_at, h.disposition AS history_disposition,
+                       h.revision AS history_revision, h.actor_staff_id AS history_actor,
+                       h.occurred_at AS history_at, a.actor_staff_id AS audit_actor,
+                       a.actor_role, a.occurred_at AS audit_at
+                FROM public.day_reviews r
+                JOIN public.day_review_history h
+                  ON h.organization_id = r.organization_id
+                 AND h.day_review_id = r.id AND h.revision = r.revision
+                JOIN public.sensitive_audit a
+                  ON a.organization_id = r.organization_id
+                 AND a.id = r.audit_event_id AND a.id = h.audit_event_id
+                WHERE r.organization_id = :tenant
+                  AND r.service_date IN (:day, :next_day)
+                ORDER BY r.service_date
+            """),
+            {"tenant": tenant, "day": DAY, "next_day": NEXT_DAY},
+        ).all()
+        assert [
+            (row.service_date, row.disposition, row.revision) for row in evidence
+        ] == [
+            (DAY, "REVIEWED", 1),
+            (NEXT_DAY, "FINAL_CLOSED", 1),
+        ]
+        for row in evidence:
+            assert row.history_disposition == row.disposition
+            assert row.history_revision == row.revision
+            assert (
+                row.actor_staff_id
+                == row.history_actor
+                == row.audit_actor
+                == receptionist
+            )
+            assert row.actor_role == "RECEPTIONIST"
+            assert row.occurred_at == row.history_at == row.audit_at
+            assert row.occurred_at.microsecond == 0
 
 
 def test_day_reviews_enforce_tenant_actor_context_and_operator_denial(

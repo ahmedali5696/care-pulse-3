@@ -442,6 +442,12 @@ def upgrade() -> None:
                     RAISE EXCEPTION 'Stale day review revision'
                         USING ERRCODE = '40001';
                 END IF;
+                -- BR-049 permits separately audited management amendments;
+                -- BR-036 does not delegate this action to Receptionists.
+                IF actual_role <> 'DOCTOR_OWNER' THEN
+                    RAISE EXCEPTION 'Day review amendment requires clinic Owner'
+                        USING ERRCODE = '42501';
+                END IF;
                 day_review_id := prior_review.id;
                 next_revision := prior_review.revision + 1;
                 prior_state := jsonb_build_object(

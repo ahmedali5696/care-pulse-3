@@ -314,3 +314,115 @@ def test_direct_active_queue_entry_update_uses_same_barrier(
             )
             == 0
         )
+
+
+def test_direct_active_entry_insert_waits_for_barrier_before_rejecting_booked_source(
+    appointment_storage,
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        booked = _appointment(connection, tenant, doctor, status="Booked")
+        appointment = booked["id"]
+        patient = connection.scalar(
+            text("""
+                SELECT patient_id FROM public.appointments
+                WHERE organization_id=:tenant AND id=CAST(:appointment AS uuid)
+            """),
+            {"tenant": tenant, "appointment": appointment},
+        )
+        day_id = uuid4()
+        connection.execute(
+            text("""
+                INSERT INTO public.queue_days (
+                    id, organization_id, doctor_staff_id, service_date, lane,
+                    queue_policy_version, arrival_counter)
+                VALUES (:day_id, :tenant, :doctor, :day, 'MAIN', 1, 0)
+            """),
+            {"day_id": day_id, "tenant": tenant, "doctor": doctor, "day": DAY},
+        )
+
+    started = Event()
+    waiter_pid = []
+
+    def invalid_attendance():
+        with transaction(runtime, tenant) as connection:
+            waiter_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            # Satisfy D-06's counter precondition within this rollback-only attempt.
+            connection.execute(
+                text("""
+                    UPDATE public.queue_days
+                    SET arrival_counter=1, revision=revision+1
+                    WHERE organization_id=:tenant AND id=:day_id
+                """),
+                {"tenant": tenant, "day_id": day_id},
+            )
+            started.set()
+            connection.execute(
+                text("""
+                    INSERT INTO public.queue_entries (
+                        id, organization_id, queue_day_id, appointment_id,
+                        patient_id, doctor_staff_id, service_date, lane,
+                        arrival_sequence, attested_by_staff_id, attested_at,
+                        routine_rank, disposition)
+                    VALUES (:entry, :tenant, :day_id, CAST(:appointment AS uuid),
+                            :patient, :doctor, :day, 'MAIN',
+                            1, :doctor, clock_timestamp(), 1, 'ACTIVE')
+                """),
+                {
+                    "entry": uuid4(),
+                    "tenant": tenant,
+                    "day_id": day_id,
+                    "appointment": appointment,
+                    "patient": patient,
+                    "doctor": doctor,
+                    "day": DAY,
+                },
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with transaction(runtime, tenant) as holder:
+            holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
+            holder.execute(
+                text("""
+                    SELECT 1 FROM public.clinic_policy_heads
+                    WHERE organization_id=:tenant AND kind='SCHEDULE' FOR UPDATE
+                """),
+                {"tenant": tenant},
+            ).one()
+            pending = executor.submit(invalid_attendance)
+            assert started.wait(timeout=10)
+            blocked_sql = _observe_waiter(runtime, tenant, waiter_pid[0], holder_pid)
+            assert blocked_sql.startswith("INSERT INTO public.queue_entries")
+        with pytest.raises(DBAPIError) as denied:
+            pending.result(timeout=20)
+    assert denied.value.orig.sqlstate == "23514"
+    assert "Attestation requires Waiting actor evidence" in str(denied.value.orig)
+
+    with transaction(runtime, tenant) as connection:
+        assert (
+            connection.scalar(
+                text("""
+                SELECT status FROM public.appointments
+                WHERE organization_id=:tenant AND id=CAST(:appointment AS uuid)
+            """),
+                {"tenant": tenant, "appointment": appointment},
+            )
+            == "Booked"
+        )
+        assert (
+            connection.scalar(
+                text("""
+                SELECT count(*) FROM public.queue_entries
+                WHERE organization_id=:tenant AND queue_day_id=:day_id
+            """),
+                {"tenant": tenant, "day_id": day_id},
+            )
+            == 0
+        )
+        assert connection.execute(
+            text("""
+                SELECT arrival_counter, revision FROM public.queue_days
+                WHERE organization_id=:tenant AND id=:day_id
+            """),
+            {"tenant": tenant, "day_id": day_id},
+        ).one() == (0, 1)
