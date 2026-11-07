@@ -317,6 +317,7 @@ def test_failed_later_revision_rolls_back_and_keeps_d07(
         shutil.copytree(ROOT / "db/migrations", scripts)
         # This history test isolates D-07 -> a synthetic failing successor.
         # Exclude the real later D-08 head from the temporary migration tree.
+        (scripts / "versions/0027_d11_day_review.py").unlink()
         (scripts / "versions/0026_d07_completion_attestation.py").unlink()
         (scripts / "versions/0025_d06_queue_foundations.py").unlink()
         (scripts / "versions/0024_b06_followup_window.py").unlink()
