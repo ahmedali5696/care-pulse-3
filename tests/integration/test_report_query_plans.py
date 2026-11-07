@@ -158,12 +158,15 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
                   AND a.status=:status AND a.lane=:lane
             """,
             "active_queue_day_lane": """
-                SELECT e.id FROM public.queue_days q
-                JOIN public.queue_entries e
-                  ON e.organization_id=q.organization_id AND e.queue_day_id=q.id
-                WHERE q.organization_id=:tenant AND e.organization_id=:tenant
-                  AND q.service_date=:day AND q.lane=:lane
-                  AND e.disposition='ACTIVE' ORDER BY e.arrival_sequence
+                SELECT e.id FROM public.queue_entries e
+                WHERE e.organization_id=:tenant
+                  AND e.queue_day_id=(
+                      SELECT q.id FROM public.queue_days q
+                      WHERE q.organization_id=:tenant
+                        AND q.service_date=:day AND q.lane=:lane
+                  )
+                  AND e.disposition='ACTIVE'
+                ORDER BY e.arrival_sequence
             """,
             "family_phone": """
                 SELECT p.id FROM public.patients p
