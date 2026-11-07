@@ -245,6 +245,10 @@ def test_denied_routes_preserve_current_persistence_boundary():
             ("clinical_revisions",),
             ("followup_claims",),
             ("followup_extensions",),
+            ("queue_days",),
+            ("queue_entries",),
+            ("doctor_controls",),
+            ("doctor_admission_confirmations",),
         }
         assert connection.execute(
             "SELECT version_num FROM public.alembic_version"
