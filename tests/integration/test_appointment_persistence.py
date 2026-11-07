@@ -163,8 +163,16 @@ def _query(tenant, doctor):
     )
 
 
+def _has_d06_queue(connection):
+    return bool(
+        connection.scalar(text("SELECT to_regclass('public.queue_days') IS NOT NULL"))
+    )
+
+
 def _seed_waiting_entry(connection, tenant, doctor, appointment, actor):
     """Test-only genuine original-day attendance; not a runtime intake API."""
+    if not _has_d06_queue(connection):
+        return  # Historical D-05/D-07/D-08 databases predate queue membership.
     appointment_id = UUID(appointment["id"])
     service_date = date.fromisoformat(str(appointment["service_date"]))
     lane, classification = connection.execute(
@@ -255,6 +263,7 @@ def _admit_saved(
         text("SELECT set_config('app.staff_id', :actor, true)"),
         {"actor": str(actor)},
     )
+    has_queue = _has_d06_queue(connection)
     current = "Booked"
     for revision, status in enumerate(
         ("Waiting", "In Examination", "Completed")
@@ -262,7 +271,7 @@ def _admit_saved(
         else ("Waiting", "In Examination"),
         start=1,
     ):
-        if status == "In Examination":
+        if status == "In Examination" and has_queue:
             connection.execute(
                 text("""
                     SELECT * FROM public.lock_doctor_admission_capacity(
@@ -320,7 +329,7 @@ def _admit_saved(
         )
         if status == "Waiting":
             _seed_waiting_entry(connection, tenant, doctor, saved, actor)
-        elif status == "In Examination":
+        elif status == "In Examination" and has_queue:
             connection.execute(
                 text("""
                     UPDATE public.queue_entries

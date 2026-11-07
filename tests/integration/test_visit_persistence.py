@@ -12,6 +12,7 @@ from test_appointment_persistence import (
     _draft,
     _patient,
     _query,
+    _seed_waiting_entry,
 )
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 
@@ -210,6 +211,8 @@ def test_pre_admission_appointment_has_no_visit(appointment_storage, status):
             _draft(_patient(connection, tenant), doctor, status=status),
             _query(tenant, doctor),
         )
+        if status == "Waiting":
+            _seed_waiting_entry(connection, tenant, doctor, saved, doctor)
         connection.execute(
             text("SELECT set_config('app.staff_id', :actor, true)"),
             {"actor": str(doctor)},
