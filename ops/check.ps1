@@ -230,6 +230,9 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             foreach ($suite in @('tests/integration/test_queue_persistence.py', 'tests/integration/test_queue_capacity.py', 'tests/integration/test_queue_races.py', 'tests/integration/test_queue_migration.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required D-06 verification: $suite" }
             }
+            foreach ($suite in @('tests/integration/test_day_review_persistence.py', 'tests/integration/test_report_query_plans.py', 'tests/integration/test_day_review_races.py', 'tests/integration/test_day_review_migration.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required D-11 verification: $suite" }
+            }
             # Linux CI retains the accepted Bash probes; PowerShell checks their exit immediately.
             $integration = @'
 set -euo pipefail
@@ -320,6 +323,19 @@ docker compose --profile test run --rm --no-deps \
   tests/integration/test_queue_races.py tests/integration/test_queue_migration.py | tee "$private/d06-queue.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d06-queue.log"; then
   echo 'FAIL mandatory D-06 real-PostgreSQL evidence skipped'; exit 1
+fi
+# D-11 close/write serialization, report query plans and upgrade are PostgreSQL-only.
+docker compose --profile test run --rm --no-deps \
+  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
+  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider \
+  tests/integration/test_day_review_persistence.py tests/integration/test_report_query_plans.py \
+  tests/integration/test_day_review_races.py tests/integration/test_day_review_migration.py | tee "$private/d11-day-review.log"
+if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d11-day-review.log"; then
+  echo 'FAIL mandatory D-11 real-PostgreSQL evidence skipped'; exit 1
 fi
 # All B-06 suites run against disposable PostgreSQL; no silent skip counts.
 docker compose --profile test run --rm --no-deps \
