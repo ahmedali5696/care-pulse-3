@@ -273,6 +273,24 @@ def test_queue_day_uses_effective_original_date_policy_not_latest_head(
                 },
             )
         assert unpublished.value.orig.sqlstate == "23514"
+        snapshot = text("""
+            SELECT queue_policy_version, revision FROM public.queue_days
+            WHERE organization_id=:tenant AND id=:id
+        """)
+        day_identity = {"tenant": tenant, "id": current_day}
+        original = connection.execute(snapshot, day_identity).one()
+        assert original.queue_policy_version == 2
+        assert (
+            connection.scalar(
+                text("""
+                SELECT has_column_privilege(
+                    'carepulse_runtime', 'public.queue_days',
+                    'queue_policy_version', 'UPDATE'
+                )
+            """)
+            )
+            is False
+        )
         with pytest.raises(DBAPIError) as immutable, connection.begin_nested():
             connection.execute(
                 text("""
@@ -280,9 +298,10 @@ def test_queue_day_uses_effective_original_date_policy_not_latest_head(
                 SET queue_policy_version=1, revision=revision+1
                 WHERE organization_id=:tenant AND id=:id
             """),
-                {"tenant": tenant, "id": current_day},
+                day_identity,
             )
-        assert immutable.value.orig.sqlstate == "23514"
+        assert immutable.value.orig.sqlstate == "42501"
+        assert connection.execute(snapshot, day_identity).one() == original
         assert len({old_day, current_day, future_day}) == 3
 
 
