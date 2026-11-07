@@ -27,7 +27,13 @@ from carepulse.policies.schedule_service import (
     stage_or_preview,
 )
 from sqlalchemy import text
-from test_appointment_persistence import _admit_saved, _draft, _patient, _query
+from test_appointment_persistence import (
+    _admit_saved,
+    _draft,
+    _patient,
+    _query,
+    _seed_waiting_entry,
+)
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import (
@@ -148,6 +154,8 @@ def _booking(
         ),
         _query(tenant, doctor),
     )
+    if status == "Waiting":
+        _seed_waiting_entry(connection, tenant, doctor, saved, doctor)
     if status in ("In Examination", "Completed"):
         _admit_saved(connection, tenant, doctor, saved, complete=status == "Completed")
     return saved

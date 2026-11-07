@@ -20,7 +20,7 @@ from sqlalchemy import URL, create_engine, text
 from sqlalchemy.exc import DBAPIError
 
 ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0024_b06_followup_window"
+REVISION = "0025_d06_queue_foundations"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -168,6 +168,10 @@ def test_organization_schema_owned_by_migration_role():
                 "clinical_revisions",
                 "followup_claims",
                 "followup_extensions",
+                "queue_days",
+                "queue_entries",
+                "doctor_controls",
+                "doctor_admission_confirmations",
             } <= owned_tables.keys()
             assert set(owned_tables.values()) == {"carepulse_migration"}
             assert (
@@ -239,9 +243,9 @@ def test_failed_isolated_migration_rolls_back_objects_and_version(
     _create_empty_database(admin, empty_database)
     scripts = tmp_path / "migrations"
     shutil.copytree(ROOT / "db/migrations", scripts)
-    (scripts / "versions/0025_failure.py").write_text(
-        'from alembic import op\nrevision = "0025_failure"\n'
-        'down_revision = "0024_b06_followup_window"\n'
+    (scripts / "versions/0026_failure.py").write_text(
+        'from alembic import op\nrevision = "0026_failure"\n'
+        'down_revision = "0025_d06_queue_foundations"\n'
         "def upgrade():\n"
         '    op.execute("CREATE TABLE public.synthetic_partial (value integer)")\n'
         '    op.execute("SELECT 1 / 0")\n'

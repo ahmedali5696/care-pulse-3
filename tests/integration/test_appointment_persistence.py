@@ -163,6 +163,80 @@ def _query(tenant, doctor):
     )
 
 
+def _seed_waiting_entry(connection, tenant, doctor, appointment, actor):
+    """Test-only genuine original-day attendance; not a runtime intake API."""
+    appointment_id = UUID(appointment["id"])
+    service_date = date.fromisoformat(str(appointment["service_date"]))
+    lane, classification = connection.execute(
+        text("""
+            SELECT lane, classification FROM public.appointments
+            WHERE organization_id = :tenant AND id = :appointment
+        """),
+        {"tenant": tenant, "appointment": appointment_id},
+    ).one()
+    day_id, _ = connection.execute(
+        text("""
+            INSERT INTO public.queue_days
+                (id, organization_id, doctor_staff_id, service_date, lane,
+                 queue_policy_version, arrival_counter)
+            SELECT :day, :tenant, :doctor, :service_date, :lane,
+                   v.version, 1
+            FROM public.clinic_policy_versions v
+            JOIN public.clinic_policy_heads h
+              ON h.organization_id=v.organization_id AND h.kind=v.kind
+             AND v.version <= h.current_version
+            WHERE v.organization_id = :tenant AND v.kind = 'QUEUE'
+              AND NOT v.pending_effective
+              AND (v.version = 1 OR
+                   (v.effective_on IS NOT NULL
+                    AND v.effective_on <= :service_date))
+            ORDER BY v.version DESC LIMIT 1
+            ON CONFLICT (organization_id, service_date, lane)
+            DO UPDATE SET arrival_counter = public.queue_days.arrival_counter + 1,
+                          revision = public.queue_days.revision + 1
+            RETURNING id, arrival_counter
+        """),
+        {
+            "day": uuid4(),
+            "tenant": tenant,
+            "doctor": doctor,
+            "service_date": service_date,
+            "lane": lane,
+        },
+    ).one()
+    rank = None
+    if lane == "MAIN" and classification == "ROUTINE":
+        rank = connection.scalar(
+            text("""
+                SELECT coalesce(max(routine_rank), 0) + 1
+                FROM public.queue_entries
+                WHERE organization_id = :tenant AND queue_day_id = :day
+                  AND disposition = 'ACTIVE'
+            """),
+            {"tenant": tenant, "day": day_id},
+        )
+    connection.execute(
+        text("""
+            INSERT INTO public.queue_entries
+                (id, organization_id, queue_day_id, appointment_id,
+                 patient_id, doctor_staff_id, service_date, lane,
+                 routine_rank, disposition)
+            SELECT :entry, a.organization_id, :day, a.id,
+                   a.patient_id, a.doctor_staff_id, a.service_date, a.lane,
+                   :rank, 'ACTIVE'
+            FROM public.appointments a
+            WHERE a.organization_id = :tenant AND a.id = :appointment
+        """),
+        {
+            "entry": uuid4(),
+            "tenant": tenant,
+            "day": day_id,
+            "appointment": appointment_id,
+            "rank": rank,
+        },
+    )
+
+
 def _admit_saved(
     connection,
     tenant,
@@ -188,6 +262,25 @@ def _admit_saved(
         else ("Waiting", "In Examination"),
         start=1,
     ):
+        if status == "In Examination":
+            connection.execute(
+                text("""
+                    SELECT * FROM public.lock_doctor_admission_capacity(
+                        :tenant, :doctor, :service_date, :lane)
+                """),
+                {
+                    "tenant": tenant,
+                    "doctor": doctor,
+                    "service_date": date.fromisoformat(str(saved["service_date"])),
+                    "lane": connection.scalar(
+                        text("""
+                            SELECT lane FROM public.appointments
+                            WHERE organization_id = :tenant AND id = :appointment
+                        """),
+                        {"tenant": tenant, "appointment": appointment},
+                    ),
+                },
+            ).one()
         connection.execute(
             text("""
                 UPDATE public.appointments SET status = :status, revision = :revision
@@ -225,6 +318,29 @@ def _admit_saved(
                 "id": appointment,
             },
         )
+        if status == "Waiting":
+            _seed_waiting_entry(connection, tenant, doctor, saved, actor)
+        elif status == "In Examination":
+            connection.execute(
+                text("""
+                    UPDATE public.queue_entries
+                    SET disposition = 'CLOSED', closure_history_revision = :revision,
+                        revision = revision + 1
+                    WHERE organization_id = :tenant AND appointment_id = :id
+                      AND disposition = 'ACTIVE'
+                """),
+                {"tenant": tenant, "id": appointment, "revision": revision},
+            )
+            connection.execute(
+                text("""
+                    UPDATE public.queue_days
+                    SET revision = revision + 1
+                    WHERE organization_id = :tenant
+                      AND id = (SELECT queue_day_id FROM public.queue_entries
+                                WHERE organization_id = :tenant AND appointment_id = :id)
+                """),
+                {"tenant": tenant, "id": appointment},
+            )
         if status == "In Examination" and insert_visit:
             connection.execute(
                 text("""
@@ -254,8 +370,16 @@ def _persist_with_status(connection, tenant, patient, doctor, status, **changes)
         _draft(patient, doctor, status="Booked" if needs_visit else status, **changes),
         _query(tenant, doctor),
     )
+    if status == "Waiting":
+        _seed_waiting_entry(connection, tenant, doctor, saved, doctor)
     if needs_visit:
-        _admit_saved(connection, tenant, doctor, saved, complete=status == "Completed")
+        _admit_saved(
+            connection,
+            tenant,
+            doctor,
+            saved,
+            complete=status == "Completed",
+        )
     return {**saved, "status": status}
 
 
