@@ -3,8 +3,7 @@
 import json
 import runpy
 import shutil
-from datetime import timedelta
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from alembic import command
@@ -39,7 +38,7 @@ from test_database import (
 from test_database import (
     empty_database as empty_database,  # noqa: PLC0414 - fixture export
 )
-from test_followup_persistence import _insert_claim, _provenance, _source
+from test_followup_persistence import _v2_priced_followup
 
 MIGRATION = ROOT / "db/migrations/versions/0019_b06_price_policy_strings.py"
 
@@ -397,26 +396,20 @@ def test_postgresql_final_check_accepts_python_confirmed_corpus(
     }
     # If PostgreSQL's unchanged D-05 CHECK diverges, surface this exact corpus value.
     with transaction(runtime, tenant) as conn:
-        source = _source(conn, tenant, doctor) if service == "FOLLOW_UP" else None
-        provenance = _provenance(source) if source else None
-        frozen["entitlement_provenance"] = provenance
-        assert validate_price_snapshot(frozen)["net_egp"] == quote.net_egp
-        saved = persist_appointment(
-            conn,
-            _draft(
-                source["patient"] if source else _patient(conn, tenant),
-                doctor,
-                service_type=service,
-                classification=classification,
-                **(
-                    {"service_date": source["day"] + timedelta(days=1)}
-                    if source
-                    else {}
+        if service == "FOLLOW_UP":
+            saved = _v2_priced_followup(conn, tenant, doctor, frozen)
+            frozen["entitlement_provenance"] = saved["entitlement_provenance"]
+        else:
+            saved = persist_appointment(
+                conn,
+                _draft(
+                    _patient(conn, tenant),
+                    doctor,
+                    service_type=service,
+                    classification=classification,
+                    price_snapshot=frozen,
                 ),
-                price_snapshot=frozen,
-            ),
-            _query(tenant, doctor),
-        )
-        if source:
-            _insert_claim(conn, tenant, source, UUID(saved["id"]), provenance)
+                _query(tenant, doctor),
+            )
+        assert validate_price_snapshot(frozen)["net_egp"] == quote.net_egp
         assert saved["net_egp"] == format(quote.net_egp, ".2f"), frozen

@@ -110,6 +110,33 @@ def _v2_booking(source, offset=1):
     }
 
 
+def _v2_priced_followup(connection, tenant, doctor, price_snapshot):
+    """Create a priced Follow-up through the post-cutover SQL writer for test fixtures."""
+    source = _v2_source(connection, tenant, doctor)
+    claim = _v2_command(
+        connection,
+        "create_followup_claim",
+        source,
+        **{**_v2_booking(source), "price_snapshot": price_snapshot},
+    )
+    appointment, net, provenance = connection.execute(
+        text("""
+            SELECT c.appointment_id, p.net_egp, p.entitlement_provenance
+            FROM public.followup_claims c
+            JOIN public.appointment_price_snapshots p
+              ON (p.organization_id, p.appointment_id) =
+                 (c.organization_id, c.appointment_id)
+            WHERE c.organization_id=:tenant AND c.id=:claim
+        """),
+        {"tenant": tenant, "claim": claim},
+    ).one()
+    return {
+        "id": str(appointment),
+        "net_egp": f"{net:.2f}",
+        "entitlement_provenance": provenance,
+    }
+
+
 def _v2_record(connection, claim):
     appointment, day, number = connection.execute(
         text("""
