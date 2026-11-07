@@ -314,6 +314,7 @@ docker compose --profile test run --rm --no-deps \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   test python -m pytest -q -s -ra --tb=short -p no:cacheprovider \
   tests/integration/test_queue_persistence.py tests/integration/test_queue_capacity.py \
   tests/integration/test_queue_races.py tests/integration/test_queue_migration.py | tee "$private/d06-queue.log"

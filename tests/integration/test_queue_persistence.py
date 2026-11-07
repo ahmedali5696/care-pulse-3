@@ -248,11 +248,15 @@ def test_queue_day_uses_effective_original_date_policy_not_latest_head(
                 text("""
                     INSERT INTO public.clinic_policy_versions
                         (organization_id, kind, version, payload, effective_on)
-                    VALUES (:tenant, 'QUEUE', 4,
-                            '{"routine_order":"ARRIVAL_FIFO","late_depth":8}'::jsonb,
-                            :day)
+                    VALUES (:tenant, 'QUEUE', 4, CAST(:payload AS jsonb), :day)
                 """),
-                {"tenant": tenant, "day": DAY},
+                {
+                    "tenant": tenant,
+                    "payload": json.dumps(
+                        {"routine_order": "ARRIVAL_FIFO", "late_depth": 8}
+                    ),
+                    "day": DAY,
+                },
             )
             connection.execute(
                 text("""
@@ -507,8 +511,7 @@ def test_duplicate_active_entry_and_wrong_doctor_are_rejected(appointment_storag
             )
             == 1
         )
-        # The schema permits just one DOCTOR_OWNER per tenant, so a foreign
-        # Doctor violates the composite staff/tenant FK before commit.
+        # The queue-day identity guard refuses a Doctor from another clinic.
         with pytest.raises(DBAPIError) as wrong_doctor, connection.begin_nested():
             _arrive(
                 connection,
@@ -517,7 +520,30 @@ def test_duplicate_active_entry_and_wrong_doctor_are_rejected(appointment_storag
                 _appointment(connection, tenant, doctor),
                 service_date=DAY + timedelta(days=1),
             )
-        assert wrong_doctor.value.orig.sqlstate == "23503"
+        assert wrong_doctor.value.orig.sqlstate == "23514"
+        assert (
+            wrong_doctor.value.orig.diag.message_primary
+            == "Queue Doctor must be clinic Doctor"
+        )
+        assert (
+            connection.scalar(
+                text("""
+                SELECT count(*) FROM public.queue_days
+                WHERE organization_id = :tenant AND service_date = :day
+            """),
+                {"tenant": tenant, "day": DAY + timedelta(days=1)},
+            )
+            == 0
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.queue_entries WHERE organization_id = :tenant"
+                ),
+                {"tenant": tenant},
+            )
+            == 1
+        )
 
 
 def test_cancelled_waiting_entry_closes_with_immutable_history(appointment_storage):
