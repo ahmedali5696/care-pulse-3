@@ -362,11 +362,10 @@ def test_direct_active_entry_insert_waits_for_barrier_before_rejecting_booked_so
                     INSERT INTO public.queue_entries (
                         id, organization_id, queue_day_id, appointment_id,
                         patient_id, doctor_staff_id, service_date, lane,
-                        arrival_sequence, attested_by_staff_id, attested_at,
                         routine_rank, disposition)
                     VALUES (:entry, :tenant, :day_id, CAST(:appointment AS uuid),
                             :patient, :doctor, :day, 'MAIN',
-                            1, :doctor, clock_timestamp(), 1, 'ACTIVE')
+                            1, 'ACTIVE')
                 """),
                 {
                     "entry": uuid4(),
