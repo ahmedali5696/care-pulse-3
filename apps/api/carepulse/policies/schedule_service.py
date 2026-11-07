@@ -1,4 +1,4 @@
-"""Owner calendar staging, conflict review and serialized publication."""
+"""Authorized calendar staging, conflict review and serialized publication."""
 
 import json
 import re
@@ -11,7 +11,10 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import Connection, text
 
-from carepulse.identity.authorization import AuthorizedStaff
+from carepulse.identity.authorization import (
+    AuthorizedStaff,
+    can_manage_operational_settings,
+)
 from carepulse.identity.contracts import (
     ContractError,
     normalized_request_digest,
@@ -320,7 +323,7 @@ def load_current_schedule(connection: Connection, tenant) -> ScheduleConfig:
 
 
 def read_schedule(connection: Connection, actor: AuthorizedStaff) -> dict:
-    _owner(actor)
+    _require_schedule_manager(actor)
     try:
         lock_schedule_barrier(connection, actor.organization_id, shared=True)
         lock_policy_heads(connection, actor.organization_id, {"CAPACITY": "SHARE"})
@@ -339,8 +342,8 @@ def read_schedule(connection: Connection, actor: AuthorizedStaff) -> dict:
     }
 
 
-def _owner(actor: AuthorizedStaff) -> None:
-    if actor.role != "DOCTOR_OWNER":
+def _require_schedule_manager(actor: AuthorizedStaff) -> None:
+    if not can_manage_operational_settings(actor):
         raise ContractError(403)
 
 
@@ -596,7 +599,7 @@ def stage_or_preview(
     idempotency_key: str,
     operation: str,
 ) -> dict:
-    _owner(actor)
+    _require_schedule_manager(actor)
     if operation not in ("settings.schedule.stage", "settings.schedule.preview"):
         raise ValueError("Unsupported calendar operation")
     query = _receipt_query(actor, command, idempotency_key, operation)
@@ -678,7 +681,7 @@ def activate(
     command: ScheduleActivate,
     idempotency_key: str,
 ) -> dict:
-    _owner(actor)
+    _require_schedule_manager(actor)
     query = _receipt_query(
         actor, command, idempotency_key, "settings.schedule.activate"
     )

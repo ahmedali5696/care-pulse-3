@@ -1,4 +1,4 @@
-"""Owner-only calendar configuration and revision-bound staged activation."""
+"""Authorized calendar configuration and revision-bound staged activation."""
 
 from fastapi import APIRouter, Request
 
