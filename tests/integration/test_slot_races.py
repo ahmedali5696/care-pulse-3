@@ -26,6 +26,7 @@ from test_appointment_persistence import (
     _patient,
     _raw_appointment,
     _raw_snapshot,
+    _seed_waiting_entry,
 )
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_schedule import (
@@ -286,14 +287,17 @@ def test_only_four_counted_statuses_reserve_timed_capacity(
             number,
             "Booked" if admitted else status,
         )
+        saved = {"id": str(appointment), "service_date": SERVICE_DAY}
         if admitted:
             _admit_saved(
                 connection,
                 tenant,
                 doctor,
-                {"id": str(appointment)},
+                saved,
                 complete=status == "Completed",
             )
+        elif status == "Waiting":
+            _seed_waiting_entry(connection, tenant, doctor, saved, doctor)
     with transaction(runtime, tenant) as connection:
         if counts:
             with pytest.raises(ContractError) as denied:
