@@ -260,6 +260,33 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
             )
             assert plan and "Plan" in plan[0]
             print(f"D-11 T109 {name} EXPLAIN: {json.dumps(plan[0], sort_keys=True)}")
+            if name == "appointments_day_status_lane":
+                # A small tenant may use the existing counted-patient index for
+                # tenant/day lookup; the full report index must still be valid.
+                assert _index_path(
+                    plan[0], "appointments", ("organization_id", "service_date")
+                ), "Missing indexed tenant/day Appointment access"
+                report_index = connection.execute(
+                    text("""
+                        SELECT i.indisvalid, i.indisready,
+                               pg_get_indexdef(i.indexrelid, 1, true),
+                               pg_get_indexdef(i.indexrelid, 2, true),
+                               pg_get_indexdef(i.indexrelid, 3, true),
+                               pg_get_indexdef(i.indexrelid, 4, true)
+                        FROM pg_index i
+                        WHERE i.indexrelid =
+                            'public.appointments_day_status_lane_report'::regclass
+                    """)
+                ).one()
+                assert report_index == (
+                    True,
+                    True,
+                    "organization_id",
+                    "service_date",
+                    "status",
+                    "lane",
+                )
+                continue
             if name == "completed_service_value":
                 assert _bounded_completed_value_plan(plan[0]), (
                     "Completed value must use a dated Appointment index or a "
