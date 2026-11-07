@@ -19,14 +19,387 @@ from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
 from test_followup_decisions import _actor, _doctor_context, _extension
-from test_followup_persistence import _claim, _outcome, _provenance, _source
+from test_followup_persistence import (
+    _claim,
+    _outcome,
+    _provenance,
+    _source,
+    _v2_booking,
+    _v2_command,
+    _v2_source,
+)
 from test_visit_migration import _prepare, _upgrade
-from test_visit_persistence import _seed
+from test_visit_persistence import _receptionist, _seed
 
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATION = ROOT / "db/migrations/versions/0022_d08_followup_claims.py"
 BEFORE = "0021_d07_visits"
 AFTER = "0022_d08_followup_claims"
+PROVENANCE_BEFORE = "0027_d11_day_review"
+PROVENANCE_AFTER = "0028_d08_followup_provenance"
+
+
+def _d08_snapshot(connection):
+    return {
+        relation: connection.execute(
+            text(
+                f"SELECT to_jsonb(t) FROM public.{relation} t ORDER BY to_jsonb(t)::text"
+            )
+        )
+        .scalars()
+        .all()
+        for relation in (
+            "appointments",
+            "appointment_history",
+            "visits",
+            "clinical_revisions",
+            "clinical_audit",
+            "followup_claims",
+            "followup_extensions",
+            "appointment_price_snapshots",
+            "idempotency_receipts",
+            "sensitive_audit",
+            "completion_attestations",
+        )
+    }
+
+
+def test_v2_populated_immediate_predecessor_preserves_legacy_evidence_and_denies_unattested_actions(
+    admin, empty_database
+):
+    migration, runtime, tenant, doctor = _predecessor(admin, empty_database)
+    try:
+        _upgrade(migration, "0024_b06_followup_window")
+        with transaction(runtime, tenant) as connection:
+            source = _source(connection, tenant, doctor)
+            active = _claim(connection, tenant, source)
+            _doctor_context(connection, doctor)
+            command = _extension(source, active["id"])
+            key = str(uuid4())
+            receipt = extend_followup(
+                connection, _actor(tenant, doctor), source["visit"], command, key
+            )
+            released_source = _source(connection, tenant, doctor)
+            released = _claim(connection, tenant, released_source)
+            _outcome(connection, tenant, doctor, released, status="Cancelled")
+            consumed_source = _source(connection, tenant, doctor)
+            consumed = _claim(connection, tenant, consumed_source)
+            _outcome(connection, tenant, doctor, consumed, status="Completed")
+        _upgrade(migration, PROVENANCE_BEFORE)
+        with migration.connect() as connection:
+            before = _d08_snapshot(connection)
+            assert before["followup_extensions"] and before["clinical_revisions"]
+            assert {row["state"] for row in before["followup_claims"]} == {
+                "ACTIVE",
+                "RELEASED",
+                "CONSUMED",
+            }
+            assert before["completion_attestations"] == []
+        _upgrade(migration, PROVENANCE_AFTER)
+        _upgrade(migration, PROVENANCE_AFTER)
+        with migration.connect() as connection:
+            assert _d08_snapshot(connection) == before
+            for relation in (
+                "followup_source_decision_events",
+                "followup_authorization_events",
+                "completion_attestations",
+            ):
+                assert (
+                    connection.scalar(text(f"SELECT count(*) FROM public.{relation}"))
+                    == 0
+                )
+        with transaction(runtime, tenant) as connection:
+            _doctor_context(connection, doctor)
+            assert (
+                extend_followup(
+                    connection, _actor(tenant, doctor), source["visit"], command, key
+                )
+                == receipt
+            )
+            with pytest.raises(DBAPIError) as unverified, connection.begin_nested():
+                _v2_command(
+                    connection,
+                    "create_followup_claim",
+                    {**source, "tenant": tenant},
+                    expected={
+                        "source_revision": 0,
+                        "clinical_revision": 2,
+                        "policy_version": 1,
+                    },
+                    **_v2_booking(source),
+                )
+            assert unverified.value.orig.sqlstate == "23514"
+            _outcome(connection, tenant, doctor, active, status="Cancelled")
+        with migration.connect() as connection:
+            after = _d08_snapshot(connection)
+            for relation in (
+                "visits",
+                "clinical_revisions",
+                "clinical_audit",
+                "followup_extensions",
+                "appointment_price_snapshots",
+                "idempotency_receipts",
+            ):
+                assert after[relation] == before[relation]
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
+@pytest.mark.parametrize(
+    "ancestry",
+    ["correction", "metadata_extension", "anomalous_extension", "missing_audit"],
+)
+def test_v2_upgrade_replays_correction_ancestry_and_never_invents_doctor_default(
+    admin, empty_database, ancestry
+):
+    migration, runtime, tenant, doctor = _predecessor(admin, empty_database)
+    try:
+        _upgrade(migration, PROVENANCE_BEFORE)
+        staff = _receptionist(migration, tenant)
+        with transaction(runtime, tenant) as connection:
+            source = _v2_source(connection, tenant, doctor)
+            connection.execute(
+                text(
+                    "SELECT set_config('app.clinical_reason','Synthetic historical correction',true)"
+                )
+            )
+            connection.execute(
+                text("""
+                UPDATE public.visits SET followup_decision=jsonb_build_object(
+                    'kind','DEADLINE','reason','Synthetic historical correction',
+                    'deadline_date',CAST(:day AS text)) WHERE id=:visit
+            """),
+                {
+                    "visit": source["visit"],
+                    "day": (source["day"] + timedelta(days=20)).isoformat(),
+                },
+            )
+            if ancestry in ("metadata_extension", "anomalous_extension"):
+                connection.execute(
+                    text(
+                        "SELECT set_config('app.clinical_change_kind','EXTENSION',true)"
+                    )
+                )
+                connection.execute(
+                    text("""
+                    UPDATE public.visits SET followup_decision=followup_decision ||
+                        CAST(:metadata AS jsonb) WHERE id=:visit
+                """),
+                    {
+                        "visit": source["visit"],
+                        "metadata": (
+                            '{"kind":"DEFAULT"}'
+                            if ancestry == "anomalous_extension"
+                            else '{"extension_claim_id":"00000000-0000-0000-0000-000000000001","extension_deadline":"2026-12-01"}'
+                        ),
+                    },
+                )
+            if ancestry != "missing_audit":
+                connection.execute(
+                    text("""
+                    INSERT INTO public.clinical_audit(id,organization_id,doctor_staff_id,clinical_revision,correlation_id)
+                    SELECT gen_random_uuid(),organization_id,actor_staff_id,revision,id::text
+                    FROM public.clinical_revisions WHERE visit_id=:visit
+                """),
+                    {"visit": source["visit"]},
+                )
+        with migration.connect() as connection:
+            before = _d08_snapshot(connection)
+        _upgrade(migration, PROVENANCE_AFTER)
+        with migration.connect() as connection:
+            assert _d08_snapshot(connection) == before
+        with transaction(runtime, tenant) as connection:
+            expected = {
+                "source_revision": 0,
+                "clinical_revision": 2 if "extension" in ancestry else 1,
+                "policy_version": 1,
+            }
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                _v2_command(
+                    connection,
+                    "record_followup_source_decision",
+                    source,
+                    actor=staff,
+                    expected=expected,
+                    kind="DEFAULT",
+                )
+            assert denied.value.orig.sqlstate == (
+                "42501" if ancestry in ("correction", "metadata_extension") else "23514"
+            )
+            if ancestry in ("correction", "metadata_extension"):
+                claim = _v2_command(
+                    connection,
+                    "create_followup_claim",
+                    source,
+                    actor=staff,
+                    expected=expected,
+                    **_v2_booking(source, 12),
+                )
+                assert connection.scalar(
+                    text(
+                        "SELECT approved_deadline FROM public.followup_claims WHERE id=:id"
+                    ),
+                    {"id": claim},
+                ) == source["day"] + timedelta(days=20)
+                _v2_command(
+                    connection,
+                    "record_followup_source_decision",
+                    source,
+                    expected=expected,
+                    kind="DEFAULT",
+                )
+            else:
+                with pytest.raises(DBAPIError) as unknown, connection.begin_nested():
+                    _v2_command(
+                        connection,
+                        "create_followup_claim",
+                        source,
+                        expected=expected,
+                        **_v2_booking(source),
+                    )
+                assert unknown.value.orig.sqlstate == "23514"
+        with migration.connect() as connection:
+            after = _d08_snapshot(connection)
+            assert after["clinical_revisions"] == before["clinical_revisions"]
+            assert after["visits"] == before["visits"]
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
+def test_v2_failed_populated_upgrade_rolls_back_and_repeat_upgrade_is_stable(
+    admin, empty_database, tmp_path
+):
+    migration, runtime, tenant, doctor = _predecessor(admin, empty_database)
+    try:
+        _upgrade(migration, PROVENANCE_BEFORE)
+        with transaction(runtime, tenant) as connection:
+            source = _source(connection, tenant, doctor)
+            _claim(connection, tenant, source)
+        with migration.connect() as connection:
+            before = _d08_snapshot(connection)
+        scripts = tmp_path / "migrations"
+        shutil.copytree(ROOT / "db/migrations", scripts)
+        successor = scripts / "versions/0028_d08_followup_provenance.py"
+        original = successor.read_text(encoding="utf-8")
+        successor.write_text(
+            original.replace(
+                "    _privileges()\n",
+                '    _privileges()\n    op.execute("SELECT 1 / 0")\n',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(DBAPIError) as failure:
+            _upgrade(migration, PROVENANCE_AFTER, scripts)
+        assert failure.value.orig.sqlstate == "22012"
+        with migration.connect() as connection:
+            assert _d08_snapshot(connection) == before
+            assert (
+                connection.scalar(
+                    text("SELECT version_num FROM public.alembic_version")
+                )
+                == PROVENANCE_BEFORE
+            )
+            assert (
+                connection.scalar(
+                    text("SELECT to_regclass('public.followup_authorization_events')")
+                )
+                is None
+            )
+            assert connection.scalar(
+                text(
+                    "SELECT has_table_privilege('carepulse_runtime','public.followup_claims','INSERT')"
+                )
+            )
+        _upgrade(migration, PROVENANCE_AFTER)
+        _upgrade(migration, PROVENANCE_AFTER)
+        with migration.connect() as connection:
+            assert _d08_snapshot(connection) == before
+            assert (
+                connection.scalar(
+                    text("SELECT version_num FROM public.alembic_version")
+                )
+                == PROVENANCE_AFTER
+            )
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
+def test_v2_first_extension_uses_verified_legacy_deadline_without_rewriting_it(
+    admin, empty_database
+):
+    migration, runtime, tenant, doctor = _predecessor(admin, empty_database)
+    try:
+        _upgrade(migration, PROVENANCE_BEFORE)
+        with transaction(runtime, tenant) as connection:
+            source = _source(connection, tenant, doctor)
+            connection.execute(
+                text("""
+                INSERT INTO public.clinical_audit(id,organization_id,doctor_staff_id,clinical_revision,correlation_id)
+                SELECT gen_random_uuid(),organization_id,actor_staff_id,revision,id::text
+                FROM public.clinical_revisions WHERE visit_id=:visit
+            """),
+                {"visit": source["visit"]},
+            )
+            active = _claim(connection, tenant, source)
+            _doctor_context(connection, doctor)
+            extend_followup(
+                connection,
+                _actor(tenant, doctor),
+                source["visit"],
+                _extension(source, active["id"]),
+                str(uuid4()),
+            )
+        with migration.connect() as connection:
+            before = _d08_snapshot(connection)
+        _upgrade(migration, PROVENANCE_AFTER)
+        with transaction(runtime, tenant) as connection:
+            assert (
+                _v2_command(
+                    connection,
+                    "extend_followup_claim",
+                    {**source, "tenant": tenant},
+                    reference=active["claim"],
+                    expected={
+                        "source_revision": 0,
+                        "clinical_revision": 2,
+                        "policy_version": 1,
+                        "authorization_revision": 0,
+                        "claim_revision": 1,
+                        "appointment_revision": 0,
+                    },
+                    deadline_date=(source["day"] + timedelta(days=10)).isoformat(),
+                    reason="Synthetic v2 extension",
+                )
+                == 1
+            )
+            assert connection.execute(
+                text(
+                    "SELECT prior_deadline,new_deadline FROM public.followup_authorization_events WHERE claim_id=:claim"
+                ),
+                {"claim": active["claim"]},
+            ).one() == (
+                source["day"] + timedelta(days=9),
+                source["day"] + timedelta(days=10),
+            )
+        with migration.connect() as connection:
+            after = _d08_snapshot(connection)
+            for relation in (
+                "visits",
+                "clinical_revisions",
+                "clinical_audit",
+                "followup_claims",
+                "followup_extensions",
+                "appointment_price_snapshots",
+                "idempotency_receipts",
+            ):
+                assert after[relation] == before[relation]
+    finally:
+        runtime.dispose()
+        migration.dispose()
 
 
 def _predecessor(admin, database):
@@ -224,6 +597,7 @@ def test_fresh_and_failed_following_migration_keep_one_head(
         scripts = tmp_path / "migrations"
         shutil.copytree(ROOT / "db/migrations", scripts)
         # Isolate D-08 from later M1/B-06 heads for this rollback proof.
+        (scripts / "versions/0028_d08_followup_provenance.py").unlink()
         (scripts / "versions/0027_d11_day_review.py").unlink()
         (scripts / "versions/0026_d07_completion_attestation.py").unlink()
         (scripts / "versions/0025_d06_queue_foundations.py").unlink()

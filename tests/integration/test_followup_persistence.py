@@ -13,12 +13,931 @@ from carepulse.policies.versions import append_version
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import (
+    _activate_clinic,
     _admit_saved,
     _draft,
     _patient,
     _query,
 )
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
+from test_database import _engine
+from test_database import admin as admin  # noqa: PLC0414
+from test_database import disposable_project as disposable_project  # noqa: PLC0414
+from test_database import empty_database as empty_database  # noqa: PLC0414
+from test_visit_migration import _prepare, _upgrade
+from test_visit_persistence import _receptionist
+from test_visit_persistence import _seed as _admitted_source
+
+
+@pytest.fixture
+def legacy_followup_storage(admin, empty_database):
+    """Keep pre-cutover regressions on their real predecessor, with its old writers."""
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, "0024_b06_followup_window")
+        with migration.begin() as connection:
+            operator = connection.scalar(
+                text(
+                    "SELECT created_by_operator_id FROM public.organizations WHERE id=:tenant"
+                ),
+                {"tenant": tenant},
+            )
+            other = uuid4()
+            connection.execute(
+                text(
+                    "INSERT INTO public.organizations(id,branch,created_by_operator_id) VALUES(:id,'Synthetic legacy D-08',:operator)"
+                ),
+                {"id": other, "operator": operator},
+            )
+            foreign_doctor = _activate_clinic(connection, other, operator)
+        yield runtime, migration, (tenant, other), (doctor, foreign_doctor)
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
+def _v2_source(connection, tenant, doctor):
+    appointment = _admitted_source(connection, tenant, doctor, complete=True)
+    visit, completion = connection.execute(
+        text("""
+            SELECT c.visit_id, (c.completed_at AT TIME ZONE 'Africa/Cairo')::date
+            FROM public.completion_attestations c WHERE c.appointment_id=:appointment
+        """),
+        {"appointment": appointment},
+    ).one()
+    return {
+        "tenant": tenant,
+        "doctor": doctor,
+        "appointment": appointment,
+        "visit": visit,
+        "day": completion,
+    }
+
+
+def _v2_command(connection, routine, source, **command):
+    connection.execute(text("SET LOCAL lock_timeout = '5s'"))
+    connection.execute(text("SET LOCAL statement_timeout = '15s'"))
+    connection.execute(
+        text("SELECT set_config('app.staff_id', :actor, true)"),
+        {"actor": str(command.pop("actor", source["doctor"]))},
+    )
+    expected = command.pop(
+        "expected", {"source_revision": 0, "clinical_revision": 0, "policy_version": 1}
+    )
+    reference = command.pop("reference", source["visit"])
+    return connection.scalar(
+        text(
+            f"SELECT public.{routine}(:org, :reference, CAST(:expected AS jsonb), CAST(:body AS jsonb))"
+        ),
+        {
+            "org": source["tenant"],
+            "reference": reference,
+            "expected": json.dumps(expected),
+            "body": json.dumps(command),
+        },
+    )
+
+
+def _v2_booking(source, offset=1):
+    return {
+        "service_date": (source["day"] + timedelta(days=offset)).isoformat(),
+        "booking_mode": "OPEN",
+        "price_snapshot": dict(_draft(uuid4(), source["doctor"]).price_snapshot),
+    }
+
+
+def _v2_record(connection, claim):
+    appointment, day, number = connection.execute(
+        text("""
+            SELECT a.id, a.service_date, a.current_number FROM public.followup_claims c
+            JOIN public.appointments a ON (a.organization_id,a.id)=(c.organization_id,c.appointment_id)
+            WHERE c.id=:claim
+        """),
+        {"claim": claim},
+    ).one()
+    return {
+        "id": appointment,
+        "claim": claim,
+        "saved": {
+            "id": str(appointment),
+            "service_date": day.isoformat(),
+            "number": number,
+        },
+    }
+
+
+@pytest.mark.parametrize("actor_kind", ["doctor", "receptionist", "manager"])
+def test_v2_no_decision_and_actual_staff_events_preserve_clinical_content(
+    appointment_storage, actor_kind
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    staff = doctor if actor_kind == "doctor" else _receptionist(migration, tenant)
+    if actor_kind == "manager":
+        with migration.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE public.staff_accounts SET operational_manager=true, security_revision=security_revision+1 WHERE id=:id"
+                ),
+                {"id": staff},
+            )
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        claim = _v2_command(
+            connection,
+            "create_followup_claim",
+            source,
+            actor=staff,
+            **_v2_booking(source),
+        )
+        assert connection.execute(
+            text("""
+            SELECT source_revision, decision, decision_actor_staff_id
+            FROM public.followup_source_state WHERE visit_id=:visit
+        """),
+            {"visit": source["visit"]},
+        ).one() == (0, None, None)
+        for revision, decision in enumerate(
+            (
+                {
+                    "kind": "DEADLINE",
+                    "deadline_date": (source["day"] + timedelta(days=12)).isoformat(),
+                    "reason": "Synthetic staff decision",
+                },
+                {"kind": "DEFAULT"},
+            ),
+            start=1,
+        ):
+            assert (
+                _v2_command(
+                    connection,
+                    "record_followup_source_decision",
+                    source,
+                    actor=staff,
+                    expected={
+                        "source_revision": revision - 1,
+                        "clinical_revision": 0,
+                        "policy_version": 1,
+                    },
+                    **decision,
+                )
+                == revision
+            )
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+        assert connection.execute(
+            text(
+                "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
+            ),
+            {"visit": source["visit"]},
+        ).one() == (0, None)
+        events = connection.execute(
+            text("""
+            SELECT e.source_revision, e.actor_staff_id, e.actor_role, e.before_decision,
+                   e.decision, a.before_state, a.after_state
+            FROM public.followup_source_decision_events e JOIN public.sensitive_audit a
+              ON (a.organization_id,a.id)=(e.organization_id,e.sensitive_audit_id)
+            WHERE e.source_visit_id=:visit ORDER BY e.source_revision
+        """),
+            {"visit": source["visit"]},
+        ).all()
+        role = "DOCTOR_OWNER" if staff == doctor else "RECEPTIONIST"
+        assert [
+            (row.source_revision, row.actor_staff_id, row.actor_role) for row in events
+        ] == [(1, staff, role), (2, staff, role)]
+        assert events[0].before_decision is None
+        assert events[1].before_decision == events[0].decision
+        assert events[1].before_state["actor_staff_id"] == str(staff)
+        assert events[1].after_state["decision"] == {"kind": "DEFAULT"}
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinical_revisions WHERE visit_id=:visit"
+                ),
+                {"visit": source["visit"]},
+            )
+            == 0
+        )
+        assert connection.scalar(
+            text("SELECT approved_deadline FROM public.followup_claims WHERE id=:id"),
+            {"id": claim},
+        ) == source["day"] + timedelta(days=7)
+
+
+@pytest.mark.parametrize("restriction", ["OPTED_OUT", "DEADLINE"])
+def test_v2_doctor_priority_blocks_receptionist_reset_exception_and_extension(
+    appointment_storage, restriction
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    staff = _receptionist(migration, tenant)
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        claim = _v2_command(
+            connection, "create_followup_claim", source, **_v2_booking(source)
+        )
+        decision = {"kind": restriction, "reason": "Synthetic Doctor restriction"}
+        if restriction == "DEADLINE":
+            decision["deadline_date"] = (source["day"] + timedelta(days=20)).isoformat()
+        _v2_command(connection, "record_followup_source_decision", source, **decision)
+        expected = {"source_revision": 1, "clinical_revision": 0, "policy_version": 1}
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            _v2_command(
+                connection,
+                "record_followup_source_decision",
+                source,
+                actor=staff,
+                expected=expected,
+                kind="DEFAULT",
+            )
+        assert denied.value.orig.sqlstate == "42501"
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            _v2_command(
+                connection,
+                "extend_followup_claim",
+                source,
+                actor=staff,
+                reference=claim,
+                expected={
+                    **expected,
+                    "claim_revision": 1,
+                    "appointment_revision": 0,
+                    "authorization_revision": 0,
+                },
+                deadline_date=(source["day"] + timedelta(days=21)).isoformat(),
+                reason="Cannot bypass Doctor",
+            )
+        assert denied.value.orig.sqlstate == "23514"
+        _outcome(
+            connection,
+            tenant,
+            doctor,
+            _v2_record(connection, claim),
+            status="Cancelled",
+        )
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            _v2_command(
+                connection,
+                "create_followup_claim",
+                source,
+                actor=staff,
+                expected=expected,
+                **_v2_booking(source, 21),
+                exception_reason="Cannot bypass Doctor",
+            )
+        assert denied.value.orig.sqlstate == "23514"
+        if restriction == "DEADLINE":
+            fresh = _v2_command(
+                connection,
+                "create_followup_claim",
+                source,
+                actor=staff,
+                expected=expected,
+                **_v2_booking(source, 12),
+            )
+            assert connection.scalar(
+                text(
+                    "SELECT approved_deadline FROM public.followup_claims WHERE id=:id"
+                ),
+                {"id": fresh},
+            ) == source["day"] + timedelta(days=20)
+        else:
+            _v2_command(
+                connection,
+                "record_followup_source_decision",
+                source,
+                expected=expected,
+                kind="DEFAULT",
+            )
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+
+
+@pytest.mark.parametrize("window", [0, 365])
+def test_v2_current_policy_boundaries_are_derived_without_doctor_default(
+    appointment_storage, window
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        append_version(
+            connection,
+            tenant,
+            "FOLLOWUP",
+            {"completion_day_zero": True, "last_day_inclusive": window},
+            1,
+            actor_staff_id=str(doctor),
+        )
+        with pytest.raises(DBAPIError) as stale, connection.begin_nested():
+            _v2_command(
+                connection,
+                "create_followup_claim",
+                source,
+                **_v2_booking(source, window),
+            )
+        assert stale.value.orig.sqlstate == "40001"
+        claim = _v2_command(
+            connection,
+            "create_followup_claim",
+            source,
+            expected={
+                "source_revision": 0,
+                "clinical_revision": 0,
+                "policy_version": 2,
+            },
+            **_v2_booking(source, window),
+        )
+        assert connection.scalar(
+            text("SELECT approved_deadline FROM public.followup_claims WHERE id=:id"),
+            {"id": claim},
+        ) == source["day"] + timedelta(days=window)
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.followup_source_decision_events WHERE source_visit_id=:visit"
+                ),
+                {"visit": source["visit"]},
+            )
+            == 0
+        )
+
+
+def test_v2_new_date_is_exact_creation_extension_is_separate_and_release_does_not_inherit(
+    appointment_storage,
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    staff = _receptionist(migration, tenant)
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        with pytest.raises(DBAPIError) as reason, connection.begin_nested():
+            _v2_command(
+                connection, "create_followup_claim", source, **_v2_booking(source, 10)
+            )
+        assert reason.value.orig.sqlstate == "23514"
+        claim = _v2_command(
+            connection,
+            "create_followup_claim",
+            source,
+            actor=staff,
+            **_v2_booking(source, 10),
+        )
+        record = _v2_record(connection, claim)
+        frozen = connection.scalar(
+            text(
+                "SELECT to_jsonb(p) FROM public.appointment_price_snapshots p WHERE appointment_id=:id"
+            ),
+            {"id": record["id"]},
+        )
+        assert (
+            frozen["entitlement_provenance"]["selected_date"]
+            == (source["day"] + timedelta(days=10)).isoformat()
+        )
+        assert frozen["entitlement_provenance"]["new_date_event_id"]
+        expected = {
+            "source_revision": 0,
+            "clinical_revision": 0,
+            "policy_version": 1,
+            "claim_revision": 1,
+            "appointment_revision": 0,
+            "authorization_revision": 1,
+        }
+        for extension in (
+            {
+                "deadline_date": (source["day"] + timedelta(days=9)).isoformat(),
+                "reason": "Shortens",
+            },
+            {
+                "deadline_date": (source["day"] + timedelta(days=12)).isoformat(),
+                "reason": " ",
+            },
+        ):
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                _v2_command(
+                    connection,
+                    "extend_followup_claim",
+                    source,
+                    actor=staff,
+                    reference=claim,
+                    expected=expected,
+                    **extension,
+                )
+            assert denied.value.orig.sqlstate == "23514"
+        assert (
+            _v2_command(
+                connection,
+                "extend_followup_claim",
+                source,
+                actor=staff,
+                reference=claim,
+                expected=expected,
+                deadline_date=(source["day"] + timedelta(days=12)).isoformat(),
+                reason="Synthetic confirmed extension",
+            )
+            == 2
+        )
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT to_jsonb(p) FROM public.appointment_price_snapshots p WHERE appointment_id=:id"
+                ),
+                {"id": record["id"]},
+            )
+            == frozen
+        )
+        connection.execute(text("SET CONSTRAINTS ALL DEFERRED"))
+        _outcome(connection, tenant, doctor, record, status="Cancelled")
+        with pytest.raises(DBAPIError) as released, connection.begin_nested():
+            _v2_command(
+                connection,
+                "extend_followup_claim",
+                source,
+                reference=claim,
+                expected={**expected, "authorization_revision": 2},
+                deadline_date=(source["day"] + timedelta(days=13)).isoformat(),
+                reason="Released",
+            )
+        assert released.value.orig.sqlstate == "40001"
+        fresh = _v2_command(
+            connection, "create_followup_claim", source, **_v2_booking(source, 2)
+        )
+        assert fresh != claim
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.followup_authorization_events WHERE claim_id=:id"
+                ),
+                {"id": fresh},
+            )
+            == 0
+        )
+        _outcome(
+            connection,
+            tenant,
+            doctor,
+            _v2_record(connection, fresh),
+            status="Completed",
+        )
+        with pytest.raises(DBAPIError) as consumed, connection.begin_nested():
+            _v2_command(
+                connection, "create_followup_claim", source, **_v2_booking(source, 3)
+            )
+        assert consumed.value.orig.sqlstate == "23505"
+
+
+@pytest.mark.parametrize(
+    "bad_actor", ["foreign", "disabled", "missing", "forged_expected"]
+)
+def test_v2_writer_rejects_invalid_context_without_evidence(
+    appointment_storage, bad_actor
+):
+    runtime, migration, (tenant, _), (doctor, foreign_doctor) = appointment_storage
+    staff = _receptionist(migration, tenant)
+    if bad_actor == "disabled":
+        with migration.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE public.staff_accounts SET enabled=false, security_revision=security_revision+1 WHERE id=:id"
+                ),
+                {"id": staff},
+            )
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        actor = {
+            "foreign": foreign_doctor,
+            "disabled": staff,
+            "missing": "",
+            "forged_expected": staff,
+        }[bad_actor]
+        expected = {"source_revision": 0, "clinical_revision": 0, "policy_version": 1}
+        if bad_actor == "forged_expected":
+            expected["actor_staff_id"] = str(doctor)
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            _v2_command(
+                connection,
+                "record_followup_source_decision",
+                source,
+                actor=actor,
+                expected=expected,
+                kind="DEFAULT",
+            )
+        assert denied.value.orig.sqlstate == "42501"
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.followup_source_decision_events WHERE source_visit_id=:id"
+                ),
+                {"id": source["visit"]},
+            )
+            == 0
+        )
+
+
+def test_v2_effective_privileges_rls_reserved_audit_and_legacy_fences(
+    appointment_storage, role_engine
+):
+    runtime, migration, (tenant, other), (doctor, _) = appointment_storage
+    relations = (
+        "followup_source_state",
+        "followup_source_decision_events",
+        "followup_authorization_events",
+    )
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        _v2_command(
+            connection, "record_followup_source_decision", source, kind="DEFAULT"
+        )
+        for sql in (
+            "UPDATE public.visits SET followup_decision='{}'::jsonb WHERE id=:visit",
+            "INSERT INTO public.followup_source_decision_events DEFAULT VALUES",
+            "INSERT INTO public.followup_authorization_events DEFAULT VALUES",
+            "INSERT INTO public.followup_claims DEFAULT VALUES",
+            "INSERT INTO public.followup_extensions DEFAULT VALUES",
+            "TRUNCATE public.followup_source_decision_events",
+            "SELECT public.d08_context(:tenant,:visit,'{}'::jsonb)",
+            "INSERT INTO public.sensitive_audit(id,organization_id,actor_staff_id,actor_role,action,correlation_id) VALUES(gen_random_uuid(),:tenant,:doctor,'DOCTOR_OWNER','FOLLOWUP_EXTENSION','forged')",
+        ):
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(
+                    text(sql),
+                    {"tenant": tenant, "visit": source["visit"], "doctor": doctor},
+                )
+            assert denied.value.orig.sqlstate == "42501"
+        # Permitted Doctor narrative correction still uses the original clinical guard.
+        connection.execute(
+            text("SELECT set_config('app.clinical_reason','Synthetic correction',true)")
+        )
+        connection.execute(
+            text(
+                "UPDATE public.visits SET diagnosis='Synthetic correction' WHERE id=:visit"
+            ),
+            {"visit": source["visit"]},
+        )
+    for scope in (other, None):
+        with transaction(runtime, scope) as connection:
+            for relation in relations:
+                assert (
+                    connection.scalar(text(f"SELECT count(*) FROM public.{relation}"))
+                    == 0
+                )
+    with migration.connect() as connection:
+        for relation in relations:
+            assert connection.execute(
+                text(
+                    "SELECT relrowsecurity,relforcerowsecurity FROM pg_class WHERE oid=CAST(:relation AS regclass)"
+                ),
+                {"relation": f"public.{relation}"},
+            ).one() == (True, True)
+            for privilege in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+                assert not connection.scalar(
+                    text(
+                        "SELECT has_table_privilege('carepulse_runtime',:relation,:privilege)"
+                    ),
+                    {"relation": f"public.{relation}", "privilege": privilege},
+                )
+                if privilege in ("INSERT", "UPDATE"):
+                    assert not connection.scalar(
+                        text(
+                            "SELECT has_any_column_privilege('carepulse_runtime',:relation,:privilege)"
+                        ),
+                        {"relation": f"public.{relation}", "privilege": privilege},
+                    )
+        functions = connection.execute(
+            text("""
+            SELECT p.proname, pg_get_userbyid(p.proowner), p.prosecdef, p.proconfig,
+                   has_function_privilege('carepulse_operator',p.oid,'EXECUTE')
+            FROM pg_proc p WHERE p.proname IN ('create_followup_claim','extend_followup_claim','record_followup_source_decision')
+        """)
+        ).all()
+        assert len(functions) == 3
+        assert all(
+            row[1] == "carepulse_migration"
+            and row[2]
+            and row[3] == ["search_path=pg_catalog"]
+            and not row[4]
+            for row in functions
+        )
+        assert connection.execute(
+            text("""
+            SELECT rolsuper,rolbypassrls,rolcreaterole,
+                   has_schema_privilege('carepulse_runtime','public','CREATE'),
+                   pg_has_role('carepulse_runtime','carepulse_migration','MEMBER')
+            FROM pg_roles WHERE rolname='carepulse_runtime'
+        """)
+        ).one() == (False, False, False, False, False)
+        assert (
+            connection.scalar(
+                text("""
+            SELECT count(*) FROM pg_proc p,
+                LATERAL aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) permission
+            WHERE p.proname IN ('create_followup_claim','extend_followup_claim','record_followup_source_decision')
+              AND permission.grantee=0 AND permission.privilege_type='EXECUTE'
+        """)
+            )
+            == 0
+        )
+    for role in ("carepulse_operator", "carepulse_auth", "carepulse_sender"):
+        denied_role = role_engine(role)
+        try:
+            for relation in relations:
+                with (
+                    pytest.raises(DBAPIError) as denied,
+                    denied_role.connect() as connection,
+                ):
+                    connection.execute(text(f"SELECT * FROM public.{relation}"))
+                assert denied.value.orig.sqlstate == "42501"
+        finally:
+            denied_role.dispose()
+
+
+def test_runtime_direct_sql_can_spoof_tenant_and_doctor_context(appointment_storage):
+    """Issue #26: GUC-based DB checks do not authenticate an arbitrary SQL caller."""
+    runtime, migration, (tenant, other), (doctor, foreign_doctor) = appointment_storage
+    receptionist = _receptionist(migration, tenant)
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        _v2_command(
+            connection,
+            "record_followup_source_decision",
+            source,
+            kind="OPTED_OUT",
+            reason="Doctor restriction",
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM public.staff_accounts WHERE id=:id"),
+                {"id": foreign_doctor},
+            )
+            == 0
+        )
+        with connection.begin_nested() as spoofed_sql:
+            connection.execute(
+                text("SELECT set_config('app.organization_id', :org, true)"),
+                {"org": str(other)},
+            )
+            assert (
+                connection.scalar(
+                    text("SELECT count(*) FROM public.staff_accounts WHERE id=:id"),
+                    {"id": foreign_doctor},
+                )
+                == 1
+            )
+            connection.execute(
+                text("SELECT set_config('app.organization_id', :org, true)"),
+                {"org": str(tenant)},
+            )
+            connection.execute(
+                text("SELECT set_config('app.staff_id', :actor, true)"),
+                {"actor": str(receptionist)},
+            )
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(
+                    text("""
+                        SELECT public.record_followup_source_decision(
+                            :tenant, :visit, CAST(:expected AS jsonb), '{"kind":"DEFAULT"}'::jsonb)
+                    """),
+                    {
+                        "tenant": tenant,
+                        "visit": source["visit"],
+                        "expected": '{"source_revision":1,"clinical_revision":0,"policy_version":1}',
+                    },
+                )
+            assert denied.value.orig.sqlstate == "42501"
+            connection.execute(
+                text("SELECT set_config('app.staff_id', :actor, true)"),
+                {"actor": str(doctor)},
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT public.record_followup_source_decision(
+                        :tenant, :visit, CAST(:expected AS jsonb), CAST(:decision AS jsonb))
+                """),
+                    {
+                        "tenant": tenant,
+                        "visit": source["visit"],
+                        "expected": '{"source_revision":1,"clinical_revision":0,"policy_version":1}',
+                        "decision": '{"kind":"DEFAULT"}',
+                    },
+                )
+                == 2
+            )
+            assert connection.execute(
+                text("""
+                    SELECT actor_staff_id, actor_role FROM public.followup_source_decision_events
+                    WHERE source_visit_id=:visit AND source_revision=2
+                """),
+                {"visit": source["visit"]},
+            ).one() == (doctor, "DOCTOR_OWNER")
+            spoofed_sql.rollback()
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.followup_source_decision_events WHERE source_visit_id=:visit"
+                ),
+                {"visit": source["visit"]},
+            )
+            == 1
+        )
+
+
+def test_v2_creation_exception_cannot_authorize_same_date_interval_change(
+    appointment_storage,
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    staff = _receptionist(migration, tenant)
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        claim = _v2_command(
+            connection,
+            "create_followup_claim",
+            source,
+            actor=staff,
+            **_v2_booking(source, 10),
+        )
+        record = _v2_record(connection, claim)
+        starts = datetime.combine(
+            source["day"] + timedelta(days=10), datetime.min.time(), UTC
+        ) + timedelta(hours=12)
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(
+                text("""
+                UPDATE public.appointments SET booking_mode='EXACT_TIME',starts_at=:starts,
+                    ends_at=:ends,revision=revision+1 WHERE id=:id
+            """),
+                {
+                    "id": record["id"],
+                    "starts": starts,
+                    "ends": starts + timedelta(hours=1),
+                },
+            )
+        assert denied.value.orig.sqlstate == "23514"
+        with pytest.raises(DBAPIError) as late, connection.begin_nested():
+            _v2_command(
+                connection,
+                "extend_followup_claim",
+                source,
+                reference=claim,
+                expected={
+                    "source_revision": 0,
+                    "clinical_revision": 0,
+                    "policy_version": 1,
+                    "claim_revision": 1,
+                    "appointment_revision": 0,
+                    "authorization_revision": 1,
+                },
+                kind="NEW_DATE",
+                deadline_date=(source["day"] + timedelta(days=12)).isoformat(),
+                reason="Late attachment",
+            )
+        assert late.value.orig.sqlstate == "23514"
+
+
+def test_v2_declared_new_date_without_event_rolls_back_all_creation_evidence(
+    appointment_storage,
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        ordinary = _v2_command(
+            connection, "create_followup_claim", source, **_v2_booking(source)
+        )
+        snapshot = connection.scalar(
+            text("SELECT policy_snapshot FROM public.followup_claims WHERE id=:id"),
+            {"id": ordinary},
+        )
+        _outcome(
+            connection,
+            tenant,
+            doctor,
+            _v2_record(connection, ordinary),
+            status="Cancelled",
+        )
+    with transaction(migration, tenant) as connection:
+        tables = (
+            "appointments",
+            "appointment_history",
+            "appointment_price_snapshots",
+            "appointment_day_counters",
+            "followup_claims",
+            "sensitive_audit",
+            "idempotency_receipts",
+            "outbox_events",
+        )
+        counts = [
+            connection.scalar(
+                text(
+                    f"SELECT count(*) FROM public.{table} WHERE organization_id=:tenant"
+                ),
+                {"tenant": tenant},
+            )
+            for table in tables
+        ]
+        with pytest.raises(DBAPIError) as missing, connection.begin_nested():
+            _claim(
+                connection,
+                tenant,
+                source,
+                day_offset=10,
+                provenance={
+                    **snapshot,
+                    "selected_date": (source["day"] + timedelta(days=10)).isoformat(),
+                    "new_date_event_id": str(uuid4()),
+                },
+            )
+            connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+        assert missing.value.orig.sqlstate == "23514"
+        assert [
+            connection.scalar(
+                text(
+                    f"SELECT count(*) FROM public.{table} WHERE organization_id=:tenant"
+                ),
+                {"tenant": tenant},
+            )
+            for table in tables
+        ] == counts
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["head_only", "event_only", "skip", "before", "rewind", "delete", "truncate"],
+)
+def test_v2_source_requires_contiguous_matching_head_and_immutable_events(
+    appointment_storage, tamper
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        _v2_command(
+            connection, "record_followup_source_decision", source, kind="DEFAULT"
+        )
+    with transaction(migration, tenant) as connection:
+        with pytest.raises(DBAPIError) as invalid, connection.begin_nested():
+            if tamper in ("head_only", "rewind"):
+                connection.execute(
+                    text(
+                        "UPDATE public.followup_source_state SET source_revision=:revision WHERE visit_id=:visit"
+                    ),
+                    {
+                        "visit": source["visit"],
+                        "revision": 2 if tamper == "head_only" else 0,
+                    },
+                )
+            elif tamper in ("delete", "truncate"):
+                connection.execute(
+                    text(
+                        "DELETE FROM public.followup_source_decision_events WHERE source_visit_id=:visit"
+                        if tamper == "delete"
+                        else "TRUNCATE public.followup_source_decision_events"
+                    ),
+                    {"visit": source["visit"]},
+                )
+            else:
+                event, audit = uuid4(), uuid4()
+                connection.execute(
+                    text("""
+                    INSERT INTO public.sensitive_audit (
+                        id,organization_id,actor_staff_id,actor_role,action,reason,
+                        correlation_id,occurred_at,before_state,after_state)
+                    SELECT :audit,organization_id,decision_actor_staff_id,decision_actor_role,
+                        'FOLLOWUP_SOURCE_DECISION',NULL,CAST(:event AS text),date_trunc('second',clock_timestamp()),
+                        jsonb_build_object('source_visit_id',visit_id,'source_revision',1,
+                            'decision',decision,'actor_staff_id',decision_actor_staff_id,'actor_role',decision_actor_role),
+                        jsonb_build_object('source_visit_id',visit_id,'source_revision',2,
+                            'decision',decision,'actor_staff_id',decision_actor_staff_id,'actor_role',decision_actor_role)
+                    FROM public.followup_source_state WHERE visit_id=:visit
+                """),
+                    {"audit": audit, "event": event, "visit": source["visit"]},
+                )
+                connection.execute(
+                    text("""
+                    INSERT INTO public.followup_source_decision_events
+                    SELECT (jsonb_populate_record(NULL::public.followup_source_decision_events,
+                        to_jsonb(e) || jsonb_build_object('id',CAST(:event AS text),
+                            'sensitive_audit_id',CAST(:audit AS text),'source_revision',:revision,
+                            'before_decision',CASE WHEN :bad_before THEN NULL ELSE e.decision END,
+                            'before_actor_staff_id',e.actor_staff_id,'before_actor_role',e.actor_role,
+                            'occurred_at',(SELECT occurred_at FROM public.sensitive_audit WHERE id=:audit)))).*
+                    FROM public.followup_source_decision_events e
+                    WHERE e.source_visit_id=:visit AND e.source_revision=1
+                """),
+                    {
+                        "audit": audit,
+                        "event": event,
+                        "visit": source["visit"],
+                        "revision": 3 if tamper == "skip" else 2,
+                        "bad_before": tamper == "before",
+                    },
+                )
+            connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+        assert invalid.value.orig.sqlstate == (
+            "42501" if tamper == "delete" else "23514"
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT source_revision FROM public.followup_source_state WHERE visit_id=:visit"
+                ),
+                {"visit": source["visit"]},
+            )
+            == 1
+        )
 
 
 def _source(connection, tenant, doctor, *, classification="ROUTINE", complete=True):
@@ -294,9 +1213,9 @@ def _outcome(
 
 @pytest.mark.parametrize("classification", ["ROUTINE", "URGENT", "EMERGENCY"])
 def test_completed_new_examination_sources_create_active_claim(
-    appointment_storage, classification
+    legacy_followup_storage, classification
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor, classification=classification)
         record = _claim(connection, tenant, source)
@@ -345,8 +1264,8 @@ def test_completed_new_examination_sources_create_active_claim(
 @pytest.mark.parametrize(
     "bad_source", ["uncompleted", "exceptional_cancel", "followup"]
 )
-def test_nonqualifying_source_cannot_claim(appointment_storage, bad_source):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+def test_nonqualifying_source_cannot_claim(legacy_followup_storage, bad_source):
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         if bad_source == "followup":
             original = _source(connection, tenant, doctor)
@@ -416,9 +1335,9 @@ def test_nonqualifying_source_cannot_claim(appointment_storage, bad_source):
 
 @pytest.mark.parametrize("wrong_relation", ["patient", "doctor", "clinic"])
 def test_followup_target_must_match_source_tenant_patient_doctor(
-    appointment_storage, wrong_relation
+    legacy_followup_storage, wrong_relation
 ):
-    runtime, _, (tenant, other), (doctor, foreign_doctor) = appointment_storage
+    runtime, _, (tenant, other), (doctor, foreign_doctor) = legacy_followup_storage
     # A second same-tenant Owner violates D-02. Use the foreign tenant's
     # existing Doctor to prove that a forged target Doctor cannot be linked.
     second_doctor = foreign_doctor if wrong_relation == "doctor" else None
@@ -451,8 +1370,8 @@ def test_followup_target_must_match_source_tenant_patient_doctor(
     assert denied.value.orig.sqlstate in ("23514", "23503", "42501")
 
 
-def test_one_active_source_across_different_service_dates(appointment_storage):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+def test_one_active_source_across_different_service_dates(legacy_followup_storage):
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
         first = _claim(connection, tenant, source)
@@ -469,8 +1388,10 @@ def test_one_active_source_across_different_service_dates(appointment_storage):
 
 
 @pytest.mark.parametrize("tamper", ["actor", "approval", "policy_revision"])
-def test_claim_cannot_forge_frozen_authorization_evidence(appointment_storage, tamper):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+def test_claim_cannot_forge_frozen_authorization_evidence(
+    legacy_followup_storage, tamper
+):
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
         provenance = _provenance(source)
@@ -495,9 +1416,9 @@ def test_claim_cannot_forge_frozen_authorization_evidence(appointment_storage, t
 
 
 def test_consumed_source_cannot_regain_active_or_second_consumed_claim(
-    appointment_storage,
+    legacy_followup_storage,
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
         first = _claim(connection, tenant, source)
@@ -515,8 +1436,8 @@ def test_consumed_source_cannot_regain_active_or_second_consumed_claim(
         ).all() == [("CONSUMED", 1)]
 
 
-def test_released_prior_claim_cannot_become_second_consumption(appointment_storage):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+def test_released_prior_claim_cannot_become_second_consumption(legacy_followup_storage):
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
         first = _claim(connection, tenant, source)
@@ -550,8 +1471,8 @@ def test_released_prior_claim_cannot_become_second_consumption(appointment_stora
 
 
 @pytest.mark.parametrize("failure", ["missing_decision", "stale_source_revision"])
-def test_source_authorization_and_revision_required(appointment_storage, failure):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+def test_source_authorization_and_revision_required(legacy_followup_storage, failure):
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
         provenance = _provenance(source)
@@ -588,9 +1509,9 @@ def test_source_authorization_and_revision_required(appointment_storage, failure
 
 
 def test_released_history_allows_fresh_eligibility_and_price_snapshot(
-    appointment_storage,
+    legacy_followup_storage,
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
         released = _claim(connection, tenant, source, price="100.00")
@@ -679,9 +1600,9 @@ def test_released_history_allows_fresh_eligibility_and_price_snapshot(
 
 
 def test_default_claim_uses_live_followup_window_and_rebook_freezes_new_policy(
-    appointment_storage,
+    legacy_followup_storage,
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         assert (
             append_version(
@@ -842,9 +1763,9 @@ def test_default_claim_uses_live_followup_window_and_rebook_freezes_new_policy(
 
 
 def test_zero_day_followup_policy_qualifies_and_confirms_only_completion_day(
-    appointment_storage,
+    legacy_followup_storage,
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         assert (
             append_version(
@@ -922,8 +1843,8 @@ def test_zero_day_followup_policy_qualifies_and_confirms_only_completion_day(
         )
 
 
-def test_integral_decimal_followup_policy_payload_is_accepted(appointment_storage):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+def test_integral_decimal_followup_policy_payload_is_accepted(legacy_followup_storage):
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         assert (
             append_version(
@@ -963,9 +1884,9 @@ def test_integral_decimal_followup_policy_payload_is_accepted(appointment_storag
 
 
 def test_claim_and_preferential_appointment_must_both_exist_at_commit(
-    appointment_storage,
+    legacy_followup_storage,
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
     with (
@@ -1004,9 +1925,9 @@ def test_claim_and_preferential_appointment_must_both_exist_at_commit(
     [("Cancelled", False), ("No-show", False), ("Cancelled", True)],
 )
 def test_cancel_no_show_and_exceptional_admission_release_in_same_commit(
-    appointment_storage, terminal, admit
+    legacy_followup_storage, terminal, admit
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
         record = _claim(connection, tenant, source)
@@ -1041,9 +1962,9 @@ def test_cancel_no_show_and_exceptional_admission_release_in_same_commit(
 
 
 def test_completed_followup_consumes_once_and_retains_immutable_history(
-    appointment_storage,
+    legacy_followup_storage,
 ):
-    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    runtime, migration, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
         record = _claim(connection, tenant, source)
@@ -1112,9 +2033,9 @@ def test_completed_followup_consumes_once_and_retains_immutable_history(
 
 
 def test_injected_failure_after_appointment_write_rolls_back_both_sides(
-    appointment_storage,
+    legacy_followup_storage,
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
         record = _claim(connection, tenant, source)
@@ -1152,8 +2073,8 @@ def test_injected_failure_after_appointment_write_rolls_back_both_sides(
         )
 
 
-def test_unpaired_terminal_transition_cannot_commit(appointment_storage):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+def test_unpaired_terminal_transition_cannot_commit(legacy_followup_storage):
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
         record = _claim(connection, tenant, source)
@@ -1183,9 +2104,9 @@ def test_unpaired_terminal_transition_cannot_commit(appointment_storage):
 
 
 def test_tenant_rls_no_context_operator_denied_and_narrow_runtime_grants(
-    appointment_storage, role_engine
+    legacy_followup_storage,
 ):
-    runtime, migration, (tenant, other), (doctor, _) = appointment_storage
+    runtime, migration, (tenant, other), (doctor, _) = legacy_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _source(connection, tenant, doctor)
         record = _claim(connection, tenant, source)
@@ -1208,7 +2129,7 @@ def test_tenant_rls_no_context_operator_denied_and_narrow_runtime_grants(
                 ).all()
                 == []
             )
-    operator = role_engine("carepulse_operator")
+    operator = _engine("carepulse_operator", migration.url.database)
     try:
         for relation in ("followup_claims", "followup_extensions"):
             with pytest.raises(DBAPIError) as denied, operator.connect() as connection:

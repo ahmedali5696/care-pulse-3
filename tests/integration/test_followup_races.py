@@ -4,6 +4,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from threading import Barrier, Event
+from time import monotonic, sleep
 from uuid import UUID, uuid4
 
 import pytest
@@ -19,7 +20,288 @@ from test_followup_persistence import (
     _outcome,
     _provenance,
     _source,
+    _v2_booking,
+    _v2_command,
+    _v2_record,
+    _v2_source,
 )
+from test_followup_persistence import legacy_followup_storage as legacy_followup_storage  # noqa: PLC0414
+
+
+def _wait_for_pg_blocker(observer, pid):
+    until = monotonic() + 3
+    while monotonic() < until:
+        blockers = observer.scalar(text("SELECT pg_blocking_pids(:pid)"), {"pid": pid})
+        if blockers:
+            return blockers
+        sleep(0.01)
+    raise AssertionError("Contender did not reach a PostgreSQL lock wait")
+
+
+@pytest.mark.parametrize(
+    "first", ["decision", "extension", "restriction", "release", "consume"]
+)
+def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger(
+    appointment_storage, first
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        claim = _v2_command(
+            connection, "create_followup_claim", source, **_v2_booking(source)
+        )
+        record = _v2_record(connection, claim)
+    held, release, started = Event(), Event(), Event()
+    waiting_pid = []
+    expected = {
+        "source_revision": 0,
+        "clinical_revision": 0,
+        "policy_version": 1,
+        "authorization_revision": 0,
+        "claim_revision": 1,
+        "appointment_revision": 0,
+    }
+
+    def extension(connection):
+        return _v2_command(
+            connection,
+            "extend_followup_claim",
+            source,
+            reference=claim,
+            expected=expected,
+            deadline_date=(source["day"] + timedelta(days=9)).isoformat(),
+            reason="Synthetic concurrent extension",
+        )
+
+    def hold_first():
+        with transaction(runtime, tenant) as connection:
+            if first in ("decision", "restriction"):
+                _v2_command(
+                    connection,
+                    "record_followup_source_decision",
+                    source,
+                    **(
+                        {"kind": "DEFAULT"}
+                        if first == "decision"
+                        else {"kind": "OPTED_OUT", "reason": "Doctor restriction"}
+                    ),
+                )
+            elif first == "extension":
+                extension(connection)
+            else:
+                _outcome(
+                    connection,
+                    tenant,
+                    doctor,
+                    record,
+                    status="Completed" if first == "consume" else "Cancelled",
+                )
+            held.set()
+            assert release.wait(timeout=15)
+
+    def wait_second():
+        assert held.wait(timeout=10)
+        with transaction(runtime, tenant) as connection:
+            waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            started.set()
+            if first == "decision":
+                return _v2_command(
+                    connection,
+                    "record_followup_source_decision",
+                    source,
+                    kind="DEFAULT",
+                )
+            return extension(connection)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        holder = pool.submit(hold_first)
+        waiter = pool.submit(wait_second)
+        try:
+            assert started.wait(timeout=10)
+            with migration.connect() as observer:
+                assert _wait_for_pg_blocker(observer, waiting_pid[0])
+        finally:
+            release.set()
+        holder.result(timeout=20)
+        with pytest.raises(DBAPIError) as stale:
+            waiter.result(timeout=20)
+        assert stale.value.orig.sqlstate == "40001"
+    with transaction(runtime, tenant) as connection:
+        assert connection.scalar(
+            text(
+                "SELECT count(*) FROM public.followup_authorization_events WHERE claim_id=:claim"
+            ),
+            {"claim": claim},
+        ) == (1 if first == "extension" else 0)
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinical_revisions WHERE visit_id=:visit"
+                ),
+                {"visit": source["visit"]},
+            )
+            == 0
+        )
+
+
+@pytest.mark.parametrize("later", ["restriction", "release", "consume"])
+def test_v2_extension_first_remains_historical_after_later_restriction_or_terminal(
+    appointment_storage, later
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        claim = _v2_command(
+            connection, "create_followup_claim", source, **_v2_booking(source)
+        )
+        record = _v2_record(connection, claim)
+    held, release, started = Event(), Event(), Event()
+    waiting_pid = []
+
+    def extend_first():
+        with transaction(runtime, tenant) as connection:
+            _v2_command(
+                connection,
+                "extend_followup_claim",
+                source,
+                reference=claim,
+                expected={
+                    "source_revision": 0,
+                    "clinical_revision": 0,
+                    "policy_version": 1,
+                    "authorization_revision": 0,
+                    "claim_revision": 1,
+                    "appointment_revision": 0,
+                },
+                deadline_date=(source["day"] + timedelta(days=9)).isoformat(),
+                reason="Synthetic extension first",
+            )
+            held.set()
+            assert release.wait(timeout=15)
+
+    def follow_later():
+        assert held.wait(timeout=10)
+        with transaction(runtime, tenant) as connection:
+            connection.execute(text("SET LOCAL lock_timeout='5s'"))
+            connection.execute(text("SET LOCAL statement_timeout='15s'"))
+            waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            started.set()
+            if later == "restriction":
+                _v2_command(
+                    connection,
+                    "record_followup_source_decision",
+                    source,
+                    kind="OPTED_OUT",
+                    reason="Later restriction",
+                )
+            else:
+                _outcome(
+                    connection,
+                    tenant,
+                    doctor,
+                    record,
+                    status="Completed" if later == "consume" else "Cancelled",
+                )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(extend_first)
+        second = pool.submit(follow_later)
+        try:
+            assert started.wait(timeout=10)
+            with migration.connect() as observer:
+                assert _wait_for_pg_blocker(observer, waiting_pid[0])
+        finally:
+            release.set()
+        first.result(timeout=20)
+        second.result(timeout=20)
+    with transaction(runtime, tenant) as connection:
+        assert connection.execute(
+            text("SELECT state, revision FROM public.followup_claims WHERE id=:claim"),
+            {"claim": claim},
+        ).one() == (
+            {"restriction": "ACTIVE", "release": "RELEASED", "consume": "CONSUMED"}[
+                later
+            ],
+            1 if later == "restriction" else 2,
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.followup_authorization_events WHERE claim_id=:claim"
+                ),
+                {"claim": claim},
+            )
+            == 1
+        )
+
+
+@pytest.mark.parametrize("status", ["Cancelled", "Completed"])
+def test_v2_claim_waits_for_release_and_cannot_reuse_consumed_source(
+    appointment_storage, status
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        claim = _v2_command(
+            connection, "create_followup_claim", source, **_v2_booking(source)
+        )
+        record = _v2_record(connection, claim)
+    held, release, started = Event(), Event(), Event()
+    waiting_pid = []
+
+    def finish():
+        with transaction(runtime, tenant) as connection:
+            _outcome(connection, tenant, doctor, record, status=status)
+            held.set()
+            assert release.wait(timeout=15)
+
+    def rebook():
+        assert held.wait(timeout=10)
+        with transaction(runtime, tenant) as connection:
+            waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            started.set()
+            return _v2_command(
+                connection, "create_followup_claim", source, **_v2_booking(source, 2)
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        terminal = pool.submit(finish)
+        contender = pool.submit(rebook)
+        try:
+            assert started.wait(timeout=10)
+            with migration.connect() as observer:
+                assert _wait_for_pg_blocker(observer, waiting_pid[0])
+        finally:
+            release.set()
+        terminal.result(timeout=20)
+        if status == "Completed":
+            with pytest.raises(DBAPIError) as consumed:
+                contender.result(timeout=20)
+            assert consumed.value.orig.sqlstate == "23505"
+        else:
+            assert contender.result(timeout=20) != claim
+    with transaction(runtime, tenant) as connection:
+        rows = (
+            connection.execute(
+                text("""
+            SELECT c.state FROM public.followup_claims c WHERE c.source_visit_id=:visit ORDER BY c.state
+        """),
+                {"visit": source["visit"]},
+            )
+            .scalars()
+            .all()
+        )
+        assert rows == (
+            ["CONSUMED"] if status == "Completed" else ["ACTIVE", "RELEASED"]
+        )
+        assert connection.scalar(
+            text("""
+            SELECT count(*) FROM public.appointments WHERE organization_id=:tenant
+              AND patient_id=(SELECT patient_id FROM public.visits WHERE id=:visit)
+              AND service_type='FOLLOW_UP'
+        """),
+            {"tenant": tenant, "visit": source["visit"]},
+        ) == len(rows)
 
 
 def _seed(runtime, tenant, doctor):
@@ -73,9 +355,9 @@ def _claims(runtime, tenant, source):
 
 
 def test_two_simultaneous_claims_leave_one_active_and_no_orphan_appointment(
-    appointment_storage,
+    legacy_followup_storage,
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     source = _seed(runtime, tenant, doctor)
     barrier = Barrier(2)
 
@@ -96,9 +378,9 @@ def test_two_simultaneous_claims_leave_one_active_and_no_orphan_appointment(
 
 @pytest.mark.parametrize("status", ["Cancelled", "No-show", "Completed"])
 def test_terminal_first_holds_claim_until_release_or_permanent_consumption(
-    appointment_storage, status
+    legacy_followup_storage, status
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     source = _seed(runtime, tenant, doctor)
     with transaction(runtime, tenant) as connection:
         existing = _claim(connection, tenant, source)
@@ -142,9 +424,9 @@ def test_terminal_first_holds_claim_until_release_or_permanent_consumption(
 
 @pytest.mark.parametrize("status", ["Cancelled", "Completed"])
 def test_claim_attempt_first_respects_later_terminal_outcome(
-    appointment_storage, status
+    legacy_followup_storage, status
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     source = _seed(runtime, tenant, doctor)
     with transaction(runtime, tenant) as connection:
         existing = _claim(connection, tenant, source)
@@ -254,9 +536,9 @@ def _tentative_booking_evidence(connection, tenant, appointment, receipt_key):
 
 @pytest.mark.parametrize("status", ["Cancelled", "Completed"])
 def test_claim_first_staged_booking_contends_with_terminal_before_commit(
-    appointment_storage, status
+    legacy_followup_storage, status
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     source = _seed(runtime, tenant, doctor)
     with transaction(runtime, tenant) as connection:
         existing = _claim(connection, tenant, source)
@@ -490,9 +772,9 @@ def _extend(connection, tenant, source, record, *, audit_correlation=None):
 
 
 def test_extension_and_competing_claim_serialize_without_new_reservation(
-    appointment_storage,
+    legacy_followup_storage,
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     source = _seed(runtime, tenant, doctor)
     with transaction(runtime, tenant) as connection:
         existing = _claim(connection, tenant, source)
@@ -538,8 +820,8 @@ def test_extension_and_competing_claim_serialize_without_new_reservation(
         )
 
 
-def test_extension_rejects_unrelated_clinical_audit_evidence(appointment_storage):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+def test_extension_rejects_unrelated_clinical_audit_evidence(legacy_followup_storage):
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     source = _seed(runtime, tenant, doctor)
     with transaction(runtime, tenant) as connection:
         record = _claim(connection, tenant, source)
@@ -558,9 +840,9 @@ def test_extension_rejects_unrelated_clinical_audit_evidence(appointment_storage
 
 
 def test_deadline_day_is_inclusive_but_next_day_loses_parallel_race(
-    appointment_storage,
+    legacy_followup_storage,
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = legacy_followup_storage
     source = _seed(runtime, tenant, doctor)
     barrier = Barrier(2)
 

@@ -245,6 +245,8 @@ def test_denied_routes_preserve_current_persistence_boundary():
             ("clinical_revisions",),
             ("completion_attestations",),
             ("followup_source_state",),
+            ("followup_source_decision_events",),
+            ("followup_authorization_events",),
             ("followup_claims",),
             ("followup_extensions",),
             ("queue_days",),

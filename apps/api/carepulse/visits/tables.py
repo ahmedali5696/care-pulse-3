@@ -134,9 +134,38 @@ followup_source_state = Table(
     Column("organization_id", UUID(as_uuid=True), primary_key=True),
     Column("visit_id", UUID(as_uuid=True), primary_key=True),
     Column("source_revision", BigInteger, nullable=False, server_default=text("0")),
-    Column("provenance_state", Text, nullable=False, server_default=text("'UNKNOWN'")),
+    Column("provenance_state", Text, nullable=False),
+    Column("appointment_id", UUID(as_uuid=True), nullable=False),
+    Column("patient_id", UUID(as_uuid=True), nullable=False),
+    Column("doctor_staff_id", UUID(as_uuid=True), nullable=False),
+    Column("baseline_clinical_revision", BigInteger, nullable=False),
+    Column("baseline_decision", JSONB(none_as_null=True)),
+    Column("baseline_actor_staff_id", UUID(as_uuid=True)),
+    Column("baseline_actor_role", Text),
+    Column("decision", JSONB(none_as_null=True)),
+    Column("decision_actor_staff_id", UUID(as_uuid=True)),
+    Column("decision_actor_role", Text),
     ForeignKeyConstraint(
         ["organization_id", "visit_id"],
         ["public.visits.organization_id", "public.visits.id"],
+    ),
+    ForeignKeyConstraint(
+        ["organization_id", "appointment_id"],
+        ["public.appointments.organization_id", "public.appointments.id"],
+    ),
+    ForeignKeyConstraint(
+        ["organization_id", "patient_id"],
+        ["public.patients.organization_id", "public.patients.id"],
+    ),
+    *(
+        ForeignKeyConstraint(
+            ["organization_id", column],
+            ["public.staff_accounts.organization_id", "public.staff_accounts.id"],
+        )
+        for column in (
+            "doctor_staff_id",
+            "baseline_actor_staff_id",
+            "decision_actor_staff_id",
+        )
     ),
 )
