@@ -155,7 +155,7 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
             "appointments_day_status_lane": """
                 SELECT a.id FROM public.appointments a
                 WHERE a.organization_id=:tenant AND a.service_date=:day
-                  AND a.status=:status AND a.lane=:lane ORDER BY a.id
+                  AND a.status=:status AND a.lane=:lane
             """,
             "active_queue_day_lane": """
                 SELECT e.id FROM public.queue_days q
@@ -182,13 +182,11 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
                 WHERE h.organization_id=:tenant
                   AND h.occurred_at>=:start AND h.occurred_at<:end
                   AND h.new_status IN ('Completed', 'Cancelled')
-                ORDER BY h.id
             """,
             "admission_events": """
                 SELECT v.id FROM public.visits v
                 WHERE v.organization_id=:tenant
                   AND v.admitted_at>=:start AND v.admitted_at<:end
-                ORDER BY v.id
             """,
         }
         params = {
@@ -202,7 +200,7 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
         }
         index_requirements = {
             "appointments_day_status_lane": (
-                ("appointments", ("organization_id", "service_date")),
+                ("appointments", ("organization_id", "service_date", "status", "lane")),
             ),
             "active_queue_day_lane": (
                 ("queue_days", ("organization_id", "service_date")),
