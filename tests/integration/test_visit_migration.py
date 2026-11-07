@@ -2,7 +2,9 @@
 
 import runpy
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -17,11 +19,14 @@ from test_database import _create_empty_database, _engine
 from test_database import admin as admin  # noqa: PLC0414 - fixture export
 from test_database import disposable_project as disposable_project  # noqa: PLC0414 - fixture export
 from test_database import empty_database as empty_database  # noqa: PLC0414
+from test_visit_persistence import _seed
 
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATION = ROOT / "db/migrations/versions/0021_d07_visits.py"
 BEFORE = "0020_b07_manual_slot_weekly"
 AFTER = "0021_d07_visits"
+AMENDMENT_BEFORE = "0025_d06_queue_foundations"
+AMENDMENT_AFTER = "0026_d07_completion_attestation"
 PREDECESSOR_TABLES = (
     "staff_accounts",
     "patients",
@@ -311,6 +316,7 @@ def test_failed_later_revision_rolls_back_and_keeps_d07(
         shutil.copytree(ROOT / "db/migrations", scripts)
         # This history test isolates D-07 -> a synthetic failing successor.
         # Exclude the real later D-08 head from the temporary migration tree.
+        (scripts / "versions/0026_d07_completion_attestation.py").unlink()
         (scripts / "versions/0025_d06_queue_foundations.py").unlink()
         (scripts / "versions/0024_b06_followup_window.py").unlink()
         (scripts / "versions/0023_m1_operational_manager.py").unlink()
@@ -340,3 +346,244 @@ def test_failed_later_revision_rolls_back_and_keeps_d07(
             )
     finally:
         migration.dispose()
+
+
+def test_populated_0025_upgrade_preserves_legacy_clinical_history_and_receipts(
+    admin, empty_database
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, AMENDMENT_BEFORE)
+        with transaction(runtime, tenant) as connection:
+            appointment = _seed(connection, tenant, doctor, complete=True)
+            connection.execute(
+                text(
+                    "SELECT set_config('app.clinical_reason', 'Legacy correction', true)"
+                )
+            )
+            connection.execute(
+                text("""
+                    UPDATE public.visits SET diagnosis='Historical Doctor diagnosis'
+                    WHERE appointment_id=:appointment
+                """),
+                {"appointment": appointment},
+            )
+        with migration.connect() as connection:
+            before = {
+                table: connection.execute(text(f"SELECT * FROM public.{table}")).all()
+                for table in (
+                    "appointments",
+                    "appointment_history",
+                    "visits",
+                    "clinical_revisions",
+                    "appointment_price_snapshots",
+                    "idempotency_receipts",
+                    "sensitive_audit",
+                )
+            }
+            assert (
+                connection.scalar(
+                    text("SELECT count(*) FROM public.clinical_revisions")
+                )
+                == 1
+            )
+        _upgrade(migration, AMENDMENT_AFTER)
+        _upgrade(migration, AMENDMENT_AFTER)
+        with migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT version_num FROM public.alembic_version")
+                )
+                == AMENDMENT_AFTER
+            )
+            for table, original in before.items():
+                assert (
+                    connection.execute(text(f"SELECT * FROM public.{table}")).all()
+                    == original
+                )
+            assert (
+                connection.scalar(
+                    text("SELECT count(*) FROM public.completion_attestations")
+                )
+                == 0
+            )
+            assert (
+                connection.scalar(
+                    text("SELECT count(*) FROM public.followup_source_state")
+                )
+                == 0
+            )
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
+def test_failed_0026_upgrade_reverts_objects_and_predecessor_version(
+    admin, empty_database, tmp_path
+):
+    _create_empty_database(admin, empty_database)
+    migration = _engine("carepulse_migration", empty_database)
+    try:
+        _upgrade(migration, AMENDMENT_BEFORE)
+        scripts = tmp_path / "migrations"
+        shutil.copytree(ROOT / "db/migrations", scripts)
+        successor = scripts / "versions/0026_d07_completion_attestation.py"
+        original = successor.read_text(encoding="utf-8")
+        assert "\ndef downgrade() -> None:" in original
+        successor.write_text(
+            original.replace(
+                "\ndef downgrade() -> None:",
+                '    op.execute("SELECT 1 / 0")\n\n\ndef downgrade() -> None:',
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(DBAPIError) as failed:
+            _upgrade(migration, AMENDMENT_AFTER, scripts)
+        assert failed.value.orig.sqlstate == "22012"
+        with migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT version_num FROM public.alembic_version")
+                )
+                == AMENDMENT_BEFORE
+            )
+            for relation in ("completion_attestations", "followup_source_state"):
+                assert (
+                    connection.scalar(
+                        text("SELECT to_regclass(:relation)"),
+                        {"relation": f"public.{relation}"},
+                    )
+                    is None
+                )
+            assert (
+                connection.scalar(
+                    text("SELECT to_regprocedure(:signature)"),
+                    {
+                        "signature": "public.complete_examined_visit(uuid,uuid,bigint,boolean)"
+                    },
+                )
+                is None
+            )
+    finally:
+        migration.dispose()
+
+
+def test_competing_completions_consume_one_visit_revision(appointment_storage):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        appointment = _seed(connection, tenant, doctor)
+    start = Barrier(2)
+
+    def attempt_completion():
+        try:
+            with transaction(runtime, tenant) as connection:
+                connection.execute(
+                    text("SELECT set_config('app.staff_id', :actor, true)"),
+                    {"actor": str(doctor)},
+                )
+                start.wait(timeout=15)
+                connection.execute(
+                    text(
+                        "SELECT * FROM public.complete_examined_visit(:tenant, :id, 2, true)"
+                    ),
+                    {"tenant": tenant, "id": appointment},
+                ).one()
+            return "completed"
+        except DBAPIError as denied:
+            return denied.orig.sqlstate
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda _: attempt_completion(), range(2)))
+    assert sorted(outcomes) == ["40001", "completed"]
+    with transaction(runtime, tenant) as connection:
+        assert connection.execute(
+            text("SELECT status, revision FROM public.appointments WHERE id=:id"),
+            {"id": appointment},
+        ).one() == ("Completed", 3)
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.completion_attestations WHERE appointment_id=:id"
+                ),
+                {"id": appointment},
+            )
+            == 1
+        )
+
+
+def test_concurrent_clinical_correction_and_completion_preserve_both_evidence(
+    appointment_storage,
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        appointment = _seed(connection, tenant, doctor)
+    start = Barrier(2)
+
+    def complete():
+        with transaction(runtime, tenant) as connection:
+            connection.execute(
+                text("SELECT set_config('app.staff_id', :actor, true)"),
+                {"actor": str(doctor)},
+            )
+            start.wait(timeout=15)
+            connection.execute(
+                text(
+                    "SELECT * FROM public.complete_examined_visit(:tenant, :id, 2, true)"
+                ),
+                {"tenant": tenant, "id": appointment},
+            ).one()
+
+    def correct():
+        with transaction(runtime, tenant) as connection:
+            connection.execute(
+                text("SELECT set_config('app.staff_id', :actor, true)"),
+                {"actor": str(doctor)},
+            )
+            connection.execute(
+                text(
+                    "SELECT set_config('app.clinical_reason', 'Synthetic correction', true)"
+                )
+            )
+            start.wait(timeout=15)
+            connection.execute(
+                text("""
+                    UPDATE public.visits SET diagnosis='Verified correction'
+                    WHERE appointment_id=:id
+                """),
+                {"id": appointment},
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        completed = pool.submit(complete)
+        corrected = pool.submit(correct)
+        completed.result(timeout=25)
+        corrected.result(timeout=25)
+    with transaction(runtime, tenant) as connection:
+        assert connection.execute(
+            text("""
+                SELECT a.status, v.clinical_revision, v.diagnosis
+                FROM public.appointments a
+                JOIN public.visits v ON v.appointment_id=a.id
+                WHERE a.id=:id
+            """),
+            {"id": appointment},
+        ).one() == ("Completed", 1, "Verified correction")
+        assert (
+            connection.scalar(
+                text("""
+                SELECT count(*) FROM public.clinical_revisions
+                WHERE visit_id=(SELECT id FROM public.visits WHERE appointment_id=:id)
+            """),
+                {"id": appointment},
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.completion_attestations WHERE appointment_id=:id"
+                ),
+                {"id": appointment},
+            )
+            == 1
+        )

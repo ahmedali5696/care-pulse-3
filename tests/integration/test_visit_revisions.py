@@ -7,7 +7,7 @@ from carepulse.db import transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
-from test_visit_persistence import _receptionist, _seed, _visit
+from test_visit_persistence import _complete, _receptionist, _seed, _visit
 
 
 def _actor(connection, doctor, reason=None, kind="CORRECTION"):
@@ -19,6 +19,69 @@ def _actor(connection, doctor, reason=None, kind="CORRECTION"):
         connection.execute(
             text("SELECT set_config(:name, :value, true)"),
             {"name": name, "value": value},
+        )
+
+
+def test_receptionist_completion_preserves_independent_doctor_corrections(
+    appointment_storage,
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    receptionist = _receptionist(migration, tenant)
+    with transaction(runtime, tenant) as connection:
+        appointment = _seed(connection, tenant, doctor)
+        visit = _visit(connection, appointment)
+        _actor(connection, doctor, "Exam details")
+        connection.execute(
+            text(
+                "UPDATE public.visits SET diagnosis='Original finding' WHERE id=:visit"
+            ),
+            {"visit": visit.id},
+        )
+        connection.execute(
+            text("SELECT set_config('app.staff_id', :actor, true)"),
+            {"actor": str(receptionist)},
+        )
+        completion = _complete(connection, tenant, appointment)
+        assert _visit(connection, appointment).clinical_revision == 1
+    with transaction(runtime, tenant) as connection:
+        _actor(connection, doctor, "Post-completion correction")
+        connection.execute(
+            text(
+                "UPDATE public.visits SET diagnosis='Corrected finding' WHERE id=:visit"
+            ),
+            {"visit": visit.id},
+        )
+        assert _visit(connection, appointment).clinical_revision == 2
+        assert connection.execute(
+            text("""
+                SELECT revision, actor_staff_id, actor_role, change_kind
+                FROM public.clinical_revisions
+                WHERE visit_id=:visit ORDER BY revision
+            """),
+            {"visit": visit.id},
+        ).all() == [
+            (1, doctor, "DOCTOR_OWNER", "CORRECTION"),
+            (2, doctor, "DOCTOR_OWNER", "CORRECTION"),
+        ]
+        assert connection.execute(
+            text("""
+                SELECT id, actor_staff_id, actor_role, completed_at
+                FROM public.completion_attestations
+                WHERE organization_id=:tenant AND appointment_id=:appointment
+            """),
+            {"tenant": tenant, "appointment": appointment},
+        ).one() == (
+            completion.attestation_id,
+            receptionist,
+            "RECEPTIONIST",
+            completion.completed_at,
+        )
+        assert (
+            connection.scalar(
+                text("SELECT status FROM public.appointments WHERE id=:id"),
+                {"id": appointment},
+            )
+            == "Completed"
         )
 
 

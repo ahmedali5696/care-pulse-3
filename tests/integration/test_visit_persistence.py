@@ -79,6 +79,250 @@ def _visit(connection, appointment):
     ).one()
 
 
+def _complete(connection, tenant, appointment, assertion=True, revision=2):
+    return connection.execute(
+        text("""
+            SELECT attestation_id, completion_history_revision, completed_at
+            FROM public.complete_examined_visit(
+                :tenant, :appointment, :revision, :assertion)
+        """),
+        {
+            "tenant": tenant,
+            "appointment": appointment,
+            "revision": revision,
+            "assertion": assertion,
+        },
+    ).one()
+
+
+@pytest.mark.parametrize("role", ["DOCTOR_OWNER", "RECEPTIONIST"])
+def test_new_completion_attests_actual_staff_and_history_without_clinical_revision(
+    appointment_storage, role
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    actor = doctor if role == "DOCTOR_OWNER" else _receptionist(migration, tenant)
+    with transaction(runtime, tenant) as connection:
+        appointment = _seed(connection, tenant, doctor)
+        visit = _visit(connection, appointment)
+        connection.execute(
+            text("SELECT set_config('app.staff_id', :actor, true)"),
+            {"actor": str(actor)},
+        )
+        completion = _complete(connection, tenant, appointment)
+    # Sensitive audit reads are Doctor-only; inspect the committed join as migration.
+    with migration.connect() as connection:
+        evidence = connection.execute(
+            text("""
+                SELECT c.id, c.visit_id, c.examination_occurred,
+                       c.actor_staff_id, c.actor_role, c.completed_at,
+                       c.completion_history_revision, c.sensitive_audit_id,
+                       h.actor_staff_id AS history_actor,
+                       h.actor_role AS history_role, h.occurred_at AS history_time,
+                       audit.actor_staff_id AS audit_actor,
+                       audit.actor_role AS audit_role, audit.occurred_at AS audit_time,
+                       audit.action AS audit_action
+                FROM public.completion_attestations c
+                JOIN public.appointment_history h
+                  ON h.organization_id = c.organization_id
+                 AND h.appointment_id = c.appointment_id
+                 AND h.appointment_revision = c.completion_history_revision
+                JOIN public.sensitive_audit audit
+                  ON audit.organization_id = c.organization_id
+                 AND audit.id = c.sensitive_audit_id
+                WHERE c.organization_id = :tenant AND c.appointment_id = :appointment
+            """),
+            {"tenant": tenant, "appointment": appointment},
+        ).one()
+        assert evidence.id == completion.attestation_id
+        assert evidence.visit_id == visit.id
+        assert evidence.examination_occurred is True
+        assert (
+            evidence.completion_history_revision
+            == completion.completion_history_revision
+            == 3
+        )
+        assert (
+            evidence.actor_staff_id
+            == evidence.history_actor
+            == evidence.audit_actor
+            == actor
+        )
+        assert (
+            evidence.actor_role == evidence.history_role == evidence.audit_role == role
+        )
+        assert (
+            evidence.completed_at
+            == evidence.history_time
+            == evidence.audit_time
+            == completion.completed_at
+        )
+        assert evidence.completed_at.microsecond == 0
+        assert evidence.audit_action == "VISIT_EXAMINATION_COMPLETED"
+        assert connection.execute(
+            text("SELECT status, revision FROM public.appointments WHERE id=:id"),
+            {"id": appointment},
+        ).one() == ("Completed", 3)
+        assert _visit(connection, appointment).clinical_revision == 0
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinical_revisions WHERE visit_id=:visit"
+                ),
+                {"visit": visit.id},
+            )
+            == 0
+        )
+
+
+@pytest.mark.parametrize(
+    "case,expected_state",
+    [
+        ("false", "42501"),
+        ("missing_assertion", "42501"),
+        ("stale_revision", "40001"),
+        ("wrong_tenant", "42501"),
+        ("foreign_actor", "42501"),
+        ("missing_actor", "42501"),
+        ("disabled_actor", "42501"),
+    ],
+)
+def test_completion_rejects_invalid_assertion_actor_scope_and_revision(
+    appointment_storage, case, expected_state
+):
+    runtime, _, (tenant, other), (doctor, other_doctor) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        appointment = _seed(connection, tenant, doctor)
+        if case in ("foreign_actor", "missing_actor"):
+            connection.execute(
+                text("SELECT set_config('app.staff_id', :actor, true)"),
+                {"actor": str(other_doctor) if case == "foreign_actor" else ""},
+            )
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            if case == "disabled_actor":
+                connection.execute(
+                    text("""
+                        UPDATE public.staff_accounts
+                        SET enabled=false, security_revision=security_revision+1
+                        WHERE organization_id=:tenant AND id=:doctor
+                    """),
+                    {"tenant": tenant, "doctor": doctor},
+                )
+            _complete(
+                connection,
+                other if case == "wrong_tenant" else tenant,
+                appointment,
+                assertion=None if case == "missing_assertion" else case != "false",
+                revision=1 if case == "stale_revision" else 2,
+            )
+        assert denied.value.orig.sqlstate == expected_state
+        assert connection.execute(
+            text("SELECT status, revision FROM public.appointments WHERE id=:id"),
+            {"id": appointment},
+        ).one() == ("In Examination", 2)
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.completion_attestations WHERE appointment_id=:id"
+                ),
+                {"id": appointment},
+            )
+            == 0
+        )
+
+
+def test_direct_completion_without_attestation_rolls_back_at_commit(
+    appointment_storage,
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        appointment = _seed(connection, tenant, doctor)
+    with pytest.raises(DBAPIError) as denied, migration.begin() as connection:
+        connection.execute(
+            text("""
+                UPDATE public.appointments SET status='Completed', revision=3
+                WHERE organization_id=:tenant AND id=:appointment
+            """),
+            {"tenant": tenant, "appointment": appointment},
+        )
+        connection.execute(
+            text("""
+                INSERT INTO public.appointment_history (
+                    id, organization_id, appointment_id, appointment_revision,
+                    action, old_status, new_status, old_service_date,
+                    new_service_date, old_number, new_number, actor_staff_id,
+                    actor_role, reason, price_snapshot_appointment_id)
+                SELECT :history, organization_id, id, 3, 'STATUS',
+                       'In Examination', 'Completed', service_date, service_date,
+                       current_number, current_number, :doctor, 'DOCTOR_OWNER',
+                       'Examination completed', id
+                FROM public.appointments
+                WHERE organization_id=:tenant AND id=:appointment
+            """),
+            {
+                "history": uuid4(),
+                "doctor": doctor,
+                "tenant": tenant,
+                "appointment": appointment,
+            },
+        )
+    assert denied.value.orig.sqlstate == "23514"
+    with transaction(runtime, tenant) as connection:
+        assert connection.execute(
+            text("SELECT status, revision FROM public.appointments WHERE id=:id"),
+            {"id": appointment},
+        ).one() == ("In Examination", 2)
+        assert (
+            connection.scalar(
+                text("""
+                SELECT count(*) FROM public.appointment_history
+                WHERE appointment_id=:id AND appointment_revision=3
+            """),
+                {"id": appointment},
+            )
+            == 0
+        )
+
+
+def test_completion_duplicate_and_direct_evidence_forgery_are_denied(
+    appointment_storage,
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    receptionist = _receptionist(migration, tenant)
+    with transaction(runtime, tenant) as connection:
+        appointment = _seed(connection, tenant, doctor)
+        connection.execute(
+            text("SELECT set_config('app.staff_id', :actor, true)"),
+            {"actor": str(receptionist)},
+        )
+        completion = _complete(connection, tenant, appointment)
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            _complete(connection, tenant, appointment)
+        assert denied.value.orig.sqlstate == "40001"
+        for statement in (
+            "UPDATE public.completion_attestations SET actor_role='DOCTOR_OWNER' WHERE appointment_id=:id",
+            "DELETE FROM public.completion_attestations WHERE appointment_id=:id",
+            "INSERT INTO public.completion_attestations (id) VALUES (:id)",
+        ):
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(text(statement), {"id": appointment})
+            assert denied.value.orig.sqlstate == "42501"
+    with migration.connect() as connection:
+        assert connection.execute(
+            text("""
+                SELECT id, actor_staff_id, actor_role FROM public.completion_attestations
+                WHERE organization_id=:tenant AND appointment_id=:appointment
+            """),
+            {"tenant": tenant, "appointment": appointment},
+        ).one() == (completion.attestation_id, receptionist, "RECEPTIONIST")
+    for statement in (
+        "UPDATE public.completion_attestations SET actor_role='DOCTOR_OWNER' WHERE appointment_id=:id",
+        "DELETE FROM public.completion_attestations WHERE appointment_id=:id",
+    ):
+        with pytest.raises(DBAPIError) as denied, migration.begin() as connection:
+            connection.execute(text(statement), {"id": appointment})
+        assert denied.value.orig.sqlstate == "23514"
+
+
 @pytest.mark.parametrize("role", ["DOCTOR_OWNER", "RECEPTIONIST"])
 def test_admission_shell_is_tied_to_real_history_and_live_actor(
     appointment_storage, role
@@ -371,15 +615,36 @@ def test_non_live_receptionist_cannot_insert_admission_shell(appointment_storage
 def test_tenant_rls_and_effective_permissions(appointment_storage):
     runtime, migration, (tenant, other), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
-        appointment = _seed(connection, tenant, doctor)
+        appointment = _seed(connection, tenant, doctor, complete=True)
+        visit = _visit(connection, appointment)
+    with migration.begin() as connection:
+        connection.execute(
+            text("""
+                INSERT INTO public.followup_source_state (organization_id, visit_id)
+                VALUES (:tenant, :visit)
+            """),
+            {"tenant": tenant, "visit": visit.id},
+        )
+    with transaction(runtime, tenant) as connection:
+        assert connection.execute(
+            text("""
+                SELECT source_revision, provenance_state
+                FROM public.followup_source_state WHERE visit_id=:visit
+            """),
+            {"visit": visit.id},
+        ).one() == (0, "UNKNOWN")
     with transaction(runtime, other) as connection:
         assert connection.scalar(text("SELECT count(*) FROM public.visits")) == 0
         assert (
             connection.scalar(text("SELECT count(*) FROM public.clinical_revisions"))
             == 0
         )
+        for name in ("completion_attestations", "followup_source_state"):
+            assert connection.scalar(text(f"SELECT count(*) FROM public.{name}")) == 0
     with transaction(runtime) as connection:
         assert connection.scalar(text("SELECT count(*) FROM public.visits")) == 0
+        for name in ("completion_attestations", "followup_source_state"):
+            assert connection.scalar(text(f"SELECT count(*) FROM public.{name}")) == 0
     with migration.connect() as connection:
         assert (
             connection.scalar(
@@ -462,6 +727,79 @@ def test_tenant_rls_and_effective_permissions(appointment_storage):
             assert details[0] is expected_definer
             assert "search_path=pg_catalog" in details[1]
             assert details[2:] == (False, False)
+
+        for name in ("completion_attestations", "followup_source_state"):
+            relation = f"public.{name}"
+            assert connection.execute(
+                text("""
+                    SELECT relrowsecurity, relforcerowsecurity
+                    FROM pg_class WHERE oid=CAST(:relation AS regclass)
+                """),
+                {"relation": relation},
+            ).one() == (True, True)
+            for role in ("carepulse_operator", "carepulse_runtime"):
+                for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                    assert connection.scalar(
+                        text(
+                            "SELECT has_table_privilege(:role, :relation, :privilege)"
+                        ),
+                        {"role": role, "relation": relation, "privilege": privilege},
+                    ) is (role == "carepulse_runtime" and privilege == "SELECT")
+                for privilege in ("INSERT", "UPDATE"):
+                    assert (
+                        connection.scalar(
+                            text(
+                                "SELECT has_any_column_privilege(:role, :relation, :privilege)"
+                            ),
+                            {
+                                "role": role,
+                                "relation": relation,
+                                "privilege": privilege,
+                            },
+                        )
+                        is False
+                    )
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_class c,
+                        LATERAL aclexplode(COALESCE(c.relacl,
+                            acldefault('r', c.relowner))) acl
+                        WHERE c.oid = CAST(:relation AS regclass) AND acl.grantee = 0
+                    )
+                """),
+                    {"relation": relation},
+                )
+                is False
+            )
+
+        signature = "public.complete_examined_visit(uuid,uuid,bigint,boolean)"
+        assert connection.execute(
+            text("""
+                SELECT p.prosecdef, p.proconfig,
+                       EXISTS (
+                           SELECT 1 FROM aclexplode(COALESCE(
+                               p.proacl, acldefault('f', p.proowner))) acl
+                           WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
+                       )
+                FROM pg_proc p WHERE p.oid=CAST(:routine AS regprocedure)
+            """),
+            {"routine": signature},
+        ).one() == (True, ["search_path=pg_catalog"], False)
+        for role, allowed in (
+            ("carepulse_runtime", True),
+            ("carepulse_operator", False),
+        ):
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT has_function_privilege(:role, CAST(:routine AS regprocedure), 'EXECUTE')"
+                    ),
+                    {"role": role, "routine": signature},
+                )
+                is allowed
+            )
 
 
 def test_runtime_without_tenant_context_cannot_write_visit(appointment_storage):

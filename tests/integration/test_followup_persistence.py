@@ -204,7 +204,27 @@ def _outcome(
     previous = (
         "In Examination" if (after_admission or status == "Completed") else "Booked"
     )
-    if status == "Completed" and not pre_admitted:
+    protected_completion = (
+        status == "Completed"
+        and pre_admitted
+        and connection.scalar(
+            text(
+                "SELECT to_regprocedure('public.complete_examined_visit(uuid,uuid,bigint,boolean)') IS NOT NULL"
+            )
+        )
+    )
+    if protected_completion:
+        connection.execute(
+            text("SELECT set_config('app.staff_id', :actor, true)"),
+            {"actor": str(doctor)},
+        )
+        connection.execute(
+            text("""
+                SELECT * FROM public.complete_examined_visit(:tenant, :id, 2, true)
+            """),
+            {"tenant": tenant, "id": record["id"]},
+        ).one()
+    if status == "Completed" and (not pre_admitted or protected_completion):
         revision = 3
     else:
         revision = 3 if (after_admission or pre_admitted) else 1

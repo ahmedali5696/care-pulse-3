@@ -263,11 +263,16 @@ def _admit_saved(
         text("SELECT set_config('app.staff_id', :actor, true)"),
         {"actor": str(actor)},
     )
+    completion_writer = complete and connection.scalar(
+        text(
+            "SELECT to_regprocedure('public.complete_examined_visit(uuid,uuid,bigint,boolean)') IS NOT NULL"
+        )
+    )
     has_queue = _has_d06_queue(connection)
     current = "Booked"
     for revision, status in enumerate(
         ("Waiting", "In Examination", "Completed")
-        if complete
+        if complete and not completion_writer
         else ("Waiting", "In Examination"),
         start=1,
     ):
@@ -370,6 +375,14 @@ def _admit_saved(
                 },
             )
         current = status
+    if completion_writer:
+        connection.execute(
+            text("""
+                SELECT * FROM public.complete_examined_visit(
+                    :tenant, :appointment, 2, true)
+            """),
+            {"tenant": tenant, "appointment": appointment},
+        ).one()
 
 
 def _persist_with_status(connection, tenant, patient, doctor, status, **changes):
