@@ -107,6 +107,43 @@ def _index_path(plan, relation, indexed_columns):
     return search(plan["Plan"])
 
 
+def _plan_nodes(node):
+    yield node
+    for child in node.get("Plans", []):
+        yield from _plan_nodes(child)
+
+
+def _dated_appointment_pk_probe(node):
+    return (
+        node.get("Relation Name") == "appointments"
+        and node.get("Node Type") in ("Index Scan", "Index Only Scan")
+        and "id = s.appointment_id" in node.get("Index Cond", "")
+        and all(
+            field in node.get("Filter", "")
+            for field in ("organization_id", "service_date", "status", "Completed")
+        )
+    )
+
+
+def _bounded_completed_value_plan(plan):
+    """Accept either a dated Appointment index or a tenant-indexed snapshot join."""
+    nodes = tuple(_plan_nodes(plan["Plan"]))
+    if any(
+        node.get("Node Type") in ("Seq Scan", "Parallel Seq Scan") for node in nodes
+    ):
+        return False
+    if _index_path(plan, "appointments", ("organization_id", "service_date")):
+        return True
+    return any(
+        node.get("Node Type") == "Nested Loop"
+        and _index_path(
+            {"Plan": node}, "appointment_price_snapshots", ("organization_id",)
+        )
+        and any(_dated_appointment_pk_probe(child) for child in _plan_nodes(node))
+        for node in nodes
+    )
+
+
 def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage):
     runtime, _, (tenant, other), (doctor, other_doctor) = appointment_storage
     with transaction(runtime, tenant) as connection:
@@ -210,9 +247,6 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
                 ("queue_entries", ("organization_id", "queue_day_id")),
             ),
             "family_phone": (("patients", ("organization_id", "phone_normalized")),),
-            "completed_service_value": (
-                ("appointments", ("organization_id", "service_date")),
-            ),
             "completion_cancellation_events": (
                 ("appointment_history", ("organization_id", "occurred_at")),
             ),
@@ -226,6 +260,12 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
             )
             assert plan and "Plan" in plan[0]
             print(f"D-11 T109 {name} EXPLAIN: {json.dumps(plan[0], sort_keys=True)}")
+            if name == "completed_service_value":
+                assert _bounded_completed_value_plan(plan[0]), (
+                    "Completed value must use a dated Appointment index or a "
+                    "tenant-indexed snapshot→Appointment PK join with date/status filtering"
+                )
+                continue
             assert all(
                 _index_path(plan[0], relation, columns)
                 for relation, columns in index_requirements[name]
