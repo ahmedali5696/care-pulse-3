@@ -212,28 +212,30 @@ def test_unauthorized_or_unjustified_correction_denied(
         )
 
 
-def test_default_decision_is_only_reasonless_revision(appointment_storage):
+def test_followup_decision_now_uses_separate_operational_writer(appointment_storage):
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
         appointment = _seed(connection, tenant, doctor, complete=True)
         visit = _visit(connection, appointment)
         _actor(connection, doctor, kind="DECISION_DEFAULT")
-        connection.execute(
-            text("""
-                UPDATE public.visits SET followup_decision=CAST(:decision AS jsonb)
-                WHERE id=:id
-            """),
-            {"decision": '{"kind":"DEFAULT"}', "id": visit.id},
+        with pytest.raises(DBAPIError) as direct_update, connection.begin_nested():
+            connection.execute(
+                text("""
+                    UPDATE public.visits SET followup_decision=CAST(:decision AS jsonb)
+                    WHERE id=:id
+                """),
+                {"decision": '{"kind":"DEFAULT"}', "id": visit.id},
+            )
+        assert direct_update.value.orig.sqlstate == "42501"
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinical_revisions WHERE visit_id=:id"
+                ),
+                {"id": visit.id},
+            )
+            == 0
         )
-        assert connection.execute(
-            text("""
-                SELECT revision, change_kind, reason,
-                       old_values->>'followup_decision',
-                       new_values->'followup_decision'->>'kind'
-                FROM public.clinical_revisions WHERE visit_id=:id
-            """),
-            {"id": visit.id},
-        ).one() == (1, "DECISION_DEFAULT", None, None, "DEFAULT")
         with pytest.raises(DBAPIError) as denied, connection.begin_nested():
             connection.execute(
                 text("""

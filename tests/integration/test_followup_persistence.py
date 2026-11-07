@@ -58,10 +58,13 @@ def legacy_followup_storage(admin, empty_database):
 
 def _v2_source(connection, tenant, doctor):
     appointment = _admitted_source(connection, tenant, doctor, complete=True)
-    visit, completion = connection.execute(
+    visit, completion, patient = connection.execute(
         text("""
-            SELECT c.visit_id, (c.completed_at AT TIME ZONE 'Africa/Cairo')::date
-            FROM public.completion_attestations c WHERE c.appointment_id=:appointment
+            SELECT c.visit_id, (c.completed_at AT TIME ZONE 'Africa/Cairo')::date,
+                   v.patient_id
+            FROM public.completion_attestations c
+            JOIN public.visits v ON (v.organization_id,v.id)=(c.organization_id,c.visit_id)
+            WHERE c.appointment_id=:appointment
         """),
         {"appointment": appointment},
     ).one()
@@ -71,6 +74,7 @@ def _v2_source(connection, tenant, doctor):
         "appointment": appointment,
         "visit": visit,
         "day": completion,
+        "patient": patient,
     }
 
 
@@ -189,24 +193,6 @@ def test_v2_no_decision_and_actual_staff_events_preserve_clinical_content(
             ),
             {"visit": source["visit"]},
         ).one() == (0, None)
-        events = connection.execute(
-            text("""
-            SELECT e.source_revision, e.actor_staff_id, e.actor_role, e.before_decision,
-                   e.decision, a.before_state, a.after_state
-            FROM public.followup_source_decision_events e JOIN public.sensitive_audit a
-              ON (a.organization_id,a.id)=(e.organization_id,e.sensitive_audit_id)
-            WHERE e.source_visit_id=:visit ORDER BY e.source_revision
-        """),
-            {"visit": source["visit"]},
-        ).all()
-        role = "DOCTOR_OWNER" if staff == doctor else "RECEPTIONIST"
-        assert [
-            (row.source_revision, row.actor_staff_id, row.actor_role) for row in events
-        ] == [(1, staff, role), (2, staff, role)]
-        assert events[0].before_decision is None
-        assert events[1].before_decision == events[0].decision
-        assert events[1].before_state["actor_staff_id"] == str(staff)
-        assert events[1].after_state["decision"] == {"kind": "DEFAULT"}
         assert (
             connection.scalar(
                 text(
@@ -220,6 +206,27 @@ def test_v2_no_decision_and_actual_staff_events_preserve_clinical_content(
             text("SELECT approved_deadline FROM public.followup_claims WHERE id=:id"),
             {"id": claim},
         ) == source["day"] + timedelta(days=7)
+    # The Receptionist may write operational evidence but cannot read sensitive audit.
+    with migration.connect() as connection:
+        events = connection.execute(
+            text("""
+                SELECT e.source_revision, e.actor_staff_id, e.actor_role,
+                       e.before_decision, e.decision, a.before_state, a.after_state
+                FROM public.followup_source_decision_events e
+                JOIN public.sensitive_audit a
+                  ON (a.organization_id,a.id)=(e.organization_id,e.sensitive_audit_id)
+                WHERE e.source_visit_id=:visit ORDER BY e.source_revision
+            """),
+            {"visit": source["visit"]},
+        ).all()
+    role = "DOCTOR_OWNER" if staff == doctor else "RECEPTIONIST"
+    assert [
+        (row.source_revision, row.actor_staff_id, row.actor_role) for row in events
+    ] == [(1, staff, role), (2, staff, role)]
+    assert events[0].before_decision is None
+    assert events[1].before_decision == events[0].decision
+    assert events[1].before_state["actor_staff_id"] == str(staff)
+    assert events[1].after_state["decision"] == {"kind": "DEFAULT"}
 
 
 @pytest.mark.parametrize("restriction", ["OPTED_OUT", "DEADLINE"])

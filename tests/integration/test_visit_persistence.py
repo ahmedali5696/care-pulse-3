@@ -620,8 +620,12 @@ def test_tenant_rls_and_effective_permissions(appointment_storage):
     with migration.begin() as connection:
         connection.execute(
             text("""
-                INSERT INTO public.followup_source_state (organization_id, visit_id)
-                VALUES (:tenant, :visit)
+                INSERT INTO public.followup_source_state
+                    (organization_id, visit_id, appointment_id, patient_id,
+                     doctor_staff_id, baseline_clinical_revision, provenance_state)
+                SELECT organization_id, id, appointment_id, patient_id,
+                       doctor_staff_id, clinical_revision, 'VERIFIED'
+                FROM public.visits WHERE organization_id=:tenant AND id=:visit
             """),
             {"tenant": tenant, "visit": visit.id},
         )
@@ -632,7 +636,7 @@ def test_tenant_rls_and_effective_permissions(appointment_storage):
                 FROM public.followup_source_state WHERE visit_id=:visit
             """),
             {"visit": visit.id},
-        ).one() == (0, "UNKNOWN")
+        ).one() == (0, "VERIFIED")
     with transaction(runtime, other) as connection:
         assert connection.scalar(text("SELECT count(*) FROM public.visits")) == 0
         assert (

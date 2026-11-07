@@ -14,6 +14,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _admit_saved, _draft, _query
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
+from test_database import admin as admin  # noqa: PLC0414
+from test_database import disposable_project as disposable_project  # noqa: PLC0414
+from test_database import empty_database as empty_database  # noqa: PLC0414
 from test_followup_persistence import (
     _claim,
     _insert_claim,
