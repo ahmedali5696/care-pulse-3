@@ -145,12 +145,14 @@ def _locked_source(
         or appointment["doctor_staff_id"] != visit["doctor_staff_id"]
     ):
         raise ContractError(404)
+    # The source Appointment/Visit (and optional target Appointment) serialize
+    # source and claim changes; these protected rows need only SELECT privileges.
     state = (
         connection.execute(
             text("""
                 SELECT source_revision, provenance_state, decision, decision_actor_role
                 FROM public.followup_source_state
-                WHERE organization_id=:tenant AND visit_id=:visit FOR UPDATE
+                WHERE organization_id=:tenant AND visit_id=:visit
         """),
             {"tenant": tenant, "visit": visit_id},
         )
@@ -187,7 +189,7 @@ def _locked_source(
                 text("""
                     SELECT id, appointment_id, state, revision, approved_deadline
                     FROM public.followup_claims
-                    WHERE organization_id=:tenant AND id=:claim FOR UPDATE
+                    WHERE organization_id=:tenant AND id=:claim
                 """),
                 {"tenant": tenant, "claim": claim_id},
             )

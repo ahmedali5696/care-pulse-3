@@ -124,13 +124,15 @@ def qualify_followup(
     appointment, visit = locked
     if appointment["patient_id"] != patient_id or visit["patient_id"] != patient_id:
         return Qualification("NOT_FOUND")
+    # The source Appointment and Visit are already locked. A row-lock read of
+    # the protected source state would require an unnecessary UPDATE grant.
     source_state = (
         connection.execute(
             text("""
                 SELECT source_revision, provenance_state, decision,
                        decision_actor_staff_id, decision_actor_role
                 FROM public.followup_source_state
-                WHERE organization_id=:tenant AND visit_id=:visit FOR UPDATE
+                WHERE organization_id=:tenant AND visit_id=:visit
             """),
             {"tenant": tenant, "visit": source_visit_id},
         )
@@ -161,7 +163,7 @@ def qualify_followup(
             text("""
             SELECT state FROM public.followup_claims
             WHERE organization_id=:tenant AND source_visit_id=:source_visit
-            ORDER BY id FOR UPDATE
+            ORDER BY id
         """),
             {"tenant": tenant, "source_visit": source_visit_id},
         )

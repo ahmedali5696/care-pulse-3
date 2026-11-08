@@ -329,7 +329,7 @@ def test_receptionist_can_amend_own_decision_with_authorship_preserved(
         with migration.begin() as connection:
             connection.execute(
                 text(
-                    "UPDATE public.staff_accounts SET operational_manager=true WHERE id=:staff"
+                    "UPDATE public.staff_accounts SET operational_manager=true, security_revision=security_revision+1 WHERE id=:staff"
                 ),
                 {"staff": staff},
             )
@@ -451,7 +451,9 @@ def test_denied_decision_keeps_clinical_operational_and_receipt_evidence_empty(
         _staff_context(connection, doctor)
         if case == "disabled":
             connection.execute(
-                text("UPDATE public.staff_accounts SET enabled=false WHERE id=:staff"),
+                text(
+                    "UPDATE public.staff_accounts SET enabled=false, security_revision=security_revision+1 WHERE id=:staff"
+                ),
                 {"staff": doctor},
             )
         with pytest.raises(ContractError) as denied, connection.begin_nested():
@@ -467,7 +469,9 @@ def test_denied_decision_keeps_clinical_operational_and_receipt_evidence_empty(
         assert (denied.value.status_code, denied.value.code) == (status, code)
         if case == "disabled":
             connection.execute(
-                text("UPDATE public.staff_accounts SET enabled=true WHERE id=:staff"),
+                text(
+                    "UPDATE public.staff_accounts SET enabled=true, security_revision=security_revision+1 WHERE id=:staff"
+                ),
                 {"staff": doctor},
             )
         assert connection.execute(
