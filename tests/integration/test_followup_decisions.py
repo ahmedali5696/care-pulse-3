@@ -669,13 +669,14 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
     patient_backend, revoke_first
 ):
     clinic = patient_backend
+    actor = clinic.receptionist
     source = _source(clinic)
     body = _decision("DEFAULT").model_dump(mode="json", exclude_unset=True)
     changed = {**body, "followup_decision": {"kind": "OPTED_OUT", "reason": "changed"}}
     path = f"/v1/visits/{source['visit']}"
     key = str(uuid4())
     accepted = _signed_visit_request(
-        clinic, clinic.owner, path=path, method="PATCH", body=body, key=key
+        clinic, actor, path=path, method="PATCH", body=body, key=key
     )
     assert accepted[0] == 200, accepted
     saved_query = text("""
@@ -695,7 +696,7 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
 
     def observe_sql(connection, cursor, statement, parameters, context, executemany):
         marker = (
-            "FOR UPDATE OF s"
+            "SELECT public.lock_active_organization"
             if revoke_first
             else "FROM public.idempotency_receipts AS r"
         )
@@ -707,7 +708,7 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
 
     def retry():
         return _signed_visit_request(
-            clinic, clinic.owner, path=path, method="PATCH", body=body, key=key
+            clinic, actor, path=path, method="PATCH", body=body, key=key
         )
 
     def revoke():
@@ -720,7 +721,7 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
                     SET enabled=false, security_revision=security_revision+1
                     WHERE organization_id=:tenant AND id=:staff
                 """),
-                {"tenant": clinic.tenant, "staff": UUID(clinic.owner.staff_id)},
+                {"tenant": clinic.tenant, "staff": UUID(actor.staff_id)},
             )
 
     revocation_started = Queue(maxsize=1)
@@ -740,7 +741,7 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
                             """),
                             {
                                 "tenant": clinic.tenant,
-                                "staff": UUID(clinic.owner.staff_id),
+                                "staff": UUID(actor.staff_id),
                             },
                         )
                         in_flight = pool.submit(retry)
@@ -768,7 +769,7 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
     denied_codes = []
     for candidate in (body, changed):
         denied = _signed_visit_request(
-            clinic, clinic.owner, path=path, method="PATCH", body=candidate, key=key
+            clinic, actor, path=path, method="PATCH", body=candidate, key=key
         )
         assert denied[0] == 403, denied
         assert "data" not in denied[1]
