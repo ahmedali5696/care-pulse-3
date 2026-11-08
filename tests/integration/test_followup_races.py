@@ -210,13 +210,18 @@ def test_current_head_doctor_clinical_correction_and_extension_preserve_independ
                 "DOCTOR_OWNER",
                 "Synthetic confirmed extension race",
             )
-            assert (
-                connection.scalar(
-                    text("SELECT count(*) FROM public.sensitive_audit WHERE id=:audit"),
-                    {"audit": events[0].sensitive_audit_id},
+            # Runtime RLS hides sensitive audit; verify persistence through the
+            # migration read role after the successful writer has committed.
+            with migration.connect() as audit_reader:
+                assert (
+                    audit_reader.scalar(
+                        text(
+                            "SELECT count(*) FROM public.sensitive_audit WHERE id=:audit"
+                        ),
+                        {"audit": events[0].sensitive_audit_id},
+                    )
+                    == 1
                 )
-                == 1
-            )
     with (
         pytest.raises(DBAPIError) as immutable_clinical,
         migration.begin() as connection,
