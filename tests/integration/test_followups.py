@@ -1103,9 +1103,15 @@ def test_signed_saved_receipt_hidden_appointment_is_non_oracular(followup_clinic
         body={**body, "expected_net_egp": "29.00"},
         key=key,
     )
-    assert matching == changed
-    assert matching[0] == 404
-    assert "data" not in matching[1]
+    for status, response in (matching, changed):
+        assert status == 404
+        assert set(response) == {"error"}
+        assert set(response["error"]) == {"code", "message", "request_id"}
+        assert (response["error"]["code"], response["error"]["message"]) == (
+            "NOT_FOUND",
+            "Resource not found",
+        )
+        UUID(response["error"]["request_id"])
     assert booking_effects(clinic) == before
 
 
