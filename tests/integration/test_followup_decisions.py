@@ -747,7 +747,12 @@ def test_signed_committed_v1_replays_exact_original_digest_including_null_distin
     assert _effects(clinic, visit_id, "visits.followup_decision") == (0, 0, 0, 0, 1)
 
 
-def test_overbroad_saved_v2_receipt_denies_before_digest_conflict(patient_backend):
+@pytest.mark.parametrize(
+    "corruption", ["extra_field", "altered_decision", "altered_revision"]
+)
+def test_invalid_saved_v2_decision_receipt_denies_before_digest_conflict(
+    patient_backend, corruption
+):
     clinic = patient_backend
     source = _source(clinic)
     path = f"/v1/visits/{source['visit']}"
@@ -758,6 +763,16 @@ def test_overbroad_saved_v2_receipt_denies_before_digest_conflict(patient_backen
     )
     assert status == 200, accepted
     key = str(uuid4())
+    saved_projection = dict(accepted["data"])
+    if corruption == "extra_field":
+        saved_projection["medical_notes"] = "restricted narrative"
+    elif corruption == "altered_decision":
+        saved_projection["followup_decision"] = {
+            "kind": "OPTED_OUT",
+            "reason": "forged",
+        }
+    else:
+        saved_projection["source_decision_revision"] += 1
     with transaction(clinic.runtime, clinic.tenant) as connection:
         _staff_context(connection, UUID(clinic.owner.staff_id))
         insert_tenant_receipt(
@@ -769,10 +784,7 @@ def test_overbroad_saved_v2_receipt_denies_before_digest_conflict(patient_backen
                 request_digest=sha256(
                     source["visit"].bytes + normalize_typed_body(command)
                 ).hexdigest(),
-                result_projection={
-                    **accepted["data"],
-                    "medical_notes": "restricted narrative",
-                },
+                result_projection=saved_projection,
                 result_revision=accepted["revision"],
                 organization_id=clinic.tenant,
                 staff_id=UUID(clinic.owner.staff_id),
@@ -815,6 +827,61 @@ def test_overbroad_saved_v2_receipt_denies_before_digest_conflict(patient_backen
         0,
         1,
         0,
+        2,
+    )
+
+
+def test_saved_v2_extension_receipt_must_match_immutable_authorization_event(
+    followup_clinic,
+):
+    clinic = followup_clinic
+    source = _source(clinic)
+    confirmed = _confirmed(clinic, source)
+    command = _extension(source, confirmed["id"])
+    body = command.model_dump(mode="json", exclude_unset=True)
+    path = f"/v1/visits/{source['visit']}/extend-followup"
+    status, accepted = _signed_visit_request(
+        clinic, clinic.owner, path=path, method="POST", body=body, key=str(uuid4())
+    )
+    assert status == 200, accepted
+    altered = {
+        **accepted["data"],
+        "extended_deadline": (source["day"] + timedelta(days=10)).isoformat(),
+    }
+    key = str(uuid4())
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _staff_context(connection, UUID(clinic.owner.staff_id))
+        insert_tenant_receipt(
+            connection,
+            Receipt(
+                actor_id=UUID(clinic.owner.staff_id),
+                operation="visits.extend_followup",
+                idempotency_key=key,
+                request_digest=sha256(
+                    source["visit"].bytes + normalize_typed_body(command)
+                ).hexdigest(),
+                result_projection=altered,
+                result_revision=accepted["revision"],
+                organization_id=clinic.tenant,
+                staff_id=UUID(clinic.owner.staff_id),
+            ),
+        )
+    for attempted in (body, {**body, "reason": "Different reason"}):
+        denied, response = _signed_visit_request(
+            clinic,
+            clinic.owner,
+            path=path,
+            method="POST",
+            body=attempted,
+            key=key,
+        )
+        assert denied == 403, response
+        assert "data" not in response
+    assert _effects(clinic, source["visit"], "visits.extend_followup") == (
+        0,
+        0,
+        0,
+        1,
         2,
     )
 

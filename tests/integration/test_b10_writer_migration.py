@@ -11,7 +11,7 @@ from test_followup_persistence import _v2_booking, _v2_command, _v2_source
 from test_visit_migration import _prepare, _upgrade
 
 BEFORE = "0028_d08_followup_provenance"
-AFTER = "0029_b10_ordered_followup_writers"
+AFTER = "0029_b10_followup_writers"
 
 
 def test_populated_successor_retains_claim_and_fences_legacy_sql(admin, empty_database):

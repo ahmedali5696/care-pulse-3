@@ -275,7 +275,8 @@ def _replay_receipt(
         if v2:
             event = connection.execute(
                 text("""
-                    SELECT actor_staff_id, actor_role
+                    SELECT actor_staff_id, actor_role, decision,
+                           source_revision, clinical_revision
                     FROM public.followup_source_decision_events
                     WHERE organization_id=:tenant AND source_visit_id=:visit
                       AND id=:event
@@ -286,9 +287,15 @@ def _replay_receipt(
                     "event": _event_uuid(projection["event_id"]),
                 },
             ).one_or_none()
-            if event is None or (event.actor_staff_id, event.actor_role) != (
-                actor.staff_id,
-                actor.role,
+            if (
+                event is None
+                or (event.actor_staff_id, event.actor_role)
+                != (actor.staff_id, actor.role)
+                or event.decision != decision
+                or projection.get("revision") != event.source_revision
+                or projection.get("source_decision_revision") != event.source_revision
+                or projection.get("visit_revision") != event.clinical_revision
+                or revision != event.source_revision
             ):
                 raise ContractError(403)
         elif actor.role != "DOCTOR_OWNER":
@@ -313,7 +320,10 @@ def _replay_receipt(
         if v2:
             event = connection.execute(
                 text("""
-                    SELECT actor_staff_id, actor_role FROM public.followup_authorization_events
+                    SELECT actor_staff_id, actor_role, new_deadline,
+                           authorization_revision, source_revision,
+                           clinical_revision, appointment_revision, claim_revision
+                    FROM public.followup_authorization_events
                     WHERE organization_id=:tenant AND claim_id=:claim AND id=:event
                       AND kind='EXTENSION'
                 """),
@@ -328,6 +338,15 @@ def _replay_receipt(
                 or (event.actor_staff_id, event.actor_role)
                 != (actor.staff_id, actor.role)
                 or projection.get("claim_id") != str(claim.id)
+                or projection.get("extended_deadline") != event.new_deadline.isoformat()
+                or projection.get("revision") != event.authorization_revision
+                or projection.get("authorization_revision")
+                != event.authorization_revision
+                or projection.get("source_decision_revision") != event.source_revision
+                or projection.get("visit_revision") != event.clinical_revision
+                or projection.get("claim_revision") != event.claim_revision
+                or projection.get("appointment_revision") != event.appointment_revision
+                or revision != event.authorization_revision
             ):
                 raise ContractError(403)
         elif actor.role != "DOCTOR_OWNER":

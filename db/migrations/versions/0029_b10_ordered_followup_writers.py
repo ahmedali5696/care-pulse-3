@@ -6,7 +6,7 @@ Caller-set runtime GUCs remain subject to the separate G3 / Issue #26 review.
 
 from alembic import op
 
-revision = "0029_b10_ordered_followup_writers"
+revision = "0029_b10_followup_writers"
 down_revision = "0028_d08_followup_provenance"
 branch_labels = None
 depends_on = None
