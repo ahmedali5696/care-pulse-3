@@ -430,6 +430,46 @@ def test_v2_current_policy_boundaries_are_derived_without_doctor_default(
         )
 
 
+@pytest.mark.parametrize(
+    ("window", "eligible_offset", "ineligible_offset"),
+    [(10, 10, 11), (2, 2, 10), (0, 0, 1), ("7.00", 7, 8)],
+)
+def test_current_followup_qualification_uses_live_policy_window(
+    appointment_storage, window, eligible_offset, ineligible_offset
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        payload = (
+            '{"completion_day_zero":true,"last_day_inclusive":7.00}'
+            if window == "7.00"
+            else {"completion_day_zero": True, "last_day_inclusive": window}
+        )
+        append_version(
+            connection, tenant, "FOLLOWUP", payload, 1, actor_staff_id=str(doctor)
+        )
+        now = datetime.now(UTC) + timedelta(seconds=2)
+
+        def qualification(offset):
+            return qualify_followup(
+                connection,
+                tenant,
+                source["patient"],
+                source["day"] + timedelta(days=offset),
+                source["visit"],
+                0,
+                now,
+                expected_visit_revision=0,
+            )
+
+        allowed = qualification(eligible_offset)
+        assert (allowed.outcome, allowed.approved_deadline) == (
+            "PREFERENTIAL",
+            source["day"] + timedelta(days=eligible_offset),
+        )
+        assert qualification(ineligible_offset).outcome == "FALLBACK"
+
+
 def test_v2_ordered_new_date_extension_and_direct_terminal_fence(
     appointment_storage,
 ):
@@ -1694,31 +1734,6 @@ def test_default_claim_uses_live_followup_window_and_rebook_freezes_new_policy(
         )
         source = _source(connection, tenant, doctor)
         original_provenance = _provenance(source, version=2)
-        current_time = datetime.now(UTC) + timedelta(seconds=2)
-        assert (
-            qualify_followup(
-                connection,
-                tenant,
-                source["patient"],
-                source["day"] + timedelta(days=10),
-                source["visit"],
-                1,
-                current_time,
-            ).outcome
-            == "PREFERENTIAL"
-        )
-        assert (
-            qualify_followup(
-                connection,
-                tenant,
-                source["patient"],
-                source["day"] + timedelta(days=11),
-                source["visit"],
-                1,
-                current_time,
-            ).outcome
-            == "FALLBACK"
-        )
         # Even a current ten-day deadline cannot use a superseded policy head.
         with pytest.raises(DBAPIError) as mismatched, connection.begin_nested():
             _claim(
@@ -1775,31 +1790,6 @@ def test_default_claim_uses_live_followup_window_and_rebook_freezes_new_policy(
             == 3
         )
         fresh_provenance = _provenance(source, version=3)
-        current_time = datetime.now(UTC) + timedelta(seconds=2)
-        assert (
-            qualify_followup(
-                connection,
-                tenant,
-                source["patient"],
-                source["day"] + timedelta(days=10),
-                source["visit"],
-                1,
-                current_time,
-            ).outcome
-            == "FALLBACK"
-        )
-        assert (
-            qualify_followup(
-                connection,
-                tenant,
-                source["patient"],
-                source["day"] + timedelta(days=2),
-                source["visit"],
-                1,
-                current_time,
-            ).outcome
-            == "PREFERENTIAL"
-        )
         fresh = _claim(
             connection,
             tenant,
@@ -1857,30 +1847,6 @@ def test_zero_day_followup_policy_qualifies_and_confirms_only_completion_day(
         )
         source = _source(connection, tenant, doctor)
         provenance = _provenance(source, version=2)
-        now = datetime.now(UTC) + timedelta(seconds=2)
-        today = qualify_followup(
-            connection,
-            tenant,
-            source["patient"],
-            source["day"],
-            source["visit"],
-            1,
-            now,
-        )
-        assert today.outcome == "PREFERENTIAL"
-        assert today.approved_deadline == source["day"]
-        assert (
-            qualify_followup(
-                connection,
-                tenant,
-                source["patient"],
-                source["day"] + timedelta(days=1),
-                source["visit"],
-                1,
-                now,
-            ).outcome
-            == "FALLBACK"
-        )
         with pytest.raises(DBAPIError) as rejected, connection.begin_nested():
             _claim(
                 connection,
@@ -1935,18 +1901,6 @@ def test_integral_decimal_followup_policy_payload_is_accepted(legacy_followup_st
             == 2
         )
         source = _source(connection, tenant, doctor)
-        assert (
-            qualify_followup(
-                connection,
-                tenant,
-                source["patient"],
-                source["day"] + timedelta(days=7),
-                source["visit"],
-                1,
-                datetime.now(UTC) + timedelta(seconds=2),
-            ).outcome
-            == "PREFERENTIAL"
-        )
         record = _claim(
             connection,
             tenant,

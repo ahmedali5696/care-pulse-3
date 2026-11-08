@@ -843,7 +843,7 @@ def test_saved_v2_extension_receipt_must_match_immutable_authorization_event(
     status, accepted = _signed_visit_request(
         clinic, clinic.owner, path=path, method="POST", body=body, key=str(uuid4())
     )
-    assert status == 200, accepted
+    assert status == 201, accepted
     altered = {
         **accepted["data"],
         "extended_deadline": (source["day"] + timedelta(days=10)).isoformat(),
