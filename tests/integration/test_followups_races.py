@@ -359,6 +359,98 @@ def test_release_or_consume_races_fresh_claim_without_double_use(
             assert _claim_count(clinic, source) == 0
 
 
+def test_claim_confirmation_first_blocks_terminal_until_booking_commits(
+    followup_clinic,
+):
+    clinic = followup_clinic
+    source = _source_for(clinic)
+    before = booking_effects(clinic)
+    confirmed = Event()
+    release_booking = Event()
+    terminal_started = Event()
+    booking_pid = []
+    terminal_pid = []
+    pending_booking = []
+    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+
+    def book():
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            booking_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            _doctor_context(connection, actor.staff_id)
+            saved = book_appointment(connection, actor, _command(source), str(uuid4()))
+            pending_booking.append(saved)
+            confirmed.set()
+            assert release_booking.wait(timeout=20)
+            return saved
+
+    def cancel():
+        with clinic.migration.begin() as connection:
+            connection.execute(text("SET LOCAL lock_timeout = '30s'"))
+            connection.execute(text("SET LOCAL statement_timeout = '45s'"))
+            terminal_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            terminal_started.set()
+            connection.execute(
+                text("""
+                    SELECT id FROM public.patients
+                    WHERE organization_id=:tenant AND id=:patient FOR UPDATE
+                """),
+                {"tenant": clinic.tenant, "patient": source["patient"]},
+            ).one()
+            return terminal_claim(
+                clinic,
+                pending_booking[0],
+                status="Cancelled",
+                migration_connection=connection,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        booking = pool.submit(book)
+        assert confirmed.wait(timeout=15)
+        terminal = pool.submit(cancel)
+        try:
+            assert terminal_started.wait(timeout=15)
+            with transaction(clinic.runtime, clinic.tenant) as observer:
+                _wait_for_postgres_lock(observer, terminal_pid[0], booking_pid[0])
+            assert booking_effects(clinic) == before
+            assert _claim_count(clinic, source) == 0
+        finally:
+            release_booking.set()
+        saved = booking.result(timeout=30)
+        released = terminal.result(timeout=30)
+
+    assert saved["service_type"] == "FOLLOW_UP"
+    assert released is not None
+    assert _claim_count(clinic, source) == 0
+    assert booking_effects(clinic) == tuple(
+        count + delta for count, delta in zip(before, (1, 1, 1, 1, 2, 1, 1, 1))
+    )
+    with clinic.migration.connect() as connection:
+        state = connection.execute(
+            text("""
+                SELECT c.id, c.state, c.terminal_history_revision,
+                       a.status, a.revision, h.action, h.new_status, h.actor_staff_id
+                FROM public.followup_claims c
+                JOIN public.appointments a ON (a.organization_id,a.id)
+                    = (c.organization_id,c.appointment_id)
+                JOIN public.appointment_history h ON (h.organization_id,h.appointment_id,
+                    h.appointment_revision) =
+                    (a.organization_id,a.id,c.terminal_history_revision)
+                WHERE c.organization_id=:tenant AND a.id=:appointment
+            """),
+            {"tenant": clinic.tenant, "appointment": UUID(saved["id"])},
+        ).one()
+        assert state == (
+            released,
+            "RELEASED",
+            1,
+            "Cancelled",
+            1,
+            "STATUS",
+            "Cancelled",
+            actor.staff_id,
+        )
+
+
 def test_doctor_extension_and_new_claim_compete_for_same_source(followup_clinic):
     clinic = followup_clinic
     source = _source_for(clinic)

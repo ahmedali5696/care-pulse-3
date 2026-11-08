@@ -28,16 +28,16 @@ from test_appointment_persistence import appointment_storage as appointment_stor
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_booking import booking_request
 from test_database import admin as admin  # noqa: PLC0414
+from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
 from test_followup_persistence import (
     _claim,
-    _outcome,
     _v2_source,
 )
 from test_followup_persistence import (
     _source as _legacy_source,
 )
-from test_followups import followup_body
+from test_followups import followup_body, terminal_claim
 from test_followups import followup_clinic as followup_clinic  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _patch, pricing_request
@@ -1221,15 +1221,11 @@ def test_denied_extension_preserves_claim_and_has_no_new_authorization_evidence(
     source = _source(clinic)
     confirmed = _confirmed(clinic, source)
     if case in ("released", "consumed"):
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            _staff_context(connection, UUID(clinic.owner.staff_id))
-            _outcome(
-                connection,
-                clinic.tenant,
-                UUID(clinic.owner.staff_id),
-                confirmed,
-                status="Cancelled" if case == "released" else "Completed",
-            )
+        terminal_claim(
+            clinic,
+            confirmed["saved"],
+            status="Cancelled" if case == "released" else "Completed",
+        )
     command = _extension(
         source,
         uuid4() if case == "wrong_target" else confirmed["id"],

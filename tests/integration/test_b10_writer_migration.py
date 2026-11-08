@@ -1,5 +1,7 @@
 """B-10 successor upgrade and real PostgreSQL writer boundaries."""
 
+import shutil
+
 import pytest
 from carepulse.db import transaction
 from sqlalchemy import text
@@ -8,7 +10,7 @@ from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
 from test_followup_persistence import _v2_booking, _v2_command, _v2_source
-from test_visit_migration import _prepare, _upgrade
+from test_visit_migration import ROOT, _prepare, _upgrade
 
 BEFORE = "0028_d08_followup_provenance"
 AFTER = "0029_b10_followup_writers"
@@ -66,6 +68,67 @@ def test_operational_proof_successor_preserves_claim_and_limits_runtime_access(
                 "actor_staff_id": None,
                 "actor_role": None,
             }
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
+def test_operational_proof_failure_rolls_back_to_immediate_predecessor(
+    admin, empty_database, tmp_path
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, AFTER)
+        with transaction(runtime, tenant) as connection:
+            source = _v2_source(connection, tenant, doctor)
+            claim = _v2_command(
+                connection, "create_followup_claim", source, **_v2_booking(source)
+            )
+        with migration.connect() as connection:
+            previous = connection.scalar(
+                text("SELECT to_jsonb(c) FROM public.followup_claims c WHERE id=:id"),
+                {"id": claim},
+            )
+        scripts = tmp_path / "migrations"
+        shutil.copytree(ROOT / "db/migrations", scripts)
+        successor = scripts / "versions/0030_b10_operational_source_proof.py"
+        original = successor.read_text(encoding="utf-8")
+        marker = '    """)\n\n\ndef downgrade()'
+        assert original.count(marker) == 1
+        successor.write_text(
+            original.replace(
+                marker, '    """)\n    op.execute("SELECT 1 / 0")\n\n\ndef downgrade()'
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(DBAPIError) as failure:
+            _upgrade(migration, PROOF_AFTER, scripts)
+        assert failure.value.orig.sqlstate == "22012"
+        with migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT version_num FROM public.alembic_version")
+                )
+                == AFTER
+            )
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT to_regprocedure('public.b10_operational_source_proof(uuid,uuid)')"
+                    )
+                )
+                is None
+            )
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT to_jsonb(c) FROM public.followup_claims c WHERE id=:id"
+                    ),
+                    {"id": claim},
+                )
+                == previous
+            )
+        _upgrade(migration, PROOF_AFTER)
     finally:
         runtime.dispose()
         migration.dispose()

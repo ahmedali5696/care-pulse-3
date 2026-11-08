@@ -31,6 +31,7 @@ from test_booking import (
     booking_clinic as booking_clinic,  # noqa: PLC0414
 )
 from test_database import admin as admin  # noqa: PLC0414
+from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
 from test_followup_persistence import _source, _v2_booking, _v2_command, _v2_source
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
