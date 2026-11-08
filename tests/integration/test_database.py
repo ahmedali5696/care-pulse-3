@@ -20,7 +20,7 @@ from sqlalchemy import URL, create_engine, text
 from sqlalchemy.exc import DBAPIError
 
 ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0030_b10_source_proof"
+REVISION = "0031_b10_writer_guard"
 
 
 @pytest.fixture(scope="module", autouse=True)

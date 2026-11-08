@@ -69,6 +69,77 @@ def provenance_followup_storage(admin, empty_database):
 
 
 def _v2_source(connection, tenant, doctor):
+    strict_quote = None
+    if connection.scalar(
+        text("""
+        SELECT to_regprocedure('public.b10_assert_followup_price(uuid,jsonb)') IS NOT NULL
+    """)
+    ):
+        policies = (
+            connection.execute(
+                text("""
+            SELECT h.kind, h.revision, h.current_version, v.payload
+            FROM public.clinic_policy_heads h
+            JOIN public.clinic_policy_versions v
+              ON (v.organization_id,v.kind,v.version)=
+                 (h.organization_id,h.kind,h.current_version)
+            WHERE h.organization_id=:tenant AND h.kind IN ('PRICE','SCHEDULE')
+        """),
+                {"tenant": tenant},
+            )
+            .mappings()
+            .all()
+        )
+        active = {row["kind"]: row for row in policies}
+        price = active["PRICE"]
+        price_payload = dict(price["payload"])
+        if (
+            price_payload.get("standard_new_exam_egp") is None
+            or price_payload.get("preferential_followup_egp") is None
+        ):
+            price_payload["standard_new_exam_egp"] = (
+                price_payload["standard_new_exam_egp"] or "100.00"
+            )
+            price_payload["preferential_followup_egp"] = (
+                price_payload["preferential_followup_egp"] or "100.00"
+            )
+            append_version(
+                connection,
+                tenant,
+                "PRICE",
+                price_payload,
+                price["revision"],
+                actor_staff_id=str(doctor),
+            )
+            price = {
+                **price,
+                "current_version": price["current_version"] + 1,
+                "payload": price_payload,
+            }
+        schedule = active["SCHEDULE"]
+        schedule_payload = dict(schedule["payload"])
+        if (
+            schedule_payload["booking_mode"] == "OPEN"
+            and not schedule_payload.get("holiday_booking_enabled")
+            and not schedule_payload.get("working_weekdays")
+        ):
+            schedule_payload["working_weekdays"] = list(range(1, 8))
+            append_version(
+                connection,
+                tenant,
+                "SCHEDULE",
+                schedule_payload,
+                schedule["revision"],
+                actor_staff_id=str(doctor),
+            )
+        strict_quote = {
+            "base_egp": str(price["payload"]["preferential_followup_egp"]),
+            "net_egp": str(price["payload"]["preferential_followup_egp"]),
+            "creation_standard_base_egp": str(
+                price["payload"]["standard_new_exam_egp"]
+            ),
+            "pricing_version": price["current_version"],
+        }
     appointment = _admitted_source(connection, tenant, doctor, complete=True)
     visit, completion, patient = connection.execute(
         text("""
@@ -87,6 +158,7 @@ def _v2_source(connection, tenant, doctor):
         "visit": visit,
         "day": completion,
         "patient": patient,
+        **({"strict_quote": strict_quote} if strict_quote else {}),
     }
 
 
@@ -141,10 +213,26 @@ def _v2_command(connection, routine, source, **command):
 
 
 def _v2_booking(source, offset=1):
+    quote = dict(_draft(uuid4(), source["doctor"]).price_snapshot)
+    if "strict_quote" in source:
+        quote = {
+            key: quote[key]
+            for key in (
+                "base_egp",
+                "discount_type",
+                "discount_value",
+                "discount_reason",
+                "is_free",
+                "net_egp",
+                "pricing_version",
+                "creation_standard_base_egp",
+            )
+        }
+        quote.update(source["strict_quote"])
     return {
         "service_date": (source["day"] + timedelta(days=offset)).isoformat(),
         "booking_mode": "OPEN",
-        "price_snapshot": dict(_draft(uuid4(), source["doctor"]).price_snapshot),
+        "price_snapshot": quote,
     }
 
 

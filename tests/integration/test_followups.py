@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
+from hashlib import sha256
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -890,6 +891,13 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
             )
             command = BookAppointment.model_validate(body)
             assert command.source_family == "v1"
+            # Independent predecessor wire fixture: raw signed JSON and a digest
+            # derived directly from its typed field map, not the receipt helper.
+            legacy_raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
+            independent_digest = sha256(
+                json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            assert independent_digest == normalized_request_digest(command)
             saved = appointment_detail(connection, _actor(tenant, doctor), appointment)
             assert saved["service_type"] == "FOLLOW_UP"
             assert saved["history"][0]["reason"] is None
@@ -923,7 +931,7 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
                     actor_id=doctor,
                     operation="appointments.book",
                     idempotency_key=key,
-                    request_digest=normalized_request_digest(command),
+                    request_digest=independent_digest,
                     result_projection=saved,
                     result_revision=0,
                     organization_id=tenant,
@@ -939,7 +947,7 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
         receipt_params = {"tenant": tenant, "key": key}
         with migration.connect() as connection:
             original_receipt = connection.execute(receipt_query, receipt_params).one()
-        assert original_receipt == (normalized_request_digest(command), saved, 0)
+        assert original_receipt == (independent_digest, saved, 0)
         _upgrade(migration, "0029_b10_followup_writers")
         with migration.connect() as connection:
             assert (
@@ -947,7 +955,7 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
                 == original_receipt
             )
         app.state.db_engine = runtime
-        assert booking_request(clinic, actor, body=body, key=key) == (
+        assert booking_request(clinic, actor, raw_body=legacy_raw, key=key) == (
             201,
             {"data": saved, "revision": 0},
         )
@@ -1028,6 +1036,35 @@ def test_signed_v1_committed_booking_recovery_authorizes_full_history_before_dig
             {"tenant": clinic.tenant, "key": key},
         )
         assert stored == persisted
+
+
+def test_signed_receipt_conflict_authorizes_original_claim_not_substituted_source(
+    followup_clinic,
+):
+    clinic = followup_clinic
+    original = completed_source(clinic)
+    status, created = booking_request(
+        clinic, clinic.owner, body=followup_body(original, offset=2), key=str(uuid4())
+    )
+    assert status == 201, created
+    body, key, persisted = _seed_historical_booking_receipt(
+        clinic, created["data"]["id"], original
+    )
+    other_visible_source = completed_source(clinic)
+    before = booking_effects(clinic)
+    assert booking_request(clinic, clinic.owner, body=body, key=key) == (
+        201,
+        {"data": persisted, "revision": 0},
+    )
+    status, conflict = booking_request(
+        clinic,
+        clinic.owner,
+        body={**body, "source_visit_id": str(other_visible_source["visit"])},
+        key=key,
+    )
+    assert status == 409, conflict
+    assert conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert booking_effects(clinic) == before
 
 
 def test_signed_duplicate_json_keys_and_fresh_v1_source_writer_are_rejected(

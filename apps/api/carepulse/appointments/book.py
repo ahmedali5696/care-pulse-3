@@ -88,9 +88,7 @@ _CREATED_FIELDS = {
 }
 
 
-def _committed_booking(
-    connection: Connection, receipt: TenantReceiptQuery, command: BookAppointment
-):
+def _committed_booking(connection: Connection, receipt: TenantReceiptQuery):
     """Check current resource and every saved field before disclosing a key conflict."""
     actor = receipt.actor
     stored = lookup_tenant_receipt(
@@ -105,8 +103,9 @@ def _committed_booking(
     projection = stored["result_projection"]
     if (
         not isinstance(projection, dict)
-        or set(projection) - _RECEIPT_FIELDS
+        or set(projection) != _RECEIPT_FIELDS
         or type(stored["result_revision"]) is not int
+        or stored["result_revision"] < 0
         or any(
             isinstance(value, (dict, list))
             for name, value in projection.items()
@@ -120,47 +119,37 @@ def _committed_booking(
     except (KeyError, TypeError, ValueError) as invalid:
         raise ContractError(403) from invalid
     current = appointment_detail(connection, actor, appointment_id)
-    if command.source_visit_id is not None:
+    if current["service_type"] == "FOLLOW_UP":
         linkage = connection.scalar(
             text("""
-                SELECT 1 FROM public.visits v
+                SELECT 1 FROM public.followup_claims c
+                JOIN public.visits v
+                  ON v.organization_id=c.organization_id AND v.id=c.source_visit_id
                 JOIN public.appointments a
                   ON a.organization_id=v.organization_id AND a.id=v.appointment_id
-                WHERE v.organization_id=:tenant AND v.id=:source_visit
+                WHERE c.organization_id=:tenant AND c.appointment_id=:appointment
                   AND v.patient_id=:patient AND v.doctor_staff_id=:doctor
                   AND a.patient_id=v.patient_id AND a.doctor_staff_id=v.doctor_staff_id
             """),
             {
                 "tenant": actor.organization_id,
-                "source_visit": command.source_visit_id,
+                "appointment": appointment_id,
                 "patient": UUID(current["patient_id"]),
                 "doctor": UUID(current["doctor_staff_id"]),
             },
         )
         if linkage is None:
             raise ContractError(404)
-        if current["service_type"] == "FOLLOW_UP" and not connection.scalar(
-            text("""
-                SELECT 1 FROM public.followup_claims
-                WHERE organization_id=:tenant AND appointment_id=:appointment
-                  AND source_visit_id=:source_visit
-            """),
-            {
-                "tenant": actor.organization_id,
-                "appointment": appointment_id,
-                "source_visit": command.source_visit_id,
-            },
-        ):
-            raise ContractError(404)
     if (
         current["patient_id"] != projection.get("patient_id")
         or current["doctor_staff_id"] != projection.get("doctor_staff_id")
+        or current["service_type"] != projection.get("service_type")
         or not isinstance(history, list)
         or len(history) != 1
         or not isinstance(history[0], dict)
         or history[0].get("action") != "CREATED"
         or history[0].get("reason", object()) is not None
-        or set(history[0]) - _CREATED_FIELDS
+        or set(history[0]) != _CREATED_FIELDS
         or any(isinstance(value, (dict, list)) for value in history[0].values())
     ):
         raise ContractError(403)
@@ -372,14 +361,14 @@ def book_appointment(
         idempotency_key,
         normalized_request_digest(command),
     )
-    cached = _committed_booking(connection, receipt, command)
+    cached = _committed_booking(connection, receipt)
     if cached is not None:
         return cached[0]
     lock_patient_for_new_appointment(
         connection, actor.organization_id, command.patient_id
     )
     # A concurrent same-patient request may have committed while the row was locked.
-    cached = _committed_booking(connection, receipt, command)
+    cached = _committed_booking(connection, receipt)
     if cached is not None:
         return cached[0]
     try:

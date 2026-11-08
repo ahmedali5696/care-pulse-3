@@ -2,10 +2,13 @@
 
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
+from queue import Queue
+from threading import Event
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -23,10 +26,11 @@ from carepulse.visits.eligibility_contracts import (
     FollowupDecisionPatchV2,
 )
 from pydantic import ValidationError
-from sqlalchemy import text
+from sqlalchemy import event, text
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_booking import booking_request
+from test_booking_races import _wait_for_postgres_lock
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
@@ -659,6 +663,120 @@ def test_signed_v2_receipt_replay_conflict_and_revoked_session(
 
 
 @pytest.mark.parametrize(
+    "revoke_first", [True, False], ids=["revoke-first", "retry-first"]
+)
+def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
+    patient_backend, revoke_first
+):
+    clinic = patient_backend
+    source = _source(clinic)
+    body = _decision("DEFAULT").model_dump(mode="json", exclude_unset=True)
+    changed = {**body, "followup_decision": {"kind": "OPTED_OUT", "reason": "changed"}}
+    path = f"/v1/visits/{source['visit']}"
+    key = str(uuid4())
+    accepted = _signed_visit_request(
+        clinic, clinic.owner, path=path, method="PATCH", body=body, key=key
+    )
+    assert accepted[0] == 200, accepted
+    saved_query = text("""
+        SELECT request_digest, result_projection, result_revision,
+          (SELECT count(*) FROM public.followup_source_decision_events
+           WHERE organization_id=:tenant AND source_visit_id=:visit) AS events
+        FROM public.idempotency_receipts
+        WHERE organization_id=:tenant AND idempotency_key=:key
+          AND operation='visits.followup_decision'
+    """)
+    saved_params = {"tenant": clinic.tenant, "visit": source["visit"], "key": key}
+    with clinic.migration.connect() as connection:
+        frozen = connection.execute(saved_query, saved_params).one()
+    runtime_pid = Queue(maxsize=1)
+    receipt_reached = Event()
+    allow_receipt = Event()
+
+    def observe_sql(connection, cursor, statement, parameters, context, executemany):
+        marker = (
+            "FOR UPDATE OF s"
+            if revoke_first
+            else "FROM public.idempotency_receipts AS r"
+        )
+        if marker in statement and runtime_pid.empty():
+            runtime_pid.put(cursor.connection.info.backend_pid)
+            if not revoke_first:
+                receipt_reached.set()
+                assert allow_receipt.wait(timeout=10)
+
+    def retry():
+        return _signed_visit_request(
+            clinic, clinic.owner, path=path, method="PATCH", body=body, key=key
+        )
+
+    def revoke():
+        with clinic.migration.begin() as connection:
+            revoker_pid = connection.scalar(text("SELECT pg_backend_pid()"))
+            revocation_started.put(revoker_pid)
+            connection.execute(
+                text("""
+                    UPDATE public.staff_accounts SET enabled=false
+                    WHERE organization_id=:tenant AND id=:staff
+                """),
+                {"tenant": clinic.tenant, "staff": UUID(clinic.owner.staff_id)},
+            )
+
+    revocation_started = Queue(maxsize=1)
+    event.listen(clinic.runtime, "before_cursor_execute", observe_sql)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            if revoke_first:
+                with clinic.migration.connect() as holder:
+                    tx = holder.begin()
+                    try:
+                        holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
+                        holder.execute(
+                            text("""
+                                UPDATE public.staff_accounts SET enabled=false
+                                WHERE organization_id=:tenant AND id=:staff
+                            """),
+                            {
+                                "tenant": clinic.tenant,
+                                "staff": UUID(clinic.owner.staff_id),
+                            },
+                        )
+                        in_flight = pool.submit(retry)
+                        waiter_pid = runtime_pid.get(timeout=10)
+                        with clinic.runtime.connect() as observer:
+                            _wait_for_postgres_lock(observer, waiter_pid, holder_pid)
+                    finally:
+                        tx.commit()
+                assert in_flight.result(timeout=15)[0] == 403
+            else:
+                in_flight = pool.submit(retry)
+                assert receipt_reached.wait(timeout=10)
+                holder_pid = runtime_pid.get(timeout=10)
+                revoked = pool.submit(revoke)
+                waiter_pid = revocation_started.get(timeout=10)
+                with clinic.migration.connect() as observer:
+                    _wait_for_postgres_lock(observer, waiter_pid, holder_pid)
+                allow_receipt.set()
+                assert in_flight.result(timeout=15) == accepted
+                revoked.result(timeout=15)
+    finally:
+        allow_receipt.set()
+        event.remove(clinic.runtime, "before_cursor_execute", observe_sql)
+
+    denied_codes = []
+    for candidate in (body, changed):
+        denied = _signed_visit_request(
+            clinic, clinic.owner, path=path, method="PATCH", body=candidate, key=key
+        )
+        assert denied[0] == 403, denied
+        assert "data" not in denied[1]
+        denied_codes.append(denied[1]["error"]["code"])
+    assert denied_codes == ["FORBIDDEN", "FORBIDDEN"]
+    with clinic.migration.connect() as connection:
+        assert connection.execute(saved_query, saved_params).one() == frozen
+
+
+@pytest.mark.parametrize(
     "bad_body",
     [
         '{"followup_decision":{"kind":"DEFAULT","kind":"OPTED_OUT"},"expected_source_decision_revision":0,"expected_visit_revision":0,"expected_followup_revision":1}',
@@ -907,7 +1025,16 @@ def test_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_chec
 
 
 @pytest.mark.parametrize(
-    "corruption", ["extra_field", "altered_decision", "altered_revision"]
+    "corruption",
+    [
+        "extra_field",
+        "altered_decision",
+        "altered_revision",
+        "nested_followup_revision",
+        "boolean_followup_revision",
+        "wrong_followup_revision",
+        "nested_reason",
+    ],
 )
 def test_invalid_saved_v2_decision_receipt_denies_before_digest_conflict(
     patient_backend, corruption
@@ -930,8 +1057,19 @@ def test_invalid_saved_v2_decision_receipt_denies_before_digest_conflict(
             "kind": "OPTED_OUT",
             "reason": "forged",
         }
-    else:
+    elif corruption == "altered_revision":
         saved_projection["source_decision_revision"] += 1
+    elif corruption == "nested_followup_revision":
+        saved_projection["followup_revision"] = {"clinical_notes": "private"}
+    elif corruption == "boolean_followup_revision":
+        saved_projection["followup_revision"] = True
+    elif corruption == "wrong_followup_revision":
+        saved_projection["followup_revision"] += 1
+    else:
+        saved_projection["followup_decision"] = {
+            "kind": "OPTED_OUT",
+            "reason": {"clinical_notes": "private"},
+        }
     with transaction(clinic.runtime, clinic.tenant) as connection:
         _staff_context(connection, UUID(clinic.owner.staff_id))
         insert_tenant_receipt(
@@ -990,8 +1128,18 @@ def test_invalid_saved_v2_decision_receipt_denies_before_digest_conflict(
     )
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "deadline",
+        "nested_followup_revision",
+        "boolean_followup_revision",
+        "wrong_followup_revision",
+        "nested_claim_revision",
+    ],
+)
 def test_saved_v2_extension_receipt_must_match_immutable_authorization_event(
-    followup_clinic,
+    followup_clinic, corruption
 ):
     clinic = followup_clinic
     source = _source(clinic)
@@ -1003,10 +1151,17 @@ def test_saved_v2_extension_receipt_must_match_immutable_authorization_event(
         clinic, clinic.owner, path=path, method="POST", body=body, key=str(uuid4())
     )
     assert status == 201, accepted
-    altered = {
-        **accepted["data"],
-        "extended_deadline": (source["day"] + timedelta(days=10)).isoformat(),
-    }
+    altered = dict(accepted["data"])
+    if corruption == "deadline":
+        altered["extended_deadline"] = (source["day"] + timedelta(days=10)).isoformat()
+    elif corruption == "nested_followup_revision":
+        altered["followup_revision"] = {"clinical_notes": "private"}
+    elif corruption == "boolean_followup_revision":
+        altered["followup_revision"] = False
+    elif corruption == "wrong_followup_revision":
+        altered["followup_revision"] += 1
+    else:
+        altered["claim_revision"] = ["private clinical details"]
     key = str(uuid4())
     with transaction(clinic.runtime, clinic.tenant) as connection:
         _staff_context(connection, UUID(clinic.owner.staff_id))

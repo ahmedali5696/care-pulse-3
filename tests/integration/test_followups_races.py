@@ -6,10 +6,13 @@ from threading import Event
 from uuid import UUID, uuid4
 
 import pytest
+from carepulse.appointments import persistence as appointment_persistence
 from carepulse.appointments.book import book_appointment
 from carepulse.appointments.booking_contracts import BookAppointment
 from carepulse.db import transaction
 from carepulse.identity.contracts import ContractError
+from carepulse.policies.schedule_service import load_current_schedule
+from carepulse.policies.slots import candidates_for_date
 from carepulse.policies.versions import append_version
 from carepulse.visits.eligibility import extend_followup, record_followup_decision
 from carepulse.visits.eligibility_contracts import (
@@ -525,6 +528,125 @@ def test_doctor_extension_and_new_claim_compete_for_same_source(followup_clinic)
     assert _claim_count(clinic, source) == 1
 
 
+@pytest.mark.parametrize(
+    "source_first", [True, False], ids=["source-lower", "target-lower"]
+)
+def test_extension_locks_source_and_target_by_uuid_before_claim(
+    followup_clinic, monkeypatch, source_first
+):
+    clinic = followup_clinic
+    chosen_id = UUID(
+        "00000000-0000-4000-8000-000000000001"
+        if source_first
+        else "ffffffff-ffff-4fff-bfff-ffffffffffff"
+    )
+    controlled_ids = iter([chosen_id])
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            appointment_persistence,
+            "uuid4",
+            lambda: next(controlled_ids, None) or uuid4(),
+        )
+        source = _source_for(clinic)
+    first = _attempt(clinic, _command(source))
+    source_id, target_id = source["appointment"], UUID(first["id"])
+    assert source_id == chosen_id
+    assert (source_id < target_id) is source_first
+    before = booking_effects(clinic)
+    extension = ExtendFollowupV2.model_validate(
+        {
+            "appointment_id": first["id"],
+            "extended_deadline": (source["day"] + timedelta(days=9)).isoformat(),
+            "reason": "Ordered pair lock witness",
+            "expected_source_decision_revision": 0,
+            "expected_visit_revision": 0,
+            "expected_followup_revision": 1,
+            "expected_claim_revision": 1,
+            "expected_authorization_revision": 0,
+            "expected_appointment_revision": 0,
+        }
+    )
+    started = Event()
+    extension_pid = []
+
+    def extend():
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            extension_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            started.set()
+            _doctor_context(connection, UUID(clinic.owner.staff_id))
+            return extend_followup(
+                connection,
+                _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
+                source["visit"],
+                extension,
+                str(uuid4()),
+            )
+
+    lock_row = text("""
+        SELECT id FROM public.appointments
+        WHERE organization_id=:tenant AND id=:appointment FOR UPDATE
+    """)
+    first_id, second_id = sorted((source_id, target_id))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with clinic.migration.begin() as second_holder:
+            assert (
+                second_holder.execute(
+                    lock_row, {"tenant": clinic.tenant, "appointment": second_id}
+                ).scalar_one()
+                == second_id
+            )
+            second_pid = second_holder.scalar(text("SELECT pg_backend_pid()"))
+            with clinic.migration.begin() as first_holder:
+                assert (
+                    first_holder.execute(
+                        lock_row, {"tenant": clinic.tenant, "appointment": first_id}
+                    ).scalar_one()
+                    == first_id
+                )
+                first_pid = first_holder.scalar(text("SELECT pg_backend_pid()"))
+                competing = pool.submit(extend)
+                assert started.wait(timeout=15)
+                with clinic.migration.connect() as observer:
+                    _wait_for_postgres_lock(observer, extension_pid[0], first_pid)
+            with clinic.migration.connect() as observer:
+                _wait_for_postgres_lock(observer, extension_pid[0], second_pid)
+                assert (
+                    observer.scalar(
+                        text("""
+                        SELECT count(*) FROM public.followup_authorization_events
+                        WHERE organization_id=:tenant AND appointment_id=:appointment
+                    """),
+                        {"tenant": clinic.tenant, "appointment": target_id},
+                    )
+                    == 0
+                )
+        extended, revision = competing.result(timeout=30)
+
+    assert revision == 1
+    assert extended["extended_deadline"] == extension.extended_deadline.isoformat()
+    assert booking_effects(clinic) == before
+    assert _claim_count(clinic, source) == 1
+    with clinic.migration.connect() as connection:
+        assert connection.execute(
+            text("""
+                SELECT kind, source_visit_id, appointment_id, actor_staff_id,
+                       actor_role, authorization_revision, new_deadline, reason
+                FROM public.followup_authorization_events
+                WHERE organization_id=:tenant AND id=:event
+            """),
+            {"tenant": clinic.tenant, "event": UUID(extended["event_id"])},
+        ).one() == (
+            "EXTENSION",
+            source["visit"],
+            target_id,
+            UUID(clinic.owner.staff_id),
+            "DOCTOR_OWNER",
+            1,
+            extension.extended_deadline,
+            extension.reason,
+        )
+
+
 def test_source_lock_is_acquired_after_day_counter_on_confirmation(followup_clinic):
     clinic = followup_clinic
     source = _source_for(clinic)
@@ -563,6 +685,95 @@ def test_source_lock_is_acquired_after_day_counter_on_confirmation(followup_clin
         saved = future.result(timeout=30)
     assert saved["service_type"] == "FOLLOW_UP"
     assert _claim_count(clinic, source) == 1
+
+
+def test_timed_followup_rescans_capacity_after_waiting_for_day_allocator(
+    followup_clinic,
+):
+    clinic = followup_clinic
+    sources = [_source_for(clinic), _source_for(clinic)]
+    day = max(source["day"] for source in sources) + timedelta(days=2)
+    weekday = day.isoweekday()
+    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _publish(
+            connection,
+            actor,
+            _config(
+                mode="EXACT_TIME",
+                working_weekdays=[weekday],
+                weekly_work_periods=[
+                    {"weekday": weekday, "starts_at": "09:00", "ends_at": "12:00"}
+                ],
+            ),
+            revision=3,
+        )
+        slot = candidates_for_date(
+            load_current_schedule(connection, clinic.tenant), day
+        )[0]
+    commands = [
+        _command(
+            source,
+            (day - source["day"]).days,
+            starts_at=slot.starts_at.isoformat(),
+            ends_at=slot.ends_at.isoformat(),
+            expected_schedule_revision=4,
+        )
+        for source in sources
+    ]
+    before = booking_effects(clinic)
+    first_confirmed = Event()
+    allow_first_commit = Event()
+    second_started = Event()
+    first_pid = []
+    second_pid = []
+
+    def first_booking():
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            first_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            _doctor_context(connection, actor.staff_id)
+            saved = book_appointment(connection, actor, commands[0], str(uuid4()))
+            first_confirmed.set()
+            assert allow_first_commit.wait(timeout=20)
+            return saved
+
+    def competing_booking():
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            second_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            second_started.set()
+            _doctor_context(connection, actor.staff_id)
+            return book_appointment(connection, actor, commands[1], str(uuid4()))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(first_booking)
+        assert first_confirmed.wait(timeout=15)
+        second = pool.submit(competing_booking)
+        try:
+            assert second_started.wait(timeout=15)
+            with transaction(clinic.runtime, clinic.tenant) as observer:
+                _wait_for_postgres_lock(observer, second_pid[0], first_pid[0])
+            assert booking_effects(clinic) == before
+        finally:
+            allow_first_commit.set()
+        booked = first.result(timeout=30)
+        with pytest.raises(ContractError) as denied:
+            second.result(timeout=30)
+
+    assert booked["service_type"] == "FOLLOW_UP"
+    assert denied.value.status_code == 409
+    assert booking_effects(clinic) == tuple(count + 1 for count in before)
+    assert [_claim_count(clinic, source) for source in sources] == [1, 0]
+    with clinic.migration.connect() as connection:
+        assert (
+            connection.scalar(
+                text("""
+                SELECT last_number FROM public.appointment_day_counters
+                WHERE organization_id=:tenant AND service_date=:day
+            """),
+                {"tenant": clinic.tenant, "day": day},
+            )
+            == 1
+        )
 
 
 @pytest.mark.parametrize(

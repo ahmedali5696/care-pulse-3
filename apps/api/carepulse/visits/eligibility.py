@@ -7,6 +7,7 @@ from datetime import date
 from hashlib import sha256
 from uuid import UUID
 
+from pydantic import ValidationError
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import DBAPIError
 
@@ -29,6 +30,7 @@ from carepulse.policies.versions import StalePolicyRevision, lock_policy_heads
 from carepulse.visits.eligibility_contracts import (
     ExtendFollowup,
     ExtendFollowupV2,
+    FollowupDecision,
     FollowupDecisionPatch,
     FollowupDecisionPatchV2,
 )
@@ -245,6 +247,13 @@ _EXTENSION_V2_FIELDS = _EXTENSION_V1_FIELDS | {
 }
 
 
+def _valid_revisions(projection: dict, fields: tuple[str, ...]) -> bool:
+    return all(
+        type(projection.get(field)) is int and projection[field] >= 0
+        for field in fields
+    )
+
+
 def _replay_receipt(
     connection: Connection, query: TenantReceiptQuery, visit_id: UUID
 ) -> tuple[dict, int] | None:
@@ -261,7 +270,7 @@ def _replay_receipt(
     _source_reference(connection, actor, visit_id)
     projection = stored["result_projection"]
     revision = stored["result_revision"]
-    if not isinstance(projection, dict) or type(revision) is not int:
+    if not isinstance(projection, dict) or type(revision) is not int or revision < 0:
         raise ContractError(403)
     v2 = "event_id" in projection
     if query.operation == "visits.followup_decision":
@@ -272,13 +281,34 @@ def _replay_receipt(
             or projection.get("visit_id") != str(visit_id)
             or not isinstance(decision, dict)
             or not {"kind"} <= set(decision) <= {"kind", "deadline_date", "reason"}
+            or not _valid_revisions(
+                projection,
+                (
+                    "revision",
+                    "source_decision_revision",
+                    "visit_revision",
+                    "followup_revision",
+                )
+                if v2
+                else ("revision",),
+            )
         ):
             raise ContractError(403)
+        try:
+            if (
+                FollowupDecision.model_validate(decision).model_dump(
+                    mode="json", exclude_unset=True
+                )
+                != decision
+            ):
+                raise ContractError(403)
+        except ValidationError as invalid:
+            raise ContractError(403) from invalid
         if v2:
             event = connection.execute(
                 text("""
                     SELECT actor_staff_id, actor_role, decision,
-                           source_revision, clinical_revision
+                           source_revision, clinical_revision, policy_version
                     FROM public.followup_source_decision_events
                     WHERE organization_id=:tenant AND source_visit_id=:visit
                       AND id=:event
@@ -297,6 +327,7 @@ def _replay_receipt(
                 or projection.get("revision") != event.source_revision
                 or projection.get("source_decision_revision") != event.source_revision
                 or projection.get("visit_revision") != event.clinical_revision
+                or projection.get("followup_revision") != event.policy_version
                 or revision != event.source_revision
             ):
                 raise ContractError(403)
@@ -306,7 +337,24 @@ def _replay_receipt(
             raise ContractError(403)
     else:
         permitted = _EXTENSION_V2_FIELDS if v2 else _EXTENSION_V1_FIELDS
-        if set(projection) != permitted or projection.get("visit_id") != str(visit_id):
+        if (
+            set(projection) != permitted
+            or projection.get("visit_id") != str(visit_id)
+            or not _valid_revisions(
+                projection,
+                (
+                    "revision",
+                    "claim_revision",
+                    "authorization_revision",
+                    "source_decision_revision",
+                    "visit_revision",
+                    "followup_revision",
+                    "appointment_revision",
+                )
+                if v2
+                else ("revision", "claim_revision"),
+            )
+        ):
             raise ContractError(403)
         target = _event_uuid(projection.get("appointment_id"))
         claim = connection.execute(
@@ -324,7 +372,8 @@ def _replay_receipt(
                 text("""
                     SELECT actor_staff_id, actor_role, new_deadline,
                            authorization_revision, source_revision,
-                           clinical_revision, appointment_revision, claim_revision
+                           clinical_revision, appointment_revision, claim_revision,
+                           policy_version
                     FROM public.followup_authorization_events
                     WHERE organization_id=:tenant AND claim_id=:claim AND id=:event
                       AND kind='EXTENSION'
@@ -348,6 +397,7 @@ def _replay_receipt(
                 or projection.get("visit_revision") != event.clinical_revision
                 or projection.get("claim_revision") != event.claim_revision
                 or projection.get("appointment_revision") != event.appointment_revision
+                or projection.get("followup_revision") != event.policy_version
                 or revision != event.authorization_revision
             ):
                 raise ContractError(403)
