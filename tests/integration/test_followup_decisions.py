@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -26,7 +27,16 @@ from sqlalchemy import text
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_booking import booking_request
-from test_followup_persistence import _outcome, _v2_source
+from test_database import admin as admin  # noqa: PLC0414
+from test_database import empty_database as empty_database  # noqa: PLC0414
+from test_followup_persistence import (
+    _claim,
+    _outcome,
+    _v2_source,
+)
+from test_followup_persistence import (
+    _source as _legacy_source,
+)
 from test_followups import followup_body
 from test_followups import followup_clinic as followup_clinic  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
@@ -749,6 +759,151 @@ def test_signed_committed_v1_replays_exact_original_digest_including_null_distin
         ).one()
     assert stored == (digest, historical, 0)
     assert _effects(clinic, visit_id, "visits.followup_decision") == (0, 0, 0, 0, 1)
+
+
+def test_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_checks(
+    patient_backend, admin, empty_database, monkeypatch
+):
+    # Local import avoids the historical migration test's fixture-helper import cycle.
+    from test_followup_migration import _historical_extension, _predecessor
+    from test_visit_migration import _upgrade
+
+    migration, runtime, tenant, doctor = _predecessor(admin, empty_database)
+    try:
+        _upgrade(migration, "0024_b06_followup_window")
+        session_id = f"synthetic-b10-v1-extension-{uuid4()}"
+        with migration.begin() as connection:
+            connection.execute(
+                text("""
+                    INSERT INTO public."session"
+                        (id, "userId", token, "expiresAt", "createdAt", "updatedAt",
+                         "securityRevision", "absoluteDeadline", "lastActivity")
+                    SELECT :session, s.auth_user_id, :token,
+                           now() + interval '1 hour', now(), now(), 0,
+                           now() + interval '1 hour', now()
+                    FROM public.staff_accounts s
+                    WHERE s.organization_id=:tenant AND s.id=:doctor
+                """),
+                {
+                    "session": session_id,
+                    "token": str(uuid4()),
+                    "tenant": tenant,
+                    "doctor": doctor,
+                },
+            )
+        with transaction(runtime, tenant) as connection:
+            source = _legacy_source(connection, tenant, doctor)
+            claim = _claim(connection, tenant, source)
+            key = str(uuid4())
+            command, original = _historical_extension(
+                connection, tenant, doctor, source, claim, key
+            )
+        typed_body = command.model_dump(mode="json", exclude_unset=True)
+        digest = sha256(
+            source["visit"].bytes + normalize_typed_body(command)
+        ).hexdigest()
+        receipt_sql = text("""
+            SELECT request_digest, result_projection, result_revision
+            FROM public.idempotency_receipts
+            WHERE organization_id=:tenant AND operation='visits.extend_followup'
+              AND idempotency_key=:key
+        """)
+        receipt_args = {"tenant": tenant, "key": key}
+        with migration.connect() as connection:
+            original_receipt = connection.execute(receipt_sql, receipt_args).one()
+        assert original_receipt == (digest, original, 2)
+        _upgrade(migration, "0029_b10_followup_writers")
+        with migration.connect() as connection:
+            assert (
+                connection.execute(receipt_sql, receipt_args).one() == original_receipt
+            )
+
+        actor = replace(
+            patient_backend.owner,
+            organization_id=str(tenant),
+            staff_id=str(doctor),
+            session_id=session_id,
+        )
+        clinic = SimpleNamespace(
+            tenant=tenant,
+            runtime=runtime,
+            migration=migration,
+            owner=actor,
+            config=patient_backend.config,
+        )
+        monkeypatch.setattr(app.state, "db_engine", runtime)
+        path = f"/v1/visits/{source['visit']}/extend-followup"
+        before = _effects(clinic, source["visit"], "visits.extend_followup")
+        assert _signed_visit_request(
+            clinic, actor, path=path, method="POST", body=typed_body, key=key
+        ) == (201, {"data": original, "revision": 2})
+        changed = {**typed_body, "reason": "Different reason"}
+        status, conflict = _signed_visit_request(
+            clinic, actor, path=path, method="POST", body=changed, key=key
+        )
+        assert status == 409, conflict
+        assert conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+        assert (
+            _signed_visit_request(
+                clinic,
+                actor,
+                path=path,
+                method="POST",
+                body=typed_body,
+                key=str(uuid4()),
+            )[0]
+            == 409
+        )
+        for candidate in (typed_body, changed):
+            status, refusal = _signed_visit_request(
+                clinic,
+                actor,
+                path=f"/v1/visits/{uuid4()}/extend-followup",
+                method="POST",
+                body=candidate,
+                key=key,
+            )
+            assert status == 404, refusal
+            assert "data" not in refusal
+        status, refusal = _signed_visit_request(
+            clinic,
+            actor,
+            path=path,
+            method="POST",
+            body=changed,
+            key=key,
+            purpose="APPOINTMENT_BOOKING",
+        )
+        assert status == 403, refusal
+        assert "data" not in refusal
+        with migration.begin() as connection:
+            connection.execute(
+                text('DELETE FROM public."session" WHERE id=:session'),
+                {"session": session_id},
+            )
+        for candidate in (typed_body, changed):
+            status, refusal = _signed_visit_request(
+                clinic, actor, path=path, method="POST", body=candidate, key=key
+            )
+            assert status in (401, 403), refusal
+            assert "data" not in refusal
+        with migration.connect() as connection:
+            assert (
+                connection.execute(receipt_sql, receipt_args).one() == original_receipt
+            )
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM public.followup_extensions WHERE claim_id=:claim"
+                    ),
+                    {"claim": claim["claim"]},
+                )
+                == 1
+            )
+        assert _effects(clinic, source["visit"], "visits.extend_followup") == before
+    finally:
+        runtime.dispose()
+        migration.dispose()
 
 
 @pytest.mark.parametrize(

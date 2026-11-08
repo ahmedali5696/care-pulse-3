@@ -1,8 +1,10 @@
 """B-10 real-PostgreSQL acceptance of preferential booking and receipts."""
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -14,6 +16,8 @@ from carepulse.appointments.queries import appointment_detail
 from carepulse.db import transaction
 from carepulse.identity.contracts import normalized_request_digest
 from carepulse.identity.receipts import Receipt, insert_tenant_receipt
+from carepulse.main import app
+from carepulse.notifications.evidence import append_outbox, append_sensitive_audit
 from sqlalchemy import text
 from test_appointment_persistence import _admit_saved, _draft, _query
 from test_booking import (
@@ -25,11 +29,14 @@ from test_booking import (
 from test_booking import (
     booking_clinic as booking_clinic,  # noqa: PLC0414
 )
-from test_followup_persistence import _source, _v2_source
+from test_database import admin as admin  # noqa: PLC0414
+from test_database import empty_database as empty_database  # noqa: PLC0414
+from test_followup_persistence import _source, _v2_booking, _v2_command, _v2_source
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _patch, pricing_request
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 from test_schedule import _actor, _config, _publish
+from test_visit_migration import _prepare, _upgrade
 
 
 @pytest.fixture
@@ -809,6 +816,167 @@ def _seed_historical_booking_receipt(clinic, appointment, source, *, unsafe=Fals
             ),
         )
     return body, key, projection
+
+
+def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
+    patient_backend, admin, empty_database
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, "0028_d08_followup_provenance")
+        session = f"synthetic-b10-legacy-{uuid4()}"
+        with migration.begin() as connection:
+            connection.execute(
+                text("""
+                    INSERT INTO public."session"
+                        (id, "userId", token, "expiresAt", "createdAt", "updatedAt",
+                         "securityRevision", "absoluteDeadline", "lastActivity")
+                    SELECT :session, s.auth_user_id, :token,
+                           now() + interval '1 hour', now(), now(), 0,
+                           now() + interval '1 hour', now()
+                    FROM public.staff_accounts s
+                    WHERE s.organization_id=:tenant AND s.id=:doctor
+                """),
+                {
+                    "session": session,
+                    "token": str(uuid4()),
+                    "tenant": tenant,
+                    "doctor": doctor,
+                },
+            )
+        actor = replace(
+            patient_backend.owner,
+            organization_id=str(tenant),
+            staff_id=str(doctor),
+            session_id=session,
+        )
+        clinic = SimpleNamespace(
+            tenant=tenant,
+            runtime=runtime,
+            migration=migration,
+            owner=actor,
+            config=patient_backend.config,
+        )
+        with transaction(runtime, tenant) as connection:
+            source = _v2_source(connection, tenant, doctor)
+            claim = _v2_command(
+                connection, "create_followup_claim", source, **_v2_booking(source, 2)
+            )
+            appointment = connection.scalar(
+                text(
+                    "SELECT appointment_id FROM public.followup_claims WHERE id=:claim"
+                ),
+                {"claim": claim},
+            )
+            body = booking_body(
+                source["patient"],
+                day=source["day"] + timedelta(days=2),
+                requested_service_type="FOLLOW_UP",
+                source_visit_id=str(source["visit"]),
+                expected_source_revision=0,
+                expected_base_egp="100.00",
+                expected_net_egp="100.00",
+                expected_price_revision=1,
+                expected_schedule_revision=1,
+                expected_followup_revision=1,
+            )
+            command = BookAppointment.model_validate(body)
+            assert command.source_family == "v1"
+            saved = appointment_detail(connection, _actor(tenant, doctor), appointment)
+            assert saved["service_type"] == "FOLLOW_UP"
+            assert saved["history"][0]["reason"] is None
+            key = str(uuid4())
+            # The predecessor SQL writer persists the claim; the v1 API also wrote
+            # its booking audit, outbox and D-09 receipt in this transaction.
+            append_sensitive_audit(
+                connection,
+                {
+                    "organization_id": tenant,
+                    "actor_staff_id": doctor,
+                    "actor_role": "DOCTOR_OWNER",
+                    "action": "appointments.book",
+                    "correlation_id": str(appointment),
+                    "after_state": {"appointment_id": str(appointment), "revision": 0},
+                },
+            )
+            append_outbox(
+                connection,
+                {
+                    "organization_id": tenant,
+                    "event_type": "APPOINTMENT_BOOKED",
+                    "aggregate_type": "APPOINTMENT",
+                    "aggregate_id": str(appointment),
+                    "payload": {"appointment_id": str(appointment)},
+                },
+            )
+            insert_tenant_receipt(
+                connection,
+                Receipt(
+                    actor_id=doctor,
+                    operation="appointments.book",
+                    idempotency_key=key,
+                    request_digest=normalized_request_digest(command),
+                    result_projection=saved,
+                    result_revision=0,
+                    organization_id=tenant,
+                    staff_id=doctor,
+                ),
+            )
+        receipt_query = text("""
+            SELECT request_digest, result_projection, result_revision
+            FROM public.idempotency_receipts
+            WHERE organization_id=:tenant AND operation='appointments.book'
+              AND idempotency_key=:key
+        """)
+        receipt_params = {"tenant": tenant, "key": key}
+        with migration.connect() as connection:
+            original_receipt = connection.execute(receipt_query, receipt_params).one()
+        assert original_receipt == (normalized_request_digest(command), saved, 0)
+        _upgrade(migration, "0029_b10_followup_writers")
+        with migration.connect() as connection:
+            assert (
+                connection.execute(receipt_query, receipt_params).one()
+                == original_receipt
+            )
+        app.state.db_engine = runtime
+        assert booking_request(clinic, actor, body=body, key=key) == (
+            201,
+            {"data": saved, "revision": 0},
+        )
+        conflict_status, conflict = booking_request(
+            clinic, actor, body={**body, "expected_net_egp": "99.00"}, key=key
+        )
+        assert conflict_status == 409
+        assert conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+        assert booking_request(clinic, actor, body=body, key=str(uuid4()))[0] == 409
+        with migration.begin() as connection:
+            connection.execute(
+                text('DELETE FROM public."session" WHERE id=:session'),
+                {"session": session},
+            )
+        for candidate in (body, {**body, "expected_net_egp": "99.00"}):
+            status, refusal = booking_request(clinic, actor, body=candidate, key=key)
+            assert status in (401, 403), refusal
+            assert "data" not in refusal
+        with migration.connect() as connection:
+            assert (
+                connection.execute(receipt_query, receipt_params).one()
+                == original_receipt
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT count(*) FROM public.followup_claims
+                    WHERE organization_id=:tenant AND source_visit_id=:visit
+                """),
+                    {"tenant": tenant, "visit": source["visit"]},
+                )
+                == 1
+            )
+    finally:
+        app.state.db_engine = patient_backend.runtime
+        runtime.dispose()
+        migration.dispose()
 
 
 @pytest.mark.parametrize("unsafe", [False, True])

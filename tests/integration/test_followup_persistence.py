@@ -440,6 +440,25 @@ def test_current_followup_qualification_uses_live_policy_window(
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
         source = _v2_source(connection, tenant, doctor)
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.scalar(
+                text("SELECT public.b10_operational_source_proof(:tenant, :visit)"),
+                {"tenant": tenant, "visit": source["visit"]},
+            )
+        assert denied.value.orig.sqlstate == "42501"
+        connection.execute(
+            text("SELECT set_config('app.staff_id', :staff, true)"),
+            {"staff": str(doctor)},
+        )
+        assert connection.scalar(
+            text("SELECT public.b10_operational_source_proof(:tenant, :visit)"),
+            {"tenant": tenant, "visit": source["visit"]},
+        ) == {
+            "state": "VERIFIED",
+            "decision": None,
+            "actor_staff_id": None,
+            "actor_role": None,
+        }
         payload = (
             '{"completion_day_zero":true,"last_day_inclusive":7.00}'
             if window == "7.00"

@@ -174,7 +174,7 @@ def followup_qualification(
     )
     if evidence is not None and evidence["source_revision"] is None:
         proof = connection.scalar(
-            text("SELECT public.d08_legacy_source(:tenant, :visit)"),
+            text("SELECT public.b10_operational_source_proof(:tenant, :visit)"),
             {"tenant": actor.organization_id, "visit": evidence["id"]},
         )
         evidence = {
@@ -347,7 +347,7 @@ def confirmed_followup_control(
         return None
     if claim["source_decision_revision"] is None:
         proof = connection.scalar(
-            text("SELECT public.d08_legacy_source(:tenant, :visit)"),
+            text("SELECT public.b10_operational_source_proof(:tenant, :visit)"),
             {"tenant": actor.organization_id, "visit": claim["source_visit_id"]},
         )
         claim = {

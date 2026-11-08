@@ -12,6 +12,63 @@ from test_visit_migration import _prepare, _upgrade
 
 BEFORE = "0028_d08_followup_provenance"
 AFTER = "0029_b10_followup_writers"
+PROOF_AFTER = "0030_b10_source_proof"
+
+
+def test_operational_proof_successor_preserves_claim_and_limits_runtime_access(
+    admin, empty_database
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, AFTER)
+        with transaction(runtime, tenant) as connection:
+            source = _v2_source(connection, tenant, doctor)
+            claim = _v2_command(
+                connection, "create_followup_claim", source, **_v2_booking(source)
+            )
+        with migration.connect() as connection:
+            old_claim = connection.scalar(
+                text("SELECT to_jsonb(c) FROM public.followup_claims c WHERE id=:id"),
+                {"id": claim},
+            )
+        _upgrade(migration, PROOF_AFTER)
+        _upgrade(migration, PROOF_AFTER)
+        with migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT to_jsonb(c) FROM public.followup_claims c WHERE id=:id"
+                    ),
+                    {"id": claim},
+                )
+                == old_claim
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT has_function_privilege('carepulse_runtime',
+                        'public.d08_legacy_source(uuid,uuid)', 'EXECUTE')
+                """)
+                )
+                is False
+            )
+        with transaction(runtime, tenant) as connection:
+            connection.execute(
+                text("SELECT set_config('app.staff_id', :staff, true)"),
+                {"staff": str(doctor)},
+            )
+            assert connection.scalar(
+                text("SELECT public.b10_operational_source_proof(:org,:visit)"),
+                {"org": tenant, "visit": source["visit"]},
+            ) == {
+                "state": "VERIFIED",
+                "decision": None,
+                "actor_staff_id": None,
+                "actor_role": None,
+            }
+    finally:
+        runtime.dispose()
+        migration.dispose()
 
 
 def test_populated_successor_retains_claim_and_fences_legacy_sql(admin, empty_database):

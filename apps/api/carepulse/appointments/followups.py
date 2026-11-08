@@ -11,7 +11,6 @@ from carepulse.appointments.followup_rules import (
     cairo_completion_date,
     current_last_day_inclusive,
     default_deadline,
-    validate_exception_deadline,
 )
 from carepulse.identity.contracts import ContractError, require_matching_revision
 from carepulse.policies.pricing_service import current_price_state
@@ -95,9 +94,11 @@ def _approved_deadline(
         deadline = date.fromisoformat(stated_date)
         if deadline.isoformat() != stated_date:
             return None
-        return validate_exception_deadline(
-            completion, deadline, decision.get("reason", "")
-        )
+        if deadline < completion:
+            return None
+        # The SQL proof deliberately omits historical Doctor reason text. Both
+        # the persisted decision writer and the proof reader validate it at rest.
+        return deadline
     except (TypeError, ValueError, AttributeError):
         return None
 
@@ -141,7 +142,7 @@ def qualify_followup(
     )
     if source_state is None:
         proof = connection.scalar(
-            text("SELECT public.d08_legacy_source(:tenant, :visit)"),
+            text("SELECT public.b10_operational_source_proof(:tenant, :visit)"),
             {"tenant": tenant, "visit": source_visit_id},
         )
         source_state = {
