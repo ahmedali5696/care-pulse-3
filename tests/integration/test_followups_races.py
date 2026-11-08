@@ -10,6 +10,7 @@ from carepulse.appointments.book import book_appointment
 from carepulse.appointments.booking_contracts import BookAppointment
 from carepulse.db import transaction
 from carepulse.identity.contracts import ContractError
+from carepulse.policies.versions import append_version
 from carepulse.visits.eligibility import extend_followup, record_followup_decision
 from carepulse.visits.eligibility_contracts import (
     ExtendFollowupV2,
@@ -409,7 +410,9 @@ def test_claim_confirmation_first_blocks_terminal_until_booking_commits(
         terminal = pool.submit(cancel)
         try:
             assert terminal_started.wait(timeout=15)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
+            # pg_stat_activity masks another role's wait details; observe the
+            # migration waiter using a separate migration-role connection.
+            with clinic.migration.connect() as observer:
                 _wait_for_postgres_lock(observer, terminal_pid[0], booking_pid[0])
             assert booking_effects(clinic) == before
             assert _claim_count(clinic, source) == 0
@@ -560,3 +563,114 @@ def test_source_lock_is_acquired_after_day_counter_on_confirmation(followup_clin
         saved = future.result(timeout=30)
     assert saved["service_type"] == "FOLLOW_UP"
     assert _claim_count(clinic, source) == 1
+
+
+@pytest.mark.parametrize(
+    "policy_first", [True, False], ids=["policy-first", "booking-first"]
+)
+def test_followup_policy_publication_serializes_with_preferential_booking(
+    followup_clinic, policy_first
+):
+    clinic = followup_clinic
+    source = _source_for(clinic)
+    command = _command(source)
+    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+    before = booking_effects(clinic)
+    holder_ready = Event()
+    waiter_started = Event()
+    release_holder = Event()
+    publication_pid = []
+    booking_pid = []
+    frozen_query = text("""
+        SELECT c.state, c.approved_deadline, c.policy_snapshot,
+               p.entitlement_provenance, p.net_egp
+        FROM public.followup_claims c
+        JOIN public.appointment_price_snapshots p
+          ON (p.organization_id, p.appointment_id) =
+             (c.organization_id, c.appointment_id)
+        WHERE c.organization_id=:tenant AND c.appointment_id=:appointment
+    """)
+
+    def publish(hold):
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            _doctor_context(connection, actor.staff_id)
+            publication_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            if not hold:
+                waiter_started.set()
+            revision = append_version(
+                connection,
+                clinic.tenant,
+                "FOLLOWUP",
+                {"completion_day_zero": True, "last_day_inclusive": 10},
+                1,
+                actor_staff_id=str(actor.staff_id),
+            )
+            if hold:
+                holder_ready.set()
+                assert release_holder.wait(timeout=20)
+            return revision
+
+    def book(hold):
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            _doctor_context(connection, actor.staff_id)
+            booking_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            if not hold:
+                waiter_started.set()
+            saved = book_appointment(connection, actor, command, str(uuid4()))
+            frozen = connection.execute(
+                frozen_query,
+                {"tenant": clinic.tenant, "appointment": UUID(saved["id"])},
+            ).one()
+            if hold:
+                holder_ready.set()
+                assert release_holder.wait(timeout=20)
+            return saved, frozen
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        holder = pool.submit(publish if policy_first else book, True)
+        try:
+            assert holder_ready.wait(timeout=15)
+            waiter = pool.submit(book if policy_first else publish, False)
+            assert waiter_started.wait(timeout=15)
+            with transaction(clinic.runtime, clinic.tenant) as observer:
+                _wait_for_postgres_lock(
+                    observer,
+                    booking_pid[0] if policy_first else publication_pid[0],
+                    publication_pid[0] if policy_first else booking_pid[0],
+                )
+        finally:
+            release_holder.set()
+        if policy_first:
+            assert holder.result(timeout=30) == 2
+            with pytest.raises(ContractError) as denied:
+                waiter.result(timeout=30)
+            assert denied.value.status_code == 409
+            assert denied.value.code == "STALE_REVISION"
+        else:
+            saved, frozen = holder.result(timeout=30)
+            assert waiter.result(timeout=30) == 2
+            assert saved["service_type"] == "FOLLOW_UP"
+            assert frozen.state == "ACTIVE"
+            assert frozen.approved_deadline == source["day"] + timedelta(days=7)
+            assert frozen.policy_snapshot["policy_revision"] == 1
+
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert connection.execute(
+            text("""
+                SELECT current_version, revision FROM public.clinic_policy_heads
+                WHERE organization_id=:tenant AND kind='FOLLOWUP'
+            """),
+            {"tenant": clinic.tenant},
+        ).one() == (2, 2)
+        if not policy_first:
+            assert (
+                connection.execute(
+                    frozen_query,
+                    {"tenant": clinic.tenant, "appointment": UUID(saved["id"])},
+                ).one()
+                == frozen
+            )
+    assert _claim_count(clinic, source) == (0 if policy_first else 1)
+    assert booking_effects(clinic) == (
+        before if policy_first else tuple(count + 1 for count in before)
+    )

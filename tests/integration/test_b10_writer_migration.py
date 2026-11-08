@@ -1,6 +1,7 @@
 """B-10 successor upgrade and real PostgreSQL writer boundaries."""
 
 import shutil
+from uuid import uuid4
 
 import pytest
 from carepulse.db import transaction
@@ -59,6 +60,12 @@ def test_operational_proof_successor_preserves_claim_and_limits_runtime_access(
                 text("SELECT set_config('app.staff_id', :staff, true)"),
                 {"staff": str(doctor)},
             )
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.scalar(
+                    text("SELECT public.b10_operational_source_proof(:org,:visit)"),
+                    {"org": uuid4(), "visit": source["visit"]},
+                )
+            assert denied.value.orig.sqlstate == "42501"
             assert connection.scalar(
                 text("SELECT public.b10_operational_source_proof(:org,:visit)"),
                 {"org": tenant, "visit": source["visit"]},
