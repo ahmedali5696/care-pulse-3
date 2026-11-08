@@ -40,6 +40,22 @@ class FallbackAcknowledgment(BaseModel):
     discount_reaffirmed: Literal[True]
 
 
+class NewBookingDateException(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selected_service_date: CanonicalServiceDate
+    reason: StrictStr | None = None
+
+    @field_validator("reason")
+    @classmethod
+    def valid_reason(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not value.strip() or any(ord(character) < 32 for character in value)
+        ):
+            raise ValueError("A supplied exception reason must be nonblank")
+        return value.strip() if value is not None else None
+
+
 class BookAppointment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -57,6 +73,9 @@ class BookAppointment(BaseModel):
     expected_schedule_revision: Revision
     expected_capacity_revision: Revision | None = None
     expected_source_revision: Revision | None = None
+    expected_source_decision_revision: Revision | None = None
+    expected_visit_revision: Revision | None = None
+    new_booking_date_exception: NewBookingDateException | None = None
     fallback_acknowledgment: FallbackAcknowledgment | None = None
 
     @field_validator("expected_base_egp", "expected_net_egp")
@@ -67,24 +86,60 @@ class BookAppointment(BaseModel):
 
     @model_validator(mode="after")
     def booking_intent(self):
+        old = self.expected_source_revision is not None
+        old_field = "expected_source_revision" in self.model_fields_set
+        new = (
+            self.expected_source_decision_revision is not None
+            or self.expected_visit_revision is not None
+            or "new_booking_date_exception" in self.model_fields_set
+        )
         if self.requested_service_type == "NEW_EXAMINATION" and (
             self.source_visit_id is not None
-            or self.expected_source_revision is not None
+            or old
+            or new
             or self.fallback_acknowledgment is not None
         ):
             raise ValueError("New Examination cannot claim a source Visit")
         if self.requested_service_type == "FOLLOW_UP":
-            if (self.source_visit_id is None) != (
-                self.expected_source_revision is None
+            if self.source_visit_id is None and (old or new):
+                raise ValueError("Source tokens require a referenced Visit")
+            if self.source_visit_id is not None and (
+                old == new
+                or old_field
+                and new
+                or old
+                and (
+                    self.expected_visit_revision is not None
+                    or self.expected_source_decision_revision is not None
+                )
+                or new
+                and (
+                    self.expected_visit_revision is None
+                    or self.expected_source_decision_revision is None
+                )
             ):
                 raise ValueError(
-                    "Referenced source and revision must be supplied together"
+                    "Exactly one complete source revision family is required"
                 )
             if self.expected_followup_revision is None:
                 raise ValueError("Follow-up policy revision is required")
+            if "new_booking_date_exception" in self.model_fields_set and (
+                self.new_booking_date_exception is None
+                or self.new_booking_date_exception.selected_service_date
+                != self.service_date
+                or self.fallback_acknowledgment is not None
+                or not new
+            ):
+                raise ValueError("NEW_DATE requires a matching v2 preferential booking")
         if (self.starts_at is None) != (self.ends_at is None):
             raise ValueError("Both timed endpoints are required together")
         return self
+
+    @property
+    def source_family(self) -> Literal["common", "v1", "v2"]:
+        if self.source_visit_id is None:
+            return "common"
+        return "v1" if self.expected_source_revision is not None else "v2"
 
 
 class AppointmentQuery(BaseModel):

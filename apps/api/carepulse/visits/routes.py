@@ -1,13 +1,21 @@
-"""Signed Doctor-only follow-up authorizations."""
+"""Purpose-bound signed source decisions and claim extensions."""
 
+import json
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
+from pydantic import ValidationError
 
 from carepulse.identity.authorization import protected_transaction
 from carepulse.identity.contracts import ContractError, success_response
 from carepulse.visits.eligibility import extend_followup, record_followup_decision
-from carepulse.visits.eligibility_contracts import ExtendFollowup, FollowupDecisionPatch
+from carepulse.visits.eligibility_contracts import (
+    ExtendFollowup,
+    ExtendFollowupV2,
+    FollowupDecisionPatch,
+    FollowupDecisionPatchV2,
+)
 
 router = APIRouter(prefix="/v1/visits")
 
@@ -25,29 +33,89 @@ def _transaction(request: Request):
     )
 
 
+def _unique_json_pairs(pairs):
+    fields = {}
+    for key, value in pairs:
+        if key in fields:
+            raise ValueError("Duplicate request key")
+        fields[key] = value
+    return fields
+
+
+async def _strict_body(request: Request) -> dict:
+    try:
+        body = json.loads(
+            await request.body(),
+            object_pairs_hook=_unique_json_pairs,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+        )
+        if not isinstance(body, dict):
+            raise TypeError("Expected an object")
+        return body
+    except (TypeError, ValueError, UnicodeError) as invalid:
+        raise ContractError(422) from invalid
+
+
+async def _decision_body(
+    request: Request,
+) -> FollowupDecisionPatch | FollowupDecisionPatchV2:
+    body = await _strict_body(request)
+    v2_fields = {"expected_source_decision_revision", "expected_followup_revision"}
+    contract = (
+        FollowupDecisionPatchV2 if body.keys() & v2_fields else FollowupDecisionPatch
+    )
+    try:
+        return contract.model_validate(body)
+    except ValidationError as invalid:
+        raise ContractError(422) from invalid
+
+
+async def _extension_body(request: Request) -> ExtendFollowup | ExtendFollowupV2:
+    body = await _strict_body(request)
+    v2_fields = {
+        "expected_source_decision_revision",
+        "expected_followup_revision",
+        "expected_authorization_revision",
+        "expected_appointment_revision",
+    }
+    contract = ExtendFollowupV2 if body.keys() & v2_fields else ExtendFollowup
+    try:
+        return contract.model_validate(body)
+    except ValidationError as invalid:
+        raise ContractError(422) from invalid
+
+
 @router.patch("/{visit_id}")
 def patch_followup_decision(
-    visit_id: UUID, command: FollowupDecisionPatch, request: Request
+    visit_id: UUID,
+    command: Annotated[
+        FollowupDecisionPatch | FollowupDecisionPatchV2, Depends(_decision_body)
+    ],
+    request: Request,
 ):
     with _transaction(request) as (connection, actor):
-        projection = record_followup_decision(
+        projection, revision = record_followup_decision(
             connection,
             actor,
             visit_id,
             command,
             request.scope["carepulse.identity"].idempotency_key,
         )
-        return success_response(projection, projection["revision"])
+        return success_response(projection, revision)
 
 
 @router.post("/{visit_id}/extend-followup")
-def post_followup_extension(visit_id: UUID, command: ExtendFollowup, request: Request):
+def post_followup_extension(
+    visit_id: UUID,
+    command: Annotated[ExtendFollowup | ExtendFollowupV2, Depends(_extension_body)],
+    request: Request,
+):
     with _transaction(request) as (connection, actor):
-        projection = extend_followup(
+        projection, revision = extend_followup(
             connection,
             actor,
             visit_id,
             command,
             request.scope["carepulse.identity"].idempotency_key,
         )
-        return success_response(projection, projection["revision"], status_code=201)
+        return success_response(projection, revision, status_code=201)

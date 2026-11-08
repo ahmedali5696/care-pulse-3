@@ -56,6 +56,18 @@ def legacy_followup_storage(admin, empty_database):
         migration.dispose()
 
 
+@pytest.fixture
+def provenance_followup_storage(admin, empty_database):
+    """Exercise historical 0028 terminal and writer behavior before B-10 fencing."""
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, "0028_d08_followup_provenance")
+        yield runtime, migration, (tenant, None), (doctor, None)
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
 def _v2_source(connection, tenant, doctor):
     appointment = _admitted_source(connection, tenant, doctor, complete=True)
     visit, completion, patient = connection.execute(
@@ -89,6 +101,32 @@ def _v2_command(connection, routine, source, **command):
         "expected", {"source_revision": 0, "clinical_revision": 0, "policy_version": 1}
     )
     reference = command.pop("reference", source["visit"])
+    legacy_entrypoint = command.pop("legacy_entrypoint", False)
+    ordered = connection.scalar(
+        text("""
+            SELECT to_regprocedure(
+                'public.create_followup_claim_ordered(uuid,uuid,jsonb,jsonb)')
+                IS NOT NULL
+        """)
+    )
+    if (
+        ordered
+        and not legacy_entrypoint
+        and routine in ("create_followup_claim", "extend_followup_claim")
+    ):
+        routine += "_ordered"
+    if routine == "create_followup_claim_ordered" and "allocated_number" not in command:
+        command["allocated_number"] = connection.scalar(
+            text("""
+                INSERT INTO public.appointment_day_counters
+                    (organization_id, service_date, last_number)
+                VALUES (:tenant, CAST(:day AS date), 1)
+                ON CONFLICT (organization_id, service_date)
+                DO UPDATE SET last_number = public.appointment_day_counters.last_number + 1
+                RETURNING last_number
+            """),
+            {"tenant": source["tenant"], "day": command["service_date"]},
+        )
     return connection.scalar(
         text(
             f"SELECT public.{routine}(:org, :reference, CAST(:expected AS jsonb), CAST(:body AS jsonb))"
@@ -258,9 +296,9 @@ def test_v2_no_decision_and_actual_staff_events_preserve_clinical_content(
 
 @pytest.mark.parametrize("restriction", ["OPTED_OUT", "DEADLINE"])
 def test_v2_doctor_priority_blocks_receptionist_reset_exception_and_extension(
-    appointment_storage, restriction
+    provenance_followup_storage, restriction
 ):
-    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    runtime, migration, (tenant, _), (doctor, _) = provenance_followup_storage
     staff = _receptionist(migration, tenant)
     with transaction(runtime, tenant) as connection:
         source = _v2_source(connection, tenant, doctor)
@@ -392,7 +430,7 @@ def test_v2_current_policy_boundaries_are_derived_without_doctor_default(
         )
 
 
-def test_v2_new_date_is_exact_creation_extension_is_separate_and_release_does_not_inherit(
+def test_v2_ordered_new_date_extension_and_direct_terminal_fence(
     appointment_storage,
 ):
     runtime, migration, (tenant, _), (doctor, _) = appointment_storage
@@ -410,6 +448,11 @@ def test_v2_new_date_is_exact_creation_extension_is_separate_and_release_does_no
             source,
             actor=staff,
             **_v2_booking(source, 10),
+            new_booking_date_exception={
+                "selected_service_date": (
+                    source["day"] + timedelta(days=10)
+                ).isoformat(),
+            },
         )
         record = _v2_record(connection, claim)
         frozen = connection.scalar(
@@ -476,43 +519,27 @@ def test_v2_new_date_is_exact_creation_extension_is_separate_and_release_does_no
             == frozen
         )
         connection.execute(text("SET CONSTRAINTS ALL DEFERRED"))
-        _outcome(connection, tenant, doctor, record, status="Cancelled")
-        with pytest.raises(DBAPIError) as released, connection.begin_nested():
-            _v2_command(
-                connection,
-                "extend_followup_claim",
-                source,
-                reference=claim,
-                expected={**expected, "authorization_revision": 2},
-                deadline_date=(source["day"] + timedelta(days=13)).isoformat(),
-                reason="Released",
-            )
-        assert released.value.orig.sqlstate == "40001"
-        fresh = _v2_command(
-            connection, "create_followup_claim", source, **_v2_booking(source, 2)
-        )
-        assert fresh != claim
+        with pytest.raises(DBAPIError) as terminal, connection.begin_nested():
+            _outcome(connection, tenant, doctor, record, status="Cancelled")
+        assert terminal.value.orig.sqlstate == "42501"
+        assert connection.execute(
+            text("SELECT state, revision FROM public.followup_claims WHERE id=:claim"),
+            {"claim": claim},
+        ).one() == ("ACTIVE", 1)
         assert (
             connection.scalar(
                 text(
-                    "SELECT count(*) FROM public.followup_authorization_events WHERE claim_id=:id"
+                    "SELECT count(*) FROM public.followup_authorization_events WHERE claim_id=:claim"
                 ),
-                {"id": fresh},
+                {"claim": claim},
             )
-            == 0
+            == 2
         )
-        _outcome(
-            connection,
-            tenant,
-            doctor,
-            _v2_record(connection, fresh),
-            status="Completed",
-        )
-        with pytest.raises(DBAPIError) as consumed, connection.begin_nested():
+        with pytest.raises(DBAPIError) as competing, connection.begin_nested():
             _v2_command(
-                connection, "create_followup_claim", source, **_v2_booking(source, 3)
+                connection, "create_followup_claim", source, **_v2_booking(source, 2)
             )
-        assert consumed.value.orig.sqlstate == "23505"
+        assert competing.value.orig.sqlstate == "23505"
 
 
 @pytest.mark.parametrize(
@@ -784,6 +811,11 @@ def test_v2_creation_exception_cannot_authorize_same_date_interval_change(
             source,
             actor=staff,
             **_v2_booking(source, 10),
+            new_booking_date_exception={
+                "selected_service_date": (
+                    source["day"] + timedelta(days=10)
+                ).isoformat(),
+            },
         )
         record = _v2_record(connection, claim)
         starts = datetime.combine(
@@ -801,7 +833,7 @@ def test_v2_creation_exception_cannot_authorize_same_date_interval_change(
                     "ends": starts + timedelta(hours=1),
                 },
             )
-        assert denied.value.orig.sqlstate == "23514"
+        assert denied.value.orig.sqlstate == "42501"
         with pytest.raises(DBAPIError) as late, connection.begin_nested():
             _v2_command(
                 connection,
@@ -824,9 +856,9 @@ def test_v2_creation_exception_cannot_authorize_same_date_interval_change(
 
 
 def test_v2_declared_new_date_without_event_rolls_back_all_creation_evidence(
-    appointment_storage,
+    provenance_followup_storage,
 ):
-    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    runtime, migration, (tenant, _), (doctor, _) = provenance_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _v2_source(connection, tenant, doctor)
         ordinary = _v2_command(
@@ -975,7 +1007,7 @@ def test_v2_source_requires_contiguous_matching_head_and_immutable_events(
 
 
 def _source(connection, tenant, doctor, *, classification="ROUTINE", complete=True):
-    """Use the D-07 admission history and a real Doctor decision as source evidence."""
+    """Create a completed source; preserve Doctor decisions on legacy predecessors."""
     patient = _patient(connection, tenant)
     saved = persist_appointment(
         connection,
@@ -998,17 +1030,28 @@ def _source(connection, tenant, doctor, *, classification="ROUTINE", complete=Tr
         text("SELECT id FROM public.visits WHERE appointment_id=:id"),
         {"id": appointment},
     )
-    connection.execute(
-        text("SELECT set_config('app.clinical_change_kind', 'DECISION_DEFAULT', true)")
-    )
-    connection.execute(text("SELECT set_config('app.clinical_reason', '', true)"))
-    connection.execute(
-        text("""
-            UPDATE public.visits SET followup_decision=CAST(:decision AS jsonb)
-            WHERE id=:visit
-        """),
-        {"decision": '{"kind":"DEFAULT","eligible":true}', "visit": visit},
-    )
+    if (
+        connection.scalar(
+            text("""
+            SELECT to_regprocedure(
+                'public.record_followup_source_decision(uuid,uuid,jsonb,jsonb)')
+        """)
+        )
+        is None
+    ):
+        connection.execute(
+            text(
+                "SELECT set_config('app.clinical_change_kind', 'DECISION_DEFAULT', true)"
+            )
+        )
+        connection.execute(text("SELECT set_config('app.clinical_reason', '', true)"))
+        connection.execute(
+            text("""
+                UPDATE public.visits SET followup_decision=CAST(:decision AS jsonb)
+                WHERE id=:visit
+            """),
+            {"decision": '{"kind":"DEFAULT","eligible":true}', "visit": visit},
+        )
     completion_day = connection.scalar(
         text("""
             SELECT (h.occurred_at AT TIME ZONE 'Africa/Cairo')::date

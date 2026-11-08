@@ -128,16 +128,18 @@ def appointment_detail(
         .mappings()
         .all()
     )
-    return {
-        **_projection(row),
-        "history": [
-            {
-                key: value.isoformat() if hasattr(value, "isoformat") else value
-                for key, value in entry.items()
-            }
-            for entry in history
-        ],
-    }
+    recorded = []
+    for entry in history:
+        item = {
+            key: value.isoformat() if hasattr(value, "isoformat") else value
+            for key, value in entry.items()
+            if key != "reason"
+        }
+        # An original CREATED null is classified history, not free-text rationale.
+        if entry["action"] == "CREATED" and entry["reason"] is None:
+            item["reason"] = None
+        recorded.append(item)
+    return {**_projection(row), "history": recorded}
 
 
 def followup_qualification(
@@ -152,13 +154,17 @@ def followup_qualification(
         connection.execute(
             text("""
             SELECT v.id, v.patient_id, v.doctor_staff_id,
-                   v.clinical_revision, v.followup_decision,
+                   v.clinical_revision,
+                   s.source_revision, s.provenance_state, s.decision,
+                   s.decision_actor_staff_id, s.decision_actor_role,
                 (SELECT h.occurred_at FROM public.appointment_history h
                  WHERE h.organization_id = v.organization_id
                    AND h.appointment_id = v.appointment_id
                    AND h.new_status = 'Completed'
                  ORDER BY h.appointment_revision DESC LIMIT 1) AS completed_at
             FROM public.visits v
+            LEFT JOIN public.followup_source_state s
+              ON s.organization_id=v.organization_id AND s.visit_id=v.id
             WHERE v.organization_id = :tenant AND v.appointment_id = :appointment
         """),
             {"tenant": actor.organization_id, "appointment": appointment_id},
@@ -166,6 +172,19 @@ def followup_qualification(
         .mappings()
         .one_or_none()
     )
+    if evidence is not None and evidence["source_revision"] is None:
+        proof = connection.scalar(
+            text("SELECT public.d08_legacy_source(:tenant, :visit)"),
+            {"tenant": actor.organization_id, "visit": evidence["id"]},
+        )
+        evidence = {
+            **evidence,
+            "source_revision": 0,
+            "provenance_state": proof["state"],
+            "decision": proof.get("decision"),
+            "decision_actor_staff_id": proof.get("actor_staff_id"),
+            "decision_actor_role": proof.get("actor_role"),
+        }
     pricing = current_price_state(connection, actor.organization_id)
     try:
         last_day = current_last_day_inclusive(pricing["FOLLOWUP"]["payload"])
@@ -179,7 +198,7 @@ def followup_qualification(
         and evidence
         and evidence["completed_at"] is not None
     ):
-        decision = evidence["followup_decision"] or {}
+        decision = evidence["decision"]
         completed = evidence["completed_at"].astimezone(ZoneInfo("Africa/Cairo")).date()
         deadline = _approved_deadline(completed, decision, last_day)
         claim_state = connection.scalar(
@@ -193,16 +212,7 @@ def followup_qualification(
         )
         if claim_state == "ACTIVE":
             raise ContractError(409)
-        if deadline is not None and evidence["clinical_revision"] >= 1:
-            decision_actor = connection.scalar(
-                text("""
-                    SELECT actor_staff_id FROM public.clinical_revisions
-                    WHERE organization_id = :tenant AND visit_id = :visit
-                      AND change_kind IN ('DECISION_DEFAULT','DECISION_EXCEPTION')
-                    ORDER BY revision DESC LIMIT 1
-                """),
-                {"tenant": actor.organization_id, "visit": evidence["id"]},
-            )
+        if deadline is not None and evidence["provenance_state"] == "VERIFIED":
             active_doctor = connection.scalar(
                 text("""
                     SELECT id FROM public.staff_accounts
@@ -216,7 +226,14 @@ def followup_qualification(
                 and evidence["patient_id"] == UUID(source["patient_id"])
                 and evidence["doctor_staff_id"] == UUID(source["doctor_staff_id"])
                 and evidence["doctor_staff_id"] == active_doctor
-                and decision_actor == active_doctor
+                and connection.scalar(
+                    text("""
+                        SELECT EXISTS (SELECT 1 FROM public.completion_attestations
+                        WHERE organization_id=:tenant AND visit_id=:visit
+                          AND examination_occurred)
+                    """),
+                    {"tenant": actor.organization_id, "visit": evidence["id"]},
+                )
                 and intended_date_allowed(completed, intended_date, deadline)
             )
     service_type = "FOLLOW_UP" if eligible else "NEW_EXAMINATION"
@@ -247,6 +264,8 @@ def followup_qualification(
         "preferential_available": eligible,
         "source_visit_id": str(evidence["id"]) if evidence else None,
         "source_revision": evidence["clinical_revision"] if evidence else None,
+        "source_decision_revision": evidence["source_revision"] if evidence else None,
+        "visit_revision": evidence["clinical_revision"] if evidence else None,
         "price_revision": pricing["PRICE"]["revision"],
         "followup_revision": pricing["FOLLOWUP"]["revision"],
         "schedule_revision": _schedule_head(connection, actor.organization_id)[
@@ -254,9 +273,122 @@ def followup_qualification(
         ],
         "price_quote": price_quote,
     }
-    if actor.role == "DOCTOR_OWNER" and evidence:
-        qualification["doctor_followup_decision"] = evidence["followup_decision"]
+    if evidence:
+        decision = evidence["decision"]
+        author_role = evidence["decision_actor_role"]
+        doctor_restriction = (
+            author_role == "DOCTOR_OWNER"
+            and isinstance(decision, dict)
+            and decision.get("kind") in ("OPTED_OUT", "DEADLINE")
+        )
+        qualification["decision_control"] = {
+            "kind": (
+                "ANCESTRY_UNKNOWN"
+                if evidence["provenance_state"] != "VERIFIED"
+                else decision.get("kind", "NO_DECISION")
+                if isinstance(decision, dict)
+                else "NO_DECISION"
+            ),
+            "deadline_date": (
+                decision.get("deadline_date") if isinstance(decision, dict) else None
+            ),
+            "actor_role": author_role,
+            "can_revise": (
+                source["status"] == "Completed"
+                and evidence["provenance_state"] == "VERIFIED"
+                and (actor.role == "DOCTOR_OWNER" or not doctor_restriction)
+            ),
+            "completion_local_date": (
+                evidence["completed_at"]
+                .astimezone(ZoneInfo("Africa/Cairo"))
+                .date()
+                .isoformat()
+                if evidence["completed_at"] is not None
+                else None
+            ),
+            "source_decision_revision": evidence["source_revision"],
+            "visit_revision": evidence["clinical_revision"],
+            "followup_revision": pricing["FOLLOWUP"]["revision"],
+        }
     return qualification
+
+
+def confirmed_followup_control(
+    connection: Connection, actor: AuthorizedStaff, appointment_id: UUID
+) -> dict | None:
+    """Action-specific extension tokens for this visible claim, without Visit content."""
+    claim = (
+        connection.execute(
+            text("""
+                SELECT c.id, c.source_visit_id, c.revision AS claim_revision,
+                       c.state, v.clinical_revision AS visit_revision,
+                       s.source_revision AS source_decision_revision,
+                       s.provenance_state, s.decision, s.decision_actor_role,
+                       (SELECT max(authorization_revision)
+                        FROM public.followup_authorization_events e
+                        WHERE e.organization_id=c.organization_id AND e.claim_id=c.id)
+                        AS authorization_revision,
+                       h.revision AS followup_revision
+                FROM public.followup_claims c
+                JOIN public.visits v
+                  ON v.organization_id=c.organization_id AND v.id=c.source_visit_id
+                LEFT JOIN public.followup_source_state s
+                  ON s.organization_id=v.organization_id AND s.visit_id=v.id
+                JOIN public.clinic_policy_heads h
+                  ON h.organization_id=c.organization_id AND h.kind='FOLLOWUP'
+                WHERE c.organization_id=:tenant AND c.appointment_id=:appointment
+            """),
+            {"tenant": actor.organization_id, "appointment": appointment_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if claim is None:
+        return None
+    if claim["source_decision_revision"] is None:
+        proof = connection.scalar(
+            text("SELECT public.d08_legacy_source(:tenant, :visit)"),
+            {"tenant": actor.organization_id, "visit": claim["source_visit_id"]},
+        )
+        claim = {
+            **claim,
+            "source_decision_revision": 0,
+            "provenance_state": proof["state"],
+            "decision": proof.get("decision"),
+            "decision_actor_role": proof.get("actor_role"),
+        }
+    decision = claim["decision"]
+    restriction = (
+        claim["decision_actor_role"] == "DOCTOR_OWNER"
+        and isinstance(decision, dict)
+        and decision.get("kind") in ("OPTED_OUT", "DEADLINE")
+    )
+    return {
+        "source_visit_id": str(claim["source_visit_id"]),
+        "claim_id": str(claim["id"]),
+        "claim_revision": claim["claim_revision"],
+        "authorization_revision": claim["authorization_revision"] or 0,
+        "source_decision_revision": claim["source_decision_revision"],
+        "visit_revision": claim["visit_revision"],
+        "followup_revision": claim["followup_revision"],
+        "decision_kind": (
+            "ANCESTRY_UNKNOWN"
+            if claim["provenance_state"] != "VERIFIED"
+            else decision.get("kind")
+            if isinstance(decision, dict)
+            else "NO_DECISION"
+        ),
+        "decision_deadline_date": (
+            decision.get("deadline_date") if isinstance(decision, dict) else None
+        ),
+        "decision_actor_role": claim["decision_actor_role"],
+        "can_extend": (
+            claim["state"] == "ACTIVE"
+            and claim["provenance_state"] == "VERIFIED"
+            and not (isinstance(decision, dict) and decision.get("kind") == "OPTED_OUT")
+            and (actor.role == "DOCTOR_OWNER" or not restriction)
+        ),
+    }
 
 
 def _cursor_signature(secret: str, scope: bytes, identifier: bytes) -> bytes:

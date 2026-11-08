@@ -11,12 +11,15 @@ from carepulse.appointments.booking_contracts import BookAppointment
 from carepulse.db import transaction
 from carepulse.identity.contracts import ContractError
 from carepulse.visits.eligibility import extend_followup, record_followup_decision
-from carepulse.visits.eligibility_contracts import ExtendFollowup, FollowupDecisionPatch
+from carepulse.visits.eligibility_contracts import (
+    ExtendFollowupV2,
+    FollowupDecisionPatchV2,
+)
 from sqlalchemy import text
 from test_booking import booking_body, booking_effects
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_booking_races import _concurrent, _wait_for_postgres_lock
-from test_followup_persistence import _outcome, _source
+from test_followup_persistence import _outcome, _v2_source
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _patch, pricing_request
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
@@ -46,14 +49,16 @@ def followup_clinic(booking_clinic):
 
 def _source_for(clinic):
     with transaction(clinic.runtime, clinic.tenant) as connection:
-        return _source(connection, clinic.tenant, UUID(clinic.owner.staff_id))
+        return _v2_source(connection, clinic.tenant, UUID(clinic.owner.staff_id))
 
 
 def _command(source, day_offset=2, **changes):
     fields = {
         "requested_service_type": "FOLLOW_UP",
         "source_visit_id": str(source["visit"]),
-        "expected_source_revision": 1,
+        "expected_source_decision_revision": 0,
+        "expected_visit_revision": 0,
+        "expected_followup_revision": 1,
         "expected_base_egp": "40.00",
         "expected_net_egp": "40.00",
         "expected_price_revision": 3,
@@ -72,7 +77,31 @@ def _command(source, day_offset=2, **changes):
 def _attempt(clinic, command):
     actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
     with transaction(clinic.runtime, clinic.tenant) as connection:
+        _doctor_context(connection, actor.staff_id)
         return book_appointment(connection, actor, command, str(uuid4()))
+
+
+def _doctor_context(connection, staff):
+    connection.execute(text("SET LOCAL lock_timeout = '30s'"))
+    connection.execute(text("SET LOCAL statement_timeout = '45s'"))
+    connection.execute(
+        text("SELECT set_config('app.staff_id', :actor, true)"),
+        {"actor": str(staff)},
+    )
+
+
+def _decision(kind, revision, *, reason=None):
+    decision = {"kind": kind}
+    if reason:
+        decision["reason"] = reason
+    return FollowupDecisionPatchV2.model_validate(
+        {
+            "followup_decision": decision,
+            "expected_source_decision_revision": revision,
+            "expected_visit_revision": 0,
+            "expected_followup_revision": 1,
+        }
+    )
 
 
 def _claim_count(clinic, source):
@@ -114,31 +143,20 @@ def test_doctor_edit_first_makes_reviewed_source_stale_without_booking_writes(
     source = _source_for(clinic)
     requested = _command(source)
     next_decision = {"kind": "OPTED_OUT", "reason": "Corrected recommendation"}
-    expected_revision = 1
+    expected_revision = 0
     if acknowledged_fallback:
         with transaction(clinic.runtime, clinic.tenant) as connection:
-            connection.execute(
-                text("SELECT set_config('app.staff_id', :actor, true)"),
-                {"actor": clinic.owner.staff_id},
-            )
+            _doctor_context(connection, UUID(clinic.owner.staff_id))
             record_followup_decision(
                 connection,
                 _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
                 source["visit"],
-                FollowupDecisionPatch.model_validate(
-                    {
-                        "followup_decision": {
-                            "kind": "OPTED_OUT",
-                            "reason": "Prior opt-out",
-                        },
-                        "expected_visit_revision": 1,
-                    }
-                ),
+                _decision("OPTED_OUT", 0, reason="Prior opt-out"),
                 str(uuid4()),
             )
         requested = _command(
             source,
-            expected_source_revision=2,
+            expected_source_decision_revision=1,
             expected_base_egp="100.00",
             expected_net_egp="100.00",
             fallback_acknowledgment={
@@ -147,7 +165,7 @@ def test_doctor_edit_first_makes_reviewed_source_stale_without_booking_writes(
             },
         )
         next_decision = {"kind": "DEFAULT"}
-        expected_revision = 2
+        expected_revision = 1
     changed = Event()
     permit_commit = Event()
     booking_started = Event()
@@ -158,19 +176,15 @@ def test_doctor_edit_first_makes_reviewed_source_stale_without_booking_writes(
     def edit():
         with transaction(clinic.runtime, clinic.tenant) as connection:
             edit_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            connection.execute(
-                text("SELECT set_config('app.staff_id', :actor, true)"),
-                {"actor": clinic.owner.staff_id},
-            )
+            _doctor_context(connection, actor.staff_id)
             record_followup_decision(
                 connection,
                 actor,
                 source["visit"],
-                FollowupDecisionPatch.model_validate(
-                    {
-                        "followup_decision": next_decision,
-                        "expected_visit_revision": expected_revision,
-                    }
+                _decision(
+                    next_decision["kind"],
+                    expected_revision,
+                    reason=next_decision.get("reason"),
                 ),
                 str(uuid4()),
             )
@@ -181,6 +195,7 @@ def test_doctor_edit_first_makes_reviewed_source_stale_without_booking_writes(
         with transaction(clinic.runtime, clinic.tenant) as connection:
             booking_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             booking_started.set()
+            _doctor_context(connection, actor.staff_id)
             return book_appointment(connection, actor, requested, str(uuid4()))
 
     before = booking_effects(clinic)
@@ -216,6 +231,7 @@ def test_confirmation_first_freezes_claim_before_doctor_opt_out(followup_clinic)
     def confirm():
         with transaction(clinic.runtime, clinic.tenant) as connection:
             confirmation_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            _doctor_context(connection, actor.staff_id)
             result = book_appointment(connection, actor, _command(source), str(uuid4()))
             booked.set()
             assert commit_booking.wait(timeout=20)
@@ -225,23 +241,12 @@ def test_confirmation_first_freezes_claim_before_doctor_opt_out(followup_clinic)
         with transaction(clinic.runtime, clinic.tenant) as connection:
             edit_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             edit_started.set()
-            connection.execute(
-                text("SELECT set_config('app.staff_id', :doctor, true)"),
-                {"doctor": clinic.owner.staff_id},
-            )
+            _doctor_context(connection, actor.staff_id)
             return record_followup_decision(
                 connection,
                 actor,
                 source["visit"],
-                FollowupDecisionPatch.model_validate(
-                    {
-                        "followup_decision": {
-                            "kind": "OPTED_OUT",
-                            "reason": "Later assessment",
-                        },
-                        "expected_visit_revision": 1,
-                    }
-                ),
+                _decision("OPTED_OUT", 0, reason="Later assessment"),
                 str(uuid4()),
             )
 
@@ -256,7 +261,7 @@ def test_confirmation_first_freezes_claim_before_doctor_opt_out(followup_clinic)
         finally:
             commit_booking.set()
         saved = confirmed.result(timeout=30)
-        assert edited.result(timeout=30)["revision"] == 2
+        assert edited.result(timeout=30)[1] == 1
 
     assert saved["service_type"] == "FOLLOW_UP"
     assert _claim_count(clinic, source) == 1
@@ -294,6 +299,7 @@ def test_release_or_consume_races_fresh_claim_without_double_use(
     def terminate():
         with transaction(clinic.runtime, clinic.tenant) as connection:
             terminal_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            _doctor_context(connection, UUID(clinic.owner.staff_id))
             _outcome(
                 connection,
                 clinic.tenant,
@@ -309,6 +315,7 @@ def test_release_or_consume_races_fresh_claim_without_double_use(
         with transaction(clinic.runtime, clinic.tenant) as connection:
             replacement_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             replacement_started.set()
+            _doctor_context(connection, actor.staff_id)
             return book_appointment(
                 connection,
                 actor,
@@ -345,13 +352,17 @@ def test_doctor_extension_and_new_claim_compete_for_same_source(followup_clinic)
     clinic = followup_clinic
     source = _source_for(clinic)
     first = _attempt(clinic, _command(source, 2))
-    extension = ExtendFollowup.model_validate(
+    extension = ExtendFollowupV2.model_validate(
         {
             "appointment_id": first["id"],
             "extended_deadline": (source["day"] + timedelta(days=9)).isoformat(),
             "reason": "Synthetic reviewed extension",
-            "expected_visit_revision": 1,
+            "expected_source_decision_revision": 0,
+            "expected_visit_revision": 0,
+            "expected_followup_revision": 1,
             "expected_claim_revision": 1,
+            "expected_authorization_revision": 0,
+            "expected_appointment_revision": 0,
         }
     )
     extension_written = Event()
@@ -363,10 +374,7 @@ def test_doctor_extension_and_new_claim_compete_for_same_source(followup_clinic)
     def doctor_extend():
         with transaction(clinic.runtime, clinic.tenant) as connection:
             extension_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            connection.execute(
-                text("SELECT set_config('app.staff_id', :doctor, true)"),
-                {"doctor": clinic.owner.staff_id},
-            )
+            _doctor_context(connection, UUID(clinic.owner.staff_id))
             result = extend_followup(
                 connection,
                 _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
@@ -382,6 +390,7 @@ def test_doctor_extension_and_new_claim_compete_for_same_source(followup_clinic)
         with transaction(clinic.runtime, clinic.tenant) as connection:
             booking_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             booking_started.set()
+            _doctor_context(connection, UUID(clinic.owner.staff_id))
             return book_appointment(
                 connection,
                 _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
@@ -400,11 +409,13 @@ def test_doctor_extension_and_new_claim_compete_for_same_source(followup_clinic)
         finally:
             release_extension.set()
         extended = extending.result(timeout=30)
-        assert extended["extended_deadline"] == extension.extended_deadline.isoformat()
+        assert (
+            extended[0]["extended_deadline"] == extension.extended_deadline.isoformat()
+        )
         with pytest.raises(ContractError) as denied:
             competing.result(timeout=30)
         assert denied.value.status_code == 409
-        assert denied.value.code == "STALE_REVISION"
+        assert denied.value.code is None
     assert _claim_count(clinic, source) == 1
 
 
@@ -421,6 +432,7 @@ def test_source_lock_is_acquired_after_day_counter_on_confirmation(followup_clin
         with transaction(clinic.runtime, clinic.tenant) as connection:
             pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             observed.set()
+            _doctor_context(connection, actor.staff_id)
             return book_appointment(connection, actor, command, str(uuid4()))
 
     with ThreadPoolExecutor(max_workers=1) as pool:

@@ -1,4 +1,4 @@
-"""Doctor-only follow-up decision and confirmed-claim extension inputs."""
+"""Strict legacy replay and operational follow-up command inputs."""
 
 from typing import Annotated, Literal
 from uuid import UUID
@@ -19,7 +19,7 @@ Revision = Annotated[int, Field(strict=True, ge=0)]
 
 def _reason(value: str) -> str:
     if not value.strip() or any(ord(character) < 32 for character in value):
-        raise ValueError("A nonblank clinical reason is required")
+        raise ValueError("A nonblank reason is required")
     return value.strip()
 
 
@@ -52,13 +52,26 @@ class FollowupDecision(BaseModel):
 
 
 class FollowupDecisionPatch(BaseModel):
+    """Original clinical-revision family, accepted for committed receipt replay."""
+
     model_config = ConfigDict(extra="forbid")
 
     followup_decision: FollowupDecision
     expected_visit_revision: Revision
 
 
+class FollowupDecisionPatchV2(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    followup_decision: FollowupDecision
+    expected_source_decision_revision: Revision
+    expected_visit_revision: Revision
+    expected_followup_revision: Revision
+
+
 class ExtendFollowup(BaseModel):
+    """Original clinical-revision family, accepted for committed receipt replay."""
+
     model_config = ConfigDict(extra="forbid")
 
     appointment_id: UUID
@@ -71,3 +84,10 @@ class ExtendFollowup(BaseModel):
     @classmethod
     def valid_reason(cls, reason: str) -> str:
         return _reason(reason)
+
+
+class ExtendFollowupV2(ExtendFollowup):
+    expected_source_decision_revision: Revision
+    expected_followup_revision: Revision
+    expected_authorization_revision: Revision
+    expected_appointment_revision: Revision

@@ -9,15 +9,31 @@ from carepulse.db import transaction
 from sqlalchemy import text
 from test_booking import booking_body, booking_effects, booking_request, new_patient
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
-from test_followup_persistence import _claim, _outcome, _source
+from test_followup_persistence import _source
+from test_followups import (
+    completed_source,
+    doctor_decision,
+    followup_body,
+    terminal_claim,
+)
+from test_followups import followup_clinic as followup_clinic  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 from test_schedule import SERVICE_DAY
 
 
 def _completed_source(clinic):
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        return _source(connection, clinic.tenant, UUID(clinic.owner.staff_id))
+    return completed_source(clinic)
+
+
+def _reserve(clinic):
+    source = _completed_source(clinic)
+    status, result = booking_request(
+        clinic, clinic.owner, body=followup_body(source, offset=1), key=str(uuid4())
+    )
+    assert status == 201, result
+    assert result["data"]["service_type"] == "FOLLOW_UP"
+    return source, result["data"]
 
 
 def _followup_body(source, **changes):
@@ -25,7 +41,8 @@ def _followup_body(source, **changes):
         source["patient"],
         requested_service_type="FOLLOW_UP",
         source_visit_id=str(source["visit"]),
-        expected_source_revision=1,
+        expected_source_decision_revision=0,
+        expected_visit_revision=0,
         fallback_acknowledgment={
             "service_type": "NEW_EXAMINATION",
             "discount_reaffirmed": True,
@@ -111,29 +128,9 @@ def test_referenced_source_revision_is_checked_even_on_acknowledged_fallback(
 ):
     clinic = booking_clinic
     source = _completed_source(clinic)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        connection.execute(
-            text(
-                "SELECT set_config('app.staff_id', :doctor, true), "
-                "set_config('app.clinical_change_kind', 'DECISION_EXCEPTION', true), "
-                "set_config('app.clinical_reason', 'Changed eligibility', true)"
-            ),
-            {"doctor": clinic.owner.staff_id},
-        )
-        connection.execute(
-            text("""
-                UPDATE public.visits
-                SET followup_decision=CAST(:decision AS jsonb)
-                WHERE organization_id=:tenant AND id=:visit
-            """),
-            {
-                "tenant": clinic.tenant,
-                "visit": source["visit"],
-                "decision": json.dumps(
-                    {"kind": "OPTED_OUT", "reason": "Changed eligibility"}
-                ),
-            },
-        )
+    doctor_decision(
+        clinic, source["visit"], {"kind": "OPTED_OUT", "reason": "Changed eligibility"}
+    )
     before = booking_effects(clinic)
     status, response = booking_request(
         clinic, clinic.receptionist, body=_followup_body(source), key=str(uuid4())
@@ -163,41 +160,36 @@ def test_explicit_missing_or_foreign_source_cannot_be_recast_as_fallback(
     assert booking_effects(clinic) == before
 
 
-def test_active_source_never_falls_back_while_reserved(booking_clinic):
-    clinic = booking_clinic
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        source = _source(connection, clinic.tenant, UUID(clinic.owner.staff_id))
-        _claim(connection, clinic.tenant, source)
+def test_active_source_never_falls_back_while_reserved(followup_clinic):
+    clinic = followup_clinic
+    source, _ = _reserve(clinic)
     before = booking_effects(clinic)
     status, _ = booking_request(
-        clinic, clinic.receptionist, body=_followup_body(source), key=str(uuid4())
+        clinic,
+        clinic.receptionist,
+        body=followup_body(
+            source,
+            offset=2,
+            base="100.00",
+            fallback_acknowledgment={
+                "service_type": "NEW_EXAMINATION",
+                "discount_reaffirmed": True,
+            },
+        ),
+        key=str(uuid4()),
     )
     assert status == 409
     assert booking_effects(clinic) == before
 
 
-def test_active_claim_stays_busy_after_doctor_changes_source_decision(booking_clinic):
-    clinic = booking_clinic
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        source = _source(connection, clinic.tenant, UUID(clinic.owner.staff_id))
-        _claim(connection, clinic.tenant, source)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        connection.execute(
-            text("""
-                SELECT set_config('app.staff_id', :doctor, true),
-                       set_config('app.clinical_change_kind', 'DECISION_EXCEPTION', true),
-                       set_config('app.clinical_reason', 'Changed source recommendation', true)
-            """),
-            {"doctor": clinic.owner.staff_id},
-        )
-        connection.execute(
-            text("""
-                UPDATE public.visits
-                SET followup_decision='{"kind":"OPTED_OUT","reason":"Changed recommendation"}'::jsonb
-                WHERE organization_id=:tenant AND id=:visit
-            """),
-            {"tenant": clinic.tenant, "visit": source["visit"]},
-        )
+def test_active_claim_stays_busy_after_doctor_changes_source_decision(followup_clinic):
+    clinic = followup_clinic
+    source, _ = _reserve(clinic)
+    doctor_decision(
+        clinic,
+        source["visit"],
+        {"kind": "OPTED_OUT", "reason": "Changed recommendation"},
+    )
     before = booking_effects(clinic)
     status, _ = booking_request(
         clinic,
@@ -215,34 +207,15 @@ def test_receptionist_get_qualification_never_serializes_doctor_decision(
 ):
     clinic = booking_clinic
     source = _completed_source(clinic)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        connection.execute(
-            text(
-                "SELECT set_config('app.staff_id', :doctor, true), "
-                "set_config('app.clinical_change_kind', 'DECISION_EXCEPTION', true), "
-                "set_config('app.clinical_reason', 'DOCTOR_PRIVATE_REASON', true)"
-            ),
-            {"doctor": clinic.owner.staff_id},
-        )
-        connection.execute(
-            text("""
-                UPDATE public.visits SET followup_decision=CAST(:decision AS jsonb)
-                WHERE organization_id=:tenant AND id=:visit
-            """),
-            {
-                "tenant": clinic.tenant,
-                "visit": source["visit"],
-                "decision": json.dumps(
-                    {
-                        "kind": "DEADLINE",
-                        "deadline_date": (
-                            source["day"] + timedelta(days=3)
-                        ).isoformat(),
-                        "reason": "DOCTOR_PRIVATE_REASON",
-                    }
-                ),
-            },
-        )
+    doctor_decision(
+        clinic,
+        source["visit"],
+        {
+            "kind": "DEADLINE",
+            "deadline_date": (source["day"] + timedelta(days=3)).isoformat(),
+            "reason": "DOCTOR_PRIVATE_REASON",
+        },
+    )
     status, detail = booking_request(
         clinic,
         clinic.receptionist,
@@ -255,13 +228,16 @@ def test_receptionist_get_qualification_never_serializes_doctor_decision(
     assert qualification["requested_service_type"] == "FOLLOW_UP"
     assert qualification["actual_service_type"] == "NEW_EXAMINATION"
     assert qualification["source_visit_id"] == str(source["visit"])
-    assert qualification["source_revision"] == 2
+    assert qualification["source_revision"] == 0
+    assert qualification["source_decision_revision"] == 1
+    assert qualification["decision_control"]["kind"] == "DEADLINE"
+    assert qualification["decision_control"]["actor_role"] == "DOCTOR_OWNER"
+    assert qualification["decision_control"]["can_revise"] is False
     assert qualification["price_quote"]["base_egp"] == "100.00"
     serialized = json.dumps(detail, ensure_ascii=False)
     for forbidden in (
         "DOCTOR_PRIVATE_REASON",
         "followup_decision",
-        "deadline_date",
         "clinical_revisions",
         "entitlement_provenance",
     ):
@@ -297,58 +273,30 @@ def test_archived_patient_cannot_use_acknowledged_fallback(booking_clinic):
 
 
 def _doctor_extend_to_booking_day(clinic, visit_id):
-    """Keep the selected source inside its clinical deadline for denial checks."""
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        connection.execute(
-            text("""
-                SELECT set_config('app.staff_id', :doctor, true),
-                       set_config('app.clinical_change_kind', 'DECISION_EXCEPTION', true),
-                       set_config('app.clinical_reason', 'Reviewed future visit', true)
-            """),
-            {"doctor": clinic.owner.staff_id},
-        )
-        connection.execute(
-            text("""
-                UPDATE public.visits
-                SET followup_decision=CAST(:decision AS jsonb)
-                WHERE organization_id=:tenant AND id=:visit
-            """),
-            {
-                "tenant": clinic.tenant,
-                "visit": visit_id,
-                "decision": json.dumps(
-                    {
-                        "kind": "DEADLINE",
-                        "deadline_date": SERVICE_DAY.isoformat(),
-                        "reason": "Reviewed future visit",
-                    }
-                ),
-            },
-        )
-        return connection.scalar(
-            text("""
-                SELECT clinical_revision FROM public.visits
-                WHERE organization_id=:tenant AND id=:visit
-            """),
-            {"tenant": clinic.tenant, "visit": visit_id},
-        )
+    """Explicit Doctor operational deadline, distinct from Visit clinical content."""
+    return doctor_decision(
+        clinic,
+        visit_id,
+        {
+            "kind": "DEADLINE",
+            "deadline_date": SERVICE_DAY.isoformat(),
+            "reason": "Reviewed future visit",
+        },
+    )
 
 
-def test_consumed_source_cannot_book_second_preferential_followup(booking_clinic):
-    clinic = booking_clinic
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        source = _source(connection, clinic.tenant, UUID(clinic.owner.staff_id))
-        first = _claim(connection, clinic.tenant, source)
-        _outcome(
-            connection,
-            clinic.tenant,
-            UUID(clinic.owner.staff_id),
-            first,
-            status="Completed",
-        )
+def test_consumed_source_cannot_book_second_preferential_followup(followup_clinic):
+    clinic = followup_clinic
+    source, first = _reserve(clinic)
+    terminal_claim(clinic, first, status="Completed")
     revision = _doctor_extend_to_booking_day(clinic, source["visit"])
-    assert revision == 2
-    body = _followup_body(source, expected_source_revision=revision)
+    assert revision == 1
+    body = _followup_body(
+        source,
+        expected_source_decision_revision=revision,
+        expected_price_revision=3,
+        expected_schedule_revision=3,
+    )
     before = booking_effects(clinic)
     denied, response = booking_request(
         clinic,
@@ -376,31 +324,24 @@ def test_consumed_source_cannot_book_second_preferential_followup(booking_clinic
 
 
 def test_completed_followup_visit_cannot_be_recursive_preferential_source(
-    booking_clinic,
+    followup_clinic,
 ):
-    clinic = booking_clinic
+    clinic = followup_clinic
+    original, first = _reserve(clinic)
+    terminal_claim(clinic, first, status="Completed")
     with transaction(clinic.runtime, clinic.tenant) as connection:
-        original = _source(connection, clinic.tenant, UUID(clinic.owner.staff_id))
-        first = _claim(connection, clinic.tenant, original)
-        _outcome(
-            connection,
-            clinic.tenant,
-            UUID(clinic.owner.staff_id),
-            first,
-            status="Completed",
-        )
         recursive_visit = connection.scalar(
             text("""
                 SELECT id FROM public.visits
                 WHERE organization_id=:tenant AND appointment_id=:appointment
             """),
-            {"tenant": clinic.tenant, "appointment": first["id"]},
+            {"tenant": clinic.tenant, "appointment": UUID(first["id"])},
         )
         assert recursive_visit is not None
-    revision = _doctor_extend_to_booking_day(clinic, recursive_visit)
-    assert revision == 1
     candidate = {**original, "visit": recursive_visit}
-    body = _followup_body(candidate, expected_source_revision=revision)
+    body = _followup_body(
+        candidate, expected_price_revision=3, expected_schedule_revision=3
+    )
     before = booking_effects(clinic)
     denied, response = booking_request(
         clinic,
@@ -503,9 +444,7 @@ def test_in_examination_source_requires_acknowledgment_to_book_ordinary(
             )
             == "In Examination"
         )
-    revision = _doctor_extend_to_booking_day(clinic, source["visit"])
-    assert revision == 2
-    body = _followup_body(source, expected_source_revision=revision)
+    body = _followup_body(source)
     before = booking_effects(clinic)
     denied, response = booking_request(
         clinic,

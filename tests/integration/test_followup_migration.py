@@ -3,14 +3,18 @@
 import runpy
 import shutil
 from datetime import timedelta
+from hashlib import sha256
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
+from carepulse.identity.contracts import normalize_typed_body
+from carepulse.identity.receipts import Receipt, insert_tenant_receipt
 from carepulse.policies.versions import append_version
 from carepulse.visits.eligibility import extend_followup
+from carepulse.visits.eligibility_contracts import ExtendFollowup
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _activate_clinic, _draft, _patient, _query
@@ -18,7 +22,8 @@ from test_database import _create_empty_database, _engine
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
-from test_followup_decisions import _actor, _doctor_context, _extension
+from test_followup_decisions import _actor
+from test_followup_decisions import _staff_context as _doctor_context
 from test_followup_persistence import (
     _claim,
     _outcome,
@@ -28,6 +33,7 @@ from test_followup_persistence import (
     _v2_command,
     _v2_source,
 )
+from test_followup_races import _extend
 from test_visit_migration import _prepare, _upgrade
 from test_visit_persistence import _receptionist, _seed
 
@@ -37,6 +43,45 @@ BEFORE = "0021_d07_visits"
 AFTER = "0022_d08_followup_claims"
 PROVENANCE_BEFORE = "0027_d11_day_review"
 PROVENANCE_AFTER = "0028_d08_followup_provenance"
+
+
+def _historical_extension(connection, tenant, doctor, source, record, key=None):
+    """Write genuine 0024 Doctor evidence; preserve v1 receipt bytes for replay."""
+    command = ExtendFollowup.model_validate(
+        {
+            "appointment_id": str(record["id"]),
+            "extended_deadline": (source["day"] + timedelta(days=9)).isoformat(),
+            "reason": "Synthetic extension",
+            "expected_visit_revision": 1,
+            "expected_claim_revision": 1,
+        }
+    )
+    _doctor_context(connection, doctor)
+    _extend(connection, tenant, source, record, deadline_offset=9)
+    projection = {
+        "visit_id": str(source["visit"]),
+        "appointment_id": str(record["id"]),
+        "extended_deadline": command.extended_deadline.isoformat(),
+        "revision": 2,
+        "claim_revision": 1,
+    }
+    if key is not None:
+        insert_tenant_receipt(
+            connection,
+            Receipt(
+                actor_id=doctor,
+                operation="visits.extend_followup",
+                idempotency_key=key,
+                request_digest=sha256(
+                    source["visit"].bytes + normalize_typed_body(command)
+                ).hexdigest(),
+                result_projection=projection,
+                result_revision=2,
+                organization_id=tenant,
+                staff_id=doctor,
+            ),
+        )
+    return command, projection
 
 
 def _d08_snapshot(connection):
@@ -73,11 +118,9 @@ def test_v2_populated_immediate_predecessor_preserves_legacy_evidence_and_denies
         with transaction(runtime, tenant) as connection:
             source = _source(connection, tenant, doctor)
             active = _claim(connection, tenant, source)
-            _doctor_context(connection, doctor)
-            command = _extension(source, active["id"])
             key = str(uuid4())
-            receipt = extend_followup(
-                connection, _actor(tenant, doctor), source["visit"], command, key
+            command, receipt = _historical_extension(
+                connection, tenant, doctor, source, active, key
             )
             released_source = _source(connection, tenant, doctor)
             released = _claim(connection, tenant, released_source)
@@ -110,12 +153,9 @@ def test_v2_populated_immediate_predecessor_preserves_legacy_evidence_and_denies
                 )
         with transaction(runtime, tenant) as connection:
             _doctor_context(connection, doctor)
-            assert (
-                extend_followup(
-                    connection, _actor(tenant, doctor), source["visit"], command, key
-                )
-                == receipt
-            )
+            assert extend_followup(
+                connection, _actor(tenant, doctor), source["visit"], command, key
+            ) == (receipt, receipt["revision"])
             with pytest.raises(DBAPIError) as unverified, connection.begin_nested():
                 _v2_command(
                     connection,
@@ -345,14 +385,7 @@ def test_v2_first_extension_uses_verified_legacy_deadline_without_rewriting_it(
                 {"visit": source["visit"]},
             )
             active = _claim(connection, tenant, source)
-            _doctor_context(connection, doctor)
-            extend_followup(
-                connection,
-                _actor(tenant, doctor),
-                source["visit"],
-                _extension(source, active["id"]),
-                str(uuid4()),
-            )
+            _historical_extension(connection, tenant, doctor, source, active)
         with migration.connect() as connection:
             before = _d08_snapshot(connection)
         _upgrade(migration, PROVENANCE_AFTER)
@@ -597,6 +630,7 @@ def test_fresh_and_failed_following_migration_keep_one_head(
         scripts = tmp_path / "migrations"
         shutil.copytree(ROOT / "db/migrations", scripts)
         # Isolate D-08 from later M1/B-06 heads for this rollback proof.
+        (scripts / "versions/0029_b10_ordered_followup_writers.py").unlink()
         (scripts / "versions/0028_d08_followup_provenance.py").unlink()
         (scripts / "versions/0027_d11_day_review.py").unlink()
         (scripts / "versions/0026_d07_completion_attestation.py").unlink()
@@ -794,15 +828,9 @@ def test_populated_0023_followup_evidence_survives_0024_and_new_claims_use_live_
         with transaction(runtime, tenant) as connection:
             active_source = _source(connection, tenant, doctor)
             active = _claim(connection, tenant, active_source, price="80.00")
-            extension_command = _extension(active_source, active["id"])
             extension_key = str(uuid4())
-            _doctor_context(connection, doctor)
-            extension_result = extend_followup(
-                connection,
-                _actor(tenant, doctor),
-                active_source["visit"],
-                extension_command,
-                extension_key,
+            extension_command, extension_result = _historical_extension(
+                connection, tenant, doctor, active_source, active, extension_key
             )
             assert extension_result["revision"] == 2
 
@@ -925,16 +953,13 @@ def test_populated_0023_followup_evidence_survives_0024_and_new_claims_use_live_
                 == 4
             )
             _doctor_context(connection, doctor)
-            assert (
-                extend_followup(
-                    connection,
-                    _actor(tenant, doctor),
-                    active_source["visit"],
-                    extension_command,
-                    extension_key,
-                )
-                == extension_result
-            )
+            assert extend_followup(
+                connection,
+                _actor(tenant, doctor),
+                active_source["visit"],
+                extension_command,
+                extension_key,
+            ) == (extension_result, extension_result["revision"])
             assert (
                 connection.scalar(
                     text(

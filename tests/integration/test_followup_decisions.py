@@ -1,4 +1,4 @@
-"""B-10 Doctor decisions and exact confirmed-claim extensions on real PostgreSQL."""
+"""B-10 signed source decisions and confirmed extensions on real PostgreSQL."""
 
 import asyncio
 import json
@@ -11,57 +11,115 @@ from uuid import UUID, uuid4
 import pytest
 from carepulse.db import transaction
 from carepulse.identity.authorization import AuthorizedStaff
-from carepulse.identity.contracts import ContractError
-from carepulse.identity.receipts import ReceiptConflict
+from carepulse.identity.contracts import ContractError, normalize_typed_body
+from carepulse.identity.receipts import Receipt, ReceiptConflict, insert_tenant_receipt
 from carepulse.identity.signing import canonical_payload
 from carepulse.main import app
 from carepulse.visits.eligibility import extend_followup, record_followup_decision
-from carepulse.visits.eligibility_contracts import ExtendFollowup, FollowupDecisionPatch
+from carepulse.visits.eligibility_contracts import (
+    ExtendFollowupV2,
+    FollowupDecisionPatch,
+    FollowupDecisionPatchV2,
+)
 from pydantic import ValidationError
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
-from test_followup_persistence import _claim, _outcome, _source
+from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
+from test_booking import booking_request
+from test_followup_persistence import _outcome, _v2_source
+from test_followups import followup_body
+from test_followups import followup_clinic as followup_clinic  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _patch, pricing_request
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
-from test_visit_persistence import _receptionist, _seed, _visit
+from test_visit_persistence import _receptionist
 
 
-def _actor(tenant, staff, role="DOCTOR_OWNER"):
-    return AuthorizedStaff(tenant, staff, role, False, 0, 0, 0)
+def _actor(tenant, staff, role="DOCTOR_OWNER", *, manager=False):
+    return AuthorizedStaff(tenant, staff, role, False, 0, 0, 0, manager)
 
 
-def _doctor_context(connection, staff):
+def _staff_context(connection, staff):
     connection.execute(
-        text("SELECT set_config('app.staff_id', :staff, true)"),
-        {"staff": str(staff)},
+        text("SELECT set_config('app.staff_id', :actor, true)"),
+        {"actor": str(staff)},
     )
 
 
-def _decision(kind, revision, *, deadline=None, reason=None):
-    details = {"kind": kind}
+def _source(clinic):
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        return _v2_source(connection, clinic.tenant, UUID(clinic.owner.staff_id))
+
+
+def _decision(
+    kind,
+    revision=0,
+    *,
+    visit_revision=0,
+    followup_revision=1,
+    deadline=None,
+    reason=None,
+):
+    decision = {"kind": kind}
     if deadline is not None:
-        details["deadline_date"] = deadline.isoformat()
+        decision["deadline_date"] = deadline.isoformat()
     if reason is not None:
-        details["reason"] = reason
-    return FollowupDecisionPatch.model_validate(
-        {"followup_decision": details, "expected_visit_revision": revision}
+        decision["reason"] = reason
+    return FollowupDecisionPatchV2.model_validate(
+        {
+            "followup_decision": decision,
+            "expected_source_decision_revision": revision,
+            "expected_visit_revision": visit_revision,
+            "expected_followup_revision": followup_revision,
+        }
     )
 
 
-def _extension(source, target, *, revision=1, claim_revision=1, deadline=None):
-    return ExtendFollowup.model_validate(
+def _extension(
+    source,
+    appointment,
+    *,
+    source_revision=0,
+    visit_revision=0,
+    followup_revision=1,
+    claim_revision=1,
+    authorization_revision=0,
+    appointment_revision=0,
+    deadline=None,
+):
+    return ExtendFollowupV2.model_validate(
         {
-            "appointment_id": str(target),
+            "appointment_id": str(appointment),
             "extended_deadline": (
                 deadline or source["day"] + timedelta(days=9)
             ).isoformat(),
-            "reason": "Synthetic Doctor extension",
-            "expected_visit_revision": revision,
+            "reason": "Synthetic confirmed extension",
+            "expected_source_decision_revision": source_revision,
+            "expected_visit_revision": visit_revision,
+            "expected_followup_revision": followup_revision,
             "expected_claim_revision": claim_revision,
+            "expected_authorization_revision": authorization_revision,
+            "expected_appointment_revision": appointment_revision,
         }
     )
+
+
+def _confirmed(clinic, source):
+    status, reply = booking_request(
+        clinic, clinic.owner, body=followup_body(source, offset=1), key=str(uuid4())
+    )
+    assert status == 201, reply
+    saved = reply["data"]
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        claim = connection.scalar(
+            text("""
+                SELECT id FROM public.followup_claims
+                WHERE organization_id=:tenant AND appointment_id=:appointment
+            """),
+            {"tenant": clinic.tenant, "appointment": UUID(saved["id"])},
+        )
+    assert claim is not None
+    return {"id": UUID(saved["id"]), "claim": claim, "saved": saved}
 
 
 def _signed_visit_request(
@@ -75,8 +133,11 @@ def _signed_visit_request(
     omit_key_header=False,
     purpose="VISIT_FOLLOWUP",
 ):
-    """Exercise the actual API boundary with a fresh signed nonce per request."""
-    encoded = json.dumps(body, separators=(",", ":")).encode()
+    encoded = (
+        body.encode()
+        if isinstance(body, str)
+        else json.dumps(body, separators=(",", ":")).encode()
+    )
     envelope = replace(
         actor,
         method=method,
@@ -154,262 +215,371 @@ def _signed_visit_request(
     )
 
 
-def _visit_effects(clinic, visit_id, operation):
+def _effects(clinic, visit, operation):
     with transaction(clinic.runtime, clinic.tenant) as connection:
-        _doctor_context(connection, UUID(clinic.owner.staff_id))
+        _staff_context(connection, UUID(clinic.owner.staff_id))
         return connection.execute(
             text("""
-                SELECT
-                    (SELECT count(*) FROM public.clinical_revisions
-                      WHERE organization_id=:tenant AND visit_id=:visit),
-                    (SELECT count(*) FROM public.clinical_audit a
-                      JOIN public.clinical_revisions r
-                        ON r.id::text=a.correlation_id
-                       AND r.organization_id=a.organization_id
-                      WHERE a.organization_id=:tenant AND r.visit_id=:visit),
-                    (SELECT count(*) FROM public.followup_extensions
-                      WHERE organization_id=:tenant AND source_visit_id=:visit),
-                    (SELECT count(*) FROM public.idempotency_receipts
-                      WHERE organization_id=:tenant AND operation=:operation)
-            """),
-            {"tenant": clinic.tenant, "visit": visit_id, "operation": operation},
+            SELECT
+                (SELECT clinical_revision FROM public.visits
+                 WHERE organization_id=:tenant AND id=:visit),
+                (SELECT count(*) FROM public.clinical_revisions
+                 WHERE organization_id=:tenant AND visit_id=:visit),
+                (SELECT count(*) FROM public.followup_source_decision_events
+                 WHERE organization_id=:tenant AND source_visit_id=:visit),
+                (SELECT count(*) FROM public.followup_authorization_events
+                 WHERE organization_id=:tenant AND source_visit_id=:visit
+                   AND kind='EXTENSION'),
+                (SELECT count(*) FROM public.idempotency_receipts
+                 WHERE organization_id=:tenant AND operation=:operation)
+        """),
+            {"tenant": clinic.tenant, "visit": visit, "operation": operation},
         ).one()
+
+
+def _frozen_claim(connection, claim):
+    return connection.execute(
+        text("""
+        SELECT c.state, c.revision, c.approved_deadline, c.policy_snapshot,
+               p.entitlement_provenance, p.base_egp, p.net_egp,
+               a.service_date, a.status, a.revision AS appointment_revision
+        FROM public.followup_claims c
+        JOIN public.appointment_price_snapshots p
+          ON (p.organization_id,p.appointment_id)=(c.organization_id,c.appointment_id)
+        JOIN public.appointments a
+          ON (a.organization_id,a.id)=(c.organization_id,c.appointment_id)
+        WHERE c.id=:claim
+    """),
+        {"claim": claim},
+    ).one()
 
 
 @pytest.mark.parametrize("kind", ["DEFAULT", "OPTED_OUT", "DEADLINE"])
-def test_doctor_records_only_decision_slice_with_clinical_evidence(
+def test_doctor_decision_appends_actual_operational_evidence_without_clinical_change(
     appointment_storage, kind
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
-        appointment = _seed(connection, tenant, doctor, complete=True)
-        visit = _visit(connection, appointment)
-        completed = connection.scalar(
-            text("""
-            SELECT (occurred_at AT TIME ZONE 'Africa/Cairo')::date
-            FROM public.appointment_history
-            WHERE appointment_id=:id AND new_status='Completed'
-        """),
-            {"id": appointment},
-        )
+        source = _v2_source(connection, tenant, doctor)
     command = _decision(
         kind,
-        0,
-        deadline=completed + timedelta(days=14) if kind == "DEADLINE" else None,
-        reason="Synthetic clinical judgment" if kind != "DEFAULT" else None,
+        deadline=source["day"] + timedelta(days=14) if kind == "DEADLINE" else None,
+        reason="Synthetic Doctor restriction" if kind != "DEFAULT" else None,
     )
     with transaction(runtime, tenant) as connection:
-        _doctor_context(connection, doctor)
-        result = record_followup_decision(
-            connection, _actor(tenant, doctor), visit.id, command, str(uuid4())
+        _staff_context(connection, doctor)
+        projection, revision = record_followup_decision(
+            connection, _actor(tenant, doctor), source["visit"], command, str(uuid4())
         )
-        assert result["revision"] == 1
-        record = connection.execute(
-            text("""
-            SELECT r.change_kind, r.old_values, r.new_values, r.reason,
-                   a.doctor_staff_id, a.clinical_revision, a.correlation_id
-            FROM public.clinical_revisions r
-            JOIN public.clinical_audit a ON a.organization_id=r.organization_id
-                 AND a.correlation_id=r.id::text
-            WHERE r.visit_id=:visit
-        """),
-            {"visit": visit.id},
-        ).one()
-        assert record.change_kind == (
-            "DECISION_DEFAULT" if kind == "DEFAULT" else "DECISION_EXCEPTION"
+        assert (projection["revision"], revision, projection["visit_revision"]) == (
+            1,
+            1,
+            0,
         )
-        assert record.old_values["followup_decision"] is None
-        assert record.new_values["followup_decision"] == result["followup_decision"]
-        assert record.doctor_staff_id == doctor and record.clinical_revision == 1
-        assert record.reason == command.followup_decision.reason
+        assert projection["followup_decision"] == command.followup_decision.model_dump(
+            mode="json", exclude_none=True
+        )
+        assert connection.execute(
+            text(
+                "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
+            ),
+            {"visit": source["visit"]},
+        ).one() == (0, None)
         assert (
-            connection.execute(
-                text("""
-            SELECT examination, findings, diagnosis, medical_notes, treatment, tests
-            FROM public.visits WHERE id=:visit
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinical_revisions WHERE visit_id=:visit"
+                ),
+                {"visit": source["visit"]},
+            )
+            == 0
+        )
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+    with migration.connect() as connection:
+        event = connection.execute(
+            text("""
+            SELECT e.source_revision, e.actor_staff_id, e.actor_role,
+                   e.before_decision, e.decision, e.clinical_revision,
+                   a.before_state, a.after_state
+            FROM public.followup_source_decision_events e
+            JOIN public.sensitive_audit a ON a.id=e.sensitive_audit_id
+            WHERE e.organization_id=:tenant AND e.source_visit_id=:visit
         """),
-                {"visit": visit.id},
-            ).one()
-            == (None,) * 6
+            {"tenant": tenant, "visit": source["visit"]},
+        ).one()
+    assert (event.source_revision, event.actor_staff_id, event.actor_role) == (
+        1,
+        doctor,
+        "DOCTOR_OWNER",
+    )
+    assert event.before_decision is None
+    assert event.decision == projection["followup_decision"]
+    assert event.clinical_revision == 0
+    assert event.before_state["source_revision"] == 0
+    assert event.after_state["source_revision"] == 1
+
+
+@pytest.mark.parametrize("manager", [False, True])
+def test_receptionist_can_amend_own_decision_with_authorship_preserved(
+    appointment_storage, manager
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    staff = _receptionist(migration, tenant)
+    if manager:
+        with migration.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE public.staff_accounts SET operational_manager=true WHERE id=:staff"
+                ),
+                {"staff": staff},
+            )
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+    actor = _actor(tenant, staff, "RECEPTIONIST", manager=manager)
+    with transaction(runtime, tenant) as connection:
+        _staff_context(connection, staff)
+        first, _ = record_followup_decision(
+            connection,
+            actor,
+            source["visit"],
+            _decision(
+                "DEADLINE",
+                deadline=source["day"] + timedelta(days=12),
+                reason="Receptionist operational decision",
+            ),
+            str(uuid4()),
+        )
+        second, _ = record_followup_decision(
+            connection, actor, source["visit"], _decision("DEFAULT", 1), str(uuid4())
+        )
+        assert (first["revision"], second["revision"]) == (1, 2)
+        assert connection.execute(
+            text(
+                "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
+            ),
+            {"visit": source["visit"]},
+        ).one() == (0, None)
+    with migration.connect() as connection:
+        events = connection.execute(
+            text("""
+            SELECT source_revision, actor_staff_id, actor_role, before_decision, decision
+            FROM public.followup_source_decision_events
+            WHERE organization_id=:tenant AND source_visit_id=:visit
+            ORDER BY source_revision
+        """),
+            {"tenant": tenant, "visit": source["visit"]},
+        ).all()
+    assert [
+        (row.source_revision, row.actor_staff_id, row.actor_role) for row in events
+    ] == [(1, staff, "RECEPTIONIST"), (2, staff, "RECEPTIONIST")]
+    assert events[1].before_decision == events[0].decision
+    assert events[1].decision == {"kind": "DEFAULT"}
+
+
+@pytest.mark.parametrize("restriction", ["OPTED_OUT", "DEADLINE"])
+def test_receptionist_cannot_replace_actual_doctor_restriction(
+    appointment_storage, restriction
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    staff = _receptionist(migration, tenant)
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+    with transaction(runtime, tenant) as connection:
+        _staff_context(connection, doctor)
+        record_followup_decision(
+            connection,
+            _actor(tenant, doctor),
+            source["visit"],
+            _decision(
+                restriction,
+                deadline=source["day"] + timedelta(days=3)
+                if restriction == "DEADLINE"
+                else None,
+                reason="Doctor clinical restriction",
+            ),
+            str(uuid4()),
+        )
+    with transaction(runtime, tenant) as connection:
+        _staff_context(connection, staff)
+        with pytest.raises(ContractError) as denied:
+            record_followup_decision(
+                connection,
+                _actor(tenant, staff, "RECEPTIONIST"),
+                source["visit"],
+                _decision("DEFAULT", 1),
+                str(uuid4()),
+            )
+        assert denied.value.status_code == 403
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.followup_source_decision_events WHERE source_visit_id=:visit"
+                ),
+                {"visit": source["visit"]},
+            )
+            == 1
         )
 
 
 @pytest.mark.parametrize(
-    "case", ["before_completion", "stale", "receptionist", "operator", "disabled"]
+    ("case", "status", "code"),
+    [
+        ("before_completion", 422, None),
+        ("stale_source", 409, "STALE_REVISION"),
+        ("stale_visit", 409, "STALE_REVISION"),
+        ("stale_policy", 409, "STALE_REVISION"),
+        ("operator", 403, None),
+        ("disabled", 403, None),
+    ],
 )
-def test_invalid_or_unauthorized_decision_rolls_back_all_evidence(
-    appointment_storage, case
+def test_denied_decision_keeps_clinical_operational_and_receipt_evidence_empty(
+    appointment_storage, case, status, code
 ):
-    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
-        appointment = _seed(connection, tenant, doctor, complete=True)
-        visit = _visit(connection, appointment)
-        completed = connection.scalar(
-            text("""
-            SELECT (occurred_at AT TIME ZONE 'Africa/Cairo')::date
-            FROM public.appointment_history
-            WHERE appointment_id=:id AND new_status='Completed'
-        """),
-            {"id": appointment},
-        )
-    receptionist = _receptionist(migration, tenant) if case == "receptionist" else None
-    acting_staff = receptionist or doctor
-    role = (
-        "RECEPTIONIST"
-        if receptionist
-        else "OPERATOR"
-        if case == "operator"
-        else "DOCTOR_OWNER"
-    )
+        source = _v2_source(connection, tenant, doctor)
     command = _decision(
         "DEADLINE",
-        int(case == "stale"),
-        deadline=completed + timedelta(days=-1 if case == "before_completion" else 8),
-        reason="Synthetic exception",
+        revision=int(case == "stale_source"),
+        visit_revision=int(case == "stale_visit"),
+        followup_revision=2 if case == "stale_policy" else 1,
+        deadline=source["day"]
+        + timedelta(days=-1 if case == "before_completion" else 8),
+        reason="Synthetic operational decision",
     )
     with transaction(runtime, tenant) as connection:
-        _doctor_context(connection, acting_staff)
+        _staff_context(connection, doctor)
         if case == "disabled":
             connection.execute(
-                text("""
-                    UPDATE public.staff_accounts
-                    SET enabled=false, security_revision=security_revision+1
-                    WHERE id=:id
-                """),
-                {"id": doctor},
+                text("UPDATE public.staff_accounts SET enabled=false WHERE id=:staff"),
+                {"staff": doctor},
             )
-        failure_type = DBAPIError if case == "disabled" else ContractError
-        with pytest.raises(failure_type) as denied, connection.begin_nested():
+        with pytest.raises(ContractError) as denied, connection.begin_nested():
             record_followup_decision(
                 connection,
-                _actor(tenant, acting_staff, role),
-                visit.id,
+                _actor(
+                    tenant, doctor, "OPERATOR" if case == "operator" else "DOCTOR_OWNER"
+                ),
+                source["visit"],
                 command,
                 str(uuid4()),
             )
-        if isinstance(denied.value, ContractError):
-            assert denied.value.status_code == (
-                403
-                if case in ("receptionist", "operator")
-                else 409
-                if case == "stale"
-                else 422
-            )
+        assert (denied.value.status_code, denied.value.code) == (status, code)
         if case == "disabled":
-            # Restore the clinic's sole Owner before the deferred ACTIVE-tenant
-            # invariant is checked at commit; the denied write stays rolled back.
             connection.execute(
+                text("UPDATE public.staff_accounts SET enabled=true WHERE id=:staff"),
+                {"staff": doctor},
+            )
+        assert connection.execute(
+            text(
+                "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
+            ),
+            {"visit": source["visit"]},
+        ).one() == (0, None)
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.followup_source_decision_events WHERE source_visit_id=:visit"
+                ),
+                {"visit": source["visit"]},
+            )
+            == 0
+        )
+        assert (
+            connection.scalar(
                 text("""
-                    UPDATE public.staff_accounts
-                    SET enabled=true, security_revision=security_revision+1
-                    WHERE id=:id
-                """),
-                {"id": doctor},
-            )
-        assert (
-            connection.scalar(
-                text("SELECT clinical_revision FROM public.visits WHERE id=:id"),
-                {"id": visit.id},
-            )
-            == 0
-        )
-        assert (
-            connection.scalar(
-                text(
-                    "SELECT count(*) FROM public.clinical_revisions WHERE visit_id=:id"
-                ),
-                {"id": visit.id},
-            )
-            == 0
-        )
-        assert (
-            connection.scalar(
-                text(
-                    "SELECT count(*) FROM public.idempotency_receipts WHERE operation='visits.followup_decision' AND organization_id=:tenant"
-                ),
+            SELECT count(*) FROM public.idempotency_receipts
+            WHERE organization_id=:tenant AND operation='visits.followup_decision'
+        """),
                 {"tenant": tenant},
             )
             == 0
         )
 
 
-def test_strict_decision_input_excludes_clinical_edit_and_missing_reason():
+def test_v2_dto_rejects_clinical_fields_missing_reason_and_partial_tokens():
+    for fields in (
+        {
+            "followup_decision": {"kind": "OPTED_OUT", "reason": " "},
+            "expected_source_decision_revision": 0,
+            "expected_visit_revision": 0,
+            "expected_followup_revision": 1,
+        },
+        {
+            "followup_decision": {"kind": "DEFAULT"},
+            "expected_visit_revision": 0,
+            "expected_source_decision_revision": 0,
+            "expected_followup_revision": 1,
+            "diagnosis": "override",
+        },
+        {
+            "followup_decision": {"kind": "DEFAULT"},
+            "expected_visit_revision": 0,
+            "expected_source_decision_revision": 0,
+        },
+    ):
+        with pytest.raises(ValidationError):
+            FollowupDecisionPatchV2.model_validate(fields)
     with pytest.raises(ValidationError):
-        FollowupDecisionPatch.model_validate(
-            {
-                "followup_decision": {"kind": "OPTED_OUT", "reason": " "},
-                "expected_visit_revision": 0,
-            }
-        )
-    with pytest.raises(ValidationError):
-        FollowupDecisionPatch.model_validate(
-            {
-                "followup_decision": {"kind": "DEFAULT"},
-                "expected_visit_revision": 0,
-                "diagnosis": "override",
-            }
-        )
-    with pytest.raises(ValidationError):
-        ExtendFollowup.model_validate(
+        ExtendFollowupV2.model_validate(
             {
                 "appointment_id": str(uuid4()),
                 "extended_deadline": "2026-11-10",
                 "reason": "",
-                "expected_visit_revision": 1,
+                "expected_source_decision_revision": 0,
+                "expected_visit_revision": 0,
+                "expected_followup_revision": 1,
                 "expected_claim_revision": 1,
+                "expected_authorization_revision": 0,
+                "expected_appointment_revision": 0,
             }
         )
 
 
 @pytest.mark.parametrize(
     ("operation", "method", "success_status"),
-    [
-        ("decision", "PATCH", 200),
-        ("extension", "POST", 201),
-    ],
+    [("decision", "PATCH", 200), ("extension", "POST", 201)],
 )
-def test_signed_doctor_followup_receipt_recovery_and_revocation(
-    patient_backend, operation, method, success_status
+@pytest.mark.parametrize("staff_kind", ["owner", "receptionist"])
+def test_signed_v2_receipt_replay_conflict_and_revoked_session(
+    followup_clinic, operation, method, success_status, staff_kind
 ):
-    clinic = patient_backend
-    doctor = UUID(clinic.owner.staff_id)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        source = _source(connection, clinic.tenant, doctor)
-        confirmed = _claim(connection, clinic.tenant, source)
-    visit_id = source["visit"]
-    path = f"/v1/visits/{visit_id}"
+    clinic = followup_clinic
+    source = _source(clinic)
+    confirmed = _confirmed(clinic, source) if operation == "extension" else None
+    actor = getattr(clinic, staff_kind)
+    path = f"/v1/visits/{source['visit']}"
     if operation == "decision":
-        body = _decision(
-            "OPTED_OUT", 1, reason="Synthetic revised Doctor decision"
-        ).model_dump(mode="json")
-        changed = {
-            **body,
-            "followup_decision": {
-                "kind": "OPTED_OUT",
-                "reason": "Different clinical reason",
-            },
-        }
+        command = _decision("OPTED_OUT", reason="Actual staff operational reason")
+        changed_decision = {"kind": "DEFAULT"}
         receipt_operation = "visits.followup_decision"
     else:
         path += "/extend-followup"
-        body = _extension(source, confirmed["id"]).model_dump(mode="json")
-        changed = {**body, "reason": "Different clinical reason"}
+        command = _extension(source, confirmed["id"])
         receipt_operation = "visits.extend_followup"
-    before = _visit_effects(clinic, visit_id, receipt_operation)
-    assert before == (1, 0, 0, 0)
+    body = command.model_dump(mode="json", exclude_unset=True)
+    changed = (
+        {**body, "followup_decision": changed_decision}
+        if operation == "decision"
+        else {**body, "reason": "Different operational reason"}
+    )
+    before = _effects(clinic, source["visit"], receipt_operation)
+    assert before == (0, 0, 0, 0, 0)
 
-    for missing in ({"key": ""}, {"key": str(uuid4()), "omit_key_header": True}):
-        status, refused = _signed_visit_request(
-            clinic, clinic.owner, path=path, method=method, body=body, **missing
-        )
-        assert status == (401 if missing.get("omit_key_header") else 422), refused
-        assert "data" not in refused
-    for actor, wrong_method, wrong_purpose in (
-        (clinic.receptionist, method, "VISIT_FOLLOWUP"),
-        (clinic.owner, "GET", "VISIT_FOLLOWUP"),
-        (clinic.owner, method, "APPOINTMENT_BOOKING"),
+    for options, expected in (
+        ({"key": ""}, 422),
+        ({"key": str(uuid4()), "omit_key_header": True}, 401),
     ):
-        status, refused = _signed_visit_request(
+        refused_status, refused = _signed_visit_request(
+            clinic, actor, path=path, method=method, body=body, **options
+        )
+        assert refused_status == expected, refused
+        assert "data" not in refused
+    for wrong_method, wrong_purpose in (
+        ("GET", "VISIT_FOLLOWUP"),
+        (method, "APPOINTMENT_BOOKING"),
+    ):
+        refused_status, refused = _signed_visit_request(
             clinic,
             actor,
             path=path,
@@ -418,251 +588,453 @@ def test_signed_doctor_followup_receipt_recovery_and_revocation(
             key=str(uuid4()),
             purpose=wrong_purpose,
         )
-        assert status == 403, refused
+        assert refused_status == 403, refused
         assert "data" not in refused
-    assert _visit_effects(clinic, visit_id, receipt_operation) == before
+    assert _effects(clinic, source["visit"], receipt_operation) == before
 
     key = str(uuid4())
-    status, accepted = _signed_visit_request(
-        clinic, clinic.owner, path=path, method=method, body=body, key=key
+    accepted_status, accepted = _signed_visit_request(
+        clinic, actor, path=path, method=method, body=body, key=key
     )
-    assert status == success_status, accepted
-    assert accepted["revision"] == 2
-    assert accepted["data"]["visit_id"] == str(visit_id)
-    assert accepted["data"]["revision"] == 2
-    after = _visit_effects(clinic, visit_id, receipt_operation)
-    assert after == (2, 1, int(operation == "extension"), 1)
+    assert accepted_status == success_status, accepted
+    assert accepted["revision"] == accepted["data"]["revision"] == 1
+    assert accepted["data"]["visit_revision"] == 0
+    assert accepted["data"]["actor_role"] == (
+        "DOCTOR_OWNER" if staff_kind == "owner" else "RECEPTIONIST"
+    )
+    assert UUID(accepted["data"]["event_id"])
+    after = _effects(clinic, source["visit"], receipt_operation)
+    assert after == (
+        0,
+        0,
+        int(operation == "decision"),
+        int(operation == "extension"),
+        1,
+    )
 
     price_status, price = pricing_request(
         clinic,
         clinic.owner,
         method="PATCH",
-        body=_patch(standard_new_exam_egp="125.00"),
+        body=_patch(expected_price_revision=3, standard_new_exam_egp="125.00"),
         key=str(uuid4()),
     )
     assert price_status == 200, price
     assert _signed_visit_request(
-        clinic, clinic.owner, path=path, method=method, body=body, key=key
+        clinic, actor, path=path, method=method, body=body, key=key
     ) == (success_status, accepted)
-    conflict, denied = _signed_visit_request(
-        clinic, clinic.owner, path=path, method=method, body=changed, key=key
+    conflict_status, refused = _signed_visit_request(
+        clinic, actor, path=path, method=method, body=changed, key=key
     )
-    assert conflict == 409
-    assert denied["error"]["code"] == "IDEMPOTENCY_CONFLICT"
-    assert "data" not in denied
-    assert _visit_effects(clinic, visit_id, receipt_operation) == after
+    assert conflict_status == 409, refused
+    assert refused["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert "data" not in refused
+    assert _effects(clinic, source["visit"], receipt_operation) == after
 
     with clinic.migration.begin() as connection:
         connection.execute(
             text('DELETE FROM public."session" WHERE id=:id'),
-            {"id": clinic.owner.session_id},
+            {"id": actor.session_id},
         )
-    revoked, denied = _signed_visit_request(
-        clinic, clinic.owner, path=path, method=method, body=body, key=key
+    revoked_status, refused = _signed_visit_request(
+        clinic, actor, path=path, method=method, body=body, key=key
     )
-    assert revoked in (401, 403), denied
-    assert "data" not in denied
-    assert _visit_effects(clinic, visit_id, receipt_operation) == after
-
-
-def test_source_decision_edit_preserves_confirmed_claim_and_replays_receipt(
-    appointment_storage,
-):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
-    with transaction(runtime, tenant) as connection:
-        source = _source(connection, tenant, doctor)
-        confirmed = _claim(connection, tenant, source)
-    command = _decision("OPTED_OUT", 1, reason="Synthetic later opt-out")
-    key = str(uuid4())
-    with transaction(runtime, tenant) as connection:
-        _doctor_context(connection, doctor)
-        original = connection.execute(
-            text("""
-            SELECT c.approved_deadline, c.policy_snapshot, s.entitlement_provenance,
-                   s.base_egp, s.net_egp, a.service_date
-            FROM public.followup_claims c
-            JOIN public.appointment_price_snapshots s ON s.appointment_id=c.appointment_id
-            JOIN public.appointments a ON a.id=c.appointment_id
-            WHERE c.id=:claim
-        """),
-            {"claim": confirmed["claim"]},
-        ).one()
-        result = record_followup_decision(
-            connection, _actor(tenant, doctor), source["visit"], command, key
-        )
-        assert result["revision"] == 2
-    with transaction(runtime, tenant) as connection:
-        _doctor_context(connection, doctor)
-        assert (
-            record_followup_decision(
-                connection, _actor(tenant, doctor), source["visit"], command, key
-            )
-            == result
-        )
-        with pytest.raises(ReceiptConflict):
-            record_followup_decision(
-                connection,
-                _actor(tenant, doctor),
-                source["visit"],
-                _decision("DEFAULT", 2),
-                key,
-            )
-        frozen = connection.execute(
-            text("""
-            SELECT c.approved_deadline, c.policy_snapshot, s.entitlement_provenance,
-                   s.base_egp, s.net_egp, a.service_date
-            FROM public.followup_claims c
-            JOIN public.appointment_price_snapshots s ON s.appointment_id=c.appointment_id
-            JOIN public.appointments a ON a.id=c.appointment_id
-            WHERE c.id=:claim
-        """),
-            {"claim": confirmed["claim"]},
-        ).one()
-        assert frozen == original
-
-
-def test_extension_preserves_confirmed_target_and_records_linked_evidence(
-    appointment_storage,
-):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
-    with transaction(runtime, tenant) as connection:
-        source = _source(connection, tenant, doctor)
-        confirmed = _claim(connection, tenant, source)
-    command = _extension(source, confirmed["id"])
-    key = str(uuid4())
-    with transaction(runtime, tenant) as connection:
-        _doctor_context(connection, doctor)
-        frozen = connection.execute(
-            text("""
-            SELECT c.state, c.revision, c.approved_deadline, c.policy_snapshot,
-                   s.entitlement_provenance, s.base_egp, s.net_egp,
-                   a.service_date, a.status
-            FROM public.followup_claims c
-            JOIN public.appointment_price_snapshots s ON s.appointment_id=c.appointment_id
-            JOIN public.appointments a ON a.id=c.appointment_id
-            WHERE c.id=:claim
-        """),
-            {"claim": confirmed["claim"]},
-        ).one()
-        result = extend_followup(
-            connection, _actor(tenant, doctor), source["visit"], command, key
-        )
-        assert result["revision"] == 2
-        record = connection.execute(
-            text("""
-            SELECT e.prior_deadline, e.extended_deadline,
-                   e.reason AS extension_reason,
-                   e.expected_source_revision, e.expected_claim_revision,
-                   r.change_kind, r.reason AS revision_reason,
-                   r.revision, a.correlation_id
-            FROM public.followup_extensions e
-            JOIN public.clinical_revisions r ON r.id=e.clinical_revision_id
-            JOIN public.clinical_audit a ON a.id=e.clinical_audit_id
-            WHERE e.claim_id=:claim
-        """),
-            {"claim": confirmed["claim"]},
-        ).one()
-        assert record.prior_deadline == source["day"] + timedelta(days=7)
-        assert record.extended_deadline == source["day"] + timedelta(days=9)
-        assert record.extension_reason == record.revision_reason == command.reason
-        assert record.change_kind == "EXTENSION" and record.revision == 2
-        assert (
-            record.expected_source_revision == 1 and record.expected_claim_revision == 1
-        )
-        assert (
-            connection.execute(
-                text("""
-            SELECT c.state, c.revision, c.approved_deadline, c.policy_snapshot,
-                   s.entitlement_provenance, s.base_egp, s.net_egp,
-                   a.service_date, a.status
-            FROM public.followup_claims c
-            JOIN public.appointment_price_snapshots s ON s.appointment_id=c.appointment_id
-            JOIN public.appointments a ON a.id=c.appointment_id
-            WHERE c.id=:claim
-        """),
-                {"claim": confirmed["claim"]},
-            ).one()
-            == frozen
-        )
-        assert frozen.state == "ACTIVE"
-        assert frozen.approved_deadline == source["day"] + timedelta(days=7)
-    with transaction(runtime, tenant) as connection:
-        _doctor_context(connection, doctor)
-        assert (
-            extend_followup(
-                connection, _actor(tenant, doctor), source["visit"], command, key
-            )
-            == result
-        )
-        repeated_deadline = _extension(
-            source,
-            confirmed["id"],
-            revision=2,
-            deadline=source["day"] + timedelta(days=9),
-        )
-        renewed = extend_followup(
-            connection,
-            _actor(tenant, doctor),
-            source["visit"],
-            repeated_deadline,
-            str(uuid4()),
-        )
-        assert renewed["revision"] == 3
-        deadlines = connection.execute(
-            text("""
-            SELECT prior_deadline, extended_deadline
-            FROM public.followup_extensions WHERE claim_id=:claim
-            ORDER BY expected_source_revision
-        """),
-            {"claim": confirmed["claim"]},
-        ).all()
-        assert len(deadlines) == 2
-        assert deadlines[1] == (command.extended_deadline, command.extended_deadline)
+    assert revoked_status in (401, 403), refused
+    assert "data" not in refused
+    assert _effects(clinic, source["visit"], receipt_operation) == after
 
 
 @pytest.mark.parametrize(
-    "case",
-    ["wrong_target", "stale_source", "stale_claim", "shorten", "released", "consumed"],
+    "bad_body",
+    [
+        '{"followup_decision":{"kind":"DEFAULT","kind":"OPTED_OUT"},"expected_source_decision_revision":0,"expected_visit_revision":0,"expected_followup_revision":1}',
+        '{"followup_decision":{"kind":"DEFAULT"},"expected_source_decision_revision":0,"expected_visit_revision":0}',
+        '{"followup_decision":{"kind":"DEFAULT"},"expected_source_decision_revision":0,"expected_visit_revision":0,"expected_followup_revision":1,"medical_notes":"hidden"}',
+        '{"followup_decision":{"kind":"DEFAULT"},"expected_source_decision_revision":null,"expected_visit_revision":0,"expected_followup_revision":1}',
+    ],
 )
-def test_extension_denials_leave_no_new_evidence(appointment_storage, case):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
-    with transaction(runtime, tenant) as connection:
-        source = _source(connection, tenant, doctor)
-        confirmed = _claim(connection, tenant, source)
-        if case in ("released", "consumed"):
+def test_signed_partial_duplicate_or_hybrid_v2_request_denies_without_evidence(
+    patient_backend, bad_body
+):
+    clinic = patient_backend
+    source = _source(clinic)
+    status, refused = _signed_visit_request(
+        clinic,
+        clinic.owner,
+        path=f"/v1/visits/{source['visit']}",
+        method="PATCH",
+        body=bad_body,
+        key=str(uuid4()),
+    )
+    assert status == 422, refused
+    assert "data" not in refused
+    assert _effects(clinic, source["visit"], "visits.followup_decision") == (
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+
+
+def test_signed_committed_v1_replays_exact_original_digest_including_null_distinction(
+    patient_backend,
+):
+    clinic = patient_backend
+    source = _source(clinic)
+    visit_id = source["visit"]
+    key = str(uuid4())
+    command = FollowupDecisionPatch.model_validate(
+        {"followup_decision": {"kind": "DEFAULT"}, "expected_visit_revision": 0}
+    )
+    body = command.model_dump(mode="json", exclude_unset=True)
+    historical = {
+        "visit_id": str(visit_id),
+        "followup_decision": {"kind": "DEFAULT"},
+        "revision": 0,
+    }
+    digest = sha256(visit_id.bytes + normalize_typed_body(command)).hexdigest()
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _staff_context(connection, UUID(clinic.owner.staff_id))
+        insert_tenant_receipt(
+            connection,
+            Receipt(
+                actor_id=UUID(clinic.owner.staff_id),
+                operation="visits.followup_decision",
+                idempotency_key=key,
+                request_digest=digest,
+                result_projection=historical,
+                result_revision=0,
+                organization_id=clinic.tenant,
+                staff_id=UUID(clinic.owner.staff_id),
+            ),
+        )
+    path = f"/v1/visits/{visit_id}"
+    assert _signed_visit_request(
+        clinic, clinic.owner, path=path, method="PATCH", body=body, key=key
+    ) == (200, {"data": historical, "revision": 0})
+    with_null = {**body, "followup_decision": {"kind": "DEFAULT", "reason": None}}
+    conflict_status, conflict = _signed_visit_request(
+        clinic, clinic.owner, path=path, method="PATCH", body=with_null, key=key
+    )
+    assert conflict_status == 409, conflict
+    assert conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    unavailable_status, unavailable = _signed_visit_request(
+        clinic, clinic.owner, path=path, method="PATCH", body=body, key=str(uuid4())
+    )
+    assert unavailable_status == 409, unavailable
+    for candidate in (body, with_null):
+        hidden_status, hidden = _signed_visit_request(
+            clinic,
+            clinic.owner,
+            path=f"/v1/visits/{uuid4()}",
+            method="PATCH",
+            body=candidate,
+            key=key,
+        )
+        assert hidden_status == 404, hidden
+        assert "data" not in hidden
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        stored = connection.execute(
+            text("""
+            SELECT request_digest, result_projection, result_revision
+            FROM public.idempotency_receipts WHERE organization_id=:tenant
+              AND operation='visits.followup_decision' AND idempotency_key=:key
+        """),
+            {"tenant": clinic.tenant, "key": key},
+        ).one()
+    assert stored == (digest, historical, 0)
+    assert _effects(clinic, visit_id, "visits.followup_decision") == (0, 0, 0, 0, 1)
+
+
+def test_overbroad_saved_v2_receipt_denies_before_digest_conflict(patient_backend):
+    clinic = patient_backend
+    source = _source(clinic)
+    path = f"/v1/visits/{source['visit']}"
+    command = _decision("DEFAULT")
+    body = command.model_dump(mode="json", exclude_unset=True)
+    status, accepted = _signed_visit_request(
+        clinic, clinic.owner, path=path, method="PATCH", body=body, key=str(uuid4())
+    )
+    assert status == 200, accepted
+    key = str(uuid4())
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _staff_context(connection, UUID(clinic.owner.staff_id))
+        insert_tenant_receipt(
+            connection,
+            Receipt(
+                actor_id=UUID(clinic.owner.staff_id),
+                operation="visits.followup_decision",
+                idempotency_key=key,
+                request_digest=sha256(
+                    source["visit"].bytes + normalize_typed_body(command)
+                ).hexdigest(),
+                result_projection={
+                    **accepted["data"],
+                    "medical_notes": "restricted narrative",
+                },
+                result_revision=accepted["revision"],
+                organization_id=clinic.tenant,
+                staff_id=UUID(clinic.owner.staff_id),
+            ),
+        )
+    with clinic.migration.connect() as connection:
+        frozen = connection.execute(
+            text("""
+            SELECT result_projection, request_digest, result_revision
+            FROM public.idempotency_receipts
+            WHERE organization_id=:tenant AND operation='visits.followup_decision'
+              AND idempotency_key=:key
+        """),
+            {"tenant": clinic.tenant, "key": key},
+        ).one()
+    for candidate in (
+        body,
+        {**body, "followup_decision": {"kind": "OPTED_OUT", "reason": "changed"}},
+    ):
+        denial_status, denied = _signed_visit_request(
+            clinic, clinic.owner, path=path, method="PATCH", body=candidate, key=key
+        )
+        assert denial_status == 403, denied
+        assert "data" not in denied
+    with clinic.migration.connect() as connection:
+        assert (
+            connection.execute(
+                text("""
+            SELECT result_projection, request_digest, result_revision
+            FROM public.idempotency_receipts
+            WHERE organization_id=:tenant AND operation='visits.followup_decision'
+              AND idempotency_key=:key
+        """),
+                {"tenant": clinic.tenant, "key": key},
+            ).one()
+            == frozen
+        )
+    assert _effects(clinic, source["visit"], "visits.followup_decision") == (
+        0,
+        0,
+        1,
+        0,
+        2,
+    )
+
+
+def test_receptionist_cannot_recover_legacy_doctor_reason_from_saved_receipt(
+    patient_backend,
+):
+    clinic = patient_backend
+    source = _source(clinic)
+    visit_id = source["visit"]
+    key = str(uuid4())
+    command = FollowupDecisionPatch.model_validate(
+        {
+            "followup_decision": {
+                "kind": "OPTED_OUT",
+                "reason": "Protected Doctor narrative",
+            },
+            "expected_visit_revision": 0,
+        }
+    )
+    payload = command.model_dump(mode="json", exclude_unset=True)
+    digest = sha256(visit_id.bytes + normalize_typed_body(command)).hexdigest()
+    receptionist = UUID(clinic.receptionist.staff_id)
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _staff_context(connection, receptionist)
+        insert_tenant_receipt(
+            connection,
+            Receipt(
+                actor_id=receptionist,
+                operation="visits.followup_decision",
+                idempotency_key=key,
+                request_digest=digest,
+                result_projection={
+                    "visit_id": str(visit_id),
+                    "revision": 0,
+                    "followup_decision": payload["followup_decision"],
+                },
+                result_revision=0,
+                organization_id=clinic.tenant,
+                staff_id=receptionist,
+            ),
+        )
+    for candidate in (payload, {**payload, "expected_visit_revision": 1}):
+        status, denied = _signed_visit_request(
+            clinic,
+            clinic.receptionist,
+            path=f"/v1/visits/{visit_id}",
+            method="PATCH",
+            body=candidate,
+            key=key,
+        )
+        assert status == 403, denied
+        assert "data" not in denied
+    assert _effects(clinic, visit_id, "visits.followup_decision") == (0, 0, 0, 0, 1)
+
+
+def test_post_confirmation_doctor_restriction_leaves_original_entitlement_frozen(
+    followup_clinic,
+):
+    clinic = followup_clinic
+    source = _source(clinic)
+    confirmed = _confirmed(clinic, source)
+    command = _decision("OPTED_OUT", reason="Doctor later restriction")
+    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+    key = str(uuid4())
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _staff_context(connection, actor.staff_id)
+        frozen = _frozen_claim(connection, confirmed["claim"])
+        original = record_followup_decision(
+            connection, actor, source["visit"], command, key
+        )
+        assert original[1] == 1
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _staff_context(connection, actor.staff_id)
+        assert (
+            record_followup_decision(connection, actor, source["visit"], command, key)
+            == original
+        )
+        with pytest.raises(ReceiptConflict):
+            record_followup_decision(
+                connection, actor, source["visit"], _decision("DEFAULT", 1), key
+            )
+        assert _frozen_claim(connection, confirmed["claim"]) == frozen
+
+
+def test_confirmed_extension_appends_authorization_without_clinical_or_price_change(
+    followup_clinic,
+):
+    clinic = followup_clinic
+    source = _source(clinic)
+    confirmed = _confirmed(clinic, source)
+    command = _extension(source, confirmed["id"])
+    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+    key = str(uuid4())
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _staff_context(connection, actor.staff_id)
+        frozen = _frozen_claim(connection, confirmed["claim"])
+        original = extend_followup(connection, actor, source["visit"], command, key)
+        assert original[1] == original[0]["revision"] == 1
+        assert (original[0]["claim_revision"], original[0]["visit_revision"]) == (1, 0)
+        assert _frozen_claim(connection, confirmed["claim"]) == frozen
+        assert connection.execute(
+            text(
+                "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
+            ),
+            {"visit": source["visit"]},
+        ).one() == (0, None)
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _staff_context(connection, actor.staff_id)
+        assert (
+            extend_followup(connection, actor, source["visit"], command, key)
+            == original
+        )
+        repeated = extend_followup(
+            connection,
+            actor,
+            source["visit"],
+            _extension(source, confirmed["id"], authorization_revision=1),
+            str(uuid4()),
+        )
+        assert repeated[1] == 2
+        assert _frozen_claim(connection, confirmed["claim"]) == frozen
+    with clinic.migration.connect() as connection:
+        events = connection.execute(
+            text("""
+            SELECT e.authorization_revision, e.kind, e.prior_deadline,
+                   e.new_deadline, e.claim_revision, e.clinical_revision,
+                   e.actor_staff_id, e.actor_role, a.before_state, a.after_state
+            FROM public.followup_authorization_events e
+            JOIN public.sensitive_audit a ON a.id=e.sensitive_audit_id
+            WHERE e.organization_id=:tenant AND e.claim_id=:claim
+            ORDER BY e.authorization_revision
+        """),
+            {"tenant": clinic.tenant, "claim": confirmed["claim"]},
+        ).all()
+    assert len(events) == 2
+    assert [event.authorization_revision for event in events] == [1, 2]
+    assert [event.kind for event in events] == ["EXTENSION", "EXTENSION"]
+    assert [event.prior_deadline for event in events] == [
+        source["day"] + timedelta(days=7),
+        source["day"] + timedelta(days=9),
+    ]
+    assert all(
+        event.new_deadline == source["day"] + timedelta(days=9) for event in events
+    )
+    assert all(
+        (
+            event.claim_revision,
+            event.clinical_revision,
+            event.actor_staff_id,
+            event.actor_role,
+        )
+        == (1, 0, actor.staff_id, "DOCTOR_OWNER")
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "status", "code"),
+    [
+        ("wrong_target", 409, None),
+        ("stale_source", 409, "STALE_REVISION"),
+        ("stale_visit", 409, "STALE_REVISION"),
+        ("stale_policy", 409, "STALE_REVISION"),
+        ("stale_claim", 409, "STALE_REVISION"),
+        ("stale_authorization", 409, "STALE_REVISION"),
+        ("stale_appointment", 409, "STALE_REVISION"),
+        ("shorten", 422, None),
+        ("released", 409, None),
+        ("consumed", 409, None),
+    ],
+)
+def test_denied_extension_preserves_claim_and_has_no_new_authorization_evidence(
+    followup_clinic, case, status, code
+):
+    clinic = followup_clinic
+    source = _source(clinic)
+    confirmed = _confirmed(clinic, source)
+    if case in ("released", "consumed"):
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            _staff_context(connection, UUID(clinic.owner.staff_id))
             _outcome(
                 connection,
-                tenant,
-                doctor,
+                clinic.tenant,
+                UUID(clinic.owner.staff_id),
                 confirmed,
                 status="Cancelled" if case == "released" else "Completed",
             )
     command = _extension(
         source,
         uuid4() if case == "wrong_target" else confirmed["id"],
-        revision=0 if case == "stale_source" else 1,
+        source_revision=int(case == "stale_source"),
+        visit_revision=int(case == "stale_visit"),
+        followup_revision=2 if case == "stale_policy" else 1,
         claim_revision=0 if case == "stale_claim" else 1,
+        authorization_revision=int(case == "stale_authorization"),
+        appointment_revision=2 if case == "stale_appointment" else 0,
         deadline=source["day"] + timedelta(days=6) if case == "shorten" else None,
     )
-    with transaction(runtime, tenant) as connection:
-        _doctor_context(connection, doctor)
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _staff_context(connection, UUID(clinic.owner.staff_id))
+        frozen = _frozen_claim(connection, confirmed["claim"])
         with pytest.raises(ContractError) as denied:
             extend_followup(
                 connection,
-                _actor(tenant, doctor),
+                _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
                 source["visit"],
                 command,
                 str(uuid4()),
             )
-        assert denied.value.status_code == (422 if case == "shorten" else 409)
-        if case in ("stale_source", "stale_claim"):
-            assert denied.value.code == "STALE_REVISION"
+        assert (denied.value.status_code, denied.value.code) == (status, code)
+        assert _frozen_claim(connection, confirmed["claim"]) == frozen
         assert (
             connection.scalar(
-                text(
-                    "SELECT count(*) FROM public.followup_extensions WHERE claim_id=:claim"
-                ),
-                {"claim": confirmed["claim"]},
+                text("""
+            SELECT count(*) FROM public.followup_authorization_events
+            WHERE organization_id=:tenant AND claim_id=:claim AND kind='EXTENSION'
+        """),
+                {"tenant": clinic.tenant, "claim": confirmed["claim"]},
             )
             == 0
         )
@@ -671,5 +1043,15 @@ def test_extension_denials_leave_no_new_evidence(appointment_storage, case):
                 text("SELECT clinical_revision FROM public.visits WHERE id=:visit"),
                 {"visit": source["visit"]},
             )
-            == 1
+            == 0
+        )
+        assert (
+            connection.scalar(
+                text("""
+            SELECT count(*) FROM public.idempotency_receipts
+            WHERE organization_id=:tenant AND operation='visits.extend_followup'
+        """),
+                {"tenant": clinic.tenant},
+            )
+            == 0
         )

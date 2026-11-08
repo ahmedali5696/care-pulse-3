@@ -39,9 +39,14 @@ def booking_request(
     body=None,
     key="",
     query=None,
+    raw_body=None,
 ):
     encoded = (
-        json.dumps(body, separators=(",", ":")).encode() if body is not None else b""
+        raw_body
+        if raw_body is not None
+        else json.dumps(body, separators=(",", ":")).encode()
+        if body is not None
+        else b""
     )
     signed = replace(
         actor,

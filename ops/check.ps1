@@ -218,7 +218,7 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             foreach ($suite in @('tests/integration/test_booking.py', 'tests/integration/test_booking_races.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-09 verification: $suite" }
             }
-            foreach ($suite in @('tests/integration/test_followups.py', 'tests/integration/test_followups_denial.py', 'tests/integration/test_followup_decisions.py', 'tests/integration/test_followups_races.py')) {
+            foreach ($suite in @('tests/integration/test_followups.py', 'tests/integration/test_followups_denial.py', 'tests/integration/test_followup_decisions.py', 'tests/integration/test_followups_races.py', 'tests/integration/test_b10_writer_migration.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required B-10 verification: $suite" }
             }
             foreach ($suite in @('tests/integration/test_visit_persistence.py', 'tests/integration/test_visit_revisions.py', 'tests/integration/test_visit_migration.py')) {
@@ -389,7 +389,8 @@ docker compose --profile test run --rm --no-deps \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider \
   tests/integration/test_followups.py tests/integration/test_followups_denial.py \
-  tests/integration/test_followup_decisions.py tests/integration/test_followups_races.py | tee "$private/b10-followups.log"
+  tests/integration/test_followup_decisions.py tests/integration/test_followups_races.py \
+  tests/integration/test_b10_writer_migration.py | tee "$private/b10-followups.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b10-followups.log"; then
   echo 'FAIL mandatory B-10 follow-up evidence skipped'; exit 1
 fi

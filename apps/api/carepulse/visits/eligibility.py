@@ -1,17 +1,16 @@
-"""Doctor follow-up authorization with serialized source and claim evidence."""
+"""Signed operational follow-up decisions and confirmed claim extensions."""
 
 import json
 import re
 from dataclasses import dataclass
+from datetime import date
 from hashlib import sha256
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from sqlalchemy import Connection, text
+from sqlalchemy.exc import DBAPIError
 
-from carepulse.appointments.followup_rules import (
-    extension_must_not_shorten,
-    validate_exception_deadline,
-)
+from carepulse.appointments.followup_rules import extension_must_not_shorten
 from carepulse.identity.authorization import AuthorizedStaff
 from carepulse.identity.contracts import (
     ContractError,
@@ -21,73 +20,109 @@ from carepulse.identity.contracts import (
 from carepulse.identity.receipts import (
     Receipt,
     TenantReceiptQuery,
+    assert_same_request,
     insert_tenant_receipt,
-    resolve_tenant_receipt,
+    lookup_tenant_receipt,
 )
-from carepulse.notifications.evidence import append_clinical_audit
 from carepulse.patients.lifecycle import lock_patient_for_existing_appointment
 from carepulse.policies.versions import StalePolicyRevision, lock_policy_heads
-from carepulse.visits.eligibility_contracts import ExtendFollowup, FollowupDecisionPatch
+from carepulse.visits.eligibility_contracts import (
+    ExtendFollowup,
+    ExtendFollowupV2,
+    FollowupDecisionPatch,
+    FollowupDecisionPatchV2,
+)
 
 
 @dataclass(frozen=True)
-class _ClinicalChange:
-    decision: dict
-    kind: str
-    reason: str | None
+class _SourceContext:
+    visit_revision: int
+    source_revision: int
+    followup_revision: int
+    policy_version: int
+    completion_date: date
+    decision: dict | None
+    decision_actor_role: str | None
+    claim: dict | None = None
+    appointment_revision: int | None = None
 
 
 def _receipt_query(
     actor: AuthorizedStaff, operation: str, key: str, request_digest: str
 ) -> TenantReceiptQuery:
-    if actor.role != "DOCTOR_OWNER":
+    if actor.role not in ("DOCTOR_OWNER", "RECEPTIONIST"):
         raise ContractError(403)
     if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", key):
         raise ContractError(422)
     return TenantReceiptQuery(actor, operation, key, request_digest)
 
 
-def _source(connection: Connection, actor: AuthorizedStaff, visit_id: UUID):
+def _source_reference(connection: Connection, actor: AuthorizedStaff, visit_id: UUID):
     tenant = actor.organization_id
     source = (
         connection.execute(
             text("""
-            SELECT patient_id, appointment_id, doctor_staff_id FROM public.visits
-            WHERE organization_id=:tenant AND id=:visit
+            SELECT v.patient_id, v.appointment_id, v.doctor_staff_id
+            FROM public.visits v JOIN public.appointments a
+              ON (a.organization_id, a.id) = (v.organization_id, v.appointment_id)
+            WHERE v.organization_id=:tenant AND v.id=:visit
+              AND (v.patient_id, v.doctor_staff_id) =
+                  (a.patient_id, a.doctor_staff_id)
         """),
             {"tenant": tenant, "visit": visit_id},
         )
         .mappings()
         .one_or_none()
     )
-    if source is None or source["doctor_staff_id"] != actor.staff_id:
+    if source is None or (
+        actor.role == "DOCTOR_OWNER" and source["doctor_staff_id"] != actor.staff_id
+    ):
         raise ContractError(404)
+    return source
+
+
+def _locked_source(
+    connection: Connection,
+    actor: AuthorizedStaff,
+    visit_id: UUID,
+    target_id: UUID | None = None,
+) -> _SourceContext:
+    tenant = actor.organization_id
+    source = _source_reference(connection, actor, visit_id)
     lock_patient_for_existing_appointment(connection, tenant, source["patient_id"])
     try:
-        lock_policy_heads(
-            connection,
-            tenant,
-            {
-                "SCHEDULE": "SHARE",
-                "CAPACITY": "SHARE",
-                "FOLLOWUP": "SHARE",
-                "PRICE": "SHARE",
-            },
-        )
+        lock_policy_heads(connection, tenant, {"FOLLOWUP": "SHARE"})
     except StalePolicyRevision as invalid:
         raise ContractError(409, "STALE_REVISION") from invalid
-    appointment = (
-        connection.execute(
+    claim_id = None
+    if target_id is not None:
+        claim_id = connection.scalar(
             text("""
-            SELECT id, patient_id, doctor_staff_id, status, service_type, classification
-            FROM public.appointments WHERE organization_id=:tenant AND id=:appointment
-            FOR UPDATE
-        """),
-            {"tenant": tenant, "appointment": source["appointment_id"]},
+                SELECT id FROM public.followup_claims
+                WHERE organization_id=:tenant AND source_visit_id=:visit
+                  AND appointment_id=:appointment
+            """),
+            {"tenant": tenant, "visit": visit_id, "appointment": target_id},
         )
-        .mappings()
-        .one_or_none()
-    )
+        if claim_id is None:
+            raise ContractError(409)
+    appointments = {}
+    for appointment_id in sorted({source["appointment_id"], target_id} - {None}):
+        appointments[appointment_id] = (
+            connection.execute(
+                text("""
+                    SELECT id, patient_id, doctor_staff_id, status, service_type,
+                           classification, revision FROM public.appointments
+                    WHERE organization_id=:tenant AND id=:appointment FOR UPDATE
+                """),
+                {"tenant": tenant, "appointment": appointment_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if appointments[appointment_id] is None:
+            raise ContractError(404)
+    appointment = appointments[source["appointment_id"]]
     visit = (
         connection.execute(
             text("""
@@ -104,24 +139,23 @@ def _source(connection: Connection, actor: AuthorizedStaff, visit_id: UUID):
         appointment is None
         or visit is None
         or visit["patient_id"] != source["patient_id"]
-        or visit["doctor_staff_id"] != actor.staff_id
+        or visit["doctor_staff_id"] != source["doctor_staff_id"]
         or visit["appointment_id"] != appointment["id"]
         or appointment["patient_id"] != visit["patient_id"]
-        or appointment["doctor_staff_id"] != actor.staff_id
+        or appointment["doctor_staff_id"] != visit["doctor_staff_id"]
     ):
         raise ContractError(404)
-    claims = (
+    state = (
         connection.execute(
             text("""
-            SELECT id, appointment_id, state, revision, approved_deadline
-            FROM public.followup_claims
-            WHERE organization_id=:tenant AND source_visit_id=:visit
-            ORDER BY id FOR UPDATE
+                SELECT source_revision, provenance_state, decision, decision_actor_role
+                FROM public.followup_source_state
+                WHERE organization_id=:tenant AND visit_id=:visit FOR UPDATE
         """),
             {"tenant": tenant, "visit": visit_id},
         )
         .mappings()
-        .all()
+        .one_or_none()
     )
     if (
         appointment["status"] != "Completed"
@@ -129,64 +163,208 @@ def _source(connection: Connection, actor: AuthorizedStaff, visit_id: UUID):
         or appointment["classification"] not in ("ROUTINE", "URGENT", "EMERGENCY")
     ):
         raise ContractError(409)
-    completion = connection.scalar(
+    completion_date = connection.scalar(
         text("""
-            SELECT (occurred_at AT TIME ZONE 'Africa/Cairo')::date
-            FROM public.appointment_history
-            WHERE organization_id=:tenant AND appointment_id=:appointment
-              AND new_status='Completed'
-            ORDER BY appointment_revision DESC LIMIT 1
+            SELECT (completed_at AT TIME ZONE 'Africa/Cairo')::date
+            FROM public.completion_attestations
+            WHERE organization_id=:tenant AND visit_id=:visit
         """),
-        {"tenant": tenant, "appointment": appointment["id"]},
+        {"tenant": tenant, "visit": visit_id},
     )
-    if completion is None:
+    if completion_date is None or (state and state["provenance_state"] != "VERIFIED"):
         raise ContractError(409)
-    return visit, claims, completion
-
-
-def _clinical_revision(
-    connection: Connection,
-    actor: AuthorizedStaff,
-    visit_id: UUID,
-    change: _ClinicalChange,
-):
-    connection.execute(
+    policy = connection.execute(
         text("""
-            SELECT set_config('app.clinical_change_kind', :kind, true),
-                   set_config('app.clinical_reason', :reason, true)
+            SELECT current_version, revision FROM public.clinic_policy_heads
+            WHERE organization_id=:tenant AND kind='FOLLOWUP'
         """),
-        {"kind": change.kind, "reason": change.reason or ""},
-    )
-    current = connection.execute(
-        text("""
-            UPDATE public.visits SET followup_decision=CAST(:decision AS jsonb)
-            WHERE organization_id=:tenant AND id=:visit RETURNING clinical_revision
-        """),
-        {
-            "tenant": actor.organization_id,
-            "visit": visit_id,
-            "decision": json.dumps(change.decision, allow_nan=False),
-        },
-    ).scalar_one()
-    revision = connection.execute(
-        text("""
-            SELECT id, occurred_at FROM public.clinical_revisions
-            WHERE organization_id=:tenant AND visit_id=:visit AND revision=:revision
-        """),
-        {"tenant": actor.organization_id, "visit": visit_id, "revision": current},
+        {"tenant": tenant},
     ).one()
-    audit_id = append_clinical_audit(
-        connection,
-        {
-            "organization_id": actor.organization_id,
-            "doctor_staff_id": actor.staff_id,
-            "clinical_revision": current,
-            "before_ref": f"{visit_id}:{current - 1}",
-            "after_ref": f"{visit_id}:{current}",
-            "correlation_id": str(revision.id),
-        },
+    claim = None
+    if claim_id is not None:
+        claim = (
+            connection.execute(
+                text("""
+                    SELECT id, appointment_id, state, revision, approved_deadline
+                    FROM public.followup_claims
+                    WHERE organization_id=:tenant AND id=:claim FOR UPDATE
+                """),
+                {"tenant": tenant, "claim": claim_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        target = appointments[target_id]
+        if (
+            claim is None
+            or claim["appointment_id"] != target["id"]
+            or target["patient_id"] != visit["patient_id"]
+            or target["doctor_staff_id"] != visit["doctor_staff_id"]
+            or target["service_type"] != "FOLLOW_UP"
+        ):
+            raise ContractError(404)
+    return _SourceContext(
+        visit["clinical_revision"],
+        state["source_revision"] if state else 0,
+        policy.revision,
+        policy.current_version,
+        completion_date,
+        state["decision"] if state else None,
+        state["decision_actor_role"] if state else None,
+        dict(claim) if claim else None,
+        appointments[target_id]["revision"] if target_id else None,
     )
-    return current, revision.id, revision.occurred_at, audit_id
+
+
+_DECISION_V1_FIELDS = {"visit_id", "followup_decision", "revision"}
+_DECISION_V2_FIELDS = _DECISION_V1_FIELDS | {
+    "source_decision_revision",
+    "visit_revision",
+    "followup_revision",
+    "event_id",
+    "actor_role",
+}
+_EXTENSION_V1_FIELDS = {
+    "visit_id",
+    "appointment_id",
+    "extended_deadline",
+    "revision",
+    "claim_revision",
+}
+_EXTENSION_V2_FIELDS = _EXTENSION_V1_FIELDS | {
+    "claim_id",
+    "authorization_revision",
+    "source_decision_revision",
+    "visit_revision",
+    "followup_revision",
+    "appointment_revision",
+    "event_id",
+    "actor_role",
+}
+
+
+def _replay_receipt(
+    connection: Connection, query: TenantReceiptQuery, visit_id: UUID
+) -> tuple[dict, int] | None:
+    stored = lookup_tenant_receipt(
+        connection,
+        query.actor.organization_id,
+        query.actor.staff_id,
+        query.operation,
+        query.idempotency_key,
+    )
+    if stored is None:
+        return None
+    actor = query.actor
+    _source_reference(connection, actor, visit_id)
+    projection = stored["result_projection"]
+    revision = stored["result_revision"]
+    if not isinstance(projection, dict) or type(revision) is not int:
+        raise ContractError(403)
+    v2 = "event_id" in projection
+    if query.operation == "visits.followup_decision":
+        permitted = _DECISION_V2_FIELDS if v2 else _DECISION_V1_FIELDS
+        decision = projection.get("followup_decision")
+        if (
+            set(projection) != permitted
+            or projection.get("visit_id") != str(visit_id)
+            or not isinstance(decision, dict)
+            or not {"kind"} <= set(decision) <= {"kind", "deadline_date", "reason"}
+        ):
+            raise ContractError(403)
+        if v2:
+            event = connection.execute(
+                text("""
+                    SELECT actor_staff_id, actor_role
+                    FROM public.followup_source_decision_events
+                    WHERE organization_id=:tenant AND source_visit_id=:visit
+                      AND id=:event
+                """),
+                {
+                    "tenant": actor.organization_id,
+                    "visit": visit_id,
+                    "event": _event_uuid(projection["event_id"]),
+                },
+            ).one_or_none()
+            if event is None or (event.actor_staff_id, event.actor_role) != (
+                actor.staff_id,
+                actor.role,
+            ):
+                raise ContractError(403)
+        elif actor.role != "DOCTOR_OWNER":
+            raise ContractError(403)
+        if "reason" in decision and actor.role == "RECEPTIONIST" and not v2:
+            raise ContractError(403)
+    else:
+        permitted = _EXTENSION_V2_FIELDS if v2 else _EXTENSION_V1_FIELDS
+        if set(projection) != permitted or projection.get("visit_id") != str(visit_id):
+            raise ContractError(403)
+        target = _event_uuid(projection.get("appointment_id"))
+        claim = connection.execute(
+            text("""
+                SELECT id FROM public.followup_claims
+                WHERE organization_id=:tenant AND source_visit_id=:visit
+                  AND appointment_id=:target
+            """),
+            {"tenant": actor.organization_id, "visit": visit_id, "target": target},
+        ).one_or_none()
+        if claim is None:
+            raise ContractError(404)
+        if v2:
+            event = connection.execute(
+                text("""
+                    SELECT actor_staff_id, actor_role FROM public.followup_authorization_events
+                    WHERE organization_id=:tenant AND claim_id=:claim AND id=:event
+                      AND kind='EXTENSION'
+                """),
+                {
+                    "tenant": actor.organization_id,
+                    "claim": claim.id,
+                    "event": _event_uuid(projection["event_id"]),
+                },
+            ).one_or_none()
+            if (
+                event is None
+                or (event.actor_staff_id, event.actor_role)
+                != (actor.staff_id, actor.role)
+                or projection.get("claim_id") != str(claim.id)
+            ):
+                raise ContractError(403)
+        elif actor.role != "DOCTOR_OWNER":
+            raise ContractError(403)
+    if v2 and projection.get("actor_role") != actor.role:
+        raise ContractError(403)
+    assert_same_request(stored["request_digest"], query.request_digest)
+    return projection, revision
+
+
+def _event_uuid(identifier: str | None) -> UUID:
+    try:
+        return UUID(identifier)
+    except (TypeError, ValueError) as invalid:
+        raise ContractError(403) from invalid
+
+
+def _expected(source: _SourceContext) -> dict:
+    return {
+        "source_revision": source.source_revision,
+        "clinical_revision": source.visit_revision,
+        "policy_version": source.policy_version,
+    }
+
+
+def _sql_write(connection: Connection, statement: str, parameters: dict) -> int:
+    try:
+        return connection.scalar(text(statement), parameters)
+    except DBAPIError as invalid:
+        sqlstate = getattr(invalid.orig, "sqlstate", None)
+        if sqlstate == "40001":
+            raise ContractError(409, "STALE_REVISION") from invalid
+        if sqlstate == "42501":
+            raise ContractError(403) from invalid
+        if sqlstate == "23514":
+            raise ContractError(409) from invalid
+        raise
 
 
 def _store_receipt(
@@ -211,144 +389,218 @@ def record_followup_decision(
     connection: Connection,
     actor: AuthorizedStaff,
     visit_id: UUID,
-    command: FollowupDecisionPatch,
+    command: FollowupDecisionPatch | FollowupDecisionPatchV2,
     idempotency_key: str,
-) -> dict:
+) -> tuple[dict, int]:
     receipt = _receipt_query(
         actor,
         "visits.followup_decision",
         idempotency_key,
         sha256(visit_id.bytes + normalize_typed_body(command)).hexdigest(),
     )
-    cached = resolve_tenant_receipt(connection, receipt)
+    cached = _replay_receipt(connection, receipt, visit_id)
     if cached is not None:
-        return cached[0]
-    visit, _, completion = _source(connection, actor, visit_id)
-    cached = resolve_tenant_receipt(connection, receipt)
+        return cached
+    if isinstance(command, FollowupDecisionPatch) and not isinstance(
+        command, FollowupDecisionPatchV2
+    ):
+        _source_reference(connection, actor, visit_id)
+        raise ContractError(409)
+    source = _locked_source(connection, actor, visit_id)
+    cached = _replay_receipt(connection, receipt, visit_id)
     if cached is not None:
-        return cached[0]
+        return cached
+    require_matching_revision(command.expected_visit_revision, source.visit_revision)
     require_matching_revision(
-        command.expected_visit_revision, visit["clinical_revision"]
+        command.expected_source_decision_revision, source.source_revision
+    )
+    require_matching_revision(
+        command.expected_followup_revision, source.followup_revision
     )
     decision = command.followup_decision.model_dump(mode="json", exclude_none=True)
-    if decision["kind"] == "DEADLINE":
-        try:
-            validate_exception_deadline(
-                completion, command.followup_decision.deadline_date, decision["reason"]
-            )
-        except ValueError as invalid:
-            raise ContractError(422) from invalid
-    if decision == visit["followup_decision"]:
+    if decision["kind"] == "DEADLINE" and (
+        command.followup_decision.deadline_date < source.completion_date
+    ):
+        raise ContractError(422)
+    if decision == source.decision:
         raise ContractError(409)
-    kind = "DECISION_DEFAULT" if decision["kind"] == "DEFAULT" else "DECISION_EXCEPTION"
-    revision, _, _, _ = _clinical_revision(
+    if (
+        actor.role == "RECEPTIONIST"
+        and source.decision_actor_role == "DOCTOR_OWNER"
+        and (source.decision or {}).get("kind") in ("OPTED_OUT", "DEADLINE")
+    ):
+        raise ContractError(403)
+    revision = _sql_write(
         connection,
-        actor,
-        visit_id,
-        _ClinicalChange(decision, kind, decision.get("reason")),
+        """
+            SELECT public.record_followup_source_decision(
+                :tenant, :visit, CAST(:expected AS jsonb), CAST(:decision AS jsonb))
+        """,
+        {
+            "tenant": actor.organization_id,
+            "visit": visit_id,
+            "expected": json.dumps(_expected(source)),
+            "decision": json.dumps(decision, allow_nan=False),
+        },
     )
+    event = connection.execute(
+        text("""
+            SELECT id, actor_role FROM public.followup_source_decision_events
+            WHERE organization_id=:tenant AND source_visit_id=:visit
+              AND source_revision=:revision
+        """),
+        {"tenant": actor.organization_id, "visit": visit_id, "revision": revision},
+    ).one()
     projection = {
         "visit_id": str(visit_id),
         "followup_decision": decision,
         "revision": revision,
+        "source_decision_revision": revision,
+        "visit_revision": source.visit_revision,
+        "followup_revision": source.followup_revision,
+        "event_id": str(event.id),
+        "actor_role": event.actor_role,
     }
     _store_receipt(connection, receipt, projection, revision)
-    return projection
+    return projection, revision
 
 
 def extend_followup(
     connection: Connection,
     actor: AuthorizedStaff,
     visit_id: UUID,
-    command: ExtendFollowup,
+    command: ExtendFollowup | ExtendFollowupV2,
     idempotency_key: str,
-) -> dict:
+) -> tuple[dict, int]:
     receipt = _receipt_query(
         actor,
         "visits.extend_followup",
         idempotency_key,
         sha256(visit_id.bytes + normalize_typed_body(command)).hexdigest(),
     )
-    cached = resolve_tenant_receipt(connection, receipt)
+    cached = _replay_receipt(connection, receipt, visit_id)
     if cached is not None:
-        return cached[0]
-    visit, claims, _ = _source(connection, actor, visit_id)
-    cached = resolve_tenant_receipt(connection, receipt)
+        return cached
+    if isinstance(command, ExtendFollowup) and not isinstance(
+        command, ExtendFollowupV2
+    ):
+        _source_reference(connection, actor, visit_id)
+        raise ContractError(409)
+    source = _locked_source(connection, actor, visit_id, command.appointment_id)
+    cached = _replay_receipt(connection, receipt, visit_id)
     if cached is not None:
-        return cached[0]
+        return cached
+    require_matching_revision(command.expected_visit_revision, source.visit_revision)
     require_matching_revision(
-        command.expected_visit_revision, visit["clinical_revision"]
+        command.expected_source_decision_revision, source.source_revision
     )
-    claim = next(
-        (row for row in claims if row["appointment_id"] == command.appointment_id), None
+    require_matching_revision(
+        command.expected_followup_revision, source.followup_revision
     )
-    if claim is None or claim["state"] != "ACTIVE":
+    claim = source.claim
+    if claim["state"] != "ACTIVE":
         raise ContractError(409)
     require_matching_revision(command.expected_claim_revision, claim["revision"])
-    latest_deadline = connection.scalar(
+    require_matching_revision(
+        command.expected_appointment_revision, source.appointment_revision
+    )
+    latest_event = (
+        connection.execute(
+            text("""
+                SELECT authorization_revision, new_deadline
+                FROM public.followup_authorization_events
+                WHERE organization_id=:tenant AND claim_id=:claim
+                ORDER BY authorization_revision DESC LIMIT 1
+            """),
+            {"tenant": actor.organization_id, "claim": claim["id"]},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    current_authorization_revision = (
+        latest_event["authorization_revision"] if latest_event else 0
+    )
+    require_matching_revision(
+        command.expected_authorization_revision, current_authorization_revision
+    )
+    legacy_deadline = connection.scalar(
         text("""
-            SELECT COALESCE(max(extended_deadline), :deadline)
-            FROM public.followup_extensions
+            SELECT max(extended_deadline) FROM public.followup_extensions
             WHERE organization_id=:tenant AND claim_id=:claim
         """),
-        {
-            "tenant": actor.organization_id,
-            "claim": claim["id"],
-            "deadline": claim["approved_deadline"],
-        },
+        {"tenant": actor.organization_id, "claim": claim["id"]},
     )
+    latest_deadline = max(
+        deadline
+        for deadline in (
+            claim["approved_deadline"],
+            latest_event["new_deadline"] if latest_event else None,
+            legacy_deadline,
+        )
+        if deadline is not None
+    )
+    if command.extended_deadline < source.completion_date:
+        raise ContractError(422)
     try:
         extension_must_not_shorten(latest_deadline, command.extended_deadline)
     except ValueError as invalid:
         raise ContractError(422) from invalid
-    decision = dict(visit["followup_decision"] or {})
-    decision.update(
-        {
-            "extension_claim_id": str(claim["id"]),
-            "extension_deadline": command.extended_deadline.isoformat(),
-            "extension_evidence_id": str(uuid4()),
-        }
-    )
-    revision, clinical_id, issued_at, audit_id = _clinical_revision(
+    if (source.decision or {}).get("kind") == "OPTED_OUT" or (
+        actor.role == "RECEPTIONIST"
+        and source.decision_actor_role == "DOCTOR_OWNER"
+        and (source.decision or {}).get("kind") == "DEADLINE"
+        and command.extended_deadline
+        > date.fromisoformat(source.decision["deadline_date"])
+    ):
+        raise ContractError(409)
+    revision = _sql_write(
         connection,
-        actor,
-        visit_id,
-        _ClinicalChange(decision, "EXTENSION", command.reason),
-    )
-    connection.execute(
-        text("""
-            INSERT INTO public.followup_extensions
-                (id, organization_id, source_visit_id, claim_id, appointment_id,
-                 prior_deadline, extended_deadline, issuing_doctor_staff_id,
-                 reason, issued_at, expected_source_revision,
-                 expected_claim_revision, clinical_revision_id, clinical_audit_id)
-            VALUES (:id, :tenant, :visit, :claim, :appointment, :prior, :deadline,
-                    :doctor, :reason, :issued_at, :source_revision,
-                    :claim_revision, :clinical_id, :audit_id)
-        """),
+        """
+            SELECT public.extend_followup_claim_ordered(
+                :tenant, :claim, CAST(:expected AS jsonb), CAST(:extension AS jsonb))
+        """,
         {
-            "id": uuid4(),
             "tenant": actor.organization_id,
-            "visit": visit_id,
             "claim": claim["id"],
-            "appointment": claim["appointment_id"],
-            "prior": latest_deadline,
-            "deadline": command.extended_deadline,
-            "doctor": actor.staff_id,
-            "reason": command.reason,
-            "issued_at": issued_at,
-            "source_revision": command.expected_visit_revision,
-            "claim_revision": command.expected_claim_revision,
-            "clinical_id": clinical_id,
-            "audit_id": audit_id,
+            "expected": json.dumps(
+                {
+                    **_expected(source),
+                    "claim_revision": command.expected_claim_revision,
+                    "authorization_revision": command.expected_authorization_revision,
+                    "appointment_revision": command.expected_appointment_revision,
+                }
+            ),
+            "extension": json.dumps(
+                {
+                    "deadline_date": command.extended_deadline.isoformat(),
+                    "reason": command.reason,
+                },
+                allow_nan=False,
+            ),
         },
     )
+    event = connection.execute(
+        text("""
+            SELECT id, actor_role FROM public.followup_authorization_events
+            WHERE organization_id=:tenant AND claim_id=:claim
+              AND authorization_revision=:revision AND kind='EXTENSION'
+        """),
+        {"tenant": actor.organization_id, "claim": claim["id"], "revision": revision},
+    ).one()
     projection = {
         "visit_id": str(visit_id),
         "appointment_id": str(claim["appointment_id"]),
         "extended_deadline": command.extended_deadline.isoformat(),
         "revision": revision,
         "claim_revision": claim["revision"],
+        "claim_id": str(claim["id"]),
+        "authorization_revision": revision,
+        "source_decision_revision": source.source_revision,
+        "visit_revision": source.visit_revision,
+        "followup_revision": source.followup_revision,
+        "appointment_revision": source.appointment_revision,
+        "event_id": str(event.id),
+        "actor_role": event.actor_role,
     }
     _store_receipt(connection, receipt, projection, revision)
-    return projection
+    return projection, revision

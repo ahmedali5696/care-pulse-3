@@ -1,15 +1,15 @@
 """One atomic Routine booking engine for New Examinations and preferential care."""
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID
 
-from sqlalchemy import Connection, insert, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import Connection, text
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from carepulse.appointments.booking_contracts import BookAppointment
-from carepulse.appointments.followup_tables import followup_claims
 from carepulse.appointments.followups import qualify_followup
 from carepulse.appointments.persistence import (
     AppointmentDraft,
@@ -26,8 +26,9 @@ from carepulse.identity.contracts import (
 from carepulse.identity.receipts import (
     Receipt,
     TenantReceiptQuery,
+    assert_same_request,
     insert_tenant_receipt,
-    resolve_tenant_receipt,
+    lookup_tenant_receipt,
 )
 from carepulse.notifications.evidence import append_outbox, append_sensitive_audit
 from carepulse.patients.lifecycle import lock_patient_for_new_appointment
@@ -48,6 +49,123 @@ from carepulse.policies.versions import StalePolicyRevision, lock_policy_heads
 class BookingPlan:
     draft: AppointmentDraft
     claim: dict | None = None
+
+
+_RECEIPT_FIELDS = {
+    "id",
+    "patient_id",
+    "doctor_staff_id",
+    "service_date",
+    "status",
+    "service_type",
+    "classification",
+    "lane",
+    "booking_mode",
+    "starts_at",
+    "ends_at",
+    "number",
+    "revision",
+    "base_egp",
+    "discount_type",
+    "discount_value",
+    "discount_reason",
+    "is_free",
+    "net_egp",
+    "pricing_version",
+    "creation_standard_base_egp",
+    "history",
+}
+_CREATED_FIELDS = {
+    "action",
+    "old_status",
+    "new_status",
+    "old_service_date",
+    "new_service_date",
+    "old_number",
+    "new_number",
+    "appointment_revision",
+    "reason",
+}
+
+
+def _committed_booking(
+    connection: Connection, receipt: TenantReceiptQuery, command: BookAppointment
+):
+    """Check current resource and every saved field before disclosing a key conflict."""
+    actor = receipt.actor
+    stored = lookup_tenant_receipt(
+        connection,
+        actor.organization_id,
+        actor.staff_id,
+        receipt.operation,
+        receipt.idempotency_key,
+    )
+    if stored is None:
+        return None
+    projection = stored["result_projection"]
+    if (
+        not isinstance(projection, dict)
+        or set(projection) - _RECEIPT_FIELDS
+        or type(stored["result_revision"]) is not int
+        or any(
+            isinstance(value, (dict, list))
+            for name, value in projection.items()
+            if name != "history"
+        )
+    ):
+        raise ContractError(403)
+    try:
+        appointment_id = UUID(projection["id"])
+        history = projection["history"]
+    except (KeyError, TypeError, ValueError) as invalid:
+        raise ContractError(403) from invalid
+    current = appointment_detail(connection, actor, appointment_id)
+    if command.source_visit_id is not None:
+        linkage = connection.scalar(
+            text("""
+                SELECT 1 FROM public.visits v
+                JOIN public.appointments a
+                  ON a.organization_id=v.organization_id AND a.id=v.appointment_id
+                WHERE v.organization_id=:tenant AND v.id=:source_visit
+                  AND v.patient_id=:patient AND v.doctor_staff_id=:doctor
+                  AND a.patient_id=v.patient_id AND a.doctor_staff_id=v.doctor_staff_id
+            """),
+            {
+                "tenant": actor.organization_id,
+                "source_visit": command.source_visit_id,
+                "patient": UUID(current["patient_id"]),
+                "doctor": UUID(current["doctor_staff_id"]),
+            },
+        )
+        if linkage is None:
+            raise ContractError(404)
+        if current["service_type"] == "FOLLOW_UP" and not connection.scalar(
+            text("""
+                SELECT 1 FROM public.followup_claims
+                WHERE organization_id=:tenant AND appointment_id=:appointment
+                  AND source_visit_id=:source_visit
+            """),
+            {
+                "tenant": actor.organization_id,
+                "appointment": appointment_id,
+                "source_visit": command.source_visit_id,
+            },
+        ):
+            raise ContractError(404)
+    if (
+        current["patient_id"] != projection.get("patient_id")
+        or current["doctor_staff_id"] != projection.get("doctor_staff_id")
+        or not isinstance(history, list)
+        or len(history) != 1
+        or not isinstance(history[0], dict)
+        or history[0].get("action") != "CREATED"
+        or history[0].get("reason", object()) is not None
+        or set(history[0]) - _CREATED_FIELDS
+        or any(isinstance(value, (dict, list)) for value in history[0].values())
+    ):
+        raise ContractError(403)
+    assert_same_request(stored["request_digest"], receipt.request_digest)
+    return projection, stored["result_revision"]
 
 
 def _doctor_id(connection: Connection, tenant):
@@ -164,14 +282,18 @@ def _booking_plan(connection: Connection, actor, command, now):
     claim = None
     service_type = "NEW_EXAMINATION"
     if command.requested_service_type == "FOLLOW_UP":
+        if command.source_family == "v1":
+            raise ContractError(409)
         qualification = qualify_followup(
             connection,
             actor.organization_id,
             command.patient_id,
             command.service_date,
             command.source_visit_id,
-            command.expected_source_revision,
+            command.expected_source_decision_revision,
             now,
+            expected_visit_revision=command.expected_visit_revision,
+            exception_declared=command.new_booking_date_exception is not None,
         )
         if qualification.outcome == "NOT_FOUND":
             raise ContractError(404)
@@ -180,6 +302,15 @@ def _booking_plan(connection: Connection, actor, command, now):
         if qualification.outcome == "PREFERENTIAL":
             if command.fallback_acknowledgment is not None:
                 raise ContractError(409, "STALE_REVISION")
+            beyond_deadline = command.service_date > qualification.approved_deadline
+            if beyond_deadline != (command.new_booking_date_exception is not None):
+                raise ContractError(409 if beyond_deadline else 422)
+            if (
+                beyond_deadline
+                and actor.role == "DOCTOR_OWNER"
+                and not command.new_booking_date_exception.reason
+            ):
+                raise ContractError(422)
             service_type = "FOLLOW_UP"
             state = current_price_state(connection, actor.organization_id)
             claim = {
@@ -190,6 +321,8 @@ def _booking_plan(connection: Connection, actor, command, now):
                 "policy_snapshot": {
                     "source_visit_id": str(qualification.source_visit_id),
                     "source_revision": qualification.source_revision,
+                    "source_decision_revision": qualification.source_decision_revision,
+                    "visit_revision": qualification.visit_revision,
                     "doctor_staff_id": str(doctor_id),
                     "actor_staff_id": str(actor.staff_id),
                     "authorized": True,
@@ -239,14 +372,14 @@ def book_appointment(
         idempotency_key,
         normalized_request_digest(command),
     )
-    cached = resolve_tenant_receipt(connection, receipt)
+    cached = _committed_booking(connection, receipt, command)
     if cached is not None:
         return cached[0]
     lock_patient_for_new_appointment(
         connection, actor.organization_id, command.patient_id
     )
     # A concurrent same-patient request may have committed while the row was locked.
-    cached = resolve_tenant_receipt(connection, receipt)
+    cached = _committed_booking(connection, receipt, command)
     if cached is not None:
         return cached[0]
     try:
@@ -261,26 +394,82 @@ def book_appointment(
         connection, actor.organization_id, command.service_date
     )
     plan = _booking_plan(connection, actor, command, datetime.now(UTC))
-    try:
-        appointment_id, _ = insert_appointment_records(
-            connection, actor, plan.draft, number
-        )
-    except IntegrityError as invalid:
-        if invalid.orig.sqlstate == "23505":
-            raise ContractError(409) from invalid
-        raise
     if plan.claim is not None:
-        connection.execute(
-            insert(followup_claims).values(
-                id=uuid4(),
-                organization_id=actor.organization_id,
-                appointment_id=appointment_id,
-                patient_id=command.patient_id,
-                doctor_staff_id=plan.draft.doctor_staff_id,
-                **plan.claim,
-                state="ACTIVE",
+        claim = plan.claim
+        snapshot = plan.draft.price_snapshot
+        booking = {
+            "service_date": command.service_date.isoformat(),
+            "booking_mode": plan.draft.booking_mode,
+            "starts_at": plan.draft.starts_at.isoformat()
+            if plan.draft.starts_at
+            else None,
+            "ends_at": plan.draft.ends_at.isoformat() if plan.draft.ends_at else None,
+            "allocated_number": number,
+            "price_snapshot": {
+                field: str(snapshot[field]) if snapshot[field] is not None else None
+                for field in (
+                    "base_egp",
+                    "discount_type",
+                    "discount_value",
+                    "discount_reason",
+                    "is_free",
+                    "net_egp",
+                    "pricing_version",
+                    "creation_standard_base_egp",
+                )
+            },
+        }
+        if command.new_booking_date_exception is not None:
+            booking["new_booking_date_exception"] = (
+                command.new_booking_date_exception.model_dump(
+                    mode="json", exclude_unset=True
+                )
             )
+        expected = {
+            "source_revision": claim["policy_snapshot"]["source_decision_revision"],
+            "clinical_revision": claim["policy_snapshot"]["visit_revision"],
+            "policy_version": claim["policy_snapshot"]["policy_revision"],
+        }
+        try:
+            claim_id = connection.scalar(
+                text("""
+                SELECT public.create_followup_claim_ordered(
+                    :tenant, :visit, CAST(:expected AS jsonb), CAST(:booking AS jsonb))
+            """),
+                {
+                    "tenant": actor.organization_id,
+                    "visit": claim["source_visit_id"],
+                    "expected": json.dumps(expected),
+                    "booking": json.dumps(booking),
+                },
+            )
+        except DBAPIError as invalid:
+            sqlstate = getattr(invalid.orig, "sqlstate", None)
+            if sqlstate in ("40001", "23505"):
+                raise ContractError(409, "STALE_REVISION") from invalid
+            if sqlstate == "23514":
+                raise ContractError(409) from invalid
+            if sqlstate == "42501":
+                raise ContractError(403) from invalid
+            raise
+        appointment_id = connection.scalar(
+            text("""
+                SELECT appointment_id FROM public.followup_claims
+                WHERE organization_id=:tenant AND id=:claim
+            """),
+            {"tenant": actor.organization_id, "claim": claim_id},
         )
+        if appointment_id is None:
+            raise ContractError(409)
+    else:
+        try:
+            appointment_id, _ = insert_appointment_records(
+                connection, actor, plan.draft, number
+            )
+        except IntegrityError as invalid:
+            if invalid.orig.sqlstate == "23505":
+                raise ContractError(409) from invalid
+            raise
     projection = appointment_detail(connection, actor, appointment_id)
     append_sensitive_audit(
         connection,

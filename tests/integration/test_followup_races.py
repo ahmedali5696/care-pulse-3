@@ -29,6 +29,9 @@ from test_followup_persistence import (
     _v2_source,
 )
 from test_followup_persistence import legacy_followup_storage as legacy_followup_storage  # noqa: PLC0414
+from test_followup_persistence import (
+    provenance_followup_storage as provenance_followup_storage,  # noqa: PLC0414
+)
 
 
 def _wait_for_pg_blocker(observer, pid):
@@ -45,9 +48,14 @@ def _wait_for_pg_blocker(observer, pid):
     "first", ["decision", "extension", "restriction", "release", "consume"]
 )
 def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger(
-    appointment_storage, first
+    request, first
 ):
-    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    storage = request.getfixturevalue(
+        "provenance_followup_storage"
+        if first in ("release", "consume")
+        else "appointment_storage"
+    )
+    runtime, migration, (tenant, _), (doctor, _) = storage
     with transaction(runtime, tenant) as connection:
         source = _v2_source(connection, tenant, doctor)
         claim = _v2_command(
@@ -149,9 +157,14 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
 
 @pytest.mark.parametrize("later", ["restriction", "release", "consume"])
 def test_v2_extension_first_remains_historical_after_later_restriction_or_terminal(
-    appointment_storage, later
+    request, later
 ):
-    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    storage = request.getfixturevalue(
+        "provenance_followup_storage"
+        if later in ("release", "consume")
+        else "appointment_storage"
+    )
+    runtime, migration, (tenant, _), (doctor, _) = storage
     with transaction(runtime, tenant) as connection:
         source = _v2_source(connection, tenant, doctor)
         claim = _v2_command(
@@ -240,9 +253,9 @@ def test_v2_extension_first_remains_historical_after_later_restriction_or_termin
 
 @pytest.mark.parametrize("status", ["Cancelled", "Completed"])
 def test_v2_claim_waits_for_release_and_cannot_reuse_consumed_source(
-    appointment_storage, status
+    provenance_followup_storage, status
 ):
-    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    runtime, migration, (tenant, _), (doctor, _) = provenance_followup_storage
     with transaction(runtime, tenant) as connection:
         source = _v2_source(connection, tenant, doctor)
         claim = _v2_command(
@@ -690,7 +703,9 @@ def test_claim_first_staged_booking_contends_with_terminal_before_commit(
             )
 
 
-def _extend(connection, tenant, source, record, *, audit_correlation=None):
+def _extend(
+    connection, tenant, source, record, *, audit_correlation=None, deadline_offset=8
+):
     connection.execute(
         text("SELECT set_config('app.staff_id', :doctor, true)"),
         {"doctor": str(source["doctor"])},
@@ -712,8 +727,9 @@ def _extend(connection, tenant, source, record, *, audit_correlation=None):
                     "kind": "DEFAULT",
                     "eligible": True,
                     "extension_claim_id": str(record["claim"]),
+                    "extension_evidence_id": str(uuid4()),
                     "extension_deadline": (
-                        source["day"] + timedelta(days=8)
+                        source["day"] + timedelta(days=deadline_offset)
                     ).isoformat(),
                 }
             ),
@@ -764,7 +780,7 @@ def _extend(connection, tenant, source, record, *, audit_correlation=None):
             "claim": record["claim"],
             "appointment": record["id"],
             "prior": source["day"] + timedelta(days=7),
-            "extended": source["day"] + timedelta(days=8),
+            "extended": source["day"] + timedelta(days=deadline_offset),
             "doctor": source["doctor"],
             "source_revision": revision.revision - 1,
             "clinical": revision.id,
