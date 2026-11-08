@@ -13,7 +13,11 @@ from zoneinfo import ZoneInfo
 import pytest
 from carepulse.appointments.book import book_appointment
 from carepulse.appointments.booking_contracts import BookAppointment
-from carepulse.appointments.persistence import persist_appointment
+from carepulse.appointments.persistence import (
+    allocate_day_number,
+    insert_appointment_records,
+    persist_appointment,
+)
 from carepulse.appointments.queries import appointment_detail
 from carepulse.db import transaction
 from carepulse.identity.contracts import normalized_request_digest
@@ -21,7 +25,7 @@ from carepulse.identity.receipts import Receipt, insert_tenant_receipt
 from carepulse.main import app
 from carepulse.notifications.evidence import append_outbox, append_sensitive_audit
 from sqlalchemy import text
-from test_appointment_persistence import _admit_saved, _draft, _query
+from test_appointment_persistence import _admit_saved, _draft, _patient, _query
 from test_booking import (
     booking_body,
     booking_effects,
@@ -1077,6 +1081,46 @@ def test_signed_saved_receipt_hidden_appointment_is_non_oracular(followup_clinic
     body, _, saved = _seed_historical_booking_receipt(
         clinic, created["data"]["id"], source
     )
+    foreign_doctor = uuid4()
+    foreign_user = f"synthetic-b10-foreign-{uuid4()}"
+    foreign_email = f"synthetic-b10-foreign-{uuid4()}@example.invalid"
+    with clinic.migration.begin() as connection:
+        connection.execute(
+            text("""
+                INSERT INTO public."user"
+                    (id, name, email, "emailVerified", "createdAt", "updatedAt")
+                VALUES (:user, 'Synthetic Foreign Doctor', :email, true, now(), now())
+            """),
+            {"user": foreign_user, "email": foreign_email},
+        )
+        connection.execute(
+            text("""
+                INSERT INTO public.staff_accounts
+                    (id, organization_id, auth_user_id, verified_email,
+                     role, enabled, verified)
+                VALUES (:doctor, :tenant, :user, :email, 'DOCTOR_OWNER', true, true)
+            """),
+            {
+                "doctor": foreign_doctor,
+                "tenant": clinic.other,
+                "user": foreign_user,
+                "email": foreign_email,
+            },
+        )
+        foreign_patient = _patient(connection, clinic.other)
+        foreign_day = source["day"] + timedelta(days=2)
+        foreign_appointment, _ = insert_appointment_records(
+            connection,
+            _actor(clinic.other, foreign_doctor),
+            _draft(foreign_patient, foreign_doctor, service_date=foreign_day),
+            allocate_day_number(connection, clinic.other, foreign_day),
+        )
+    with clinic.migration.connect() as connection:
+        foreign_before = appointment_detail(
+            connection, _actor(clinic.other, foreign_doctor), foreign_appointment
+        )
+    assert foreign_before["id"] == str(foreign_appointment)
+    assert foreign_before["history"][0]["action"] == "CREATED"
     key = str(uuid4())
     actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
     with transaction(clinic.runtime, clinic.tenant) as connection:
@@ -1089,12 +1133,22 @@ def test_signed_saved_receipt_hidden_appointment_is_non_oracular(followup_clinic
                 request_digest=normalized_request_digest(
                     BookAppointment.model_validate(body)
                 ),
-                result_projection={**saved, "id": str(uuid4())},
+                result_projection={**saved, "id": str(foreign_appointment)},
                 result_revision=0,
                 organization_id=clinic.tenant,
                 staff_id=actor.staff_id,
             ),
         )
+    receipt_query = text("""
+        SELECT request_digest, result_projection, result_revision
+        FROM public.idempotency_receipts
+        WHERE organization_id=:tenant AND operation='appointments.book'
+          AND idempotency_key=:key
+    """)
+    receipt_params = {"tenant": clinic.tenant, "key": key}
+    with clinic.migration.connect() as connection:
+        immutable_receipt = connection.execute(receipt_query, receipt_params).one()
+    assert immutable_receipt.result_projection["id"] == str(foreign_appointment)
     before = booking_effects(clinic)
     matching = booking_request(clinic, clinic.owner, body=body, key=key)
     changed = booking_request(
@@ -1113,6 +1167,16 @@ def test_signed_saved_receipt_hidden_appointment_is_non_oracular(followup_clinic
         )
         UUID(response["error"]["request_id"])
     assert booking_effects(clinic) == before
+    with clinic.migration.connect() as connection:
+        assert (
+            connection.execute(receipt_query, receipt_params).one() == immutable_receipt
+        )
+        assert (
+            appointment_detail(
+                connection, _actor(clinic.other, foreign_doctor), foreign_appointment
+            )
+            == foreign_before
+        )
 
 
 def test_signed_duplicate_json_keys_and_fresh_v1_source_writer_are_rejected(

@@ -763,3 +763,227 @@ def test_ordered_writer_requires_declaration_and_consumes_one_reserved_number(
     finally:
         runtime.dispose()
         migration.dispose()
+
+
+def test_final_writer_new_date_denials_rollback_and_evidence_links(
+    admin, empty_database
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, OFFSET_AFTER)
+        _publish_bookable_policies(migration, tenant)
+        with transaction(runtime, tenant) as connection:
+            source = _v2_source(connection, tenant, doctor)
+            day = (source["day"] + timedelta(days=10)).isoformat()
+            booking = _priced_booking(source, service_date=day)
+            connection.execute(
+                text("SELECT set_config('app.staff_id', :doctor, true)"),
+                {"doctor": str(doctor)},
+            )
+            tables = (
+                "appointments",
+                "appointment_number_assignments",
+                "appointment_history",
+                "appointment_price_snapshots",
+                "followup_claims",
+                "followup_authorization_events",
+                "sensitive_audit",
+                "idempotency_receipts",
+                "outbox_events",
+            )
+
+            def effect_counts():
+                return tuple(
+                    connection.scalar(
+                        text(
+                            f"SELECT count(*) FROM public.{table} WHERE organization_id=:tenant"
+                        ),
+                        {"tenant": tenant},
+                    )
+                    for table in tables
+                )
+
+            before = effect_counts()
+            for declaration in (
+                {},
+                {"new_booking_date_exception": None},
+                {
+                    "new_booking_date_exception": {
+                        "selected_service_date": day,
+                        "reason": None,
+                    }
+                },
+                {
+                    "new_booking_date_exception": {
+                        "selected_service_date": source["day"].isoformat(),
+                        "reason": "Wrong date",
+                    }
+                },
+                {
+                    "new_booking_date_exception": {
+                        "selected_service_date": day,
+                        "reason": "Valid",
+                        "extra": True,
+                    }
+                },
+                {"new_booking_date_exception": {"selected_service_date": day}},
+            ):
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    _v2_command(
+                        connection,
+                        "create_followup_claim_ordered",
+                        source,
+                        **{**booking, **declaration},
+                    )
+                assert denied.value.orig.sqlstate == "23514"
+                assert effect_counts() == before
+                _assert_no_guarded_booking_effects(connection, tenant, day)
+
+            declaration = {
+                "selected_service_date": day,
+                "reason": "Doctor-approved visit",
+            }
+            claim = _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                source,
+                **booking,
+                new_booking_date_exception=declaration,
+            )
+        with migration.connect() as connection:
+            joined = (
+                connection.execute(
+                    text("""
+                    SELECT c.source_visit_id, c.source_appointment_id,
+                           c.patient_id, c.doctor_staff_id, c.state,
+                           c.approved_deadline, c.policy_snapshot,
+                           a.id AS appointment_id, a.service_date, a.current_number,
+                           n.number AS assigned_number, h.action, h.new_service_date,
+                           h.new_number, h.actor_staff_id AS history_actor,
+                           h.actor_role AS history_role, h.reason AS history_reason,
+                           h.price_snapshot_appointment_id AS history_price,
+                           p.service_type, p.base_egp, p.net_egp,
+                           p.pricing_version, p.entitlement_provenance,
+                           e.id AS event_id, e.kind, e.source_visit_id AS event_source,
+                           e.selected_date, e.prior_deadline, e.new_deadline,
+                           e.actor_staff_id AS event_actor, e.actor_role AS event_role,
+                           e.reason AS event_reason, e.occurred_at AS event_at,
+                           e.policy_version, e.source_revision, e.clinical_revision,
+                           e.authorization_revision, e.claim_revision, e.appointment_revision,
+                           au.actor_staff_id AS audit_actor, au.actor_role AS audit_role,
+                           au.action AS audit_action, au.correlation_id,
+                           au.occurred_at AS audit_at,
+                           v.appointment_id AS visit_appointment
+                    FROM public.followup_claims c
+                    JOIN public.visits v ON (v.organization_id,v.id)=(c.organization_id,c.source_visit_id)
+                    JOIN public.appointments a ON (a.organization_id,a.id)=(c.organization_id,c.appointment_id)
+                    JOIN public.appointment_number_assignments n
+                      ON (n.organization_id,n.id)=(a.organization_id,a.current_assignment_id)
+                    JOIN public.appointment_history h
+                      ON (h.organization_id,h.appointment_id)=(a.organization_id,a.id)
+                     AND h.action='CREATED'
+                    JOIN public.appointment_price_snapshots p
+                      ON (p.organization_id,p.appointment_id)=(a.organization_id,a.id)
+                    JOIN public.followup_authorization_events e
+                      ON (e.organization_id,e.claim_id)=(c.organization_id,c.id)
+                    JOIN public.sensitive_audit au
+                      ON (au.organization_id,au.id)=(e.organization_id,e.sensitive_audit_id)
+                    WHERE c.organization_id=:tenant AND c.id=:claim
+                """),
+                    {"tenant": tenant, "claim": claim},
+                )
+                .mappings()
+                .one()
+            )
+            assert (joined["source_visit_id"], joined["event_source"]) == (
+                source["visit"],
+                source["visit"],
+            )
+            assert (joined["source_appointment_id"], joined["visit_appointment"]) == (
+                source["appointment"],
+                source["appointment"],
+            )
+            assert (
+                joined["patient_id"],
+                joined["doctor_staff_id"],
+                joined["state"],
+            ) == (source["patient"], doctor, "ACTIVE")
+            assert (
+                joined["service_date"].isoformat(),
+                joined["selected_date"].isoformat(),
+                joined["new_deadline"].isoformat(),
+                joined["new_service_date"].isoformat(),
+            ) == (day, day, day, day)
+            assert (
+                joined["prior_deadline"]
+                == joined["approved_deadline"]
+                == (source["day"] + timedelta(days=7))
+            )
+            assert (
+                joined["current_number"],
+                joined["assigned_number"],
+                joined["new_number"],
+            ) == (1, 1, 1)
+            assert (
+                joined["action"],
+                joined["history_actor"],
+                joined["history_role"],
+                joined["history_reason"],
+                joined["history_price"],
+            ) == ("CREATED", doctor, "DOCTOR_OWNER", None, joined["appointment_id"])
+            assert (
+                joined["service_type"],
+                str(joined["base_egp"]),
+                str(joined["net_egp"]),
+                joined["pricing_version"],
+            ) == ("FOLLOW_UP", "100.00", "100.00", 2)
+            assert (
+                joined["kind"],
+                joined["event_actor"],
+                joined["event_role"],
+                joined["event_reason"],
+                joined["policy_version"],
+                joined["source_revision"],
+                joined["clinical_revision"],
+                joined["authorization_revision"],
+                joined["claim_revision"],
+                joined["appointment_revision"],
+            ) == (
+                "NEW_DATE",
+                doctor,
+                "DOCTOR_OWNER",
+                declaration["reason"],
+                1,
+                0,
+                0,
+                1,
+                1,
+                0,
+            )
+            assert (
+                joined["audit_actor"],
+                joined["audit_role"],
+                joined["audit_action"],
+                joined["correlation_id"],
+            ) == (doctor, "DOCTOR_OWNER", "FOLLOWUP_NEW_DATE", str(joined["event_id"]))
+            assert joined["audit_at"] == joined["event_at"]
+            assert joined["policy_snapshot"]["new_date_event_id"] == str(
+                joined["event_id"]
+            )
+            assert (
+                joined["policy_snapshot"]["new_booking_date_exception"] == declaration
+            )
+            assert joined["entitlement_provenance"] == joined["policy_snapshot"]
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT last_number FROM public.appointment_day_counters
+                    WHERE organization_id=:tenant AND service_date=CAST(:day AS date)
+                """),
+                    {"tenant": tenant, "day": day},
+                )
+                == 1
+            )
+    finally:
+        runtime.dispose()
+        migration.dispose()
