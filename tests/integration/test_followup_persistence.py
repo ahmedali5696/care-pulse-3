@@ -68,7 +68,7 @@ def provenance_followup_storage(admin, empty_database):
         migration.dispose()
 
 
-def _v2_source(connection, tenant, doctor):
+def _v2_source(connection, tenant, doctor, *, completion_actor=None):
     strict_quote = None
     if connection.scalar(
         text("""
@@ -140,7 +140,14 @@ def _v2_source(connection, tenant, doctor):
             ),
             "pricing_version": price["current_version"],
         }
-    appointment = _admitted_source(connection, tenant, doctor, complete=True)
+    appointment = _admitted_source(
+        connection,
+        tenant,
+        doctor,
+        actor=completion_actor,
+        role="RECEPTIONIST" if completion_actor else "DOCTOR_OWNER",
+        complete=True,
+    )
     visit, completion, patient = connection.execute(
         text("""
             SELECT c.visit_id, (c.completed_at AT TIME ZONE 'Africa/Cairo')::date,
@@ -621,6 +628,266 @@ def test_current_followup_qualification_uses_live_policy_window(
             source["day"] + timedelta(days=eligible_offset),
         )
         assert qualification(ineligible_offset).outcome == "FALLBACK"
+
+
+def test_v2_receptionist_completion_current_policy_and_extension_survive_denied_release(
+    appointment_storage,
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    staff = _receptionist(migration, tenant)
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor, completion_actor=staff)
+        completion = connection.execute(
+            text("""
+                SELECT a.examination_occurred, a.actor_staff_id, a.actor_role,
+                       v.clinical_revision, v.followup_decision,
+                       h.actor_staff_id, h.actor_role
+                FROM public.completion_attestations a
+                JOIN public.visits v ON (v.organization_id, v.id) =
+                    (a.organization_id, a.visit_id)
+                JOIN public.appointment_history h ON
+                    (h.organization_id, h.appointment_id, h.appointment_revision) =
+                    (a.organization_id, a.appointment_id, a.completion_history_revision)
+                WHERE a.organization_id=:tenant AND a.visit_id=:visit
+            """),
+            {"tenant": tenant, "visit": source["visit"]},
+        ).one()
+        assert completion == (
+            True,
+            staff,
+            "RECEPTIONIST",
+            0,
+            None,
+            staff,
+            "RECEPTIONIST",
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinical_revisions WHERE visit_id=:visit"
+                ),
+                {"visit": source["visit"]},
+            )
+            == 0
+        )
+        connection.execute(
+            text("SELECT set_config('app.staff_id', :actor, true)"),
+            {"actor": str(doctor)},
+        )
+        assert (
+            append_version(
+                connection,
+                tenant,
+                "FOLLOWUP",
+                {"completion_day_zero": True, "last_day_inclusive": 3},
+                1,
+                actor_staff_id=str(doctor),
+            )
+            == 2
+        )
+        now = datetime.now(UTC) + timedelta(seconds=2)
+        for offset, outcome in ((3, "PREFERENTIAL"), (4, "FALLBACK")):
+            qualification = qualify_followup(
+                connection,
+                tenant,
+                source["patient"],
+                source["day"] + timedelta(days=offset),
+                source["visit"],
+                0,
+                now,
+                expected_visit_revision=0,
+            )
+            assert qualification.outcome == outcome
+        claim = _v2_command(
+            connection,
+            "create_followup_claim",
+            source,
+            actor=staff,
+            expected={
+                "source_revision": 0,
+                "clinical_revision": 0,
+                "policy_version": 2,
+            },
+            **_v2_booking(source, 3),
+        )
+        record = _v2_record(connection, claim)
+        frozen_claim = connection.scalar(
+            text("SELECT to_jsonb(c) FROM public.followup_claims c WHERE id=:id"),
+            {"id": claim},
+        )
+        frozen_price = connection.scalar(
+            text(
+                "SELECT to_jsonb(p) FROM public.appointment_price_snapshots p WHERE appointment_id=:id"
+            ),
+            {"id": record["id"]},
+        )
+        assert (
+            frozen_claim["approved_deadline"]
+            == (source["day"] + timedelta(days=3)).isoformat()
+        )
+        assert frozen_claim["policy_snapshot"] == frozen_price["entitlement_provenance"]
+        assert (
+            _v2_command(
+                connection,
+                "extend_followup_claim",
+                source,
+                actor=staff,
+                reference=claim,
+                expected={
+                    "source_revision": 0,
+                    "clinical_revision": 0,
+                    "policy_version": 2,
+                    "claim_revision": 1,
+                    "appointment_revision": 0,
+                    "authorization_revision": 0,
+                },
+                deadline_date=(source["day"] + timedelta(days=12)).isoformat(),
+                reason="Receptionist confirmed extension",
+            )
+            == 1
+        )
+        authorization = connection.execute(
+            text("""
+                SELECT e.id, e.kind, e.prior_deadline, e.new_deadline,
+                       e.actor_staff_id, e.actor_role, e.reason
+                FROM public.followup_authorization_events e
+                WHERE e.organization_id=:tenant AND e.claim_id=:claim
+            """),
+            {"tenant": tenant, "claim": claim},
+        ).one()
+        assert tuple(authorization)[1:] == (
+            "EXTENSION",
+            source["day"] + timedelta(days=3),
+            source["day"] + timedelta(days=12),
+            staff,
+            "RECEPTIONIST",
+            "Receptionist confirmed extension",
+        )
+
+    with transaction(runtime, tenant) as connection:
+        connection.execute(
+            text("SELECT set_config('app.staff_id', :actor, true)"),
+            {"actor": str(doctor)},
+        )
+        assert (
+            append_version(
+                connection,
+                tenant,
+                "FOLLOWUP",
+                {"completion_day_zero": True, "last_day_inclusive": 1},
+                2,
+                actor_staff_id=str(doctor),
+            )
+            == 3
+        )
+
+    with transaction(runtime, tenant) as connection:
+        tables = (
+            "appointments",
+            "appointment_history",
+            "appointment_price_snapshots",
+            "appointment_day_counters",
+            "followup_claims",
+            "followup_authorization_events",
+        )
+        counts = {
+            table: connection.scalar(
+                text(
+                    f"SELECT count(*) FROM public.{table} WHERE organization_id=:tenant"
+                ),
+                {"tenant": tenant},
+            )
+            for table in tables
+        }
+        with pytest.raises(DBAPIError) as outside, connection.begin_nested():
+            _v2_command(
+                connection,
+                "create_followup_claim",
+                source,
+                actor=staff,
+                expected={
+                    "source_revision": 0,
+                    "clinical_revision": 0,
+                    "policy_version": 3,
+                },
+                **_v2_booking(source, 10),
+            )
+        assert outside.value.orig.sqlstate == "23514"
+        with pytest.raises(DBAPIError) as release, connection.begin_nested():
+            _outcome(connection, tenant, doctor, record, status="Cancelled")
+        assert release.value.orig.sqlstate == "42501"
+        assert {
+            table: connection.scalar(
+                text(
+                    f"SELECT count(*) FROM public.{table} WHERE organization_id=:tenant"
+                ),
+                {"tenant": tenant},
+            )
+            for table in tables
+        } == counts
+        assert connection.execute(
+            text("SELECT state, revision FROM public.followup_claims WHERE id=:claim"),
+            {"claim": claim},
+        ).one() == ("ACTIVE", 1)
+        assert connection.execute(
+            text("SELECT status, revision FROM public.appointments WHERE id=:id"),
+            {"id": record["id"]},
+        ).one() == ("Booked", 0)
+        assert (
+            connection.scalar(
+                text("SELECT to_jsonb(c) FROM public.followup_claims c WHERE id=:id"),
+                {"id": claim},
+            )
+            == frozen_claim
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT to_jsonb(p) FROM public.appointment_price_snapshots p WHERE appointment_id=:id"
+                ),
+                {"id": record["id"]},
+            )
+            == frozen_price
+        )
+        assert (
+            connection.execute(
+                text("""
+                SELECT id, kind, prior_deadline, new_deadline,
+                       actor_staff_id, actor_role, reason
+                FROM public.followup_authorization_events
+                WHERE organization_id=:tenant AND claim_id=:claim
+            """),
+                {"tenant": tenant, "claim": claim},
+            ).one()
+            == authorization
+        )
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+
+    with migration.connect() as connection:
+        assert (
+            connection.execute(
+                text("""
+                SELECT completion.actor_staff_id, completion.actor_role,
+                       completion_audit.actor_staff_id, completion_audit.actor_role,
+                       extension.actor_staff_id, extension.actor_role,
+                       extension_audit.actor_staff_id, extension_audit.actor_role
+                FROM public.completion_attestations completion
+                JOIN public.sensitive_audit completion_audit
+                  ON (completion_audit.organization_id, completion_audit.id) =
+                     (completion.organization_id, completion.sensitive_audit_id)
+                JOIN public.followup_authorization_events extension
+                  ON (extension.organization_id, extension.source_visit_id) =
+                     (completion.organization_id, completion.visit_id)
+                JOIN public.sensitive_audit extension_audit
+                  ON (extension_audit.organization_id, extension_audit.id) =
+                     (extension.organization_id, extension.sensitive_audit_id)
+                WHERE completion.organization_id=:tenant AND completion.visit_id=:visit
+                  AND extension.claim_id=:claim
+            """),
+                {"tenant": tenant, "visit": source["visit"], "claim": claim},
+            ).one()
+            == (staff, "RECEPTIONIST") * 4
+        )
 
 
 def test_v2_ordered_new_date_extension_and_direct_terminal_fence(

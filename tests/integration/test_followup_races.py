@@ -45,6 +45,204 @@ def _wait_for_pg_blocker(observer, pid):
 
 
 @pytest.mark.parametrize(
+    "correction_first", [True, False], ids=["clinical-first", "extension-first"]
+)
+def test_current_head_doctor_clinical_correction_and_extension_preserve_independent_revisions(
+    appointment_storage, correction_first
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        claim = _v2_command(
+            connection, "create_followup_claim", source, **_v2_booking(source)
+        )
+        record = _v2_record(connection, claim)
+        frozen = connection.execute(
+            text("""
+                SELECT a.status, a.revision, a.service_date, p.net_egp,
+                       p.entitlement_provenance
+                FROM public.appointments a
+                JOIN public.appointment_price_snapshots p
+                  ON (p.organization_id,p.appointment_id)=(a.organization_id,a.id)
+                WHERE a.organization_id=:tenant AND a.id=:appointment
+            """),
+            {"tenant": tenant, "appointment": record["id"]},
+        ).one()
+
+    held, release, started = Event(), Event(), Event()
+    holder_pid, waiter_pid = [], []
+    extended_day = source["day"] + timedelta(days=9)
+
+    def correct(connection):
+        connection.execute(text("SET LOCAL lock_timeout = '5s'"))
+        connection.execute(text("SET LOCAL statement_timeout = '15s'"))
+        connection.execute(
+            text("SELECT set_config('app.staff_id', :doctor, true)"),
+            {"doctor": str(doctor)},
+        )
+        connection.execute(
+            text(
+                "SELECT set_config('app.clinical_reason', 'Synthetic correction race', true)"
+            )
+        )
+        connection.execute(
+            text("SELECT set_config('app.clinical_change_kind', 'CORRECTION', true)")
+        )
+        return connection.execute(
+            text(
+                "UPDATE public.visits SET diagnosis='Synthetic corrected finding' WHERE id=:visit"
+            ),
+            {"visit": source["visit"]},
+        ).rowcount
+
+    def extend(connection):
+        return _v2_command(
+            connection,
+            "extend_followup_claim",
+            source,
+            reference=claim,
+            expected={
+                "source_revision": 0,
+                "clinical_revision": 0,
+                "policy_version": 1,
+                "authorization_revision": 0,
+                "claim_revision": 1,
+                "appointment_revision": 0,
+            },
+            deadline_date=extended_day.isoformat(),
+            reason="Synthetic confirmed extension race",
+        )
+
+    def hold_first():
+        with transaction(runtime, tenant) as connection:
+            holder_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            outcome = correct(connection) if correction_first else extend(connection)
+            held.set()
+            assert release.wait(timeout=15)
+            return outcome
+
+    def wait_second():
+        assert held.wait(timeout=10)
+        with transaction(runtime, tenant) as connection:
+            waiter_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            started.set()
+            return extend(connection) if correction_first else correct(connection)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        holder = pool.submit(hold_first)
+        waiter = pool.submit(wait_second)
+        try:
+            assert started.wait(timeout=10)
+            with migration.connect() as observer:
+                assert holder_pid[0] in _wait_for_pg_blocker(observer, waiter_pid[0])
+        finally:
+            release.set()
+        assert holder.result(timeout=20) == 1
+        if correction_first:
+            with pytest.raises(DBAPIError) as stale:
+                waiter.result(timeout=20)
+            assert stale.value.orig.sqlstate == "40001"
+        else:
+            assert waiter.result(timeout=20) == 1
+
+    with transaction(runtime, tenant) as connection:
+        assert (
+            connection.execute(
+                text("""
+                SELECT a.status, a.revision, a.service_date, p.net_egp,
+                       p.entitlement_provenance
+                FROM public.appointments a
+                JOIN public.appointment_price_snapshots p
+                  ON (p.organization_id,p.appointment_id)=(a.organization_id,a.id)
+                WHERE a.organization_id=:tenant AND a.id=:appointment
+            """),
+                {"tenant": tenant, "appointment": record["id"]},
+            ).one()
+            == frozen
+        )
+        assert connection.execute(
+            text("SELECT state, revision FROM public.followup_claims WHERE id=:claim"),
+            {"claim": claim},
+        ).one() == ("ACTIVE", 1)
+        assert connection.execute(
+            text("""
+                SELECT v.clinical_revision, v.diagnosis, s.source_revision
+                FROM public.visits v JOIN public.followup_source_state s
+                  ON (s.organization_id,s.visit_id)=(v.organization_id,v.id)
+                WHERE v.id=:visit
+            """),
+            {"visit": source["visit"]},
+        ).one() == (1, "Synthetic corrected finding", 0)
+        clinical = connection.execute(
+            text("""
+                SELECT revision, change_kind, actor_staff_id, actor_role,
+                       old_values, new_values, reason
+                FROM public.clinical_revisions WHERE visit_id=:visit
+            """),
+            {"visit": source["visit"]},
+        ).one()
+        assert clinical[:4] == (1, "CORRECTION", doctor, "DOCTOR_OWNER")
+        assert clinical.old_values["diagnosis"] is None
+        assert clinical.new_values["diagnosis"] == "Synthetic corrected finding"
+        assert clinical.reason == "Synthetic correction race"
+        events = connection.execute(
+            text("""
+                SELECT kind, source_revision, clinical_revision, claim_revision,
+                       appointment_revision, authorization_revision, new_deadline,
+                       actor_staff_id, actor_role, reason, sensitive_audit_id
+                FROM public.followup_authorization_events WHERE claim_id=:claim
+            """),
+            {"claim": claim},
+        ).all()
+        if correction_first:
+            assert events == []
+        else:
+            assert len(events) == 1
+            assert events[0][:10] == (
+                "EXTENSION",
+                0,
+                0,
+                1,
+                0,
+                1,
+                extended_day,
+                doctor,
+                "DOCTOR_OWNER",
+                "Synthetic confirmed extension race",
+            )
+            assert (
+                connection.scalar(
+                    text("SELECT count(*) FROM public.sensitive_audit WHERE id=:audit"),
+                    {"audit": events[0].sensitive_audit_id},
+                )
+                == 1
+            )
+    with (
+        pytest.raises(DBAPIError) as immutable_clinical,
+        migration.begin() as connection,
+    ):
+        connection.execute(
+            text(
+                "UPDATE public.clinical_revisions SET reason='Tampered' WHERE visit_id=:visit"
+            ),
+            {"visit": source["visit"]},
+        )
+    assert immutable_clinical.value.orig.sqlstate == "23514"
+    if not correction_first:
+        with (
+            pytest.raises(DBAPIError) as immutable_extension,
+            migration.begin() as connection,
+        ):
+            connection.execute(
+                text(
+                    "UPDATE public.followup_authorization_events SET reason='Tampered' WHERE claim_id=:claim"
+                ),
+                {"claim": claim},
+            )
+        assert immutable_extension.value.orig.sqlstate == "42501"
+
+
+@pytest.mark.parametrize(
     "first", ["decision", "extension", "restriction", "release", "consume"]
 )
 def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger(

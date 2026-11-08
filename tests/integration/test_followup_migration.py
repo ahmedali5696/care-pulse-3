@@ -18,6 +18,7 @@ from carepulse.visits.eligibility_contracts import ExtendFollowup
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _activate_clinic, _draft, _patient, _query
+from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_database import _create_empty_database, _engine
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
@@ -31,6 +32,7 @@ from test_followup_persistence import (
     _source,
     _v2_booking,
     _v2_command,
+    _v2_record,
     _v2_source,
 )
 from test_followup_races import _extend
@@ -1110,3 +1112,183 @@ def test_populated_0023_followup_evidence_survives_0024_and_new_claims_use_live_
         operator_engine.dispose()
         runtime.dispose()
         migration.dispose()
+
+
+@pytest.mark.parametrize("actor_kind", ["doctor", "receptionist", "manager"])
+def test_final_head_source_and_extension_evidence_names_actual_staff(
+    appointment_storage, actor_kind
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    actor = doctor if actor_kind == "doctor" else _receptionist(migration, tenant)
+    if actor_kind == "manager":
+        with transaction(runtime, tenant) as connection:
+            revision, security_revision = connection.execute(
+                text("""
+                    SELECT revision, security_revision FROM public.staff_accounts
+                    WHERE organization_id=:tenant AND id=:staff
+                """),
+                {"tenant": tenant, "staff": actor},
+            ).one()
+            _doctor_context(connection, doctor)
+            connection.execute(
+                text("""
+                    SELECT public.set_receptionist_operational_manager(
+                        :tenant, :doctor, :staff, true, :revision,
+                        :security_revision, 'Delegated synthetic manager', :correlation)
+                """),
+                {
+                    "tenant": tenant,
+                    "doctor": doctor,
+                    "staff": actor,
+                    "revision": revision,
+                    "security_revision": security_revision,
+                    "correlation": uuid4(),
+                },
+            )
+    role = "DOCTOR_OWNER" if actor == doctor else "RECEPTIONIST"
+    with migration.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM public.alembic_version")
+        ) == ("0032_b10_cairo_offset_guard")
+        if actor_kind == "manager":
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT operational_manager FROM public.staff_accounts WHERE id=:staff"
+                    ),
+                    {"staff": actor},
+                )
+                is True
+            )
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        assert (
+            _v2_command(
+                connection,
+                "record_followup_source_decision",
+                source,
+                actor=actor,
+                kind="DEFAULT",
+            )
+            == 1
+        )
+        claim = _v2_command(
+            connection,
+            "create_followup_claim",
+            source,
+            actor=actor,
+            expected={
+                "source_revision": 1,
+                "clinical_revision": 0,
+                "policy_version": 1,
+            },
+            **_v2_booking(source),
+        )
+        record = _v2_record(connection, claim)
+        price_before = connection.scalar(
+            text(
+                "SELECT to_jsonb(p) FROM public.appointment_price_snapshots p WHERE appointment_id=:id"
+            ),
+            {"id": record["id"]},
+        )
+        assert (
+            _v2_command(
+                connection,
+                "extend_followup_claim",
+                source,
+                actor=actor,
+                reference=claim,
+                expected={
+                    "source_revision": 1,
+                    "clinical_revision": 0,
+                    "policy_version": 1,
+                    "claim_revision": 1,
+                    "appointment_revision": 0,
+                    "authorization_revision": 0,
+                },
+                deadline_date=(source["day"] + timedelta(days=9)).isoformat(),
+                reason="Confirmed operational extension",
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT to_jsonb(p) FROM public.appointment_price_snapshots p WHERE appointment_id=:id"
+                ),
+                {"id": record["id"]},
+            )
+            == price_before
+        )
+        assert connection.execute(
+            text(
+                "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
+            ),
+            {"visit": source["visit"]},
+        ).one() == (0, None)
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+    # Migration reads prove persisted attribution; SQL-set runtime GUCs cannot
+    # authenticate the human session (the open Issue #26 trust boundary).
+    with migration.connect() as connection:
+        rows = connection.execute(
+            text("""
+                SELECT 'DECISION' AS kind, e.source_visit_id, NULL::uuid AS claim_id,
+                       NULL::uuid AS appointment_id, e.actor_staff_id,
+                       e.actor_role, e.source_revision, e.clinical_revision,
+                       a.actor_staff_id AS audit_actor, a.actor_role AS audit_role,
+                       a.action, a.before_state, a.after_state
+                FROM public.followup_source_decision_events e
+                JOIN public.sensitive_audit a
+                  ON (a.organization_id,a.id)=(e.organization_id,e.sensitive_audit_id)
+                WHERE e.organization_id=:tenant AND e.source_visit_id=:visit
+                UNION ALL
+                SELECT e.kind, e.source_visit_id, e.claim_id, e.appointment_id,
+                       e.actor_staff_id, e.actor_role, e.source_revision,
+                       e.clinical_revision, a.actor_staff_id, a.actor_role,
+                       a.action, a.before_state, a.after_state
+                FROM public.followup_authorization_events e
+                JOIN public.sensitive_audit a
+                  ON (a.organization_id,a.id)=(e.organization_id,e.sensitive_audit_id)
+                WHERE e.organization_id=:tenant AND e.claim_id=:claim
+                ORDER BY kind
+            """),
+            {"tenant": tenant, "visit": source["visit"], "claim": claim},
+        ).all()
+        assert len(rows) == 2
+        assert {row.kind for row in rows} == {"DECISION", "EXTENSION"}
+        assert {row.action for row in rows} == {
+            "FOLLOWUP_SOURCE_DECISION",
+            "FOLLOWUP_EXTENSION",
+        }
+        assert all(
+            (
+                row.source_visit_id,
+                row.actor_staff_id,
+                row.actor_role,
+                row.audit_actor,
+                row.audit_role,
+                row.source_revision,
+                row.clinical_revision,
+            )
+            == (source["visit"], actor, role, actor, role, 1, 0)
+            for row in rows
+        )
+        decision = next(row for row in rows if row.kind == "DECISION")
+        assert decision.before_state["source_revision"] == 0
+        assert decision.after_state["source_revision"] == 1
+        assert decision.after_state["actor_staff_id"] == str(actor)
+        assert decision.after_state["actor_role"] == role
+        extension = next(row for row in rows if row.kind == "EXTENSION")
+        assert (extension.claim_id, extension.appointment_id) == (claim, record["id"])
+        assert extension.before_state["claim_id"] == str(claim)
+        assert extension.after_state["source_visit_id"] == str(source["visit"])
+        assert extension.after_state["appointment_id"] == str(record["id"])
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinical_revisions WHERE visit_id=:visit"
+                ),
+                {"visit": source["visit"]},
+            )
+            == 0
+        )
