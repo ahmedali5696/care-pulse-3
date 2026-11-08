@@ -441,6 +441,7 @@ def test_current_followup_qualification_uses_live_policy_window(
     with transaction(runtime, tenant) as connection:
         source = _v2_source(connection, tenant, doctor)
         with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(text("SELECT set_config('app.staff_id', '', true)"))
             connection.scalar(
                 text("SELECT public.b10_operational_source_proof(:tenant, :visit)"),
                 {"tenant": tenant, "visit": source["visit"]},

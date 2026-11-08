@@ -1,6 +1,7 @@
 """B-10 real-PostgreSQL acceptance of preferential booking and receipts."""
 
 import json
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -190,17 +191,23 @@ def doctor_decision(clinic, visit_id, decision):
         )
 
 
-def terminal_claim(clinic, booked, *, status):
+def terminal_claim(
+    clinic, booked, *, status, migration_connection=None, pre_admitted=False
+):
     """Record a real terminal Appointment history and its matched frozen claim state."""
     assert status in ("Cancelled", "Completed")
     appointment_id = UUID(booked["id"])
     doctor = UUID(clinic.owner.staff_id)
-    if status == "Completed":
+    if status == "Completed" and not pre_admitted:
         # Admission is real; B-17 has no terminal endpoint yet, so migration
         # writes the matched completion and claim evidence in one transaction.
         with transaction(clinic.runtime, clinic.tenant) as connection:
             _admit_saved(connection, clinic.tenant, doctor, booked, complete=False)
-    with clinic.migration.begin() as connection:
+    with (
+        nullcontext(migration_connection)
+        if migration_connection is not None
+        else clinic.migration.begin()
+    ) as connection:
         if status == "Completed":
             revision = connection.scalar(
                 text("""

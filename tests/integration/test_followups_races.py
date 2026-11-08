@@ -16,10 +16,12 @@ from carepulse.visits.eligibility_contracts import (
     FollowupDecisionPatchV2,
 )
 from sqlalchemy import text
+from test_appointment_persistence import _admit_saved
 from test_booking import booking_body, booking_effects
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_booking_races import _concurrent, _wait_for_postgres_lock
-from test_followup_persistence import _outcome, _v2_source
+from test_followup_persistence import _v2_source
+from test_followups import terminal_claim
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _patch, pricing_request
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
@@ -282,30 +284,39 @@ def test_release_or_consume_races_fresh_claim_without_double_use(
     clinic = followup_clinic
     source = _source_for(clinic)
     first = _attempt(clinic, _command(source, 2))
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        claim_id = connection.scalar(
-            text("""
-                SELECT id FROM public.followup_claims
-                WHERE organization_id=:tenant AND appointment_id=:appointment
-            """),
-            {"tenant": clinic.tenant, "appointment": UUID(first["id"])},
-        )
     changed = Event()
     finish = Event()
     replacement_started = Event()
     terminal_pid = []
     replacement_pid = []
 
-    def terminate():
+    if terminal == "Completed":
         with transaction(clinic.runtime, clinic.tenant) as connection:
-            terminal_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             _doctor_context(connection, UUID(clinic.owner.staff_id))
-            _outcome(
+            _admit_saved(
                 connection,
                 clinic.tenant,
                 UUID(clinic.owner.staff_id),
-                {"id": UUID(first["id"]), "claim": claim_id, "saved": first},
+                first,
+                complete=False,
+            )
+
+    def terminate():
+        with clinic.migration.begin() as connection:
+            terminal_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            connection.execute(
+                text("""
+                    SELECT id FROM public.patients
+                    WHERE organization_id=:tenant AND id=:patient FOR UPDATE
+                """),
+                {"tenant": clinic.tenant, "patient": source["patient"]},
+            ).one()
+            terminal_claim(
+                clinic,
+                first,
                 status=terminal,
+                migration_connection=connection,
+                pre_admitted=terminal == "Completed",
             )
             changed.set()
             assert finish.wait(timeout=20)
