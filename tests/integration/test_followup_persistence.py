@@ -238,12 +238,57 @@ def _v2_booking(source, offset=1):
 
 def _v2_priced_followup(connection, tenant, doctor, price_snapshot):
     """Create a priced Follow-up through the post-cutover SQL writer for test fixtures."""
+    guarded = connection.scalar(
+        text("""
+        SELECT to_regprocedure('public.b10_assert_followup_price(uuid,jsonb)') IS NOT NULL
+        """)
+    )
+    if guarded:
+        head = connection.execute(
+            text("""
+                SELECT h.revision, v.payload
+                FROM public.clinic_policy_heads h
+                JOIN public.clinic_policy_versions v
+                  ON (h.organization_id,h.kind,h.current_version) =
+                     (v.organization_id,v.kind,v.version)
+                WHERE h.organization_id=:tenant AND h.kind='PRICE'
+            """),
+            {"tenant": tenant},
+        ).one()
+        policy = {
+            **head.payload,
+            "standard_new_exam_egp": price_snapshot["creation_standard_base_egp"],
+            "preferential_followup_egp": price_snapshot["base_egp"],
+        }
+        version = append_version(
+            connection,
+            tenant,
+            "PRICE",
+            policy,
+            head.revision,
+            actor_staff_id=str(doctor),
+        )
+        quote = {
+            key: price_snapshot[key]
+            for key in (
+                "base_egp",
+                "discount_type",
+                "discount_value",
+                "discount_reason",
+                "is_free",
+                "net_egp",
+                "creation_standard_base_egp",
+            )
+        }
+        quote["pricing_version"] = version
+    else:
+        quote = price_snapshot
     source = _v2_source(connection, tenant, doctor)
     claim = _v2_command(
         connection,
         "create_followup_claim",
         source,
-        **{**_v2_booking(source), "price_snapshot": price_snapshot},
+        **{**_v2_booking(source), "price_snapshot": quote},
     )
     appointment, net, provenance = connection.execute(
         text("""
