@@ -1067,6 +1067,48 @@ def test_signed_receipt_conflict_authorizes_original_claim_not_substituted_sourc
     assert booking_effects(clinic) == before
 
 
+def test_signed_saved_receipt_hidden_appointment_is_non_oracular(followup_clinic):
+    clinic = followup_clinic
+    source = completed_source(clinic)
+    status, created = booking_request(
+        clinic, clinic.owner, body=followup_body(source, offset=2), key=str(uuid4())
+    )
+    assert status == 201, created
+    body, _, saved = _seed_historical_booking_receipt(
+        clinic, created["data"]["id"], source
+    )
+    key = str(uuid4())
+    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        insert_tenant_receipt(
+            connection,
+            Receipt(
+                actor_id=actor.staff_id,
+                operation="appointments.book",
+                idempotency_key=key,
+                request_digest=normalized_request_digest(
+                    BookAppointment.model_validate(body)
+                ),
+                result_projection={**saved, "id": str(uuid4())},
+                result_revision=0,
+                organization_id=clinic.tenant,
+                staff_id=actor.staff_id,
+            ),
+        )
+    before = booking_effects(clinic)
+    matching = booking_request(clinic, clinic.owner, body=body, key=key)
+    changed = booking_request(
+        clinic,
+        clinic.owner,
+        body={**body, "expected_net_egp": "29.00"},
+        key=key,
+    )
+    assert matching == changed
+    assert matching[0] == 404
+    assert "data" not in matching[1]
+    assert booking_effects(clinic) == before
+
+
 def test_signed_duplicate_json_keys_and_fresh_v1_source_writer_are_rejected(
     followup_clinic,
 ):

@@ -716,7 +716,8 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
             revocation_started.put(revoker_pid)
             connection.execute(
                 text("""
-                    UPDATE public.staff_accounts SET enabled=false
+                    UPDATE public.staff_accounts
+                    SET enabled=false, security_revision=security_revision+1
                     WHERE organization_id=:tenant AND id=:staff
                 """),
                 {"tenant": clinic.tenant, "staff": UUID(clinic.owner.staff_id)},
@@ -733,7 +734,8 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
                         holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
                         holder.execute(
                             text("""
-                                UPDATE public.staff_accounts SET enabled=false
+                                UPDATE public.staff_accounts
+                                SET enabled=false, security_revision=security_revision+1
                                 WHERE organization_id=:tenant AND id=:staff
                             """),
                             {

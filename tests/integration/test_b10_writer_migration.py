@@ -2,7 +2,7 @@
 
 import json
 import shutil
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta, timezone
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -20,6 +20,7 @@ BEFORE = "0028_d08_followup_provenance"
 AFTER = "0029_b10_followup_writers"
 PROOF_AFTER = "0030_b10_source_proof"
 GUARD_AFTER = "0031_b10_writer_guard"
+OFFSET_AFTER = "0032_b10_cairo_offset_guard"
 
 
 def _publish_bookable_policies(migration, tenant, timed_day=None):
@@ -264,6 +265,88 @@ def test_timed_guard_rejects_offered_slot_bypass_and_over_capacity(
                     {"tenant": tenant},
                 )
                 == 1
+            )
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
+def test_cairo_offset_guard_rejects_false_offset_and_accepts_cairo_and_utc(
+    admin, empty_database
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, PROOF_AFTER)
+        with transaction(runtime, tenant) as connection:
+            first = _v2_source(connection, tenant, doctor)
+            second = _v2_source(connection, tenant, doctor)
+        day = first["day"] + timedelta(days=1)
+        _upgrade(migration, GUARD_AFTER)
+        _publish_bookable_policies(migration, tenant, timed_day=day)
+        _upgrade(migration, OFFSET_AFTER)
+        with migration.connect() as connection:
+            for signature in (
+                "b10_assert_followup_schedule(uuid,jsonb)",
+                "b10_schedule_without_offset_guard(uuid,jsonb)",
+            ):
+                can_execute, definer = connection.execute(
+                    text("""
+                        SELECT has_function_privilege(
+                            'carepulse_runtime', CAST(:function AS regprocedure), 'EXECUTE'
+                        ), prosecdef
+                        FROM pg_proc WHERE oid=CAST(:function AS regprocedure)
+                    """),
+                    {"function": f"public.{signature}"},
+                ).one()
+                assert can_execute is False
+                assert definer is True
+
+        cairo = ZoneInfo("Africa/Cairo")
+        start = datetime.combine(day, time(9), cairo)
+        end = datetime.combine(day, time(10), cairo)
+        mismatched = timezone(start.utcoffset() + timedelta(hours=1))
+        booking = _priced_booking(
+            first,
+            booking_mode="EXACT_TIME",
+            starts_at=start.isoformat(),
+            ends_at=end.isoformat(),
+        )
+        with transaction(runtime, tenant) as connection:
+            for wrong in (
+                {**booking, "starts_at": start.astimezone(mismatched).isoformat()},
+                {**booking, "ends_at": end.astimezone(mismatched).isoformat()},
+            ):
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    _v2_command(
+                        connection, "create_followup_claim_ordered", first, **wrong
+                    )
+                assert denied.value.orig.sqlstate == "23514"
+                _assert_no_guarded_booking_effects(
+                    connection, tenant, booking["service_date"]
+                )
+            _v2_command(connection, "create_followup_claim_ordered", first, **booking)
+            utc_start = datetime.combine(day, time(10), cairo).astimezone(UTC)
+            utc_end = datetime.combine(day, time(11), cairo).astimezone(UTC)
+            _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                second,
+                **_priced_booking(
+                    second,
+                    booking_mode="EXACT_TIME",
+                    starts_at=utc_start.isoformat().replace("+00:00", "Z"),
+                    ends_at=utc_end.isoformat(),
+                ),
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT count(*) FROM public.followup_claims
+                    WHERE organization_id=:tenant
+                """),
+                    {"tenant": tenant},
+                )
+                == 2
             )
     finally:
         runtime.dispose()

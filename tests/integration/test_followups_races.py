@@ -606,10 +606,11 @@ def test_extension_locks_source_and_target_by_uuid_before_claim(
                 first_pid = first_holder.scalar(text("SELECT pg_backend_pid()"))
                 competing = pool.submit(extend)
                 assert started.wait(timeout=15)
-                with clinic.migration.connect() as observer:
+                with transaction(clinic.runtime, clinic.tenant) as observer:
                     _wait_for_postgres_lock(observer, extension_pid[0], first_pid)
-            with clinic.migration.connect() as observer:
+            with transaction(clinic.runtime, clinic.tenant) as observer:
                 _wait_for_postgres_lock(observer, extension_pid[0], second_pid)
+            with clinic.migration.connect() as observer:
                 assert (
                     observer.scalar(
                         text("""
