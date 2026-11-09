@@ -3,7 +3,7 @@
 import asyncio
 import json
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from hmac import new
@@ -493,6 +493,70 @@ def test_no_booking_horizon_but_current_rules_still_apply(
     assert status == 201, result
     assert result["data"]["service_date"] == day.isoformat()
     assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
+
+
+def test_signed_booking_rejects_normalized_offset_and_truncated_instant(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    day = date(2030, 7, 12)
+    weekday = day.isoweekday()
+    config = _config(
+        working_weekdays=[weekday],
+        weekly_work_periods=[
+            {"weekday": weekday, "starts_at": "09:00", "ends_at": "12:00"}
+        ],
+    )
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _publish(
+            connection,
+            _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
+            config,
+            revision=2,
+        )
+        slot = candidates_for_date(
+            load_current_schedule(connection, clinic.tenant), day
+        )[0]
+
+    patient = new_patient(clinic)
+    end = slot.ends_at.isoformat().replace("+00:00", "Z")
+    before = booking_effects(clinic)
+    for start in (
+        f"{day}T09:00:00+02:60",
+        f"{day}T09:00:00.0000009+03:00",
+    ):
+        status, denied = booking_request(
+            clinic,
+            clinic.owner,
+            body=booking_body(
+                patient,
+                day=day,
+                expected_schedule_revision=3,
+                starts_at=start,
+                ends_at=end,
+            ),
+            key=str(uuid4()),
+        )
+        assert status == 422, denied
+        assert booking_effects(clinic) == before
+
+    status, confirmed = booking_request(
+        clinic,
+        clinic.owner,
+        body=booking_body(
+            patient,
+            day=day,
+            expected_schedule_revision=3,
+            starts_at=slot.starts_at.astimezone(ZoneInfo("Africa/Cairo")).isoformat(),
+            ends_at=end,
+        ),
+        key=str(uuid4()),
+    )
+    assert status == 201, confirmed
+    assert (
+        datetime.fromisoformat(confirmed["data"]["starts_at"]).astimezone(UTC)
+        == slot.starts_at
+    )
 
 
 @pytest.mark.parametrize("authority", ["disabled_staff", "suspended_clinic"])

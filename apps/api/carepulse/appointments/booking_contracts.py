@@ -39,6 +39,13 @@ class FallbackAcknowledgment(BaseModel):
     service_type: Literal["NEW_EXAMINATION"]
     discount_reaffirmed: Literal[True]
 
+    @field_validator("discount_reaffirmed", mode="before")
+    @classmethod
+    def require_literal_true(cls, value: object) -> object:
+        if value is not True:
+            raise ValueError("Discount reaffirmation must be JSON true")
+        return value
+
 
 class NewBookingDateException(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -88,6 +95,14 @@ class BookAppointment(BaseModel):
     def booking_intent(self):
         old = self.expected_source_revision is not None
         old_field = "expected_source_revision" in self.model_fields_set
+        new_field = bool(
+            self.model_fields_set
+            & {
+                "expected_source_decision_revision",
+                "expected_visit_revision",
+                "new_booking_date_exception",
+            }
+        )
         new = (
             self.expected_source_decision_revision is not None
             or self.expected_visit_revision is not None
@@ -104,15 +119,10 @@ class BookAppointment(BaseModel):
             if self.source_visit_id is None and (old or new):
                 raise ValueError("Source tokens require a referenced Visit")
             if self.source_visit_id is not None and (
-                old == new
+                old_field == new_field
                 or old_field
-                and new
-                or old
-                and (
-                    self.expected_visit_revision is not None
-                    or self.expected_source_decision_revision is not None
-                )
-                or new
+                and not old
+                or new_field
                 and (
                     self.expected_visit_revision is None
                     or self.expected_source_decision_revision is None

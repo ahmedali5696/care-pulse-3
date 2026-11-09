@@ -272,3 +272,54 @@ def test_fold_generated_variants_keep_true_elapsed_duration_only(cairo_transitio
         candidate.ends_at - candidate.starts_at == timedelta(minutes=90)
         for candidate in candidates_for_date(manual, fold_day)
     )
+
+
+def test_fold_manual_variants_crossing_real_break_are_not_offered(cairo_transitions):
+    fold_day, repeated = cairo_transitions["fold"]
+    weekday = fold_day.isoweekday()
+    config = replace(
+        _schedule(
+            day=fold_day,
+            periods=(_local((repeated.hour - 1, 0), (repeated.hour, 59)),),
+            duration=None,
+        ),
+        weekly_breaks=(
+            WeekdaySlot(_time(repeated.hour, 20), _time(repeated.hour, 40), weekday),
+        ),
+        manual_slots_by_date={
+            fold_day: (_local((repeated.hour, 45), (repeated.hour, 55)),)
+        },
+    )
+    offered = candidates_for_date(config, fold_day)
+    assert len(offered) == 2
+    assert all(candidate.origin == "MANUAL" for candidate in offered)
+    assert {
+        candidate.starts_at.astimezone(CAIRO).utcoffset() for candidate in offered
+    } == {timedelta(hours=2), timedelta(hours=3)}
+    assert all(
+        candidate.starts_at.astimezone(CAIRO).utcoffset()
+        == candidate.ends_at.astimezone(CAIRO).utcoffset()
+        for candidate in offered
+    )
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "2027-07-12T09:00:00+02:60",
+        "2027-07-12T09:00:00.0000009+03:00",
+    ],
+)
+def test_noncanonical_offset_and_nonzero_submicrosecond_instant_rejected(timestamp):
+    with pytest.raises(ValueError):
+        parse_timed_endpoint(timestamp, date(2027, 7, 12))
+
+
+def test_zero_submicrosecond_tail_and_equivalent_utc_instant_accepted():
+    service_date = date(2027, 7, 12)
+    expected = datetime(2027, 7, 12, 6, tzinfo=UTC)
+    assert (
+        parse_timed_endpoint("2027-07-12T09:00:00.000000000+03:00", service_date)
+        == expected
+    )
+    assert parse_timed_endpoint("2027-07-12T06:00:00Z", service_date) == expected

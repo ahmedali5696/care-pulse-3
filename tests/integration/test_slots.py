@@ -14,6 +14,15 @@ from carepulse.db import transaction
 from carepulse.identity.signing import canonical_payload, canonical_query
 from carepulse.main import app
 from sqlalchemy import text
+from test_booking import (
+    booking_body,
+    booking_effects,
+    booking_request,
+    new_patient,
+)
+from test_booking import (
+    booking_clinic as booking_clinic,  # noqa: PLC0414
+)
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 from test_schedule import SERVICE_DAY, _actor, _booking, _config, _publish
@@ -195,3 +204,69 @@ def test_signed_slots_rejects_noncanonical_service_dates(patient_backend, raw_da
     status, response = _slots_request(clinic, clinic.owner, raw_date)
     assert status == 422
     assert response["error"]["code"] == "INVALID_INPUT"
+
+
+def test_fold_break_excludes_mixed_manual_interval_from_preview_and_confirmation(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    fold_day = date(2030, 10, 31)
+    weekday = fold_day.isoweekday()
+    config = _config(
+        duration_minutes=None,
+        working_weekdays=[weekday],
+        weekly_work_periods=[
+            {"weekday": weekday, "starts_at": "22:00", "ends_at": "23:59"}
+        ],
+        weekly_breaks=[{"weekday": weekday, "starts_at": "23:20", "ends_at": "23:40"}],
+        manual_slots_by_date={
+            fold_day.isoformat(): [{"starts_at": "23:45", "ends_at": "23:55"}]
+        },
+    )
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _publish(
+            connection,
+            _actor(clinic.tenant, clinic.staff),
+            config,
+            revision=2,
+        )
+    status, response = _slots_request(clinic, clinic.owner, fold_day)
+    assert status == 200, response
+    offered = response["data"]["candidates"]
+    assert len(offered) == 2
+    assert all(slot["available"] and slot["origin"] == "MANUAL" for slot in offered)
+    starts = [datetime.fromisoformat(slot["starts_at"]) for slot in offered]
+    ends = [datetime.fromisoformat(slot["ends_at"]) for slot in offered]
+    assert len(set(starts)) == 2
+    assert all(end - start == timedelta(minutes=10) for start, end in zip(starts, ends))
+
+    before = booking_effects(clinic)
+    status, denied = booking_request(
+        clinic,
+        clinic.owner,
+        body=booking_body(
+            new_patient(clinic),
+            day=fold_day,
+            expected_schedule_revision=3,
+            starts_at=min(starts).isoformat(),
+            ends_at=max(ends).isoformat(),
+        ),
+        key=str(uuid4()),
+    )
+    assert status == 409, denied
+    assert booking_effects(clinic) == before
+
+    for slot in offered:
+        status, confirmed = booking_request(
+            clinic,
+            clinic.owner,
+            body=booking_body(
+                new_patient(clinic),
+                day=fold_day,
+                expected_schedule_revision=3,
+                starts_at=slot["starts_at"],
+                ends_at=slot["ends_at"],
+            ),
+            key=str(uuid4()),
+        )
+        assert status == 201, confirmed

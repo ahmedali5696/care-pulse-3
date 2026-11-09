@@ -17,7 +17,8 @@ from carepulse.policies.schedule import (
 
 CAIRO = ZoneInfo("Africa/Cairo")
 RFC3339 = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.(?P<fraction>\d+))?"
+    r"(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)"
 )
 
 
@@ -52,7 +53,8 @@ def resolve_cairo_local_time(
 
 
 def parse_timed_endpoint(text: str, intended_service_date: date) -> datetime:
-    if not isinstance(text, str) or not RFC3339.fullmatch(text):
+    match = RFC3339.fullmatch(text) if isinstance(text, str) else None
+    if match is None or any(digit != "0" for digit in (match["fraction"] or "")[6:]):
         raise ValueError("Timed endpoint requires RFC3339 with an explicit offset")
     supplied = datetime.fromisoformat(text)
     instant = supplied.astimezone(UTC)
@@ -106,6 +108,29 @@ def _generated_candidates(
     return tuple(generated)
 
 
+def _fits_resolved(
+    candidate: Candidate,
+    periods: tuple[Candidate, ...],
+    breaks: tuple[Candidate, ...],
+) -> bool:
+    return any(
+        period.starts_at <= candidate.starts_at and candidate.ends_at <= period.ends_at
+        for period in periods
+    ) and not any(intersects(candidate, pause) for pause in breaks)
+
+
+def _period_variants(service_date: date, period: LocalSlot) -> tuple[Candidate, ...]:
+    start = datetime.combine(service_date, period.starts_at)
+    end = datetime.combine(service_date, period.ends_at)
+    while start < end and not _cairo_instants(service_date, start.time()):
+        start += timedelta(minutes=1)
+    return (
+        _variants(service_date, LocalSlot(start.time(), period.ends_at), "PERIOD")
+        if start < end
+        else ()
+    )
+
+
 def candidates_for_date(
     config: ScheduleConfig, service_date: date
 ) -> tuple[Candidate, ...]:
@@ -115,13 +140,34 @@ def candidates_for_date(
     if not rules.eligible:
         return ()
 
+    periods = tuple(
+        variant
+        for period in rules.periods
+        for variant in _period_variants(service_date, period)
+    )
+    breaks = tuple(
+        variant
+        for pause in rules.breaks
+        for variant in _variants(service_date, pause, "BREAK")
+        if len(_cairo_instants(service_date, pause.starts_at)) < 2
+        or len(_cairo_instants(service_date, pause.ends_at)) < 2
+        or variant.starts_at.astimezone(CAIRO).utcoffset()
+        == variant.ends_at.astimezone(CAIRO).utcoffset()
+    )
     manual = tuple(
         variant
         for slot in rules.manual_slots
         if _fits(slot, rules.periods, rules.breaks)
         for variant in _variants(service_date, slot, "MANUAL")
+        if _fits_resolved(variant, periods, breaks)
     )
-    generated = _generated_candidates(rules, service_date, config.duration_minutes)
+    generated = tuple(
+        candidate
+        for candidate in _generated_candidates(
+            rules, service_date, config.duration_minutes
+        )
+        if _fits_resolved(candidate, periods, breaks)
+    )
     offered = [*manual]
     offered.extend(
         candidate

@@ -1,6 +1,7 @@
 """B-09 booking intent and no-authority projection boundaries."""
 
 import asyncio
+import hashlib
 import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -17,6 +18,7 @@ from carepulse.identity.contracts import (
     ContractError,
     contract_exception_handler,
     error_response,
+    normalized_request_digest,
 )
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -36,6 +38,83 @@ def _valid_command():
         "expected_price_revision": 1,
         "expected_schedule_revision": 1,
     }
+
+
+@pytest.mark.parametrize("numeric", [1, 1.0])
+def test_fallback_reaffirmation_requires_json_boolean_true(numeric):
+    body = {
+        **_valid_command(),
+        "requested_service_type": "FOLLOW_UP",
+        "expected_followup_revision": 1,
+        "fallback_acknowledgment": {
+            "service_type": "NEW_EXAMINATION",
+            "discount_reaffirmed": numeric,
+        },
+    }
+    with pytest.raises(ValidationError):
+        BookAppointment.model_validate_json(json.dumps(body))
+    body["fallback_acknowledgment"]["discount_reaffirmed"] = True
+    assert (
+        BookAppointment.model_validate_json(json.dumps(body)).source_family == "common"
+    )
+
+
+@pytest.mark.parametrize(
+    "source_tokens",
+    [
+        {"expected_source_revision": 0, "expected_source_decision_revision": None},
+        {"expected_source_revision": 0, "expected_visit_revision": None},
+        {"expected_source_revision": 0, "new_booking_date_exception": None},
+        {
+            "expected_source_decision_revision": 0,
+            "expected_visit_revision": 0,
+            "expected_source_revision": None,
+        },
+    ],
+)
+def test_referenced_source_rejects_null_foreign_family_keys(source_tokens):
+    body = {
+        **_valid_command(),
+        "requested_service_type": "FOLLOW_UP",
+        "source_visit_id": str(uuid4()),
+        "expected_followup_revision": 1,
+        **source_tokens,
+    }
+    with pytest.raises(ValidationError):
+        BookAppointment.model_validate(body)
+
+
+def test_common_source_null_tokens_preserve_original_request_digests():
+    original = {
+        **_valid_command(),
+        "requested_service_type": "FOLLOW_UP",
+        "expected_followup_revision": 1,
+        "fallback_acknowledgment": {
+            "service_type": "NEW_EXAMINATION",
+            "discount_reaffirmed": True,
+        },
+    }
+    explicit_null = {
+        **original,
+        "source_visit_id": None,
+        "expected_source_revision": None,
+    }
+    v2_null = {
+        **original,
+        "source_visit_id": None,
+        "expected_source_decision_revision": None,
+        "expected_visit_revision": None,
+    }
+    for body in (original, explicit_null, v2_null):
+        command = BookAppointment.model_validate(body)
+        assert command.source_family == "common"
+        expected = hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        assert normalized_request_digest(command) == expected
+    assert normalized_request_digest(BookAppointment.model_validate(original)) != (
+        normalized_request_digest(BookAppointment.model_validate(explicit_null))
+    )
 
 
 @pytest.mark.parametrize(

@@ -11,6 +11,7 @@ from test_booking import booking_body, booking_effects, booking_request, new_pat
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_followup_persistence import _source
 from test_followups import (
+    _seed_historical_booking_receipt,
     completed_source,
     doctor_decision,
     followup_body,
@@ -103,6 +104,24 @@ def test_no_reviewed_source_requires_explicit_ordinary_type_and_discount(
             },
             422,
         ),
+        (
+            {
+                "fallback_acknowledgment": {
+                    "service_type": "NEW_EXAMINATION",
+                    "discount_reaffirmed": 1,
+                }
+            },
+            422,
+        ),
+        (
+            {
+                "fallback_acknowledgment": {
+                    "service_type": "NEW_EXAMINATION",
+                    "discount_reaffirmed": 1.0,
+                }
+            },
+            422,
+        ),
         ({"expected_price_revision": 0}, 409),
         ({"expected_schedule_revision": 0}, 409),
     ],
@@ -120,6 +139,45 @@ def test_nonqualifying_followup_invalid_confirmation_leaves_no_booking(
         key=str(uuid4()),
     )
     assert status == expected
+    assert booking_effects(clinic) == before
+
+
+def test_null_foreign_family_keys_deny_before_committed_receipt_replay(followup_clinic):
+    clinic = followup_clinic
+    source = completed_source(clinic)
+    v2_body = followup_body(source, offset=2)
+    v2_key = str(uuid4())
+    status, created = booking_request(clinic, clinic.owner, body=v2_body, key=v2_key)
+    assert status == 201, created
+    legacy_body, legacy_key, projection = _seed_historical_booking_receipt(
+        clinic, created["data"]["id"], source
+    )
+    before = booking_effects(clinic)
+    for foreign_key in (
+        "expected_source_decision_revision",
+        "expected_visit_revision",
+        "new_booking_date_exception",
+    ):
+        denied, response = booking_request(
+            clinic,
+            clinic.owner,
+            body={**legacy_body, foreign_key: None},
+            key=legacy_key,
+        )
+        assert denied == 422, response
+        assert booking_effects(clinic) == before
+    denied, response = booking_request(
+        clinic,
+        clinic.owner,
+        body={**v2_body, "expected_source_revision": None},
+        key=v2_key,
+    )
+    assert denied == 422, response
+    assert booking_effects(clinic) == before
+    assert booking_request(clinic, clinic.owner, body=legacy_body, key=legacy_key) == (
+        201,
+        {"data": projection, "revision": 0},
+    )
     assert booking_effects(clinic) == before
 
 
