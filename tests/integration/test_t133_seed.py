@@ -40,7 +40,7 @@ def _historical_followup_cases(runtime, migration, tenant, doctor, cases):
             "NEW.occurred_at := date_trunc('second', clock_timestamp());",
             (
                 "NEW.occurred_at := date_trunc('second', COALESCE("
-                "NULLIF(current_setting('cp_t133_asof', true), '')::timestamptz,"
+                "NULLIF(current_setting('cp.t133_asof', true), '')::timestamptz,"
                 "clock_timestamp()));"
             ),
         ),
@@ -48,7 +48,7 @@ def _historical_followup_cases(runtime, migration, tenant, doctor, cases):
             "public.b10_schedule_without_offset_guard(uuid,jsonb)",
             "day < (clock_timestamp() AT TIME ZONE 'Africa/Cairo')::date",
             (
-                "day < (COALESCE(NULLIF(current_setting('cp_t133_asof', true),"
+                "day < (COALESCE(NULLIF(current_setting('cp.t133_asof', true),"
                 " '')::timestamptz, clock_timestamp())"
                 " AT TIME ZONE 'Africa/Cairo')::date"
             ),
@@ -68,7 +68,7 @@ def _historical_followup_cases(runtime, migration, tenant, doctor, cases):
         for name in ("no_show_old_doctor", "no_show_old_receptionist"):
             with transaction(runtime, tenant) as connection:
                 connection.execute(
-                    text("SELECT set_config('cp_t133_asof', :asof, true)"),
+                    text("SELECT set_config('cp.t133_asof', :asof, true)"),
                     {"asof": asof.isoformat()},
                 )
                 source = _v2_source(connection, tenant, doctor)
