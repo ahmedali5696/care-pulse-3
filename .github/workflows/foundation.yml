@@ -10,11 +10,19 @@ on:
         description: Run the isolated Issue 7 adapter feasibility experiment
         type: boolean
         default: false
+      t133_terminal:
+        description: Disposable synthetic T133 PostgreSQL terminal acceptance (SEC-26-CI-01)
+        type: boolean
+        default: false
+      t133_sha:
+        description: Exact 40-character commit SHA authorized for T133
+        type: string
+        default: ''
 
 # Cancel superseded PR/push checks and duplicate manual runs of the same SHA/mode.
 # Keep manual runs for different commits and spike modes independent.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.sha || 'branch' }}-${{ inputs.b04_spike && 'spike' || 'standard' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.sha || 'branch' }}-${{ inputs.b04_spike && 'spike' || 'standard' }}-${{ inputs.t133_terminal && 't133' || 'ordinary' }}
   cancel-in-progress: true
 
 permissions:
@@ -98,6 +106,8 @@ jobs:
     timeout-minutes: 40
     env:
       CP_B04_SPIKE: ${{ inputs.b04_spike || false }}
+      CP_T133_MODE: ${{ inputs.t133_terminal || false }}
+      CP_T133_SHA: ${{ inputs.t133_sha || '' }}
       COMPOSE_PROJECT_NAME: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
       CP_CI_PROJECT: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:

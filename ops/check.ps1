@@ -68,7 +68,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': '308fedbe2bc27d690ae0ca84eeaf2c4e954cf31c169c27c22b335a18fc0fc992',
+    '.github/workflows/foundation.yml': 'e516a7cf1cf469e5fe4a4f043e11f8acba627a3edb28a952038b4ada1e59f778',
     'apps/api/Dockerfile': '8465e11d5b90d94704ec63072180f10c56dcf4becf471da84258ea21de5208c8',
     'apps/web/Dockerfile': '933af52609f2a4eb638d048605ec555e2a3443cb25b3ba5d64d5a36ec585f02a',
 }
@@ -227,6 +227,9 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             foreach ($suite in @('tests/integration/test_followup_persistence.py', 'tests/integration/test_followup_races.py', 'tests/integration/test_followup_migration.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required D-08 verification: $suite" }
             }
+            foreach ($suite in @('tests/integration/test_t133_migration.py', 'tests/integration/test_t133_seed.py', 'tests/integration/test_t133_runtime.py', 'ops/t133-ci.sh')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required T133 acceptance component: $suite" }
+            }
             foreach ($suite in @('tests/integration/test_queue_persistence.py', 'tests/integration/test_queue_capacity.py', 'tests/integration/test_queue_races.py', 'tests/integration/test_queue_migration.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required D-06 verification: $suite" }
             }
@@ -307,7 +310,7 @@ docker compose --profile test run --rm --no-deps \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_patient_persistence.py tests/integration/test_policy_persistence.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py tests/integration/test_appointment_persistence.py tests/integration/test_appointment_races.py tests/integration/test_visit_persistence.py tests/integration/test_visit_revisions.py tests/integration/test_visit_migration.py tests/integration/test_followup_persistence.py tests/integration/test_followup_races.py tests/integration/test_followup_migration.py tests/integration/test_m1_migration.py | tee "$private/d08-core.log"
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_patient_persistence.py tests/integration/test_policy_persistence.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py tests/integration/test_appointment_persistence.py tests/integration/test_appointment_races.py tests/integration/test_visit_persistence.py tests/integration/test_visit_revisions.py tests/integration/test_visit_migration.py tests/integration/test_followup_persistence.py tests/integration/test_followup_races.py tests/integration/test_followup_migration.py tests/integration/test_t133_migration.py tests/integration/test_m1_migration.py | tee "$private/d08-core.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d08-core.log"; then
   echo 'FAIL mandatory D-08 persistence evidence skipped'; exit 1
 fi
@@ -810,6 +813,9 @@ if [ "${CP_B04_SPIKE:-false}" = true ]; then
     -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" \
     -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
     web --experimental-strip-types auth/b04-spike.test.ts
+fi
+if [ "${CP_T133_MODE:-false}" = true ]; then
+  bash ops/t133-ci.sh "$private"
 fi
 {
   echo '### Wave 0 and Wave 1 D-01/D-02 foundation checks'

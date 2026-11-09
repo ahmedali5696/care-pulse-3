@@ -1,0 +1,697 @@
+"""Real PostgreSQL T133 runtime acceptance under a temporary CI-only grant.
+
+This process has ONLY a carepulse_runtime password. Its SQL connections are
+genuine runtime logins, including for the accepted synthetic GUC-forgery proof.
+"""
+
+import json
+import os
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta
+from pathlib import Path
+from threading import Event
+from time import monotonic, sleep
+from uuid import UUID
+
+import psycopg
+import pytest
+from carepulse.db import transaction
+from sqlalchemy import URL, create_engine, text
+from sqlalchemy.exc import DBAPIError
+from test_followup_persistence import _v2_booking, _v2_command, _v2_record
+
+
+@pytest.fixture(scope="module")
+def fixture_data():
+    assert os.getenv("CI") == "true"
+    assert os.getenv("CP_T133_ACTIVE") == "true"
+    path = Path(os.environ["CP_T133_FIXTURE_PATH"])
+    assert path.is_file()
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _login():
+    password = Path("/run/secrets/runtime_db_password").read_text().strip()
+    return psycopg.connect(
+        host="db",
+        dbname="carepulse",
+        user="carepulse_runtime",
+        password=password,
+        connect_timeout=5,
+        options="-c statement_timeout=20000 -c lock_timeout=12000 -c application_name=t133-runtime",
+    )
+
+
+def _runtime_engine():
+    return create_engine(
+        URL.create(
+            "postgresql+psycopg",
+            username="carepulse_runtime",
+            password=Path("/run/secrets/runtime_db_password").read_text().strip(),
+            host="db",
+            database="carepulse",
+        ),
+        hide_parameters=True,
+        connect_args={"options": "-c statement_timeout=20000 -c lock_timeout=12000"},
+    )
+
+
+def _context(connection, organization, actor):
+    connection.execute(
+        "SELECT set_config('app.organization_id', %s, true)", (organization,)
+    )
+    connection.execute("SELECT set_config('app.staff_id', %s, true)", (actor,))
+
+
+def _command(case, operation, **params):
+    command = {"operation": operation, **params}
+    if case["claim"] is not None:
+        command.update(
+            expected_claim_revision=case["claim_revision"],
+            expected_source_revision=case["source_revision"],
+            expected_authorization_revision=case["authorization_revision"],
+        )
+    if case.get("queue_day_revision") is not None:
+        command["expected_queue_day_revision"] = case["queue_day_revision"]
+    return command
+
+
+def _call(connection, data, case, command, *, revision=None, target=None):
+    return connection.execute(
+        """
+        SELECT terminal_history_revision, terminal_at, attestation_id
+        FROM public.transition_terminal_appointment(
+            %s::uuid, %s::uuid, %s::bigint, %s::jsonb)
+        """,
+        (
+            data["organization"],
+            target or case["target"],
+            case["revision"] if revision is None else revision,
+            json.dumps(command),
+        ),
+    ).fetchone()
+
+
+def _state(connection, case):
+    return connection.execute(
+        """
+        SELECT a.status, a.revision,
+               (SELECT c.state FROM public.followup_claims c
+                WHERE c.organization_id=a.organization_id
+                  AND c.appointment_id=a.id),
+               (SELECT c.revision FROM public.followup_claims c
+                WHERE c.organization_id=a.organization_id
+                  AND c.appointment_id=a.id),
+               (SELECT count(*) FROM public.appointment_history h
+                WHERE h.organization_id=a.organization_id AND h.appointment_id=a.id)
+        FROM public.appointments a WHERE a.id=%s::uuid
+        """,
+        (case["target"],),
+    ).fetchone()
+
+
+@pytest.mark.parametrize(
+    ("name", "operation", "actor", "result"),
+    [
+        ("cancel_booked_doctor", "CANCEL", "doctor", "Cancelled"),
+        ("cancel_booked_receptionist", "CANCEL", "receptionist", "Cancelled"),
+        ("cancel_waiting_doctor", "CANCEL", "doctor", "Cancelled"),
+        ("cancel_waiting_receptionist", "CANCEL", "receptionist", "Cancelled"),
+        ("cancel_in_exam_doctor", "CANCEL", "doctor", "Cancelled"),
+        ("complete_in_exam_doctor", "COMPLETE", "doctor", "Completed"),
+        ("complete_in_exam_receptionist", "COMPLETE", "receptionist", "Completed"),
+        ("no_show_old_doctor", "MARK_NO_SHOW", "doctor", "No-show"),
+        ("no_show_old_receptionist", "MARK_NO_SHOW", "receptionist", "No-show"),
+    ],
+)
+def test_terminal_outcome_commits_exact_claim_and_history(
+    fixture_data, name, operation, actor, result
+):
+    case = fixture_data["cases"][name]
+    recorded_actor = fixture_data[actor]
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], recorded_actor)
+        assert connection.execute(
+            """
+            SELECT session_user, current_user,
+                   has_function_privilege(current_user,
+                       'public.transition_terminal_appointment(uuid,uuid,bigint,jsonb)',
+                       'EXECUTE')
+            """
+        ).fetchone() == ("carepulse_runtime", "carepulse_runtime", True)
+        before = _state(connection, case)
+        assert before is not None
+        waiting_before = None
+        if before[0] == "Waiting":
+            waiting_before = connection.execute(
+                """
+                SELECT e.arrival_sequence, e.routine_rank, e.attested_at,
+                       e.disposition, q.revision, q.routine_cursor
+                FROM public.queue_entries e
+                JOIN public.queue_days q
+                  ON (q.organization_id,q.id)=(e.organization_id,e.queue_day_id)
+                WHERE e.appointment_id=%s::uuid AND e.disposition='ACTIVE'
+                """,
+                (case["target"],),
+            ).fetchone()
+            assert waiting_before is not None
+        visit_before = connection.execute(
+            "SELECT count(*) FROM public.visits WHERE appointment_id=%s::uuid",
+            (case["target"],),
+        ).fetchone()[0]
+        command = _command(case, operation)
+        if operation == "CANCEL":
+            command["reason"] = "Verified intentional cancellation"
+        elif operation == "MARK_NO_SHOW":
+            command.update(
+                reason="Verified absence past clinic day", absence_confirmed=True
+            )
+        else:
+            command["examination_occurred"] = True
+        revision, committed_at, attestation = _call(
+            connection, fixture_data, case, command
+        )
+        connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
+        assert revision == case["revision"] + 1
+        assert committed_at is not None
+        assert (attestation is not None) == (operation == "COMPLETE")
+    # A fresh runtime connection sees only the committed terminal state.
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], recorded_actor)
+        observed = _state(connection, case)
+        assert observed == (
+            result,
+            revision,
+            None
+            if case["claim"] is None
+            else ("CONSUMED" if result == "Completed" else "RELEASED"),
+            None if case["claim"] is None else 2,
+            before[4] + 1,
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM public.visits WHERE appointment_id=%s::uuid",
+                (case["target"],),
+            ).fetchone()[0]
+            == visit_before
+        )
+        history = connection.execute(
+            """
+            SELECT old_status, new_status, actor_staff_id, actor_role, occurred_at,
+                   old_service_date = new_service_date, old_number = new_number
+            FROM public.appointment_history
+            WHERE appointment_id=%s::uuid AND appointment_revision=%s
+            """,
+            (case["target"], revision),
+        ).fetchone()
+        assert history == (
+            before[0],
+            result,
+            UUID(recorded_actor),
+            "DOCTOR_OWNER" if actor == "doctor" else "RECEPTIONIST",
+            committed_at,
+            True,
+            True,
+        )
+        if case["claim"] is not None:
+            claim = connection.execute(
+                """
+                SELECT terminal_history_revision, terminal_at
+                FROM public.followup_claims WHERE id=%s::uuid
+                """,
+                (case["claim"],),
+            ).fetchone()
+            assert claim == (revision, committed_at)
+        if waiting_before is not None:
+            closed = connection.execute(
+                """
+                SELECT e.arrival_sequence, e.routine_rank, e.attested_at,
+                       e.disposition, q.revision, q.routine_cursor,
+                       e.closure_history_revision, e.closure_queue_revision
+                FROM public.queue_entries e
+                JOIN public.queue_days q
+                  ON (q.organization_id,q.id)=(e.organization_id,e.queue_day_id)
+                WHERE e.appointment_id=%s::uuid AND e.disposition='CLOSED'
+                """,
+                (case["target"],),
+            ).fetchone()
+            assert closed == (
+                *waiting_before[:3],
+                "CLOSED",
+                waiting_before[4] + 1,
+                waiting_before[5],
+                revision,
+                waiting_before[4],
+            )
+
+
+@pytest.mark.parametrize(
+    ("name", "actor", "operation", "payload", "revision", "sqlstate"),
+    [
+        (
+            "deny_in_exam_receptionist",
+            "receptionist",
+            "CANCEL",
+            {"reason": "Not authorized"},
+            None,
+            "42501",
+        ),
+        (
+            "deny_stale_revision",
+            "doctor",
+            "CANCEL",
+            {"reason": "Stale revision"},
+            99,
+            "40001",
+        ),
+        (
+            "deny_blank_reason",
+            "doctor",
+            "CANCEL",
+            {"reason": "  "},
+            None,
+            "23514",
+        ),
+        (
+            "deny_missing_attestation",
+            "doctor",
+            "COMPLETE",
+            {"examination_occurred": False},
+            None,
+            "23514",
+        ),
+        (
+            "deny_no_show_future",
+            "receptionist",
+            "MARK_NO_SHOW",
+            {"reason": "Confirmed", "absence_confirmed": True},
+            None,
+            "23514",
+        ),
+        (
+            "deny_false_absence",
+            "doctor",
+            "MARK_NO_SHOW",
+            {"reason": "Absence not confirmed", "absence_confirmed": False},
+            None,
+            "23514",
+        ),
+        (
+            "deny_stale_claim",
+            "doctor",
+            "CANCEL",
+            {"reason": "Claim changed", "expected_claim_revision": 99},
+            None,
+            "40001",
+        ),
+        (
+            "deny_stale_source",
+            "doctor",
+            "CANCEL",
+            {"reason": "Source changed", "expected_source_revision": 99},
+            None,
+            "40001",
+        ),
+        (
+            "deny_stale_authorization",
+            "doctor",
+            "CANCEL",
+            {"reason": "Authorization changed", "expected_authorization_revision": 99},
+            None,
+            "40001",
+        ),
+        (
+            "deny_stale_queue",
+            "doctor",
+            "CANCEL",
+            {"reason": "Queue revision changed", "expected_queue_day_revision": 999},
+            None,
+            "40001",
+        ),
+        (
+            "deny_extra_field",
+            "doctor",
+            "CANCEL",
+            {"reason": "Unknown contract field", "unexpected": True},
+            None,
+            "42501",
+        ),
+        (
+            "deny_unsupported",
+            "doctor",
+            "RESCHEDULE",
+            {"reason": "Unsupported operation"},
+            None,
+            "42501",
+        ),
+        (
+            "deny_disabled",
+            "disabled_receptionist",
+            "CANCEL",
+            {"reason": "Former employee"},
+            None,
+            "42501",
+        ),
+        (
+            "deny_foreign",
+            "foreign_doctor",
+            "CANCEL",
+            {"reason": "Foreign actor"},
+            None,
+            "42501",
+        ),
+    ],
+)
+def test_denial_leaves_original_claim_and_history(
+    fixture_data, name, actor, operation, payload, revision, sqlstate
+):
+    case = fixture_data["cases"][name]
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data[actor])
+        before = _state(connection, case)
+        with pytest.raises(psycopg.Error) as error:
+            _call(
+                connection,
+                fixture_data,
+                case,
+                {**_command(case, operation), **payload},
+                revision=revision,
+            )
+        assert error.value.sqlstate == sqlstate
+        connection.rollback()
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        assert _state(connection, case) == before
+
+
+def test_forged_runtime_gucs_have_known_accepted_ci_only_vulnerability(fixture_data):
+    """SEC-26-CI-01: runtime credentials plus forged GUCs impersonate Doctor.
+
+    This is a security finding, not proof of independently authenticated staff.
+    """
+    case = fixture_data["cases"]["deny_foreign"]
+    with _login() as connection:
+        with pytest.raises(psycopg.Error) as denied:
+            _call(
+                connection,
+                fixture_data,
+                case,
+                _command(case, "CANCEL", reason="No tenant context"),
+            )
+        assert denied.value.sqlstate == "42501"
+        connection.rollback()
+    # The same SQL login can impersonate the live Doctor through SET LOCAL.
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        revision, completed_at, _ = _call(
+            connection,
+            fixture_data,
+            case,
+            _command(case, "CANCEL", reason="Forged doctor GUC proof"),
+        )
+        connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
+        assert revision == 1 and completed_at is not None
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        assert _state(connection, case)[:4] == ("Cancelled", 1, "RELEASED", 2)
+
+
+def _fresh_claim_after_terminal(data, case, *, must_succeed=True):
+    runtime = _runtime_engine()
+    try:
+        with transaction(runtime, UUID(data["organization"])) as connection:
+            policy = connection.execute(
+                text("""
+                    SELECT h.current_version, v.payload
+                    FROM public.clinic_policy_heads h
+                    JOIN public.clinic_policy_versions v
+                      ON (v.organization_id,v.kind,v.version)=
+                         (h.organization_id,h.kind,h.current_version)
+                    WHERE h.organization_id=:org AND h.kind='PRICE'
+                """),
+                {"org": UUID(data["organization"])},
+            ).one()
+            source = {
+                "tenant": UUID(data["organization"]),
+                "doctor": UUID(data["doctor"]),
+                "visit": UUID(case["source_visit"]),
+                "day": date.fromisoformat(case["source_date"]),
+            }
+            body = _v2_booking(source)
+            body["price_snapshot"].update(
+                base_egp=policy.payload["preferential_followup_egp"],
+                net_egp=policy.payload["preferential_followup_egp"],
+                creation_standard_base_egp=policy.payload["standard_new_exam_egp"],
+                pricing_version=policy.current_version,
+            )
+            expected = {
+                "source_revision": case["source_revision"],
+                "clinical_revision": 0,
+                "policy_version": 1,
+            }
+            if not must_succeed:
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    _v2_command(
+                        connection,
+                        "create_followup_claim",
+                        source,
+                        expected=expected,
+                        **body,
+                    )
+                assert denied.value.orig.sqlstate == "23514"
+                return None
+            claim = _v2_command(
+                connection,
+                "create_followup_claim",
+                source,
+                expected=expected,
+                **body,
+            )
+            record = _v2_record(connection, claim)
+            return tuple(
+                connection.execute(
+                    text("""
+                        SELECT p.net_egp, p.pricing_version,
+                               c.approved_deadline,
+                               p.entitlement_provenance,
+                               c.state
+                        FROM public.followup_claims c
+                        JOIN public.appointment_price_snapshots p
+                          ON (p.organization_id,p.appointment_id)=
+                             (c.organization_id,c.appointment_id)
+                        WHERE c.organization_id=:org AND c.id=:claim
+                    """),
+                    {"org": UUID(data["organization"]), "claim": claim},
+                ).one()
+            ) + (record["id"],)
+    finally:
+        runtime.dispose()
+
+
+@pytest.mark.parametrize("with_extension", [False, True])
+def test_released_claim_fresh_qualification_uses_current_price_not_old_extension(
+    fixture_data, with_extension
+):
+    case = fixture_data["cases"][
+        "release_after_extension" if with_extension else "release_requalify"
+    ]
+    if with_extension:
+        with _login() as connection:
+            _context(connection, fixture_data["organization"], fixture_data["doctor"])
+            assert _extend(connection, fixture_data, case) == (
+                case["authorization_revision"] + 1
+            )
+        case = {
+            **case,
+            "authorization_revision": case["authorization_revision"] + 1,
+        }
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        assert (
+            _call(
+                connection,
+                fixture_data,
+                case,
+                _command(case, "CANCEL", reason="Documented released claim"),
+            )[0]
+            == case["revision"] + 1
+        )
+        connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
+    new_price, version, deadline, snapshot, state, target = _fresh_claim_after_terminal(
+        fixture_data, case
+    )
+    assert str(new_price) == "75.00"
+    assert version >= 2
+    assert state == "ACTIVE"
+    assert target != UUID(case["target"])
+    assert deadline == date.fromisoformat(case["source_date"]) + timedelta(days=7)
+    assert snapshot["source_visit_id"] == case["source_visit"]
+    assert not snapshot.get("new_date_event_id")
+    assert "extended_deadline" not in snapshot
+
+
+def test_consumed_claim_cannot_be_rebooked_even_after_price_change(fixture_data):
+    case = fixture_data["cases"]["consume_denies_second"]
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        assert (
+            _call(
+                connection,
+                fixture_data,
+                case,
+                _command(case, "COMPLETE", examination_occurred=True),
+            )[0]
+            == case["revision"] + 1
+        )
+        connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
+    assert _fresh_claim_after_terminal(fixture_data, case, must_succeed=False) is None
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        assert _state(connection, case)[:4] == (
+            "Completed",
+            3,
+            "CONSUMED",
+            case["claim_revision"] + 1,
+        )
+
+
+def _extend(connection, data, case):
+    expected = {
+        "source_revision": case["source_revision"],
+        "clinical_revision": 0,
+        "policy_version": 1,
+        "claim_revision": case["claim_revision"],
+        "authorization_revision": case["authorization_revision"],
+        "appointment_revision": case["revision"],
+    }
+    extension = {
+        "deadline_date": (
+            date.fromisoformat(case["source_date"]) + timedelta(days=9)
+        ).isoformat(),
+        "reason": "Verified synthetic concurrent extension",
+    }
+    return connection.execute(
+        """
+        SELECT public.extend_followup_claim_ordered(
+            %s::uuid, %s::uuid, %s::jsonb, %s::jsonb)
+        """,
+        (
+            data["organization"],
+            case["claim"],
+            json.dumps(expected),
+            json.dumps(extension),
+        ),
+    ).fetchone()[0]
+
+
+@pytest.mark.parametrize("operation", ["CANCEL", "COMPLETE"])
+@pytest.mark.parametrize("winner", ["extension", "terminal"])
+@pytest.mark.parametrize("source_first", [True, False])
+def test_extension_and_terminal_race_observed_blocker_and_committed_winner(
+    fixture_data, operation, winner, source_first
+):
+    case = fixture_data["cases"][
+        f"race_{operation.lower()}_{winner}_"
+        f"{'source_first' if source_first else 'target_first'}"
+    ]
+    ready, release, waiter_ready = Event(), Event(), Event()
+    current_pids = {}
+    data = fixture_data
+    terminal_body = _command(
+        case,
+        operation,
+        **(
+            {"examination_occurred": True}
+            if operation == "COMPLETE"
+            else {"reason": "Verified concurrent cancellation"}
+        ),
+    )
+
+    def ordered_leader():
+        with _login() as connection:
+            _context(connection, data["organization"], data["doctor"])
+            current_pids["leader"] = connection.info.backend_pid
+            try:
+                if winner == "extension":
+                    result = _extend(connection, data, case)
+                else:
+                    result = _call(connection, data, case, terminal_body)
+                ready.set()
+                assert release.wait(timeout=20), "Observed waiter never released leader"
+                return result
+            finally:
+                ready.set()
+
+    def ordered_waiter():
+        with _login() as connection:
+            _context(connection, data["organization"], data["doctor"])
+            current_pids["waiter"] = connection.info.backend_pid
+            waiter_ready.set()
+            try:
+                if winner == "extension":
+                    _call(connection, data, case, terminal_body)
+                else:
+                    _extend(connection, data, case)
+            except psycopg.Error as error:
+                return error.sqlstate
+            return "UNEXPECTED_SUCCESS"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        leader = pool.submit(ordered_leader)
+        assert ready.wait(timeout=15)
+        waiter = pool.submit(ordered_waiter)
+        try:
+            assert waiter_ready.wait(timeout=15)
+            with _login() as observer:
+                until = monotonic() + 7
+                blocked = False
+                while monotonic() < until:
+                    blockers = observer.execute(
+                        "SELECT pg_blocking_pids(%s::integer)",
+                        (current_pids["waiter"],),
+                    ).fetchone()[0]
+                    if current_pids["leader"] in blockers:
+                        blocked = True
+                        break
+                    sleep(0.02)
+                assert blocked, "No PostgreSQL pg_blocking_pids lock witness"
+        finally:
+            release.set()
+        leader.result(timeout=25)
+        assert waiter.result(timeout=25) == "40001"
+
+    with _login() as connection:
+        _context(connection, data["organization"], data["doctor"])
+        status, revision, claim_state, claim_revision, _ = _state(connection, case)
+        if winner == "extension":
+            assert (status, revision, claim_state, claim_revision) == (
+                case["status"],
+                case["revision"],
+                "ACTIVE",
+                case["claim_revision"],
+            )
+            tail = connection.execute(
+                """
+                SELECT max(authorization_revision)
+                FROM public.followup_authorization_events
+                WHERE claim_id=%s::uuid
+                """,
+                (case["claim"],),
+            ).fetchone()[0]
+            assert tail == case["authorization_revision"] + 1
+        else:
+            assert (status, revision, claim_state, claim_revision) == (
+                "Cancelled" if operation == "CANCEL" else "Completed",
+                case["revision"] + 1,
+                "RELEASED" if operation == "CANCEL" else "CONSUMED",
+                case["claim_revision"] + 1,
+            )
+            tail = connection.execute(
+                """
+                SELECT coalesce(max(authorization_revision),0)
+                FROM public.followup_authorization_events
+                WHERE claim_id=%s::uuid
+                """,
+                (case["claim"],),
+            ).fetchone()[0]
+            assert tail == case["authorization_revision"]

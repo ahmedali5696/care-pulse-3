@@ -1083,3 +1083,30 @@ def test_deadline_day_is_inclusive_but_next_day_loses_parallel_race(
     assert len(rows) == 1
     assert rows[0].state == "ACTIVE"
     assert rows[0].service_date == source["day"] + timedelta(days=7)
+
+
+def test_t133_denied_terminal_write_cannot_unwind_existing_active_claim(
+    appointment_storage,
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        claim = _v2_command(
+            connection, "create_followup_claim", source, **_v2_booking(source)
+        )
+        target = _v2_record(connection, claim)["id"]
+    with transaction(runtime, tenant) as connection:
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(
+                text("""
+                    SELECT * FROM public.transition_terminal_appointment(
+                        :tenant, :target, 0,
+                        '{"operation":"CANCEL","reason":"Unapproved SQL call"}'::jsonb)
+                """),
+                {"tenant": tenant, "target": target},
+            )
+        assert denied.value.orig.sqlstate == "42501"
+    rows = _claims(runtime, tenant, source)
+    assert len(rows) == 1
+    assert rows[0].status == "Booked"
+    assert rows[0].state == "ACTIVE"

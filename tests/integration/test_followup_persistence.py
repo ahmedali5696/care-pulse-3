@@ -2689,3 +2689,49 @@ def test_d08_adds_no_lifecycle_or_fixture_api_routes():
         )
         for method, path in route_set
     )
+
+
+def test_t133_terminal_writer_is_default_denied_even_with_live_runtime_actor(
+    appointment_storage,
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    signature = "public.transition_terminal_appointment(uuid,uuid,bigint,jsonb)"
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        claim = _v2_command(
+            connection, "create_followup_claim", source, **_v2_booking(source)
+        )
+        target = _v2_record(connection, claim)["id"]
+        assert not connection.scalar(
+            text("SELECT has_function_privilege(current_user, :signature, 'EXECUTE')"),
+            {"signature": signature},
+        )
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(
+                text("""
+                    SELECT * FROM public.transition_terminal_appointment(
+                        :tenant, :target, 0,
+                        '{"operation":"CANCEL","reason":"Synthetic cancellation"}'::jsonb)
+                """),
+                {"tenant": tenant, "target": target},
+            )
+        assert denied.value.orig.sqlstate == "42501"
+        with pytest.raises(DBAPIError) as direct, connection.begin_nested():
+            connection.execute(
+                text("""
+                    UPDATE public.appointments SET status='Cancelled', revision=revision+1
+                    WHERE organization_id=:tenant AND id=:target
+                """),
+                {"tenant": tenant, "target": target},
+            )
+        assert direct.value.orig.sqlstate == "42501"
+        assert connection.execute(
+            text("""
+                SELECT a.status, a.revision, c.state, c.revision
+                FROM public.appointments a
+                JOIN public.followup_claims c ON
+                    (c.organization_id,c.appointment_id)=(a.organization_id,a.id)
+                WHERE a.organization_id=:tenant AND a.id=:target
+            """),
+            {"tenant": tenant, "target": target},
+        ).one() == ("Booked", 0, "ACTIVE", 1)
