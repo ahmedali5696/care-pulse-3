@@ -27,6 +27,110 @@ from test_followup_persistence import _v2_booking, _v2_command, _v2_record, _v2_
 from test_visit_persistence import _receptionist
 
 
+def _historical_followup_cases(runtime, migration, tenant, doctor, cases):
+    """Move only the disposable fixture clock, then restore both SQL guards.
+
+    The real ordered booking writer still checks every policy, price and date
+    constraint against the simulated booking day. No Doctor decision is seeded.
+    """
+    asof = datetime.now(ZoneInfo("Africa/Cairo")) - timedelta(days=3)
+    replacements = (
+        (
+            "public.guard_appointment_history_insert()",
+            "NEW.occurred_at := date_trunc('second', clock_timestamp());",
+            (
+                "NEW.occurred_at := date_trunc('second', COALESCE("
+                "NULLIF(current_setting('cp_t133_asof', true), '')::timestamptz,"
+                "clock_timestamp()));"
+            ),
+        ),
+        (
+            "public.b10_schedule_without_offset_guard(uuid,jsonb)",
+            "day < (clock_timestamp() AT TIME ZONE 'Africa/Cairo')::date",
+            (
+                "day < (COALESCE(NULLIF(current_setting('cp_t133_asof', true),"
+                " '')::timestamptz, clock_timestamp())"
+                " AT TIME ZONE 'Africa/Cairo')::date"
+            ),
+        ),
+    )
+    originals = []
+    with migration.begin() as connection:
+        for signature, old, new in replacements:
+            original = connection.scalar(
+                text("SELECT pg_get_functiondef(CAST(:signature AS regprocedure))"),
+                {"signature": signature},
+            )
+            assert original is not None and original.count(old) == 1
+            originals.append((signature, original))
+            connection.exec_driver_sql(original.replace(old, new))
+    try:
+        for name in ("no_show_old_doctor", "no_show_old_receptionist"):
+            with transaction(runtime, tenant) as connection:
+                connection.execute(
+                    text("SELECT set_config('cp_t133_asof', :asof, true)"),
+                    {"asof": asof.isoformat()},
+                )
+                source = _v2_source(connection, tenant, doctor)
+                claim = _v2_command(
+                    connection, "create_followup_claim", source, **_v2_booking(source)
+                )
+                record = _v2_record(connection, claim)
+                proof = connection.execute(
+                    text("""
+                        SELECT c.state, c.completion_local_date, a.service_date,
+                               c.source_visit_id, p.entitlement_provenance = c.policy_snapshot,
+                               (t.completed_at AT TIME ZONE 'Africa/Cairo')::date,
+                               t.examination_occurred
+                        FROM public.followup_claims c
+                        JOIN public.appointments a ON
+                            (a.organization_id,a.id)=(c.organization_id,c.appointment_id)
+                        JOIN public.appointment_price_snapshots p ON
+                            (p.organization_id,p.appointment_id)=(a.organization_id,a.id)
+                        JOIN public.completion_attestations t ON
+                            (t.organization_id,t.visit_id)=(c.organization_id,c.source_visit_id)
+                        WHERE c.organization_id=:tenant AND c.id=:claim
+                    """),
+                    {"tenant": tenant, "claim": claim},
+                ).one()
+                assert proof == (
+                    "ACTIVE",
+                    asof.date(),
+                    asof.date() + timedelta(days=1),
+                    source["visit"],
+                    True,
+                    asof.date(),
+                    True,
+                )
+                cases[name] = {
+                    "target": str(record["id"]),
+                    "claim": str(claim),
+                    "source_visit": str(source["visit"]),
+                    "source_appointment": str(source["appointment"]),
+                    "source_date": source["day"].isoformat(),
+                    "status": "Booked",
+                    "revision": 0,
+                    "claim_revision": 1,
+                    "source_revision": 0,
+                    "authorization_revision": 0,
+                    "queue_day_revision": None,
+                    "historical_booking_at": asof.isoformat(),
+                }
+    finally:
+        with migration.begin() as connection:
+            for signature, original in originals:
+                connection.exec_driver_sql(original)
+                assert (
+                    connection.scalar(
+                        text(
+                            "SELECT pg_get_functiondef(CAST(:signature AS regprocedure))"
+                        ),
+                        {"signature": signature},
+                    )
+                    == original
+                )
+
+
 def _waiting(connection, tenant, doctor, saved):
     target = UUID(saved["id"])
     connection.execute(
@@ -214,11 +318,30 @@ def test_seed_terminal_cases_for_runtime_only_worker(appointment_storage):
                     raise AssertionError(
                         f"Could not seed {outcome}/{winner}/{source_first} orientation"
                     )
+    _historical_followup_cases(runtime, migration, tenant, doctor, cases)
+    with transaction(runtime, tenant) as connection:
+        source = _v2_source(connection, tenant, doctor)
+        claim = _v2_command(
+            connection, "create_followup_claim", source, **_v2_booking(source, offset=5)
+        )
+        record = _v2_record(connection, claim)
+        cases["deny_no_show_future"] = {
+            "target": str(record["id"]),
+            "status": "Booked",
+            "revision": 0,
+            "claim": str(claim),
+            "source_visit": str(source["visit"]),
+            "source_appointment": str(source["appointment"]),
+            "claim_revision": 1,
+            "source_revision": 0,
+            "authorization_revision": 0,
+        }
     cairo_today = datetime.now(ZoneInfo("Africa/Cairo")).date()
-    for name, offset in (
-        ("no_show_old_doctor", -2),
-        ("no_show_old_receptionist", -2),
-        ("deny_no_show_future", 5),
+    for name, operation, offset in (
+        ("deny_non_followup_cancel", "CANCEL", 1),
+        ("deny_non_followup_no_show", "MARK_NO_SHOW", -2),
+        ("deny_non_followup_complete", "COMPLETE", 1),
+        ("legacy_new_exam_complete", "COMPLETE", 1),
     ):
         with transaction(runtime, tenant) as connection:
             saved = persist_appointment(
@@ -230,10 +353,13 @@ def test_seed_terminal_cases_for_runtime_only_worker(appointment_storage):
                 ),
                 _query(tenant, doctor),
             )
+            in_exam = operation == "COMPLETE"
+            if in_exam:
+                _admit_saved(connection, tenant, doctor, saved)
             cases[name] = {
                 "target": saved["id"],
-                "status": "Booked",
-                "revision": 0,
+                "status": "In Examination" if in_exam else "Booked",
+                "revision": 2 if in_exam else 0,
                 "claim": None,
             }
     # Prospective clinic price change: previously booked prices remain frozen.

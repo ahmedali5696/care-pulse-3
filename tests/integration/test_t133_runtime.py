@@ -155,6 +155,47 @@ def test_terminal_outcome_commits_exact_claim_and_history(
         ).fetchone() == ("carepulse_runtime", "carepulse_runtime", True)
         before = _state(connection, case)
         assert before is not None
+        assert case["claim"] is not None
+        assert before[2:4] == ("ACTIVE", case["claim_revision"])
+        if operation == "MARK_NO_SHOW":
+            claim_source = connection.execute(
+                """
+                SELECT c.organization_id, c.appointment_id, c.source_visit_id,
+                       c.source_appointment_id, c.state,
+                       p.entitlement_provenance = c.policy_snapshot,
+                       a.service_type, a.classification,
+                       ca.examination_occurred,
+                       (ca.completed_at AT TIME ZONE 'Africa/Cairo')::date,
+                       a.service_date
+                FROM public.followup_claims c
+                JOIN public.appointments a ON
+                    (a.organization_id,a.id)=(c.organization_id,c.appointment_id)
+                JOIN public.appointment_price_snapshots p ON
+                    (p.organization_id,p.appointment_id)=(a.organization_id,a.id)
+                JOIN public.completion_attestations ca ON
+                    (ca.organization_id,ca.visit_id)=
+                    (c.organization_id,c.source_visit_id)
+                WHERE c.organization_id=%s::uuid AND c.id=%s::uuid
+                """,
+                (fixture_data["organization"], case["claim"]),
+            ).fetchone()
+            assert claim_source == (
+                UUID(fixture_data["organization"]),
+                UUID(case["target"]),
+                UUID(case["source_visit"]),
+                UUID(case["source_appointment"]),
+                "ACTIVE",
+                True,
+                "FOLLOW_UP",
+                "ROUTINE",
+                True,
+                date.fromisoformat(case["source_date"]),
+                date.fromisoformat(case["source_date"]) + timedelta(days=1),
+            )
+            cairo_today = connection.execute(
+                "SELECT (clock_timestamp() AT TIME ZONE 'Africa/Cairo')::date"
+            ).fetchone()[0]
+            assert claim_source[-1] < cairo_today
         waiting_before = None
         if before[0] == "Waiting":
             waiting_before = connection.execute(
@@ -196,10 +237,8 @@ def test_terminal_outcome_commits_exact_claim_and_history(
         assert observed == (
             result,
             revision,
-            None
-            if case["claim"] is None
-            else ("CONSUMED" if result == "Completed" else "RELEASED"),
-            None if case["claim"] is None else 2,
+            "CONSUMED" if result == "Completed" else "RELEASED",
+            case["claim_revision"] + 1,
             before[4] + 1,
         )
         assert (
@@ -227,15 +266,14 @@ def test_terminal_outcome_commits_exact_claim_and_history(
             True,
             True,
         )
-        if case["claim"] is not None:
-            claim = connection.execute(
-                """
-                SELECT terminal_history_revision, terminal_at
-                FROM public.followup_claims WHERE id=%s::uuid
-                """,
-                (case["claim"],),
-            ).fetchone()
-            assert claim == (revision, committed_at)
+        claim = connection.execute(
+            """
+            SELECT terminal_history_revision, terminal_at
+            FROM public.followup_claims WHERE organization_id=%s::uuid AND id=%s::uuid
+            """,
+            (fixture_data["organization"], case["claim"]),
+        ).fetchone()
+        assert claim == (revision, committed_at)
         if waiting_before is not None:
             closed = connection.execute(
                 """
@@ -257,6 +295,70 @@ def test_terminal_outcome_commits_exact_claim_and_history(
                 revision,
                 waiting_before[4],
             )
+
+
+@pytest.mark.parametrize(
+    ("name", "operation", "payload"),
+    [
+        ("deny_non_followup_cancel", "CANCEL", {"reason": "Not Follow-up"}),
+        (
+            "deny_non_followup_no_show",
+            "MARK_NO_SHOW",
+            {"reason": "Verified absence", "absence_confirmed": True},
+        ),
+        (
+            "deny_non_followup_complete",
+            "COMPLETE",
+            {"examination_occurred": True},
+        ),
+    ],
+)
+def test_new_terminal_writer_rejects_non_followup_without_effects(
+    fixture_data, name, operation, payload
+):
+    case = fixture_data["cases"][name]
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        before = _state(connection, case)
+        assert before[2:4] == (None, None)
+        with pytest.raises(psycopg.Error) as rejected:
+            _call(connection, fixture_data, case, _command(case, operation, **payload))
+        assert rejected.value.sqlstate == "42501"
+        connection.rollback()
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        assert _state(connection, case) == before
+
+
+def test_new_examination_completion_keeps_legacy_signature(fixture_data):
+    case = fixture_data["cases"]["legacy_new_exam_complete"]
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        before = _state(connection, case)
+        assert before[:4] == ("In Examination", 2, None, None)
+        attestation, revision, committed_at = connection.execute(
+            """
+            SELECT * FROM public.complete_examined_visit(
+                %s::uuid, %s::uuid, %s::bigint, true)
+            """,
+            (fixture_data["organization"], case["target"], case["revision"]),
+        ).fetchone()
+        connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
+        assert attestation is not None and revision == 3 and committed_at is not None
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        assert _state(connection, case) == ("Completed", 3, None, None, before[4] + 1)
+        assert connection.execute(
+            """
+            SELECT c.completed_at, h.occurred_at, c.examination_occurred
+            FROM public.completion_attestations c
+            JOIN public.appointment_history h ON
+                (h.organization_id,h.appointment_id,h.appointment_revision)=
+                (c.organization_id,c.appointment_id,c.completion_history_revision)
+            WHERE c.organization_id=%s::uuid AND c.id=%s::uuid
+            """,
+            (fixture_data["organization"], attestation),
+        ).fetchone() == (committed_at, committed_at, True)
 
 
 @pytest.mark.parametrize(

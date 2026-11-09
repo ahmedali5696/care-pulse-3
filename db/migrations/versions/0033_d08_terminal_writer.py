@@ -83,6 +83,7 @@ def upgrade() -> None:
             locked_id uuid;
             queue_day uuid;
             queue_entry uuid;
+            retained_visit uuid;
             exam_attestation uuid;
             next_revision bigint;
             event_at timestamptz;
@@ -157,16 +158,20 @@ def upgrade() -> None:
             IF NOT FOUND THEN
                 RAISE EXCEPTION 'Appointment unavailable' USING ERRCODE = '23514';
             END IF;
-            IF proposed.service_type = 'FOLLOW_UP' THEN
-                SELECT c.source_appointment_id, c.source_visit_id
-                INTO source_appointment, source_visit
-                FROM public.followup_claims c
-                WHERE c.organization_id = target_organization
-                  AND c.appointment_id = target_appointment;
-                IF NOT FOUND THEN
-                    RAISE EXCEPTION 'Follow-up claim unavailable'
-                        USING ERRCODE = '23514';
-                END IF;
+            IF proposed.service_type IS DISTINCT FROM 'FOLLOW_UP'
+               OR proposed.classification IS DISTINCT FROM 'ROUTINE' THEN
+                RAISE EXCEPTION 'Terminal writer is Follow-up only'
+                    USING ERRCODE = '42501';
+            END IF;
+            SELECT c.source_appointment_id, c.source_visit_id
+            INTO source_appointment, source_visit
+            FROM public.followup_claims c
+            WHERE c.organization_id = target_organization
+              AND c.appointment_id = target_appointment
+              AND c.state = 'ACTIVE';
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'Active preferential Follow-up claim unavailable'
+                    USING ERRCODE = '23514';
             END IF;
             PERFORM 1 FROM public.patients
             WHERE organization_id = target_organization
@@ -182,14 +187,12 @@ def upgrade() -> None:
             IF NOT FOUND THEN
                 RAISE EXCEPTION 'Schedule barrier missing' USING ERRCODE = '23514';
             END IF;
-            IF proposed.service_type = 'FOLLOW_UP' THEN
-                PERFORM 1 FROM public.clinic_policy_heads
-                WHERE organization_id = target_organization AND kind = 'FOLLOWUP'
-                FOR SHARE;
-                IF NOT FOUND THEN
-                    RAISE EXCEPTION 'Follow-up policy barrier missing'
-                        USING ERRCODE = '23514';
-                END IF;
+            PERFORM 1 FROM public.clinic_policy_heads
+            WHERE organization_id = target_organization AND kind = 'FOLLOWUP'
+            FOR SHARE;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'Follow-up policy barrier missing'
+                    USING ERRCODE = '23514';
             END IF;
             IF proposed.status = 'Waiting' THEN
                 IF NOT COALESCE((command->>'expected_queue_day_revision')
@@ -248,12 +251,13 @@ def upgrade() -> None:
                 RAISE EXCEPTION 'Stale terminal Appointment'
                     USING ERRCODE = '40001';
             END IF;
-            IF (locked.service_type <> 'FOLLOW_UP'
-                AND command ?| ARRAY['expected_claim_revision',
-                                     'expected_source_revision',
-                                     'expected_authorization_revision'])
-               OR (locked.status <> 'Waiting'
-                   AND command ? 'expected_queue_day_revision') THEN
+            IF locked.service_type IS DISTINCT FROM 'FOLLOW_UP'
+               OR locked.classification IS DISTINCT FROM 'ROUTINE' THEN
+                RAISE EXCEPTION 'Terminal writer is Follow-up only'
+                    USING ERRCODE = '42501';
+            END IF;
+            IF locked.status <> 'Waiting'
+               AND command ? 'expected_queue_day_revision' THEN
                 RAISE EXCEPTION 'Unexpected terminal revision token'
                     USING ERRCODE = '23514';
             END IF;
@@ -275,70 +279,74 @@ def upgrade() -> None:
                 RAISE EXCEPTION 'Exam cancellation requires Doctor'
                     USING ERRCODE = '42501';
             END IF;
-            IF source_visit IS NOT NULL THEN
-                PERFORM 1 FROM public.visits WHERE organization_id = target_organization
-                    AND id = source_visit FOR UPDATE;
-                IF NOT FOUND THEN
-                    RAISE EXCEPTION 'Claim source Visit missing' USING ERRCODE = '23514';
-                END IF;
-                PERFORM 1 FROM public.followup_source_state
-                WHERE organization_id = target_organization
-                  AND visit_id = source_visit FOR UPDATE;
-                IF NOT FOUND THEN
-                    RAISE EXCEPTION 'Claim source state missing' USING ERRCODE = '23514';
-                END IF;
+            PERFORM 1 FROM public.visits WHERE organization_id = target_organization
+                AND id = source_visit FOR UPDATE;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'Claim source Visit missing' USING ERRCODE = '23514';
+            END IF;
+            PERFORM 1 FROM public.followup_source_state
+            WHERE organization_id = target_organization
+              AND visit_id = source_visit FOR UPDATE;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'Claim source state missing' USING ERRCODE = '23514';
             END IF;
             IF locked.status = 'In Examination' THEN
-                PERFORM 1 FROM public.visits
+                SELECT id INTO retained_visit FROM public.visits
                 WHERE organization_id = target_organization
                   AND appointment_id = target_appointment FOR UPDATE;
                 IF NOT FOUND THEN
                     RAISE EXCEPTION 'Exam Visit missing' USING ERRCODE = '23514';
                 END IF;
             END IF;
-            IF source_visit IS NOT NULL THEN
-                SELECT * INTO claim FROM public.followup_claims c
-                WHERE c.organization_id = target_organization
-                  AND c.appointment_id = target_appointment FOR UPDATE;
-                IF NOT FOUND OR claim.state <> 'ACTIVE'
-                   OR claim.source_visit_id <> source_visit
-                   OR claim.source_appointment_id <> source_appointment
-                   OR claim.patient_id <> locked.patient_id
-                   OR claim.doctor_staff_id <> locked.doctor_staff_id THEN
-                    RAISE EXCEPTION 'Follow-up claim no longer active'
-                        USING ERRCODE = '40001';
-                END IF;
-                IF NOT (command ?& ARRAY['expected_claim_revision',
-                                         'expected_source_revision',
-                                         'expected_authorization_revision'])
-                   OR NOT COALESCE((command->>'expected_claim_revision')
-                                   ~ '^[1-9][0-9]*$',false)
-                   OR NOT COALESCE((command->>'expected_source_revision')
-                                   ~ '^(0|[1-9][0-9]*)$',false)
-                   OR NOT COALESCE((command->>'expected_authorization_revision')
-                                   ~ '^(0|[1-9][0-9]*)$',false)
-                   OR claim.revision::text IS DISTINCT FROM
-                       command->>'expected_claim_revision' THEN
-                    RAISE EXCEPTION 'Stale terminal claim' USING ERRCODE = '40001';
-                END IF;
-                IF NOT EXISTS (
-                    SELECT 1 FROM public.followup_source_state s
-                    WHERE s.organization_id = target_organization
-                      AND s.visit_id = source_visit
-                      AND s.source_revision::text =
-                          command->>'expected_source_revision'
-                ) THEN
-                    RAISE EXCEPTION 'Stale terminal source' USING ERRCODE = '40001';
-                END IF;
-                -- Read the ledger in a fresh statement after the claim-lock wait.
-                IF (SELECT COALESCE(max(e.authorization_revision),0)::text
-                    FROM public.followup_authorization_events e
-                    WHERE e.organization_id = target_organization
-                      AND e.claim_id = claim.id)
-                   IS DISTINCT FROM command->>'expected_authorization_revision' THEN
-                    RAISE EXCEPTION 'Stale terminal authorization'
-                        USING ERRCODE = '40001';
-                END IF;
+            SELECT * INTO claim FROM public.followup_claims c
+            WHERE c.organization_id = target_organization
+              AND c.appointment_id = target_appointment FOR UPDATE;
+            IF NOT FOUND OR claim.state <> 'ACTIVE'
+               OR claim.source_visit_id <> source_visit
+               OR claim.source_appointment_id <> source_appointment
+               OR claim.patient_id <> locked.patient_id
+               OR claim.doctor_staff_id <> locked.doctor_staff_id
+               OR NOT EXISTS (
+                   SELECT 1 FROM public.appointment_price_snapshots p
+                   WHERE p.organization_id = target_organization
+                     AND p.appointment_id = target_appointment
+                     AND p.service_type = 'FOLLOW_UP'
+                     AND p.classification = 'ROUTINE'
+                     AND p.entitlement_provenance = claim.policy_snapshot
+               ) THEN
+                RAISE EXCEPTION 'Follow-up claim no longer active'
+                    USING ERRCODE = '40001';
+            END IF;
+            IF NOT (command ?& ARRAY['expected_claim_revision',
+                                     'expected_source_revision',
+                                     'expected_authorization_revision'])
+               OR NOT COALESCE((command->>'expected_claim_revision')
+                               ~ '^[1-9][0-9]*$',false)
+               OR NOT COALESCE((command->>'expected_source_revision')
+                               ~ '^(0|[1-9][0-9]*)$',false)
+               OR NOT COALESCE((command->>'expected_authorization_revision')
+                               ~ '^(0|[1-9][0-9]*)$',false)
+               OR claim.revision::text IS DISTINCT FROM
+                   command->>'expected_claim_revision' THEN
+                RAISE EXCEPTION 'Stale terminal claim' USING ERRCODE = '40001';
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM public.followup_source_state s
+                WHERE s.organization_id = target_organization
+                  AND s.visit_id = source_visit
+                  AND s.source_revision::text =
+                      command->>'expected_source_revision'
+            ) THEN
+                RAISE EXCEPTION 'Stale terminal source' USING ERRCODE = '40001';
+            END IF;
+            -- Read the ledger in a fresh statement after the claim-lock wait.
+            IF (SELECT COALESCE(max(e.authorization_revision),0)::text
+                FROM public.followup_authorization_events e
+                WHERE e.organization_id = target_organization
+                  AND e.claim_id = claim.id)
+               IS DISTINCT FROM command->>'expected_authorization_revision' THEN
+                RAISE EXCEPTION 'Stale terminal authorization'
+                    USING ERRCODE = '40001';
             END IF;
             IF requested_operation = 'COMPLETE' THEN
                 SELECT c.attestation_id, c.completion_history_revision, c.completed_at
@@ -392,10 +400,18 @@ def upgrade() -> None:
                     reason, transition_history_id::text,
                     jsonb_build_object('appointment_id', target_appointment,
                                        'revision', expected_revision, 'status', locked.status,
-                                       'history_id', transition_history_id),
+                                       'history_id', transition_history_id,
+                                       'claim_id', claim.id,
+                                       'source_visit_id', source_visit,
+                                       'source_appointment_id', source_appointment,
+                                       'visit_id', retained_visit),
                     jsonb_build_object('appointment_id', target_appointment,
                                        'revision', next_revision,
                                        'history_id', transition_history_id,
+                                       'claim_id', claim.id,
+                                       'source_visit_id', source_visit,
+                                       'source_appointment_id', source_appointment,
+                                       'visit_id', retained_visit,
                                        'status', CASE requested_operation
                                                 WHEN 'CANCEL' THEN 'Cancelled'
                                                 ELSE 'No-show' END)
@@ -404,19 +420,17 @@ def upgrade() -> None:
                             ELSE '{}'::jsonb END,
                     event_at);
             END IF;
-            IF source_visit IS NOT NULL THEN
-                UPDATE public.followup_claims SET
-                    state = CASE requested_operation WHEN 'COMPLETE'
-                                 THEN 'CONSUMED' ELSE 'RELEASED' END,
-                    revision = revision + 1,
-                    terminal_history_revision = next_revision,
-                    terminal_at = event_at
-                WHERE organization_id = target_organization
-                  AND id = claim.id AND state = 'ACTIVE';
-                IF NOT FOUND THEN
-                    RAISE EXCEPTION 'Claim terminal settlement lost'
-                        USING ERRCODE = '40001';
-                END IF;
+            UPDATE public.followup_claims SET
+                state = CASE requested_operation WHEN 'COMPLETE'
+                             THEN 'CONSUMED' ELSE 'RELEASED' END,
+                revision = revision + 1,
+                terminal_history_revision = next_revision,
+                terminal_at = event_at
+            WHERE organization_id = target_organization
+              AND id = claim.id AND state = 'ACTIVE';
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'Claim terminal settlement lost'
+                    USING ERRCODE = '40001';
             END IF;
             terminal_history_revision := next_revision;
             terminal_at := event_at;
