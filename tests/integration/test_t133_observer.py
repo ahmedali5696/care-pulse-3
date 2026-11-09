@@ -49,7 +49,7 @@ def _audits(connection, target):
                OR after_state->>'appointment_id' = %s)
         ORDER BY occurred_at, id
         """,
-        (TERMINAL_AUDIT_ACTIONS, target, target),
+        (list(TERMINAL_AUDIT_ACTIONS), target, target),
     ).fetchall()
 
 
@@ -130,6 +130,20 @@ def _audits(connection, target):
         ),
         (
             "consume_denies_second",
+            "doctor",
+            "In Examination",
+            "Completed",
+            "VISIT_EXAMINATION_COMPLETED",
+        ),
+        (
+            "race_exam_cancel_first",
+            "doctor",
+            "In Examination",
+            "Cancelled",
+            "VISIT_EXAMINATION_CANCELLED",
+        ),
+        (
+            "race_exam_complete_first",
             "doctor",
             "In Examination",
             "Completed",
@@ -228,6 +242,11 @@ def test_committed_terminal_audit_links_exact_history_and_attestation(
         "deny_stale_revision",
         "deny_blank_reason",
         "deny_missing_attestation",
+        "deny_absent_attestation",
+        "deny_missing_reason",
+        "deny_wrong_tenant",
+        "rollback_after_terminal_cancel",
+        "rollback_after_terminal_complete",
         "deny_no_show_future",
         "deny_false_absence",
         "deny_stale_claim",

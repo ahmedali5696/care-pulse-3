@@ -83,6 +83,9 @@ def test_seed_terminal_cases_for_runtime_only_worker(appointment_storage):
         "deny_stale_revision": "Booked",
         "deny_blank_reason": "Booked",
         "deny_missing_attestation": "In Examination",
+        "deny_absent_attestation": "In Examination",
+        "deny_missing_reason": "Booked",
+        "deny_wrong_tenant": "Booked",
         "deny_foreign": "Booked",
         "deny_disabled": "Booked",
         "deny_false_absence": "Booked",
@@ -97,6 +100,10 @@ def test_seed_terminal_cases_for_runtime_only_worker(appointment_storage):
         "release_requalify": "Booked",
         "release_after_extension": "Booked",
         "consume_denies_second": "In Examination",
+        "race_exam_cancel_first": "In Examination",
+        "race_exam_complete_first": "In Examination",
+        "rollback_after_terminal_cancel": "Booked",
+        "rollback_after_terminal_complete": "In Examination",
     }
     for name, status in definitions.items():
         with transaction(runtime, tenant) as connection:

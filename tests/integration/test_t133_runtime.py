@@ -295,6 +295,22 @@ def test_terminal_outcome_commits_exact_claim_and_history(
             "23514",
         ),
         (
+            "deny_absent_attestation",
+            "doctor",
+            "COMPLETE",
+            {},
+            None,
+            "23514",
+        ),
+        (
+            "deny_missing_reason",
+            "doctor",
+            "CANCEL",
+            {},
+            None,
+            "23514",
+        ),
+        (
             "deny_no_show_future",
             "receptionist",
             "MARK_NO_SHOW",
@@ -392,6 +408,66 @@ def test_denial_leaves_original_claim_and_history(
                 revision=revision,
             )
         assert error.value.sqlstate == sqlstate
+        connection.rollback()
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        assert _state(connection, case) == before
+
+
+def test_wrong_tenant_context_denies_without_terminal_effect(fixture_data):
+    case = fixture_data["cases"]["deny_wrong_tenant"]
+    with _login() as connection:
+        _context(
+            connection,
+            fixture_data["foreign_organization"],
+            fixture_data["foreign_doctor"],
+        )
+        with pytest.raises(psycopg.Error) as error:
+            _call(
+                connection,
+                fixture_data,
+                case,
+                _command(case, "CANCEL", reason="Wrong tenant"),
+            )
+        assert error.value.sqlstate == "42501"
+        connection.rollback()
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        assert _state(connection, case)[:4] == (
+            "Booked",
+            0,
+            "ACTIVE",
+            case["claim_revision"],
+        )
+
+
+@pytest.mark.parametrize("operation", ["CANCEL", "COMPLETE"])
+def test_post_writer_transaction_failure_rolls_back_every_terminal_effect(
+    fixture_data, operation
+):
+    case = fixture_data["cases"][
+        "rollback_after_terminal_cancel"
+        if operation == "CANCEL"
+        else "rollback_after_terminal_complete"
+    ]
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        before = _state(connection, case)
+        payload = (
+            {"reason": "Verified rollback after terminal writer"}
+            if operation == "CANCEL"
+            else {"examination_occurred": True}
+        )
+        assert (
+            _call(connection, fixture_data, case, _command(case, operation, **payload))[
+                0
+            ]
+            == case["revision"] + 1
+        )
+        connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
+        with pytest.raises(psycopg.Error) as failed:
+            connection.execute("SELECT 1 / 0")
+        assert failed.value.sqlstate == "22012"
         connection.rollback()
     with _login() as connection:
         _context(connection, fixture_data["organization"], fixture_data["doctor"])
@@ -797,6 +873,76 @@ def test_waiting_cancel_serializes_with_real_admission_and_queue_day(
                 "RELEASED",
                 case["claim_revision"] + 1,
             )
+
+
+@pytest.mark.parametrize("first", ["CANCEL", "COMPLETE"])
+def test_exceptional_cancellation_and_completion_share_one_terminal_winner(
+    fixture_data, first
+):
+    name = "race_exam_cancel_first" if first == "CANCEL" else "race_exam_complete_first"
+    case = fixture_data["cases"][name]
+    second = "COMPLETE" if first == "CANCEL" else "CANCEL"
+    started, released, contender_started = Event(), Event(), Event()
+    pids = {}
+
+    def attempt(operation, leading):
+        with _login() as connection:
+            _context(connection, fixture_data["organization"], fixture_data["doctor"])
+            pids["leader" if leading else "waiter"] = connection.info.backend_pid
+            if not leading:
+                contender_started.set()
+            payload = (
+                {"examination_occurred": True}
+                if operation == "COMPLETE"
+                else {"reason": "Verified exceptional clinical cancellation"}
+            )
+            try:
+                result = _call(
+                    connection, fixture_data, case, _command(case, operation, **payload)
+                )
+                connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
+                if leading:
+                    started.set()
+                    assert released.wait(timeout=20)
+                return result
+            except psycopg.Error as error:
+                if leading:
+                    started.set()
+                return error.sqlstate
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        leader = pool.submit(attempt, first, True)
+        assert started.wait(timeout=15)
+        waiter = pool.submit(attempt, second, False)
+        try:
+            assert contender_started.wait(timeout=15)
+            with _login() as observer:
+                until = monotonic() + 7
+                witnessed = False
+                while monotonic() < until:
+                    blocker_ids = observer.execute(
+                        "SELECT pg_blocking_pids(%s::integer)",
+                        (pids["waiter"],),
+                    ).fetchone()[0]
+                    if pids["leader"] in blocker_ids:
+                        witnessed = True
+                        break
+                    sleep(0.02)
+                assert witnessed, "No exceptional-cancel/completion lock witness"
+        finally:
+            released.set()
+        winner = leader.result(timeout=25)
+        loser = waiter.result(timeout=25)
+    assert isinstance(winner, tuple)
+    assert loser == "40001"
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        assert _state(connection, case)[:4] == (
+            "Cancelled" if first == "CANCEL" else "Completed",
+            3,
+            "RELEASED" if first == "CANCEL" else "CONSUMED",
+            case["claim_revision"] + 1,
+        )
 
 
 def _extend(connection, data, case):
