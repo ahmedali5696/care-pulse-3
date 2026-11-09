@@ -90,6 +90,8 @@ def test_seed_terminal_cases_for_runtime_only_worker(appointment_storage):
         "deny_stale_source": "Booked",
         "deny_stale_authorization": "Booked",
         "deny_stale_queue": "Waiting",
+        "race_waiting_attendance_first": "Waiting",
+        "race_waiting_terminal_first": "Waiting",
         "deny_extra_field": "Booked",
         "deny_unsupported": "Booked",
         "release_requalify": "Booked",
@@ -257,7 +259,8 @@ def test_seed_terminal_cases_for_runtime_only_worker(appointment_storage):
     with migration.begin() as connection:
         connection.execute(
             text("""
-                UPDATE public.staff_accounts SET enabled=false
+                UPDATE public.staff_accounts
+                SET enabled=false, security_revision=security_revision+1
                 WHERE organization_id=:tenant AND id=:staff
             """),
             {"tenant": tenant, "staff": disabled_receptionist},

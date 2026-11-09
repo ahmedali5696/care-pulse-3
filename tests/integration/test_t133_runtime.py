@@ -436,14 +436,16 @@ def _fresh_claim_after_terminal(data, case, *, must_succeed=True):
                 "doctor": UUID(data["doctor"]),
                 "visit": UUID(case["source_visit"]),
                 "day": date.fromisoformat(case["source_date"]),
+                "strict_quote": {
+                    "base_egp": str(policy.payload["preferential_followup_egp"]),
+                    "net_egp": str(policy.payload["preferential_followup_egp"]),
+                    "creation_standard_base_egp": str(
+                        policy.payload["standard_new_exam_egp"]
+                    ),
+                    "pricing_version": policy.current_version,
+                },
             }
             body = _v2_booking(source)
-            body["price_snapshot"].update(
-                base_egp=policy.payload["preferential_followup_egp"],
-                net_egp=policy.payload["preferential_followup_egp"],
-                creation_standard_base_egp=policy.payload["standard_new_exam_egp"],
-                pricing_version=policy.current_version,
-            )
             expected = {
                 "source_revision": case["source_revision"],
                 "clinical_revision": 0,
@@ -553,6 +555,193 @@ def test_consumed_claim_cannot_be_rebooked_even_after_price_change(fixture_data)
             "CONSUMED",
             case["claim_revision"] + 1,
         )
+
+
+@pytest.mark.parametrize("leader_action", ["attendance", "terminal"])
+def test_waiting_cancel_serializes_with_real_admission_and_queue_day(
+    fixture_data, leader_action
+):
+    case = fixture_data["cases"][f"race_waiting_{leader_action}_first"]
+    tenant = fixture_data["organization"]
+    doctor = fixture_data["doctor"]
+    ready, release, waiter_ready = Event(), Event(), Event()
+    pids = {}
+    terminal_command = _command(
+        case, "CANCEL", reason="Verified synthetic Waiting cancellation"
+    )
+
+    def action(kind, leading):
+        if kind == "terminal":
+            with _login() as connection:
+                _context(connection, tenant, doctor)
+                pids["leader" if leading else "waiter"] = connection.info.backend_pid
+                if not leading:
+                    waiter_ready.set()
+                try:
+                    result = _call(connection, fixture_data, case, terminal_command)
+                    connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
+                    if leading:
+                        ready.set()
+                        assert release.wait(timeout=20)
+                    return result
+                except psycopg.Error as error:
+                    if leading:
+                        ready.set()
+                    return error.sqlstate
+        engine = _runtime_engine()
+        try:
+            with transaction(engine, UUID(tenant)) as connection:
+                pids["leader" if leading else "waiter"] = connection.scalar(
+                    text("SELECT pg_backend_pid()")
+                )
+                saved = connection.execute(
+                    text("""
+                        SELECT id, service_date, lane
+                        FROM public.appointments
+                        WHERE organization_id=:tenant AND id=:target
+                    """),
+                    {"tenant": UUID(tenant), "target": UUID(case["target"])},
+                ).one()
+                if not leading:
+                    waiter_ready.set()
+                try:
+                    connection.execute(
+                        text("SELECT set_config('app.staff_id', :staff, true)"),
+                        {"staff": doctor},
+                    )
+                    connection.execute(
+                        text("""
+                            SELECT * FROM public.lock_doctor_admission_capacity(
+                                :tenant,:doctor,:day,:lane)
+                        """),
+                        {
+                            "tenant": UUID(tenant),
+                            "doctor": UUID(doctor),
+                            "day": saved.service_date,
+                            "lane": saved.lane,
+                        },
+                    ).one()
+                    connection.execute(
+                        text("""
+                            UPDATE public.appointments
+                            SET status='In Examination',revision=revision+1
+                            WHERE organization_id=:tenant AND id=:target
+                        """),
+                        {"tenant": UUID(tenant), "target": saved.id},
+                    )
+                    connection.execute(
+                        text("""
+                            INSERT INTO public.appointment_history (
+                                id, organization_id, appointment_id,
+                                appointment_revision, action, old_status, new_status,
+                                old_service_date,new_service_date,old_number,new_number,
+                                actor_staff_id,actor_role,reason,
+                                price_snapshot_appointment_id)
+                            SELECT gen_random_uuid(),organization_id,id,2,'STATUS',
+                                   'Waiting','In Examination',service_date,service_date,
+                                   current_number,current_number,:doctor,'DOCTOR_OWNER',
+                                   'Synthetic admission',id
+                            FROM public.appointments
+                            WHERE organization_id=:tenant AND id=:target
+                        """),
+                        {
+                            "doctor": UUID(doctor),
+                            "tenant": UUID(tenant),
+                            "target": saved.id,
+                        },
+                    )
+                    connection.execute(
+                        text("""
+                            UPDATE public.queue_entries
+                            SET disposition='CLOSED',closure_history_revision=2,
+                                revision=revision+1
+                            WHERE organization_id=:tenant AND appointment_id=:target
+                              AND disposition='ACTIVE'
+                        """),
+                        {"tenant": UUID(tenant), "target": saved.id},
+                    )
+                    connection.execute(
+                        text("""
+                            UPDATE public.queue_days SET revision=revision+1
+                            WHERE organization_id=:tenant
+                              AND id=(SELECT queue_day_id FROM public.queue_entries
+                                      WHERE organization_id=:tenant
+                                        AND appointment_id=:target)
+                        """),
+                        {"tenant": UUID(tenant), "target": saved.id},
+                    )
+                    connection.execute(
+                        text("""
+                            INSERT INTO public.visits (
+                                id,organization_id,appointment_id,patient_id,
+                                doctor_staff_id,service_date,
+                                admission_history_revision,admitted_at)
+                            SELECT gen_random_uuid(),organization_id,id,patient_id,
+                                   doctor_staff_id,service_date,2,clock_timestamp()
+                            FROM public.appointments
+                            WHERE organization_id=:tenant AND id=:target
+                        """),
+                        {"tenant": UUID(tenant), "target": saved.id},
+                    )
+                    connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+                    if leading:
+                        ready.set()
+                        assert release.wait(timeout=20)
+                    return "ATTENDED"
+                except DBAPIError as error:
+                    if leading:
+                        ready.set()
+                    return error.orig.sqlstate
+        finally:
+            engine.dispose()
+
+    other = "terminal" if leader_action == "attendance" else "attendance"
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        leader = pool.submit(action, leader_action, True)
+        assert ready.wait(timeout=15)
+        waiter = pool.submit(action, other, False)
+        try:
+            assert waiter_ready.wait(timeout=15)
+            with _login() as observer:
+                until = monotonic() + 7
+                witnessed = False
+                while monotonic() < until:
+                    blockers = observer.execute(
+                        "SELECT pg_blocking_pids(%s::integer)",
+                        (pids["waiter"],),
+                    ).fetchone()[0]
+                    if pids["leader"] in blockers:
+                        witnessed = True
+                        break
+                    sleep(0.02)
+                assert witnessed, (
+                    "Attendance/terminal failed to reach observed row wait"
+                )
+        finally:
+            release.set()
+        leader_result = leader.result(timeout=25)
+        waiter_result = waiter.result(timeout=25)
+    with _login() as connection:
+        _context(connection, tenant, doctor)
+        status, revision, claim_state, claim_revision, _ = _state(connection, case)
+        if leader_action == "attendance":
+            assert leader_result == "ATTENDED"
+            assert waiter_result == "40001"
+            assert (status, revision, claim_state, claim_revision) == (
+                "In Examination",
+                2,
+                "ACTIVE",
+                case["claim_revision"],
+            )
+        else:
+            assert isinstance(leader_result, tuple)
+            assert waiter_result == "23514"
+            assert (status, revision, claim_state, claim_revision) == (
+                "Cancelled",
+                2,
+                "RELEASED",
+                case["claim_revision"] + 1,
+            )
 
 
 def _extend(connection, data, case):

@@ -160,6 +160,15 @@ def upgrade() -> None:
             IF NOT FOUND THEN
                 RAISE EXCEPTION 'Schedule barrier missing' USING ERRCODE = '23514';
             END IF;
+            IF proposed.service_type = 'FOLLOW_UP' THEN
+                PERFORM 1 FROM public.clinic_policy_heads
+                WHERE organization_id = target_organization AND kind = 'FOLLOWUP'
+                FOR SHARE;
+                IF NOT FOUND THEN
+                    RAISE EXCEPTION 'Follow-up policy barrier missing'
+                        USING ERRCODE = '23514';
+                END IF;
+            END IF;
             IF proposed.status = 'Waiting' THEN
                 IF NOT COALESCE((command->>'expected_queue_day_revision')
                                 ~ '^[1-9][0-9]*$',false) THEN
@@ -369,7 +378,7 @@ def upgrade() -> None:
                                                 WHEN 'CANCEL' THEN 'Cancelled'
                                                 ELSE 'No-show' END)
                         || CASE WHEN requested_operation = 'MARK_NO_SHOW'
-                            THEN '{"absence_confirmed":true}'::jsonb
+                            THEN jsonb_build_object('absence_confirmed', true)
                             ELSE '{}'::jsonb END,
                     event_at);
             END IF;
