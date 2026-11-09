@@ -265,6 +265,13 @@ def test_seed_terminal_cases_for_runtime_only_worker(appointment_storage):
             """),
             {"tenant": tenant, "staff": disabled_receptionist},
         )
+    with migration.connect() as connection:
+        baseline_receipts = connection.scalar(
+            text("SELECT count(*) FROM public.idempotency_receipts")
+        )
+        baseline_outbox = connection.scalar(
+            text("SELECT count(*) FROM public.outbox_events")
+        )
     # The parent process grants only after this persisted synthetic dataset exists.
     result = {
         "organization": str(tenant),
@@ -274,6 +281,8 @@ def test_seed_terminal_cases_for_runtime_only_worker(appointment_storage):
         "foreign_organization": str(foreign_tenant),
         "foreign_doctor": str(foreign_doctor),
         "cases": cases,
+        "baseline_receipts": baseline_receipts,
+        "baseline_outbox": baseline_outbox,
     }
     target = Path(os.environ["CP_T133_FIXTURE_PATH"])
     target.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")

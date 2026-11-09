@@ -41,6 +41,28 @@ def upgrade() -> None:
         REVOKE ALL ON FUNCTION public.guard_d08_terminal_transition()
             FROM PUBLIC, carepulse_runtime;
     """)
+    # These newly reserved audit actions are authoritative only when emitted
+    # by the migration-owned terminal writer, not via runtime INSERT privileges.
+    op.execute("""
+        CREATE FUNCTION public.guard_d08_terminal_audit()
+        RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+        BEGIN
+            IF NEW.action IN (
+                'APPOINTMENT_CANCELLED',
+                'APPOINTMENT_MARKED_NO_SHOW',
+                'VISIT_EXAMINATION_CANCELLED'
+            ) AND current_user <> 'carepulse_migration' THEN
+                RAISE EXCEPTION 'Protected terminal audit action'
+                    USING ERRCODE = '42501';
+            END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER sensitive_audit_d08_terminal_guard
+        BEFORE INSERT ON public.sensitive_audit FOR EACH ROW
+        EXECUTE FUNCTION public.guard_d08_terminal_audit();
+        REVOKE ALL ON FUNCTION public.guard_d08_terminal_audit()
+            FROM PUBLIC, carepulse_runtime;
+    """)
     op.execute("""
         CREATE FUNCTION public.transition_terminal_appointment(
             target_organization uuid, target_appointment uuid,

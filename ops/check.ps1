@@ -227,7 +227,7 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             foreach ($suite in @('tests/integration/test_followup_persistence.py', 'tests/integration/test_followup_races.py', 'tests/integration/test_followup_migration.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required D-08 verification: $suite" }
             }
-            foreach ($suite in @('tests/integration/test_t133_migration.py', 'tests/integration/test_t133_seed.py', 'tests/integration/test_t133_runtime.py', 'ops/t133-ci.sh')) {
+            foreach ($suite in @('tests/integration/test_t133_migration.py', 'tests/integration/test_t133_seed.py', 'tests/integration/test_t133_runtime.py', 'tests/integration/test_t133_observer.py', 'ops/t133-ci.sh')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required T133 acceptance component: $suite" }
             }
             foreach ($suite in @('tests/integration/test_queue_persistence.py', 'tests/integration/test_queue_capacity.py', 'tests/integration/test_queue_races.py', 'tests/integration/test_queue_migration.py')) {

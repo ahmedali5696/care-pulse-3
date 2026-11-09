@@ -114,6 +114,19 @@ def test_t133_existing_head_preserves_owner_only_terminal_writer(appointment_sto
             )
             == "Booked"
         )
+        with pytest.raises(DBAPIError) as fabricated, connection.begin_nested():
+            connection.execute(
+                text("""
+                    INSERT INTO public.sensitive_audit (
+                        id, organization_id, actor_staff_id, actor_role,
+                        action, reason, correlation_id)
+                    VALUES (gen_random_uuid(),:tenant,:doctor,'DOCTOR_OWNER',
+                            'APPOINTMENT_CANCELLED','Forged terminal action',
+                            'synthetic-t133-direct-insert')
+                """),
+                {"tenant": tenant, "doctor": doctor},
+            )
+        assert fabricated.value.orig.sqlstate == "42501"
 
 
 def test_t133_populated_0032_upgrade_preserves_claim_and_new_exam(

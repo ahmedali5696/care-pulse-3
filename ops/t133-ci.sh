@@ -240,4 +240,22 @@ docker run --rm --name "$worker" --network "$network" --read-only \
 test "$(sql -c "SELECT count(*) FROM pg_stat_activity
   WHERE application_name='t133-runtime'")" = 0 ||
   fail 'T133 runtime session still connected'
+scoped || fail 'PostgreSQL identity changed before final revoke'
+sql -c "REVOKE ALL ON FUNCTION $signature FROM carepulse_runtime, PUBLIC"
+test "$(sql -c "SELECT CASE WHEN has_function_privilege(
+  'carepulse_runtime','$signature','EXECUTE') THEN 'FAIL' ELSE 'DENY' END")" = DENY ||
+  fail 'T133 revoke not effective'
+runtime_denial || fail 'T133 fresh runtime login can still execute terminal writer'
+grant_open=false
+echo 'T133 ACL AFTER: DENY via fresh runtime login'
+docker compose --profile test run --rm --no-deps -T \
+  --user "$(id -u):$(id -g)" \
+  -e CI=true -e CP_T133_OBSERVER=true \
+  -e CP_CI_PROJECT="$project" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -e CP_T133_FIXTURE_PATH=/tmp/t133/fixtures.json \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$private/t133:/tmp/t133:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider \
+  tests/integration/test_t133_observer.py | tee "$private/t133/observer.log"
 echo "T133 scoped runtime acceptance complete: $repo $ref $GITHUB_SHA"

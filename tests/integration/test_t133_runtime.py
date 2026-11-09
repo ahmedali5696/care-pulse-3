@@ -110,6 +110,18 @@ def _state(connection, case):
     ).fetchone()
 
 
+def _queue_revision(connection, case):
+    return connection.execute(
+        """
+        SELECT q.revision FROM public.queue_entries e
+        JOIN public.queue_days q
+          ON (q.organization_id,q.id)=(e.organization_id,e.queue_day_id)
+        WHERE e.appointment_id=%s::uuid AND e.disposition='ACTIVE'
+        """,
+        (case["target"],),
+    ).fetchone()[0]
+
+
 @pytest.mark.parametrize(
     ("name", "operation", "actor", "result"),
     [
@@ -127,10 +139,12 @@ def _state(connection, case):
 def test_terminal_outcome_commits_exact_claim_and_history(
     fixture_data, name, operation, actor, result
 ):
-    case = fixture_data["cases"][name]
+    case = {**fixture_data["cases"][name]}
     recorded_actor = fixture_data[actor]
     with _login() as connection:
         _context(connection, fixture_data["organization"], recorded_actor)
+        if case["status"] == "Waiting":
+            case["queue_day_revision"] = _queue_revision(connection, case)
         assert connection.execute(
             """
             SELECT session_user, current_user,
@@ -384,6 +398,34 @@ def test_denial_leaves_original_claim_and_history(
         assert _state(connection, case) == before
 
 
+@pytest.mark.parametrize(
+    "action",
+    [
+        "APPOINTMENT_CANCELLED",
+        "APPOINTMENT_MARKED_NO_SHOW",
+        "VISIT_EXAMINATION_CANCELLED",
+    ],
+)
+def test_runtime_cannot_forge_reserved_terminal_audit_even_during_grant(
+    fixture_data, action
+):
+    with _login() as connection:
+        _context(connection, fixture_data["organization"], fixture_data["doctor"])
+        with pytest.raises(psycopg.Error) as error:
+            connection.execute(
+                """
+                INSERT INTO public.sensitive_audit (
+                    id, organization_id, actor_staff_id, actor_role,
+                    action, reason, correlation_id)
+                VALUES (gen_random_uuid(),%s::uuid,%s::uuid,'DOCTOR_OWNER',
+                        %s,'Forged direct terminal audit','synthetic-forgery')
+                """,
+                (fixture_data["organization"], fixture_data["doctor"], action),
+            )
+        assert error.value.sqlstate == "42501"
+        connection.rollback()
+
+
 def test_forged_runtime_gucs_have_known_accepted_ci_only_vulnerability(fixture_data):
     """SEC-26-CI-01: runtime credentials plus forged GUCs impersonate Doctor.
 
@@ -460,7 +502,7 @@ def _fresh_claim_after_terminal(data, case, *, must_succeed=True):
                         expected=expected,
                         **body,
                     )
-                assert denied.value.orig.sqlstate == "23514"
+                assert denied.value.orig.sqlstate == "23505"
                 return None
             claim = _v2_command(
                 connection,
@@ -561,11 +603,14 @@ def test_consumed_claim_cannot_be_rebooked_even_after_price_change(fixture_data)
 def test_waiting_cancel_serializes_with_real_admission_and_queue_day(
     fixture_data, leader_action
 ):
-    case = fixture_data["cases"][f"race_waiting_{leader_action}_first"]
+    case = {**fixture_data["cases"][f"race_waiting_{leader_action}_first"]}
     tenant = fixture_data["organization"]
     doctor = fixture_data["doctor"]
     ready, release, waiter_ready = Event(), Event(), Event()
     pids = {}
+    with _login() as connection:
+        _context(connection, tenant, doctor)
+        case["queue_day_revision"] = _queue_revision(connection, case)
     terminal_command = _command(
         case, "CANCEL", reason="Verified synthetic Waiting cancellation"
     )
@@ -609,6 +654,16 @@ def test_waiting_cancel_serializes_with_real_admission_and_queue_day(
                         text("SELECT set_config('app.staff_id', :staff, true)"),
                         {"staff": doctor},
                     )
+                    # Witness the accepted DoctorControl barrier before any
+                    # attendance status write. Both contenders use this row.
+                    connection.execute(
+                        text("""
+                            SELECT doctor_staff_id FROM public.doctor_controls
+                            WHERE organization_id=:tenant AND doctor_staff_id=:doctor
+                            FOR UPDATE
+                        """),
+                        {"tenant": UUID(tenant), "doctor": UUID(doctor)},
+                    ).one()
                     connection.execute(
                         text("""
                             SELECT * FROM public.lock_doctor_admission_capacity(
