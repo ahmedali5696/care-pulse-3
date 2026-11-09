@@ -270,3 +270,61 @@ def test_fold_break_excludes_mixed_manual_interval_from_preview_and_confirmation
             key=str(uuid4()),
         )
         assert status == 201, confirmed
+
+
+def test_narrow_fold_work_period_rejects_mixed_manual_booking(booking_clinic):
+    clinic = booking_clinic
+    fold_day = date(2030, 10, 31)
+    weekday = fold_day.isoweekday()
+    config = _config(
+        duration_minutes=None,
+        working_weekdays=[weekday],
+        weekly_work_periods=[
+            {"weekday": weekday, "starts_at": "23:20", "ends_at": "23:40"}
+        ],
+        manual_slots_by_date={
+            fold_day.isoformat(): [{"starts_at": "23:25", "ends_at": "23:35"}]
+        },
+    )
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _publish(connection, _actor(clinic.tenant, clinic.staff), config, revision=2)
+    status, response = _slots_request(clinic, clinic.owner, fold_day)
+    assert status == 200, response
+    offered = response["data"]["candidates"]
+    assert len(offered) == 2
+    assert all(slot["available"] and slot["origin"] == "MANUAL" for slot in offered)
+    starts = [datetime.fromisoformat(slot["starts_at"]) for slot in offered]
+    ends = [datetime.fromisoformat(slot["ends_at"]) for slot in offered]
+    assert all(end - start == timedelta(minutes=10) for start, end in zip(starts, ends))
+    assert max(ends) - min(starts) == timedelta(minutes=70)
+
+    before = booking_effects(clinic)
+    status, denied = booking_request(
+        clinic,
+        clinic.owner,
+        body=booking_body(
+            new_patient(clinic),
+            day=fold_day,
+            expected_schedule_revision=3,
+            starts_at=min(starts).isoformat(),
+            ends_at=max(ends).isoformat(),
+        ),
+        key=str(uuid4()),
+    )
+    assert status == 409, denied
+    assert booking_effects(clinic) == before
+
+    for slot in offered:
+        status, booked = booking_request(
+            clinic,
+            clinic.owner,
+            body=booking_body(
+                new_patient(clinic),
+                day=fold_day,
+                expected_schedule_revision=3,
+                starts_at=slot["starts_at"],
+                ends_at=slot["ends_at"],
+            ),
+            key=str(uuid4()),
+        )
+        assert status == 201, booked

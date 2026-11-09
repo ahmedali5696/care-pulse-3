@@ -268,10 +268,45 @@ def test_fold_generated_variants_keep_true_elapsed_duration_only(cairo_transitio
         duration_minutes=None,
         manual_slots_by_date={fold_day: (LocalSlot(fold_time, end_local),)},
     )
-    assert any(
-        candidate.ends_at - candidate.starts_at == timedelta(minutes=90)
-        for candidate in candidates_for_date(manual, fold_day)
+    # The mixed 90-minute interval leaves the configured 30-minute work window.
+    manual_offered = candidates_for_date(manual, fold_day)
+    assert len(manual_offered) == 2
+    assert all(
+        candidate.ends_at - candidate.starts_at == timedelta(minutes=30)
+        for candidate in manual_offered
     )
+
+
+def test_narrow_fold_work_period_does_not_cover_mixed_manual_interval(
+    cairo_transitions,
+):
+    fold_day, repeated = cairo_transitions["fold"]
+    config = replace(
+        _schedule(
+            day=fold_day,
+            periods=(_local((repeated.hour, 20), (repeated.hour, 40)),),
+            duration=None,
+        ),
+        manual_slots_by_date={
+            fold_day: (_local((repeated.hour, 25), (repeated.hour, 35)),)
+        },
+    )
+    offered = candidates_for_date(config, fold_day)
+    assert len(offered) == 2
+    assert all(candidate.origin == "MANUAL" for candidate in offered)
+    assert {
+        candidate.starts_at.astimezone(CAIRO).utcoffset() for candidate in offered
+    } == {timedelta(hours=2), timedelta(hours=3)}
+    assert all(
+        candidate.ends_at - candidate.starts_at == timedelta(minutes=10)
+        for candidate in offered
+    )
+    mixed = (
+        min(slot.starts_at for slot in offered),
+        max(slot.ends_at for slot in offered),
+    )
+    assert mixed[1] - mixed[0] == timedelta(minutes=70)
+    assert mixed not in {(slot.starts_at, slot.ends_at) for slot in offered}
 
 
 def test_fold_manual_variants_crossing_real_break_are_not_offered(cairo_transitions):

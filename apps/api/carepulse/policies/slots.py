@@ -119,16 +119,25 @@ def _fits_resolved(
     ) and not any(intersects(candidate, pause) for pause in breaks)
 
 
-def _period_variants(service_date: date, period: LocalSlot) -> tuple[Candidate, ...]:
-    start = datetime.combine(service_date, period.starts_at)
-    end = datetime.combine(service_date, period.ends_at)
-    while start < end and not _cairo_instants(service_date, start.time()):
-        start += timedelta(minutes=1)
-    return (
-        _variants(service_date, LocalSlot(start.time(), period.ends_at), "PERIOD")
-        if start < end
-        else ()
-    )
+def _resolved_segments(
+    service_date: date, slot: LocalSlot, origin: str
+) -> tuple[Candidate, ...]:
+    # HH:MM schedule boundaries describe each real minute, including both folds.
+    minute = timedelta(minutes=1)
+    cursor = datetime.combine(service_date, slot.starts_at)
+    end = datetime.combine(service_date, slot.ends_at)
+    instants = []
+    while cursor < end:
+        instants.extend(_cairo_instants(service_date, cursor.time()))
+        cursor += minute
+    segments = []
+    for instant in sorted(instants):
+        if segments and segments[-1].ends_at == instant:
+            previous = segments[-1]
+            segments[-1] = Candidate(previous.starts_at, instant + minute, origin)
+        else:
+            segments.append(Candidate(instant, instant + minute, origin))
+    return tuple(segments)
 
 
 def candidates_for_date(
@@ -143,16 +152,12 @@ def candidates_for_date(
     periods = tuple(
         variant
         for period in rules.periods
-        for variant in _period_variants(service_date, period)
+        for variant in _resolved_segments(service_date, period, "PERIOD")
     )
     breaks = tuple(
         variant
         for pause in rules.breaks
-        for variant in _variants(service_date, pause, "BREAK")
-        if len(_cairo_instants(service_date, pause.starts_at)) < 2
-        or len(_cairo_instants(service_date, pause.ends_at)) < 2
-        or variant.starts_at.astimezone(CAIRO).utcoffset()
-        == variant.ends_at.astimezone(CAIRO).utcoffset()
+        for variant in _resolved_segments(service_date, pause, "BREAK")
     )
     manual = tuple(
         variant
