@@ -2,7 +2,7 @@
 
 import json
 import shutil
-from datetime import UTC, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -21,9 +21,18 @@ AFTER = "0029_b10_followup_writers"
 PROOF_AFTER = "0030_b10_source_proof"
 GUARD_AFTER = "0031_b10_writer_guard"
 OFFSET_AFTER = "0032_b10_cairo_offset_guard"
+EXACT_AFTER = "0035_t146_cairo_exact_schedule"
 
 
-def _publish_bookable_policies(migration, tenant, timed_day=None):
+def _publish_bookable_policies(
+    migration,
+    tenant,
+    timed_day=None,
+    *,
+    work_period=("09:00", "12:00"),
+    breaks=(),
+    manual_slots=(),
+):
     with migration.begin() as connection:
         price = {
             "standard_new_exam_egp": "100.00",
@@ -51,16 +60,31 @@ def _publish_bookable_policies(migration, tenant, timed_day=None):
                 {"tenant": tenant, "kind": kind, "payload": json.dumps(payload)},
             )
             if kind == "SCHEDULE" and timed_day:
-                connection.execute(
-                    text("""
-                        INSERT INTO public.clinic_schedule_intervals
-                            (organization_id,policy_version,interval_kind,
-                             service_date,starts_at,ends_at)
-                        VALUES (:tenant,2,'OVERRIDE_WORK',CAST(:day AS date),
-                                '09:00','12:00')
-                    """),
-                    {"tenant": tenant, "day": timed_day},
-                )
+                intervals = [
+                    ("OVERRIDE_WORK", work_period),
+                    *(("BREAK", interval) for interval in breaks),
+                    *(("MANUAL_SLOT", interval) for interval in manual_slots),
+                ]
+                for interval_kind, (starts, ends) in intervals:
+                    connection.execute(
+                        text("""
+                            INSERT INTO public.clinic_schedule_intervals
+                                (organization_id,policy_version,interval_kind,
+                                 weekday,service_date,starts_at,ends_at)
+                            VALUES (:tenant,2,:kind,:weekday,CAST(:day AS date),
+                                    CAST(:starts AS time),CAST(:ends AS time))
+                        """),
+                        {
+                            "tenant": tenant,
+                            "kind": interval_kind,
+                            "weekday": timed_day.isoweekday()
+                            if interval_kind == "BREAK"
+                            else None,
+                            "day": timed_day if interval_kind != "BREAK" else None,
+                            "starts": starts,
+                            "ends": ends,
+                        },
+                    )
             connection.execute(
                 text("""
                     UPDATE public.clinic_policy_heads
@@ -119,6 +143,26 @@ def _assert_no_guarded_booking_effects(connection, tenant, day):
             {"tenant": tenant},
         )
         == 0
+    )
+
+
+def _writer_effect_counts(connection, tenant):
+    tables = (
+        "appointment_day_counters",
+        "appointments",
+        "appointment_number_assignments",
+        "appointment_history",
+        "appointment_price_snapshots",
+        "followup_claims",
+        "followup_authorization_events",
+        "sensitive_audit",
+    )
+    return tuple(
+        connection.scalar(
+            text(f"SELECT count(*) FROM public.{table} WHERE organization_id=:tenant"),
+            {"tenant": tenant},
+        )
+        for table in tables
     )
 
 
@@ -348,6 +392,254 @@ def test_cairo_offset_guard_rejects_false_offset_and_accepts_cairo_and_utc(
                 )
                 == 2
             )
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
+def test_exact_writer_rejects_submicrosecond_rounding_without_effects(
+    admin, empty_database
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, PROOF_AFTER)
+        with transaction(runtime, tenant) as connection:
+            historical = _v2_source(connection, tenant, doctor)
+            first = _v2_source(connection, tenant, doctor)
+            second = _v2_source(connection, tenant, doctor)
+        day = first["day"] + timedelta(days=1)
+        _upgrade(migration, "0034_t145_exact_percentage")
+        _publish_bookable_policies(migration, tenant, timed_day=day)
+        cairo = ZoneInfo("Africa/Cairo")
+        start = datetime.combine(day, time(9), cairo)
+        end = datetime.combine(day, time(10), cairo)
+        booking = _priced_booking(
+            first,
+            booking_mode="EXACT_TIME",
+            starts_at=start.isoformat(),
+            ends_at=end.isoformat(),
+        )
+        with transaction(runtime, tenant) as connection:
+            previous_claim = _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                historical,
+                **_priced_booking(
+                    historical,
+                    booking_mode="EXACT_TIME",
+                    starts_at=datetime.combine(day, time(11), cairo).isoformat(),
+                    ends_at=datetime.combine(day, time(12), cairo).isoformat(),
+                ),
+            )
+            with connection.begin_nested() as savepoint:
+                assert (
+                    _v2_command(
+                        connection,
+                        "create_followup_claim_ordered",
+                        first,
+                        **{
+                            **booking,
+                            "starts_at": start.isoformat(
+                                timespec="microseconds"
+                            ).replace(".000000", ".0000004"),
+                        },
+                    )
+                    is not None
+                )
+                savepoint.rollback()
+        with migration.connect() as connection:
+            saved = connection.execute(
+                text("""
+                    SELECT to_jsonb(c), to_jsonb(a), to_jsonb(p)
+                    FROM public.followup_claims c
+                    JOIN public.appointments a ON a.id=c.appointment_id
+                    JOIN public.appointment_price_snapshots p ON p.appointment_id=a.id
+                    WHERE c.organization_id=:tenant AND c.id=:claim
+                """),
+                {"tenant": tenant, "claim": previous_claim},
+            ).one()
+        _upgrade(migration, EXACT_AFTER)
+        with migration.connect() as connection:
+            assert (
+                connection.execute(
+                    text("""
+                    SELECT to_jsonb(c), to_jsonb(a), to_jsonb(p)
+                    FROM public.followup_claims c
+                    JOIN public.appointments a ON a.id=c.appointment_id
+                    JOIN public.appointment_price_snapshots p ON p.appointment_id=a.id
+                    WHERE c.organization_id=:tenant AND c.id=:claim
+                """),
+                    {"tenant": tenant, "claim": previous_claim},
+                ).one()
+                == saved
+            )
+            for signature, allowed in (
+                ("create_followup_claim_ordered(uuid,uuid,jsonb,jsonb)", True),
+                ("extend_followup_claim_ordered(uuid,uuid,jsonb,jsonb)", True),
+                ("b10_assert_followup_schedule(uuid,jsonb)", False),
+                ("b10_schedule_without_exact_guard(uuid,jsonb)", False),
+                ("b10_schedule_without_offset_guard(uuid,jsonb)", False),
+                ("b10_unchecked_claim_creation(uuid,uuid,jsonb,jsonb)", False),
+            ):
+                assert (
+                    connection.scalar(
+                        text("""
+                        SELECT has_function_privilege('carepulse_runtime',
+                            CAST(:signature AS regprocedure), 'EXECUTE')
+                    """),
+                        {"signature": f"public.{signature}"},
+                    )
+                    is allowed
+                )
+
+        with transaction(runtime, tenant) as connection:
+            before = _writer_effect_counts(connection, tenant)
+            for endpoint, valid in (("starts_at", start), ("ends_at", end)):
+                rounded_to_valid_slot = valid.isoformat(
+                    timespec="microseconds"
+                ).replace(".000000", ".0000004")
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    _v2_command(
+                        connection,
+                        "create_followup_claim_ordered",
+                        first,
+                        **{**booking, endpoint: rounded_to_valid_slot},
+                    )
+                assert denied.value.orig.sqlstate == "23514"
+                assert _writer_effect_counts(connection, tenant) == before
+
+            # Excess trailing zeros preserve the exact instant; both offset forms work.
+            claim_one = _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                first,
+                **{
+                    **booking,
+                    "starts_at": start.isoformat(timespec="microseconds").replace(
+                        ".000000", ".000000000"
+                    ),
+                },
+            )
+            utc_start = datetime.combine(day, time(10), cairo).astimezone(UTC)
+            utc_end = datetime.combine(day, time(11), cairo).astimezone(UTC)
+            claim_two = _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                second,
+                **_priced_booking(
+                    second,
+                    booking_mode="EXACT_TIME",
+                    starts_at=utc_start.isoformat().replace("+00:00", "Z"),
+                    ends_at=utc_end.isoformat(),
+                ),
+            )
+            assert claim_one != claim_two
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT count(*) FROM public.followup_claims
+                    WHERE organization_id=:tenant AND id IN (:one, :two)
+                """),
+                    {"tenant": tenant, "one": claim_one, "two": claim_two},
+                )
+                == 2
+            )
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
+@pytest.mark.parametrize(
+    "work_period,breaks,mixed_valid",
+    [
+        (("23:20", "23:40"), (), False),
+        (("22:00", "23:59"), (("23:40", "23:50"),), False),
+        (("22:00", "23:59"), (), True),
+    ],
+    ids=("crosses-work-period", "crosses-break", "fully-covered-fold"),
+)
+def test_exact_writer_enforces_resolved_cairo_fold_work_and_breaks(
+    admin, empty_database, work_period, breaks, mixed_valid
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, "0034_t145_exact_percentage")
+        fold_day = date(2030, 10, 31)
+        _publish_bookable_policies(
+            migration,
+            tenant,
+            timed_day=fold_day,
+            work_period=work_period,
+            breaks=breaks,
+            manual_slots=(("23:25", "23:35"),),
+        )
+        with transaction(runtime, tenant) as connection:
+            sources = [_v2_source(connection, tenant, doctor) for _ in range(3)]
+        _upgrade(migration, EXACT_AFTER)
+
+        cairo = ZoneInfo("Africa/Cairo")
+        first_start = datetime.combine(fold_day, time(23, 25), cairo).replace(fold=0)
+        first_end = datetime.combine(fold_day, time(23, 35), cairo).replace(fold=0)
+        second_start = first_start.replace(fold=1)
+        second_end = first_end.replace(fold=1)
+        assert first_start.utcoffset() != second_start.utcoffset()
+        assert second_end.astimezone(UTC) - first_start.astimezone(UTC) == timedelta(
+            minutes=70
+        )
+        declaration = {
+            "selected_service_date": fold_day.isoformat(),
+            "reason": "Reviewed Cairo DST booking",
+        }
+
+        def priced(source, starts_at, ends_at):
+            return _priced_booking(
+                source,
+                service_date=fold_day.isoformat(),
+                booking_mode="EXACT_TIME",
+                starts_at=starts_at,
+                ends_at=ends_at,
+                new_booking_date_exception=declaration,
+            )
+
+        with transaction(runtime, tenant) as connection:
+            before = _writer_effect_counts(connection, tenant)
+            mixed = priced(sources[0], first_start.isoformat(), second_end.isoformat())
+            if mixed_valid:
+                claim = _v2_command(
+                    connection, "create_followup_claim_ordered", sources[0], **mixed
+                )
+                assert claim is not None
+            else:
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    _v2_command(
+                        connection,
+                        "create_followup_claim_ordered",
+                        sources[0],
+                        **mixed,
+                    )
+                assert denied.value.orig.sqlstate == "23514"
+                assert _writer_effect_counts(connection, tenant) == before
+
+                # Each explicitly resolved fold is individually bookable.
+                first_claim = _v2_command(
+                    connection,
+                    "create_followup_claim_ordered",
+                    sources[1],
+                    **priced(
+                        sources[1], first_start.isoformat(), first_end.isoformat()
+                    ),
+                )
+                second_claim = _v2_command(
+                    connection,
+                    "create_followup_claim_ordered",
+                    sources[2],
+                    **priced(
+                        sources[2],
+                        second_start.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                        second_end.astimezone(UTC).isoformat(),
+                    ),
+                )
+                assert first_claim != second_claim
     finally:
         runtime.dispose()
         migration.dispose()

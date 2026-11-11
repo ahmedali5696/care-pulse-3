@@ -18,7 +18,7 @@ TERMINAL_AUDIT_ACTIONS = (
     "VISIT_EXAMINATION_CANCELLED",
     "VISIT_EXAMINATION_COMPLETED",
 )
-CURRENT_HEAD = "0034_t145_exact_percentage"
+CURRENT_HEAD = "0035_t146_cairo_exact_schedule"
 
 
 @pytest.fixture(scope="module")
