@@ -871,6 +871,70 @@ def _seed_historical_booking_receipt(clinic, appointment, source, *, unsafe=Fals
     return body, key, projection
 
 
+def _pre_t145_appointment_detail(connection, tenant, appointment):
+    """Build the predecessor receipt projection without future table metadata."""
+    row = (
+        connection.execute(
+            text("""
+                SELECT a.id, a.patient_id, a.doctor_staff_id, a.service_date,
+                       a.status, a.service_type, a.classification, a.lane,
+                       a.booking_mode, a.starts_at, a.ends_at, a.current_number,
+                       a.revision, s.base_egp, s.discount_type, s.discount_value,
+                       s.discount_reason, s.is_free, s.net_egp, s.pricing_version,
+                       s.creation_standard_base_egp
+                FROM public.appointments a
+                JOIN public.appointment_price_snapshots s
+                  ON s.organization_id=a.organization_id AND s.appointment_id=a.id
+                WHERE a.organization_id=:tenant AND a.id=:appointment
+            """),
+            {"tenant": tenant, "appointment": appointment},
+        )
+        .mappings()
+        .one()
+    )
+    projection = {
+        key: value.isoformat() if hasattr(value, "isoformat") else value
+        for key, value in row.items()
+        if key
+        not in ("base_egp", "discount_value", "net_egp", "creation_standard_base_egp")
+    }
+    for key in ("id", "patient_id", "doctor_staff_id"):
+        projection[key] = str(projection[key])
+    for key in ("base_egp", "net_egp", "creation_standard_base_egp"):
+        projection[key] = format(row[key], ".2f")
+    projection["discount_value"] = format(
+        row["discount_value"],
+        "f" if row["discount_type"] == "PERCENT" else ".2f",
+    )
+    projection["number"] = projection.pop("current_number")
+    history = (
+        connection.execute(
+            text("""
+                SELECT action, old_status, new_status, old_service_date,
+                       new_service_date, old_number, new_number,
+                       appointment_revision, reason
+                FROM public.appointment_history
+                WHERE organization_id=:tenant AND appointment_id=:appointment
+                ORDER BY appointment_revision
+            """),
+            {"tenant": tenant, "appointment": appointment},
+        )
+        .mappings()
+        .all()
+    )
+    recorded = []
+    for entry in history:
+        item = {
+            key: value.isoformat() if hasattr(value, "isoformat") else value
+            for key, value in entry.items()
+            if key != "reason"
+        }
+        if entry["action"] == "CREATED" and entry["reason"] is None:
+            item["reason"] = None
+        recorded.append(item)
+    return {**projection, "history": recorded}
+
+
 def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
     patient_backend, admin, empty_database
 ):
@@ -942,7 +1006,7 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
                 json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
             assert independent_digest == normalized_request_digest(command)
-            saved = appointment_detail(connection, _actor(tenant, doctor), appointment)
+            saved = _pre_t145_appointment_detail(connection, tenant, appointment)
             assert saved["service_type"] == "FOLLOW_UP"
             assert saved["history"][0]["reason"] is None
             key = str(uuid4())
