@@ -20,7 +20,7 @@ from sqlalchemy import URL, create_engine, text
 from sqlalchemy.exc import DBAPIError
 
 ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0035_t146_cairo_exact_schedule"
+REVISION = "0036_b10_confirmation_parity"
 
 
 @pytest.fixture(scope="module", autouse=True)
