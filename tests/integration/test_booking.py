@@ -228,7 +228,7 @@ def test_signed_open_booking_commits_frozen_ledger_and_readback(booking_clinic, 
         assert connection.execute(
             text("""
             SELECT a.id, a.current_number, n.number, s.net_egp, s.discount_value,
-                   h.appointment_revision
+                   s.discount_percent_text, h.appointment_revision
             FROM public.appointments a
             JOIN public.appointment_number_assignments n
               ON n.id = a.current_assignment_id
@@ -237,7 +237,7 @@ def test_signed_open_booking_commits_frozen_ledger_and_readback(booking_clinic, 
             WHERE a.id = :id
         """),
             {"id": UUID(saved["id"])},
-        ).one() == (UUID(saved["id"]), 1, 1, Decimal("87.66"), Decimal("12.345"), 0)
+        ).one() == (UUID(saved["id"]), 1, 1, Decimal("87.66"), None, "12.345", 0)
         # Neither an absent future table nor an existing one may contain admission.
         for table in ("visits", "queue_entries"):
             if (
@@ -267,6 +267,44 @@ def test_signed_open_booking_commits_frozen_ledger_and_readback(booking_clinic, 
     assert status == 200 and len(listed["data"]["items"]) == 1
     assert listed["data"]["items"][0]["id"] == saved["id"]
     assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
+
+
+def test_signed_booking_roundtrips_16384_digit_percentage_and_receipt(booking_clinic):
+    clinic = booking_clinic
+    patient = new_patient(clinic)
+    percentage = "0.005" + "0" * 16380 + "1"
+    body = booking_body(
+        patient,
+        discount={
+            "discount_type": "PERCENT",
+            "discount_value": percentage,
+            "discount_reason": "Synthetic exact percentage",
+        },
+        expected_net_egp="99.99",
+    )
+    key = str(uuid4())
+    status, first = booking_request(clinic, clinic.owner, body=body, key=key)
+    assert status == 201, first
+    assert first["data"]["discount_value"] == percentage
+    assert first["data"]["net_egp"] == "99.99"
+    before = booking_effects(clinic)
+    assert booking_request(clinic, clinic.owner, body=body, key=key) == (201, first)
+    assert booking_effects(clinic) == before
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        numeric_value, text_value, net = connection.execute(
+            text("""
+                SELECT discount_value, discount_percent_text, net_egp
+                FROM public.appointment_price_snapshots
+                WHERE organization_id=:tenant AND appointment_id=:appointment
+            """),
+            {
+                "tenant": clinic.tenant,
+                "appointment": UUID(first["data"]["id"]),
+            },
+        ).one()
+        assert numeric_value is None
+        assert text_value == percentage
+        assert net == Decimal("99.99")
 
 
 def test_signed_appointment_list_keyset_cursor_and_strict_query_boundaries(

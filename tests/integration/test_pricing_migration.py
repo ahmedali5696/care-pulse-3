@@ -3,6 +3,7 @@
 import json
 import runpy
 import shutil
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -41,6 +42,8 @@ from test_database import (
 from test_followup_persistence import _v2_priced_followup
 
 MIGRATION = ROOT / "db/migrations/versions/0019_b06_price_policy_strings.py"
+T145_BEFORE = "0033_d08_terminal_writer"
+T145_AFTER = "0034_t145_exact_percentage"
 
 
 def _revisions():
@@ -413,3 +416,172 @@ def test_postgresql_final_check_accepts_python_confirmed_corpus(
             )
         assert validate_price_snapshot(frozen)["net_egp"] == quote.net_egp
         assert saved["net_egp"] == format(quote.net_egp, ".2f"), frozen
+
+
+def test_t145_upgrade_preserves_historical_numeric_percentage_and_receipt(
+    admin, empty_database
+):
+    _create_empty_database(admin, empty_database)
+    migration = _engine("carepulse_migration", empty_database)
+    runtime = _engine("carepulse_runtime", empty_database)
+    try:
+        _at_revision(migration, T145_BEFORE)
+        operator, tenant = uuid4(), uuid4()
+        appointment, assignment, patient, receipt = uuid4(), uuid4(), uuid4(), uuid4()
+        with migration.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO public.operator_identities
+                        (id, credential_digest, issued_by_reference, issued_at)
+                    VALUES (:operator, :digest, 'synthetic-t145', clock_timestamp())
+                """),
+                {"operator": operator, "digest": f"synthetic:{operator}"},
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO public.organizations (id, branch, created_by_operator_id)
+                    VALUES (:tenant, 'Synthetic T145 legacy clinic', :operator)
+                """),
+                {"tenant": tenant, "operator": operator},
+            )
+            doctor = _activate_clinic(conn, tenant, operator)
+            conn.execute(
+                text("""
+                    INSERT INTO public.patients
+                        (id, organization_id, name_parts, date_of_birth)
+                    VALUES (:patient, :tenant, ARRAY['Legacy','Percent','Patient'],
+                            DATE '2001-01-01')
+                """),
+                {"patient": patient, "tenant": tenant},
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO public.appointment_day_counters
+                        (organization_id, service_date, last_number)
+                    VALUES (:tenant, DATE '2026-11-20', 1)
+                """),
+                {"tenant": tenant},
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO public.appointments
+                        (id, organization_id, patient_id, doctor_staff_id, service_date,
+                         status, service_type, classification, lane, booking_mode,
+                         current_assignment_id, current_number)
+                    VALUES (:appointment, :tenant, :patient, :doctor, DATE '2026-11-20',
+                            'Booked', 'NEW_EXAMINATION', 'ROUTINE', 'MAIN', 'OPEN',
+                            :assignment, 1)
+                """),
+                {
+                    "appointment": appointment,
+                    "tenant": tenant,
+                    "patient": patient,
+                    "doctor": doctor,
+                    "assignment": assignment,
+                },
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO public.appointment_number_assignments
+                        (id, organization_id, appointment_id, service_date, number)
+                    VALUES (:assignment, :tenant, :appointment, DATE '2026-11-20', 1)
+                """),
+                {
+                    "assignment": assignment,
+                    "tenant": tenant,
+                    "appointment": appointment,
+                },
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO public.appointment_price_snapshots
+                        (organization_id, appointment_id, service_type, classification,
+                         base_egp, discount_type, discount_value, discount_reason,
+                         is_free, net_egp, pricing_version, creation_standard_base_egp)
+                    VALUES (:tenant, :appointment, 'NEW_EXAMINATION', 'ROUTINE',
+                            100.00, 'PERCENT', 12.345, 'Legacy approved discount',
+                            false, 87.66, 1, 100.00)
+                """),
+                {"tenant": tenant, "appointment": appointment},
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO public.appointment_history
+                        (id, organization_id, appointment_id, appointment_revision,
+                         action, new_status, new_service_date, new_number,
+                         actor_staff_id, actor_role, price_snapshot_appointment_id)
+                    VALUES (:id, :tenant, :appointment, 0, 'CREATED', 'Booked',
+                            DATE '2026-11-20', 1, :doctor, 'DOCTOR_OWNER', :appointment)
+                """),
+                {
+                    "id": uuid4(),
+                    "tenant": tenant,
+                    "appointment": appointment,
+                    "doctor": doctor,
+                },
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO public.idempotency_receipts
+                        (id, scope_kind, scope_id, actor_kind, actor_id,
+                         organization_id, staff_id, operation, idempotency_key,
+                         request_digest, result_projection, result_revision)
+                    VALUES (:id, 'TENANT', :tenant, 'STAFF', :doctor,
+                            :tenant, :doctor, 'appointments.book', 'legacy-t145',
+                            :digest, CAST(:projection AS jsonb), 0)
+                """),
+                {
+                    "id": receipt,
+                    "tenant": tenant,
+                    "doctor": doctor,
+                    "digest": "0" * 64,
+                    "projection": json.dumps(
+                        {"discount_value": "12.345", "net_egp": "87.66"}
+                    ),
+                },
+            )
+        _at_revision(migration, T145_AFTER)
+        _at_revision(migration, T145_AFTER)
+        with migration.connect() as conn:
+            assert conn.execute(
+                text("""
+                    SELECT discount_value, discount_percent_text, net_egp
+                    FROM public.appointment_price_snapshots
+                    WHERE appointment_id=:appointment
+                """),
+                {"appointment": appointment},
+            ).one() == (Decimal("12.345"), None, Decimal("87.66"))
+            assert conn.scalar(
+                text("""
+                    SELECT result_projection FROM public.idempotency_receipts WHERE id=:id
+                """),
+                {"id": receipt},
+            ) == {"discount_value": "12.345", "net_egp": "87.66"}
+            assert (
+                conn.scalar(text("SELECT version_num FROM public.alembic_version"))
+                == T145_AFTER
+            )
+        with (
+            pytest.raises(DBAPIError) as direct_runtime,
+            transaction(runtime, tenant) as conn,
+        ):
+            conn.execute(
+                text("""
+                    UPDATE public.appointment_price_snapshots SET discount_value=12.34
+                    WHERE appointment_id=:appointment
+                """),
+                {"appointment": appointment},
+            )
+        assert direct_runtime.value.orig.sqlstate == "42501"
+        with pytest.raises(DBAPIError) as immutable, migration.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE public.appointment_price_snapshots SET discount_value=12.34
+                    WHERE appointment_id=:appointment
+                """),
+                {"appointment": appointment},
+            )
+        assert immutable.value.orig.sqlstate == "23514"
+    finally:
+        runtime.dispose()
+        migration.dispose()

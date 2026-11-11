@@ -395,7 +395,14 @@ def book_appointment(
             "ends_at": plan.draft.ends_at.isoformat() if plan.draft.ends_at else None,
             "allocated_number": number,
             "price_snapshot": {
-                field: str(snapshot[field]) if snapshot[field] is not None else None
+                field: (
+                    format(snapshot[field], "f")
+                    if field == "discount_value"
+                    and snapshot["discount_type"] == "PERCENT"
+                    else str(snapshot[field])
+                    if snapshot[field] is not None
+                    else None
+                )
                 for field in (
                     "base_egp",
                     "discount_type",

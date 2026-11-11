@@ -98,11 +98,16 @@ def insert_appointment_records(
             number=number,
         )
     )
+    stored_price = dict(frozen)
+    stored_price["discount_percent_text"] = None
+    if frozen["discount_type"] == "PERCENT":
+        stored_price["discount_percent_text"] = format(frozen["discount_value"], "f")
+        stored_price["discount_value"] = None
     connection.execute(
         insert(appointment_price_snapshots).values(
             organization_id=actor.organization_id,
             appointment_id=appointment_id,
-            **frozen,
+            **stored_price,
         )
     )
     connection.execute(

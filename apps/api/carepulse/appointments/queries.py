@@ -47,6 +47,7 @@ PRICE_FIELDS = (
     "base_egp",
     "discount_type",
     "discount_value",
+    "discount_percent_text",
     "discount_reason",
     "is_free",
     "net_egp",
@@ -78,15 +79,26 @@ def _projection(row) -> dict:
         key: (value.isoformat() if hasattr(value, "isoformat") else value)
         for key, value in row.items()
         if key
-        not in ("base_egp", "discount_value", "net_egp", "creation_standard_base_egp")
+        not in (
+            "base_egp",
+            "discount_value",
+            "discount_percent_text",
+            "net_egp",
+            "creation_standard_base_egp",
+        )
     }
     for key in ("id", "patient_id", "doctor_staff_id"):
         projection[key] = str(projection[key])
     for key in ("base_egp", "net_egp", "creation_standard_base_egp"):
         projection[key] = format(row[key], ".2f")
-    projection["discount_value"] = format(
-        row["discount_value"],
-        "f" if row["discount_type"] == "PERCENT" else ".2f",
+    percent_text = row.get("discount_percent_text")
+    projection["discount_value"] = (
+        percent_text
+        if row["discount_type"] == "PERCENT" and percent_text is not None
+        else format(
+            row["discount_value"],
+            "f" if row["discount_type"] == "PERCENT" else ".2f",
+        )
     )
     projection["number"] = projection.pop("current_number")
     return projection

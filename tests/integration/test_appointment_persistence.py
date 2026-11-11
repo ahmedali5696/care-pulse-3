@@ -73,6 +73,7 @@ def _raw_snapshot(connection, tenant, appointment_id, **changes):
         "base": Decimal("100.00"),
         "discount_type": "NONE",
         "discount_value": Decimal(0),
+        "discount_percent_text": None,
         "discount_reason": None,
         "is_free": False,
         "net": Decimal("100.00"),
@@ -81,15 +82,20 @@ def _raw_snapshot(connection, tenant, appointment_id, **changes):
         "provenance": None,
     }
     fields.update(changes)
+    if fields["discount_type"] == "PERCENT" and "discount_percent_text" not in changes:
+        fields["discount_percent_text"] = format(fields["discount_value"], "f")
+        fields["discount_value"] = None
     connection.execute(
         text("""
             INSERT INTO public.appointment_price_snapshots
                 (organization_id, appointment_id, service_type, classification,
-                 base_egp, discount_type, discount_value, discount_reason,
+                 base_egp, discount_type, discount_value, discount_percent_text,
+                 discount_reason,
                  is_free, net_egp, pricing_version, creation_standard_base_egp,
                  entitlement_provenance)
             VALUES (:tenant, :appointment, :service_type, :classification,
-                    :base, :discount_type, :discount_value, :discount_reason,
+                    :base, :discount_type, :discount_value, :discount_percent_text,
+                    :discount_reason,
                     :is_free, :net, :pricing_version, :standard,
                     CAST(:provenance AS jsonb))
         """),
@@ -699,13 +705,24 @@ def test_confirmed_decimal_rounding_and_discounted_emergency_persist(
         assert saved["net_egp"] == net
         stored = connection.execute(
             text("""
-                SELECT base_egp, discount_value, net_egp, creation_standard_base_egp
+                SELECT base_egp, discount_value, discount_percent_text,
+                       net_egp, creation_standard_base_egp
                 FROM public.appointment_price_snapshots
                 WHERE appointment_id = :id
             """),
             {"id": saved["id"]},
         ).one()
-        assert stored == (Decimal(100), Decimal(discount), Decimal(net), Decimal(100))
+        expected_discount = (
+            (None, discount)
+            if discount_type == "PERCENT"
+            else (Decimal(discount), None)
+        )
+        assert stored == (
+            Decimal(100),
+            *expected_discount,
+            Decimal(net),
+            Decimal(100),
+        )
 
 
 def test_appointment_rls_and_operator_cannot_read_clinical_records(
@@ -970,6 +987,78 @@ def test_invalid_discount_money_or_urgent_snapshot_fails_database_validation(
         _raw_snapshot(connection, tenant, appointment, **changes)
     assert denied.value.orig.sqlstate == "23514"
     assert denied.value.orig.diag.constraint_name == constraint
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {
+            "discount_type": "PERCENT",
+            "discount_value": Decimal(10),
+            "discount_percent_text": None,
+            "discount_reason": "Synthetic authorized discount",
+            "net": Decimal("90.00"),
+        },
+        {
+            "discount_type": "PERCENT",
+            "discount_value": Decimal(10),
+            "discount_percent_text": "10",
+            "discount_reason": "Synthetic authorized discount",
+            "net": Decimal("90.00"),
+        },
+        {
+            "discount_type": "PERCENT",
+            "discount_value": None,
+            "discount_percent_text": None,
+            "discount_reason": "Synthetic authorized discount",
+            "net": Decimal("90.00"),
+        },
+        {
+            "discount_type": "FIXED",
+            "discount_value": Decimal("10.00"),
+            "discount_percent_text": "10",
+            "discount_reason": "Synthetic authorized discount",
+            "net": Decimal("90.00"),
+        },
+        {
+            "discount_type": "PERCENT",
+            "discount_value": None,
+            "discount_percent_text": "1e-1",
+            "discount_reason": "Synthetic authorized discount",
+            "net": Decimal("99.90"),
+        },
+        {
+            "discount_type": "PERCENT",
+            "discount_value": None,
+            "discount_percent_text": "10",
+            "discount_reason": "Synthetic authorized discount",
+            "net": Decimal("91.00"),
+        },
+    ],
+)
+def test_future_percentage_authority_is_exclusive_and_sql_failures_rollback(
+    appointment_storage, changes
+):
+    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+    statement = text("""
+        SELECT
+            (SELECT count(*) FROM public.patients WHERE organization_id=:tenant),
+            (SELECT count(*) FROM public.appointments WHERE organization_id=:tenant),
+            (SELECT count(*) FROM public.appointment_price_snapshots
+             WHERE organization_id=:tenant)
+    """)
+    with migration.connect() as connection:
+        before = connection.execute(statement, {"tenant": tenant}).one()
+    with (
+        pytest.raises(DBAPIError) as denied,
+        transaction(runtime, tenant) as connection,
+    ):
+        patient = _patient(connection, tenant)
+        appointment = _raw_appointment(connection, tenant, patient, doctor)
+        _raw_snapshot(connection, tenant, appointment, **changes)
+    assert denied.value.orig.sqlstate == "23514"
+    with migration.connect() as connection:
+        assert connection.execute(statement, {"tenant": tenant}).one() == before
 
 
 @pytest.mark.parametrize("classification", ["ROUTINE", "EMERGENCY"])

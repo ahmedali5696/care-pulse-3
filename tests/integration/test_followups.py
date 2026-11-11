@@ -420,6 +420,46 @@ def test_completed_source_books_preferential_on_day_zero_and_day_seven(
     assert evidence["policy_revision"] == 1
 
 
+def test_preferential_booking_roundtrips_16384_digit_percentage_and_receipt(
+    followup_clinic,
+):
+    clinic = followup_clinic
+    source = completed_source(clinic)
+    percentage = "0." + "0" * 16383 + "1"
+    body = followup_body(
+        source,
+        offset=1,
+        discount={
+            "discount_type": "PERCENT",
+            "discount_value": percentage,
+            "discount_reason": "Synthetic exact percentage",
+        },
+        expected_net_egp="30.00",
+    )
+    key = str(uuid4())
+    status, first = booking_request(clinic, clinic.owner, body=body, key=key)
+    assert status == 201, first
+    assert first["data"]["discount_value"] == percentage
+    before = booking_effects(clinic)
+    assert booking_request(clinic, clinic.owner, body=body, key=key) == (201, first)
+    assert booking_effects(clinic) == before
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        numeric_value, text_value, net = connection.execute(
+            text("""
+                SELECT discount_value, discount_percent_text, net_egp
+                FROM public.appointment_price_snapshots
+                WHERE organization_id=:tenant AND appointment_id=:appointment
+            """),
+            {
+                "tenant": clinic.tenant,
+                "appointment": UUID(first["data"]["id"]),
+            },
+        ).one()
+        assert numeric_value is None
+        assert text_value == percentage
+        assert net == Decimal("30.00")
+
+
 @pytest.mark.parametrize("offset", [8, 366, 3650])
 def test_expired_source_requires_acknowledged_new_examination(followup_clinic, offset):
     clinic = followup_clinic

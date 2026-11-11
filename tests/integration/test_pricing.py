@@ -5,7 +5,6 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
-from decimal import Decimal
 from hashlib import sha256
 from hmac import new
 from time import monotonic, sleep
@@ -1662,7 +1661,7 @@ def test_quote_confirm_persist_and_read_preserves_full_percentage_and_service(
     with transaction(runtime, tenant) as conn:
         row = conn.execute(
             text("""
-            SELECT a.service_type, p.discount_value::text, p.net_egp
+            SELECT a.service_type, p.discount_value, p.discount_percent_text, p.net_egp
             FROM public.appointments a
             JOIN public.appointment_price_snapshots p ON p.appointment_id = a.id
                 AND p.organization_id = a.organization_id
@@ -1671,5 +1670,6 @@ def test_quote_confirm_persist_and_read_preserves_full_percentage_and_service(
             {"appointment": saved["id"]},
         ).one()
         assert row[0] == service
-        assert Decimal(row[1]) == Decimal(discount)
-        assert row[2] == quote.net_egp
+        assert row[1] is None
+        assert row[2] == discount
+        assert row[3] == quote.net_egp
