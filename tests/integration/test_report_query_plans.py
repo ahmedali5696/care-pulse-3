@@ -145,11 +145,34 @@ def _bounded_completed_value_plan(plan):
 
 
 def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage):
-    runtime, _, (tenant, other), (doctor, other_doctor) = appointment_storage
+    runtime, migration, (tenant, other), (doctor, other_doctor) = appointment_storage
+    # Give PostgreSQL representative dated data and current statistics: without
+    # them, a tiny fixture can favor a tenant-only nested-loop cross product.
     with transaction(runtime, tenant) as connection:
         day = connection.scalar(
             text("SELECT (clock_timestamp() AT TIME ZONE 'Africa/Cairo')::date")
         )
+        _persist_with_status(
+            connection,
+            tenant,
+            _patient(connection, tenant),
+            doctor,
+            "Completed",
+            service_date=day,
+        )
+        for offset in range(1, 65):
+            _appointment(
+                connection,
+                tenant,
+                doctor,
+                status="Booked",
+                service_date=day - timedelta(days=offset),
+            )
+    with migration.begin() as connection:
+        connection.execute(
+            text("ANALYZE public.appointments, public.appointment_price_snapshots")
+        )
+    with transaction(runtime, tenant) as connection:
         start = datetime.combine(day, time.min, ZoneInfo("Africa/Cairo")).astimezone(
             UTC
         )
@@ -238,6 +261,9 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
             "start": start,
             "end": end,
         }
+        assert connection.scalar(
+            text(queries["completed_service_value"]), params
+        ) == Decimal("100.00")
         index_requirements = {
             "appointments_day_status_lane": (
                 ("appointments", ("organization_id", "service_date", "status", "lane")),
