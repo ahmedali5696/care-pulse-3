@@ -550,16 +550,16 @@ def test_exact_writer_rejects_submicrosecond_rounding_without_effects(
 
 
 @pytest.mark.parametrize(
-    "work_period,breaks,mixed_valid",
+    "work_period,breaks",
     [
-        (("23:20", "23:40"), (), False),
-        (("22:00", "23:59"), (("23:40", "23:50"),), False),
-        (("22:00", "23:59"), (), True),
+        (("23:20", "23:40"), ()),
+        (("22:00", "23:59"), (("23:40", "23:50"),)),
+        (("22:00", "23:59"), ()),
     ],
-    ids=("crosses-work-period", "crosses-break", "fully-covered-fold"),
+    ids=("crosses-work-period", "crosses-break", "crosses-2359-boundary"),
 )
 def test_exact_writer_enforces_resolved_cairo_fold_work_and_breaks(
-    admin, empty_database, work_period, breaks, mixed_valid
+    admin, empty_database, work_period, breaks
 ):
     migration, runtime, tenant, doctor = _prepare(admin, empty_database)
     try:
@@ -604,42 +604,36 @@ def test_exact_writer_enforces_resolved_cairo_fold_work_and_breaks(
         with transaction(runtime, tenant) as connection:
             before = _writer_effect_counts(connection, tenant)
             mixed = priced(sources[0], first_start.isoformat(), second_end.isoformat())
-            if mixed_valid:
-                claim = _v2_command(
-                    connection, "create_followup_claim_ordered", sources[0], **mixed
+            # Even the widest representable HH:MM work interval ends at
+            # 23:59 exclusively: the crossed 23:59 minute is not covered.
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                _v2_command(
+                    connection,
+                    "create_followup_claim_ordered",
+                    sources[0],
+                    **mixed,
                 )
-                assert claim is not None
-            else:
-                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
-                    _v2_command(
-                        connection,
-                        "create_followup_claim_ordered",
-                        sources[0],
-                        **mixed,
-                    )
-                assert denied.value.orig.sqlstate == "23514"
-                assert _writer_effect_counts(connection, tenant) == before
+            assert denied.value.orig.sqlstate == "23514"
+            assert _writer_effect_counts(connection, tenant) == before
 
-                # Each explicitly resolved fold is individually bookable.
-                first_claim = _v2_command(
-                    connection,
-                    "create_followup_claim_ordered",
-                    sources[1],
-                    **priced(
-                        sources[1], first_start.isoformat(), first_end.isoformat()
-                    ),
-                )
-                second_claim = _v2_command(
-                    connection,
-                    "create_followup_claim_ordered",
+            # Both explicitly resolved same-fold alternatives remain bookable.
+            first_claim = _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                sources[1],
+                **priced(sources[1], first_start.isoformat(), first_end.isoformat()),
+            )
+            second_claim = _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                sources[2],
+                **priced(
                     sources[2],
-                    **priced(
-                        sources[2],
-                        second_start.astimezone(UTC).isoformat().replace("+00:00", "Z"),
-                        second_end.astimezone(UTC).isoformat(),
-                    ),
-                )
-                assert first_claim != second_claim
+                    second_start.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                    second_end.astimezone(UTC).isoformat(),
+                ),
+            )
+            assert first_claim != second_claim
     finally:
         runtime.dispose()
         migration.dispose()
