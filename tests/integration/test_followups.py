@@ -3,7 +3,7 @@
 import json
 from contextlib import nullcontext
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from types import SimpleNamespace
@@ -24,7 +24,9 @@ from carepulse.identity.contracts import normalized_request_digest
 from carepulse.identity.receipts import Receipt, insert_tenant_receipt
 from carepulse.main import app
 from carepulse.notifications.evidence import append_outbox, append_sensitive_audit
+from carepulse.policies.slots_service import list_slots
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _admit_saved, _draft, _patient, _query
 from test_booking import (
     booking_body,
@@ -418,6 +420,212 @@ def test_completed_source_books_preferential_on_day_zero_and_day_seven(
     assert evidence["actor_role"] == "RECEPTIONIST"
     assert evidence["authorized"] is True
     assert evidence["policy_revision"] == 1
+
+
+@pytest.mark.parametrize(
+    "weekly_work,weekly_manual,schedule_change,generated,manual",
+    [
+        pytest.param(
+            ("08:00", "12:00"),
+            ("08:30", "09:30"),
+            "override",
+            ("09:00", "10:00"),
+            None,
+            id="weekly-manual-outside-date-override",
+        ),
+        pytest.param(
+            ("00:00", "04:00"),
+            ("00:45", "01:15"),
+            "none",
+            ("01:00", "02:00"),
+            None,
+            id="weekly-manual-starts-in-spring-gap",
+        ),
+        pytest.param(
+            ("09:00", "12:00"),
+            ("09:30", "10:30"),
+            "none",
+            ("09:00", "10:00"),
+            ("09:30", "10:30"),
+            id="resolved-manual-suppresses-generated",
+        ),
+        pytest.param(
+            ("09:00", "12:00"),
+            ("09:30", "10:30"),
+            "replacement",
+            ("09:00", "10:00"),
+            ("11:00", "12:00"),
+            id="dated-manual-set-replaces-weekly",
+        ),
+    ],
+)
+def test_timed_followup_manual_precedence_matches_offered_candidates(
+    followup_clinic, weekly_work, weekly_manual, schedule_change, generated, manual
+):
+    clinic = followup_clinic
+    source = completed_source(clinic)
+    day = date(2030, 4, 26)
+    weekday = day.isoweekday()
+    cairo = ZoneInfo("Africa/Cairo")
+    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+
+    def endpoints(interval):
+        return tuple(
+            datetime.combine(day, time.fromisoformat(bound), cairo).isoformat()
+            for bound in interval
+        )
+
+    config = _config(
+        duration_minutes="60",
+        working_weekdays=[weekday],
+        weekly_work_periods=[
+            {"weekday": weekday, "starts_at": weekly_work[0], "ends_at": weekly_work[1]}
+        ],
+        weekly_manual_slots=[
+            {
+                "weekday": weekday,
+                "starts_at": weekly_manual[0],
+                "ends_at": weekly_manual[1],
+            }
+        ],
+    )
+    if schedule_change == "override":
+        config["override_work_periods"] = [
+            {"service_date": day.isoformat(), "starts_at": "09:00", "ends_at": "12:00"}
+        ]
+    elif schedule_change == "replacement":
+        config["manual_slots_by_date"] = {
+            day.isoformat(): [{"starts_at": "11:00", "ends_at": "12:00"}]
+        }
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _publish(connection, actor, config, revision=3)
+        offered = {
+            (
+                datetime.fromisoformat(slot["starts_at"]).astimezone(cairo).isoformat(),
+                datetime.fromisoformat(slot["ends_at"]).astimezone(cairo).isoformat(),
+            ): slot["origin"]
+            for slot in list_slots(connection, actor, day)["candidates"]
+            if slot["available"]
+        }
+
+    bounds = endpoints(generated)
+    suppressed = manual == weekly_manual
+    assert offered.get(bounds) == (None if suppressed else "GENERATED")
+    if manual is not None:
+        assert offered[endpoints(manual)] == "MANUAL"
+    if schedule_change == "replacement":
+        assert endpoints(weekly_manual) not in offered
+    offset = (day - source["day"]).days
+    fields = {
+        "starts_at": bounds[0],
+        "ends_at": bounds[1],
+        "new_booking_date_exception": {
+            "selected_service_date": day.isoformat(),
+            "reason": "Reviewed future service date",
+        },
+    }
+    direct = {**_v2_booking(source, offset), **fields, "booking_mode": "EXACT_TIME"}
+    before = booking_effects(clinic)
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        if suppressed:
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                _v2_command(
+                    connection, "create_followup_claim_ordered", source, **direct
+                )
+            assert denied.value.orig.sqlstate == "23514"
+        else:
+            with connection.begin_nested() as probe:
+                assert (
+                    _v2_command(
+                        connection, "create_followup_claim_ordered", source, **direct
+                    )
+                    is not None
+                )
+                probe.rollback()
+    assert booking_effects(clinic) == before
+
+    signed = followup_body(
+        source, offset=offset, expected_schedule_revision=4, **fields
+    )
+    if suppressed:
+        status, response = booking_request(
+            clinic, clinic.owner, body=signed, key=str(uuid4())
+        )
+        assert status == 409, response
+        assert booking_effects(clinic) == before
+        signed["starts_at"], signed["ends_at"] = endpoints(manual)
+    status, response = booking_request(
+        clinic, clinic.owner, body=signed, key=str(uuid4())
+    )
+    assert status == 201, response
+    assert claim_record(clinic, response["data"]["id"])["state"] == "ACTIVE"
+
+
+@pytest.mark.parametrize(
+    "preferential", [False, True], ids=["ordinary", "preferential"]
+)
+def test_signed_discount_confirmation_preserves_reason_and_replays(
+    followup_clinic, preferential
+):
+    clinic = followup_clinic
+    if preferential:
+        source = completed_source(clinic)
+        body = followup_body(source, offset=1, expected_net_egp="25.00")
+    else:
+        body = booking_body(
+            new_patient(clinic),
+            expected_price_revision=3,
+            expected_schedule_revision=3,
+            expected_net_egp="95.00",
+        )
+    discount = {"discount_type": "FIXED", "discount_value": "5.00"}
+    before = booking_effects(clinic)
+    key = str(uuid4())
+    for invalid in (discount, {**discount, "discount_reason": " \t\u00a0 "}):
+        status, response = booking_request(
+            clinic, clinic.owner, body={**body, "discount": invalid}, key=key
+        )
+        assert status == 422, response
+        assert booking_effects(clinic) == before
+
+    reason = "  hardship  "
+    body["discount"] = {**discount, "discount_reason": reason}
+    status, response = booking_request(clinic, clinic.owner, body=body, key=key)
+    assert status == 201, response
+    booked = response["data"]
+    assert booked["net_egp"] == body["expected_net_egp"]
+    with clinic.migration.connect() as connection:
+        assert (
+            connection.scalar(
+                text("""
+                SELECT discount_reason FROM public.appointment_price_snapshots
+                WHERE organization_id=:tenant AND appointment_id=:appointment
+            """),
+                {"tenant": clinic.tenant, "appointment": UUID(booked["id"])},
+            )
+            == reason
+        )
+        digest = connection.scalar(
+            text("""
+                SELECT request_digest FROM public.idempotency_receipts
+                WHERE organization_id=:tenant AND operation='appointments.book'
+                  AND idempotency_key=:key
+            """),
+            {"tenant": clinic.tenant, "key": key},
+        )
+    assert (
+        digest
+        == sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    )
+    after = booking_effects(clinic)
+    assert booking_request(clinic, clinic.owner, body=body, key=key) == (201, response)
+    body["discount"] = {**discount, "discount_reason": reason.strip()}
+    status, conflict = booking_request(clinic, clinic.owner, body=body, key=key)
+    assert status == 409, conflict
+    assert conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert booking_effects(clinic) == after
 
 
 def test_preferential_booking_roundtrips_16384_digit_percentage_and_receipt(
@@ -1063,6 +1271,7 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
                 == original_receipt
             )
         _upgrade(migration, "0034_t145_exact_percentage")
+        _upgrade(migration, "0036_b10_confirmation_parity")
         with migration.connect() as connection:
             assert (
                 connection.execute(receipt_query, receipt_params).one()

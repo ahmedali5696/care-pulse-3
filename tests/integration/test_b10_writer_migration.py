@@ -22,6 +22,7 @@ PROOF_AFTER = "0030_b10_source_proof"
 GUARD_AFTER = "0031_b10_writer_guard"
 OFFSET_AFTER = "0032_b10_cairo_offset_guard"
 EXACT_AFTER = "0035_t146_cairo_exact_schedule"
+PARITY_AFTER = "0036_b10_confirmation_parity"
 
 
 def _publish_bookable_policies(
@@ -459,6 +460,7 @@ def test_exact_writer_rejects_submicrosecond_rounding_without_effects(
                 {"tenant": tenant, "claim": previous_claim},
             ).one()
         _upgrade(migration, EXACT_AFTER)
+        _upgrade(migration, PARITY_AFTER)
         with migration.connect() as connection:
             assert (
                 connection.execute(
@@ -575,7 +577,7 @@ def test_exact_writer_enforces_resolved_cairo_fold_work_and_breaks(
         )
         with transaction(runtime, tenant) as connection:
             sources = [_v2_source(connection, tenant, doctor) for _ in range(3)]
-        _upgrade(migration, EXACT_AFTER)
+        _upgrade(migration, PARITY_AFTER)
 
         cairo = ZoneInfo("Africa/Cairo")
         first_start = datetime.combine(fold_day, time(23, 25), cairo).replace(fold=0)
@@ -639,12 +641,88 @@ def test_exact_writer_enforces_resolved_cairo_fold_work_and_breaks(
         migration.dispose()
 
 
+def test_exact_writer_rejects_normalized_clock_components_without_effects(
+    admin, empty_database
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, PROOF_AFTER)
+        with transaction(runtime, tenant) as connection:
+            cairo_source = _v2_source(connection, tenant, doctor)
+            utc_source = _v2_source(connection, tenant, doctor)
+        day = date(2030, 1, 1)
+        _upgrade(migration, EXACT_AFTER)
+        _publish_bookable_policies(
+            migration, tenant, timed_day=day, work_period=("01:00", "10:00")
+        )
+        _upgrade(migration, PARITY_AFTER)
+
+        def timed(source, starts_at, ends_at):
+            return _priced_booking(
+                source,
+                service_date=day.isoformat(),
+                booking_mode="EXACT_TIME",
+                starts_at=starts_at,
+                ends_at=ends_at,
+                new_booking_date_exception={
+                    "selected_service_date": day.isoformat(),
+                    "reason": "Reviewed future service date",
+                },
+            )
+
+        cairo_cases = (
+            ("2030-01-01T08:59:60+02:00", "2030-01-01T10:00:00+02:00"),
+            ("2030-01-01T08:00:00+02:00", "2030-01-01T08:59:60+02:00"),
+        )
+        utc_cases = (
+            ("2029-12-31T24:00:00Z", "2030-01-01T01:00:00Z"),
+            ("2029-12-31T23:00:00Z", "2029-12-31T24:00:00Z"),
+        )
+        with migration.connect() as connection:
+            before = _writer_effect_counts(connection, tenant)
+        with transaction(runtime, tenant) as connection:
+            for starts_at, ends_at in (*cairo_cases, *utc_cases):
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    _v2_command(
+                        connection,
+                        "create_followup_claim_ordered",
+                        cairo_source,
+                        **timed(cairo_source, starts_at, ends_at),
+                    )
+                assert denied.value.orig.sqlstate == "23514"
+                assert "explicit RFC3339 offsets" in str(denied.value.orig)
+        with migration.connect() as connection:
+            assert _writer_effect_counts(connection, tenant) == before
+        with transaction(runtime, tenant) as connection:
+            cairo_claim = _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                cairo_source,
+                **timed(
+                    cairo_source,
+                    "2030-01-01T09:00:00+02:00",
+                    "2030-01-01T10:00:00+02:00",
+                ),
+            )
+            utc_claim = _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                utc_source,
+                **timed(utc_source, "2029-12-31T23:00:00Z", "2030-01-01T00:00:00Z"),
+            )
+            assert cairo_claim is not None and utc_claim is not None
+            assert cairo_claim != utc_claim
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
 def test_guard_effective_runtime_grants_preserve_ordered_operations(
     admin, empty_database
 ):
     migration, runtime, _tenant, _doctor = _prepare(admin, empty_database)
     try:
-        _upgrade(migration, GUARD_AFTER)
+        _upgrade(migration, PARITY_AFTER)
         with migration.connect() as connection:
             for signature, allowed in (
                 ("create_followup_claim_ordered(uuid,uuid,jsonb,jsonb)", True),
@@ -652,6 +730,8 @@ def test_guard_effective_runtime_grants_preserve_ordered_operations(
                 ("b10_unchecked_claim_creation(uuid,uuid,jsonb,jsonb)", False),
                 ("b10_assert_followup_price(uuid,jsonb)", False),
                 ("b10_assert_followup_schedule(uuid,jsonb)", False),
+                ("b10_schedule_without_exact_guard(uuid,jsonb)", False),
+                ("b10_schedule_without_offset_guard(uuid,jsonb)", False),
                 ("b10_operational_source_proof(uuid,uuid)", True),
                 ("d08_legacy_source(uuid,uuid)", False),
             ):
