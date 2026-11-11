@@ -327,19 +327,6 @@ docker compose --profile test run --rm --no-deps \
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d06-queue.log"; then
   echo 'FAIL mandatory D-06 real-PostgreSQL evidence skipped'; exit 1
 fi
-# D-11 close/write serialization, report query plans and upgrade are PostgreSQL-only.
-docker compose --profile test run --rm --no-deps \
-  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
-  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
-  -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
-  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
-  -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
-  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider \
-  tests/integration/test_day_review_persistence.py tests/integration/test_report_query_plans.py \
-  tests/integration/test_day_review_races.py tests/integration/test_day_review_migration.py | tee "$private/d11-day-review.log"
-if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d11-day-review.log"; then
-  echo 'FAIL mandatory D-11 real-PostgreSQL evidence skipped'; exit 1
-fi
 # All B-06 suites run against disposable PostgreSQL; no silent skip counts.
 docker compose --profile test run --rm --no-deps \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
@@ -396,6 +383,20 @@ docker compose --profile test run --rm --no-deps \
   tests/integration/test_b10_writer_migration.py | tee "$private/b10-followups.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b10-followups.log"; then
   echo 'FAIL mandatory B-10 follow-up evidence skipped'; exit 1
+fi
+# D-11 remains mandatory, but runs after the T145-owned pricing/booking/follow-up
+# suites so an unrelated fail-fast plan assertion cannot mask their evidence.
+docker compose --profile test run --rm --no-deps \
+  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
+  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider \
+  tests/integration/test_day_review_persistence.py tests/integration/test_report_query_plans.py \
+  tests/integration/test_day_review_races.py tests/integration/test_day_review_migration.py | tee "$private/d11-day-review.log"
+if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d11-day-review.log"; then
+  echo 'FAIL mandatory D-11 real-PostgreSQL evidence skipped'; exit 1
 fi
 # B-05 backend proof has no BFF/invitation prerequisite and cannot silently skip.
 docker compose --profile test run --rm --no-deps \
