@@ -1062,6 +1062,12 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
                 connection.execute(receipt_query, receipt_params).one()
                 == original_receipt
             )
+        _upgrade(migration, "0034_t145_exact_percentage")
+        with migration.connect() as connection:
+            assert (
+                connection.execute(receipt_query, receipt_params).one()
+                == original_receipt
+            )
         app.state.db_engine = runtime
         assert booking_request(clinic, actor, raw_body=legacy_raw, key=key) == (
             201,
