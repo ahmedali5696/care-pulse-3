@@ -61,7 +61,7 @@ def _exact_percentage_functions() -> None:
             scale numeric;
             rational_chunk numeric;
             supplied_chunk numeric;
-            offset integer := 1;
+            digit_offset integer := 1;
             chunk_length integer;
             chunk_size constant integer := 32;
         BEGIN
@@ -91,19 +91,19 @@ def _exact_percentage_functions() -> None:
                 RETURN 1;
             END IF;
 
-            WHILE offset <= length(fractional_part) LOOP
-                chunk_length := least(chunk_size, length(fractional_part) - offset + 1);
+            WHILE digit_offset <= length(fractional_part) LOOP
+                chunk_length := least(chunk_size, length(fractional_part) - digit_offset + 1);
                 scale := power(10::numeric, chunk_length);
                 remainder := remainder * scale;
                 rational_chunk := div(remainder, denominator);
                 remainder := mod(remainder, denominator);
-                supplied_chunk := substr(fractional_part, offset, chunk_length)::numeric;
+                supplied_chunk := substr(fractional_part, digit_offset, chunk_length)::numeric;
                 IF supplied_chunk < rational_chunk THEN
                     RETURN -1;
                 ELSIF supplied_chunk > rational_chunk THEN
                     RETURN 1;
                 END IF;
-                offset := offset + chunk_length;
+                digit_offset := digit_offset + chunk_length;
             END LOOP;
             IF remainder = 0 THEN
                 RETURN 0;
