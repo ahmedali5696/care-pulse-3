@@ -18,6 +18,7 @@ TERMINAL_AUDIT_ACTIONS = (
     "VISIT_EXAMINATION_CANCELLED",
     "VISIT_EXAMINATION_COMPLETED",
 )
+CURRENT_HEAD = "0034_t145_exact_percentage"
 
 
 @pytest.fixture(scope="module")
@@ -451,7 +452,7 @@ def test_post_revoke_sql_acl_and_private_helpers_are_default_denied(evidence):
         ).fetchone() == (True, True)
         assert (
             conn.execute("SELECT version_num FROM public.alembic_version").fetchone()[0]
-            == "0033_d08_terminal_writer"
+            == CURRENT_HEAD
         )
         assert (
             conn.execute("SELECT count(*) FROM public.idempotency_receipts").fetchone()[

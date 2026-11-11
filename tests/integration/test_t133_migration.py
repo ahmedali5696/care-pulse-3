@@ -21,6 +21,7 @@ from test_followup_persistence import _v2_booking, _v2_command, _v2_record, _v2_
 ROOT = Path(__file__).resolve().parents[2]
 BEFORE = "0032_b10_cairo_offset_guard"
 AFTER = "0033_d08_terminal_writer"
+CURRENT_HEAD = "0034_t145_exact_percentage"
 TERMINAL = "public.transition_terminal_appointment(uuid,uuid,bigint,jsonb)"
 LEGACY = "public.complete_examined_visit(uuid,uuid,bigint,boolean)"
 PRIVATE = "public.d07_complete_examined_visit_raw(uuid,uuid,bigint,boolean)"
@@ -61,7 +62,7 @@ def test_t133_existing_head_preserves_owner_only_terminal_writer(appointment_sto
     with migration.connect() as connection:
         assert (
             connection.scalar(text("SELECT version_num FROM public.alembic_version"))
-            == AFTER
+            == CURRENT_HEAD
         )
         assert _acl(connection) == ("carepulse_migration", False, False, False)
         assert connection.scalar(
@@ -183,7 +184,7 @@ def test_t133_populated_0032_upgrade_preserves_claim_and_new_exam(
                 connection.scalar(
                     text("SELECT version_num FROM public.alembic_version")
                 )
-                == AFTER
+                == CURRENT_HEAD
             )
             assert _acl(connection) == ("carepulse_migration", False, False, False)
             observed = connection.execute(
