@@ -20,7 +20,7 @@ def upgrade() -> None:
         DECLARE
             endpoint_key text;
             day date := (booking->>'service_date')::date;
-            weekday integer := extract(isodow FROM day);
+            service_weekday integer := extract(isodow FROM day);
             starts timestamptz;
             ends timestamptz;
             local_start time;
@@ -65,7 +65,7 @@ def upgrade() -> None:
                 WHERE i.organization_id=org AND i.policy_version=version
                   AND i.interval_kind=period_kind
                   AND (CASE WHEN has_override THEN i.service_date=day
-                            ELSE i.weekday=weekday END)
+                            ELSE i.weekday=service_weekday END)
                   AND i.starts_at <= local_start AND i.ends_at >= local_end
                   AND NOT EXISTS (
                       SELECT 1 FROM pg_catalog.generate_series(
@@ -79,7 +79,7 @@ def upgrade() -> None:
             ) OR EXISTS (
                 SELECT 1 FROM public.clinic_schedule_intervals b
                 WHERE b.organization_id=org AND b.policy_version=version
-                  AND b.interval_kind='BREAK' AND b.weekday=weekday
+                  AND b.interval_kind='BREAK' AND b.weekday=service_weekday
                   AND EXISTS (
                       SELECT 1 FROM pg_catalog.generate_series(
                           starts, ends - interval '1 microsecond', interval '1 minute'
