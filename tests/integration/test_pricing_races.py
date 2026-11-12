@@ -1,6 +1,7 @@
 """B-06 conflicting pricing transactions and immutable frozen-price evidence."""
 
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from uuid import UUID, uuid4
 
 import pytest
@@ -122,6 +123,67 @@ def test_signed_identical_pricing_retry_after_policy_lock_replays_original(
         )[0]
         == 409
     )
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinic_policy_versions WHERE kind='PRICE'"
+                )
+            )
+            == 2
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.idempotency_receipts "
+                    "WHERE operation='settings.pricing.update' AND idempotency_key=:key"
+                ),
+                {"key": key},
+            )
+            == 1
+        )
+
+
+def test_direct_identical_pricing_rechecks_receipt_after_policy_lock(patient_backend):
+    clinic = patient_backend
+    key = str(uuid4())
+    change = _change(1, standard_new_exam_egp="125.00")
+    retry_started = Event()
+    retry_pid = []
+
+    def competing_update():
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            retry_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            retry_started.set()
+            return update_pricing(
+                connection,
+                _owner(clinic.tenant, UUID(clinic.owner.staff_id)),
+                change,
+                key,
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            original = update_pricing(
+                connection,
+                _owner(clinic.tenant, UUID(clinic.owner.staff_id)),
+                change,
+                key,
+            )
+            holder_pid = connection.scalar(text("SELECT pg_backend_pid()"))
+            future = pool.submit(competing_update)
+            assert retry_started.wait(timeout=15)
+            blocked = _blocked_by(clinic, holder_pid)
+            assert blocked == retry_pid[0]
+            with clinic.runtime.connect() as observer:
+                blocked_sql = observer.scalar(
+                    text("SELECT query FROM pg_stat_activity WHERE pid=:pid"),
+                    {"pid": blocked},
+                )
+                assert blocked_sql and "public.clinic_policy_heads" in blocked_sql
+                assert "FOR UPDATE" in blocked_sql
+        replay = future.result(timeout=30)
+    assert replay == original
     with transaction(clinic.runtime, clinic.tenant) as connection:
         assert (
             connection.scalar(
