@@ -144,6 +144,20 @@ def test_confirmation_reason_is_independently_required(type_, reason):
 
 
 @pytest.mark.parametrize("type_", ["FIXED", "PERCENT"])
+@pytest.mark.parametrize("reason", ["Approved\x00reduction", "Approved\ud800reduction"])
+def test_confirmation_reason_rejects_postgresql_unrepresentable_characters(
+    type_, reason
+):
+    with pytest.raises(ValueError, match="Invalid discount reason characters"):
+        validate_discount_reason(type_, reason)
+
+
+@pytest.mark.parametrize("type_", ["FIXED", "PERCENT"])
+def test_confirmation_reason_accepts_untrimmed_nonblank_unicode(type_):
+    validate_discount_reason(type_, "  مساعدة مالية  ")
+
+
+@pytest.mark.parametrize("type_", ["FIXED", "PERCENT"])
 def test_full_discount_is_free_and_requires_confirmation_reason(type_):
     value = "100.00" if type_ == "FIXED" else "100"
     quote = quote_price("100.00", "100.00", "NEW_EXAMINATION", "ROUTINE", type_, value)

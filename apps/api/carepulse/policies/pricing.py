@@ -92,6 +92,12 @@ def validate_discount_reason(discount_type: str, discount_reason: str | None) ->
     elif discount_type in ("FIXED", "PERCENT"):
         if not isinstance(discount_reason, str) or not discount_reason.strip():
             raise ValueError("A discretionary discount requires a reason")
+        if "\x00" in discount_reason:
+            raise ValueError("Invalid discount reason characters")
+        try:
+            discount_reason.encode("utf-8")
+        except UnicodeEncodeError as invalid:
+            raise ValueError("Invalid discount reason characters") from invalid
     else:
         raise ValueError("Invalid discount type")
 

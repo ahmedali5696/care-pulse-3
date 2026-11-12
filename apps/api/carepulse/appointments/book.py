@@ -281,6 +281,7 @@ def _booking_plan(connection: Connection, actor, command, now):
             command.source_visit_id,
             command.expected_source_decision_revision,
             now,
+            actor_role=actor.role,
             expected_visit_revision=command.expected_visit_revision,
             exception_declared=command.new_booking_date_exception is not None,
         )

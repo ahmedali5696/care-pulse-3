@@ -31,8 +31,11 @@ def _cairo_instants(service_date: date, wall_time: time) -> tuple[datetime, ...]
     instants = set()
     for fold in (0, 1):
         local = datetime.combine(service_date, wall_time, CAIRO).replace(fold=fold)
-        instant = local.astimezone(UTC)
-        roundtrip = instant.astimezone(CAIRO)
+        try:
+            instant = local.astimezone(UTC)
+            roundtrip = instant.astimezone(CAIRO)
+        except OverflowError:
+            continue
         if roundtrip.date() == service_date and roundtrip.time() == wall_time:
             instants.add(instant)
     return tuple(sorted(instants))
@@ -57,8 +60,13 @@ def parse_timed_endpoint(text: str, intended_service_date: date) -> datetime:
     if match is None or any(digit != "0" for digit in (match["fraction"] or "")[6:]):
         raise ValueError("Timed endpoint requires RFC3339 with an explicit offset")
     supplied = datetime.fromisoformat(text)
-    instant = supplied.astimezone(UTC)
-    local = instant.astimezone(CAIRO)
+    try:
+        instant = supplied.astimezone(UTC)
+        local = instant.astimezone(CAIRO)
+    except OverflowError as invalid:
+        raise ValueError(
+            "Timed endpoint is outside supported datetime range"
+        ) from invalid
     if supplied.utcoffset() != timedelta(0) and (
         supplied.date() != local.date()
         or supplied.time() != local.time()
@@ -98,7 +106,7 @@ def _generated_candidates(
         for period in rules.periods:
             cursor = datetime.combine(service_date, period.starts_at)
             period_end = datetime.combine(service_date, period.ends_at)
-            while cursor + duration <= period_end:
+            while period_end - cursor >= duration:
                 slot = LocalSlot(cursor.time(), (cursor + duration).time())
                 if _fits(slot, (period,), rules.breaks):
                     generated.extend(

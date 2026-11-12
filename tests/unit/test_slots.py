@@ -106,6 +106,35 @@ def test_each_period_anchors_its_own_grid_with_exact_fit():
     assert _offered(config)[-1][1] == "11:10"
 
 
+def test_max_supported_date_retains_three_complete_generated_slots():
+    day = date.max
+    config = _schedule(day=day, periods=(_local((22, 0), (23, 59)),))
+    assert _offered(config, day) == [
+        ("22:00", "22:30", "GENERATED"),
+        ("22:30", "23:00", "GENERATED"),
+        ("23:00", "23:30", "GENERATED"),
+    ]
+    assert all(
+        parse_timed_endpoint(candidate.starts_at.isoformat(), day)
+        == candidate.starts_at
+        and parse_timed_endpoint(candidate.ends_at.isoformat(), day)
+        == candidate.ends_at
+        for candidate in candidates_for_date(config, day)
+    )
+
+
+@pytest.mark.parametrize(
+    ("day", "timestamp"),
+    [
+        (date.max, "9999-12-31T23:59:00-02:00"),
+        (date.min, "0001-01-01T00:00:00+02:00"),
+    ],
+)
+def test_out_of_range_utc_endpoint_is_rejected_as_invalid_input(day, timestamp):
+    with pytest.raises(ValueError, match="supported datetime range"):
+        parse_timed_endpoint(timestamp, day)
+
+
 @pytest.mark.parametrize(
     ("manual_start", "manual_end", "generated_starts"),
     [

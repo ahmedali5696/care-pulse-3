@@ -581,11 +581,17 @@ def test_signed_discount_confirmation_preserves_reason_and_replays(
     discount = {"discount_type": "FIXED", "discount_value": "5.00"}
     before = booking_effects(clinic)
     key = str(uuid4())
-    for invalid in (discount, {**discount, "discount_reason": " \t\u00a0 "}):
+    for invalid in (
+        discount,
+        {**discount, "discount_reason": " \t\u00a0 "},
+        {**discount, "discount_reason": "reason\x00unrepresentable"},
+    ):
         status, response = booking_request(
             clinic, clinic.owner, body={**body, "discount": invalid}, key=key
         )
         assert status == 422, response
+        assert "data" not in response
+        assert "unrepresentable" not in json.dumps(response)
         assert booking_effects(clinic) == before
 
     reason = "  hardship  "
@@ -804,6 +810,69 @@ def test_signed_new_date_adds_exact_authorization_evidence(
     assert evidence["new_date_event_id"] == str(event.id)
     assert event.correlation_id == str(event.id)
     assert event.after_state["id"] == str(event.id)
+
+
+@pytest.mark.parametrize("staff_kind", ["owner", "receptionist"])
+def test_doctor_deadline_new_date_exception_preserves_actor_authority(
+    followup_clinic, staff_kind
+):
+    clinic = followup_clinic
+    source = completed_source(clinic)
+    doctor_decision(
+        clinic,
+        source["visit"],
+        {
+            "kind": "DEADLINE",
+            "deadline_date": (source["day"] + timedelta(days=3)).isoformat(),
+            "reason": "Doctor-specific follow-up limit",
+        },
+    )
+    actor = getattr(clinic, staff_kind)
+    intended = source["day"] + timedelta(days=5)
+    declaration = {
+        "selected_service_date": intended.isoformat(),
+        "reason": "Doctor reviewed the specific later date",
+    }
+    body = followup_body(
+        source,
+        offset=5,
+        source_revision=1,
+        new_booking_date_exception=declaration,
+    )
+    before = booking_effects(clinic)
+    key = str(uuid4())
+    status, response = booking_request(clinic, actor, body=body, key=key)
+    if staff_kind == "receptionist":
+        assert status == 409, response
+        assert booking_effects(clinic) == before
+        return
+
+    assert status == 201, response
+    claim = claim_record(clinic, response["data"]["id"])
+    assert claim["approved_deadline"] == source["day"] + timedelta(days=3)
+    assert claim["policy_snapshot"]["new_booking_date_exception"] == declaration
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        event = connection.execute(
+            text("""
+                SELECT e.id, e.actor_staff_id, e.actor_role, e.reason, a.after_state
+                FROM public.followup_authorization_events e
+                JOIN public.followup_claims c ON (c.organization_id,c.id)
+                    = (e.organization_id,e.claim_id)
+                JOIN public.sensitive_audit a ON (a.organization_id,a.id)
+                    = (e.organization_id,e.sensitive_audit_id)
+                WHERE c.organization_id=:tenant AND c.appointment_id=:appointment
+                  AND e.kind='NEW_DATE'
+            """),
+            {"tenant": clinic.tenant, "appointment": UUID(response["data"]["id"])},
+        ).one()
+    assert (event.actor_staff_id, event.actor_role, event.reason) == (
+        UUID(clinic.owner.staff_id),
+        "DOCTOR_OWNER",
+        declaration["reason"],
+    )
+    assert claim["policy_snapshot"]["new_date_event_id"] == str(event.id)
+    assert event.after_state["id"] == str(event.id)
+    assert booking_request(clinic, actor, body=body, key=key) == (status, response)
 
 
 @pytest.mark.parametrize(

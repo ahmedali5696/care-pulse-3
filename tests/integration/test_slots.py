@@ -8,6 +8,7 @@ from hashlib import sha256
 from hmac import new
 from urllib.parse import urlencode
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from carepulse.db import transaction
@@ -172,6 +173,93 @@ def test_open_mode_long_horizon_and_unknown_query_are_handled(patient_backend):
         clinic, clinic.owner, SERVICE_DAY, other_fields={"tenant_id": "forbidden"}
     )
     assert status == 422
+
+
+def test_max_supported_date_signed_exact_slots_and_booking_boundary(booking_clinic):
+    clinic = booking_clinic
+    day = date.max
+    weekday = day.isoweekday()
+    config = _config(
+        working_weekdays=[weekday],
+        weekly_work_periods=[
+            {"weekday": weekday, "starts_at": "22:00", "ends_at": "23:59"}
+        ],
+    )
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _publish(connection, _actor(clinic.tenant, clinic.staff), config, revision=2)
+
+    status, response = _slots_request(clinic, clinic.owner, day)
+    assert status == 200, response
+    offered = response["data"]["candidates"]
+    assert len(offered) == 3
+    assert all(slot["available"] and slot["origin"] == "GENERATED" for slot in offered)
+    cairo = ZoneInfo("Africa/Cairo")
+    assert [
+        (
+            datetime.fromisoformat(slot["starts_at"])
+            .astimezone(cairo)
+            .strftime("%H:%M"),
+            datetime.fromisoformat(slot["ends_at"]).astimezone(cairo).strftime("%H:%M"),
+        )
+        for slot in offered
+    ] == [("22:00", "22:30"), ("22:30", "23:00"), ("23:00", "23:30")]
+
+    for slot in offered:
+        status, confirmed = booking_request(
+            clinic,
+            clinic.owner,
+            body=booking_body(
+                new_patient(clinic),
+                day=day,
+                expected_schedule_revision=3,
+                starts_at=slot["starts_at"],
+                ends_at=slot["ends_at"],
+            ),
+            key=str(uuid4()),
+        )
+        assert status == 201, confirmed
+
+    before = booking_effects(clinic)
+    for invalid_field in ("starts_at", "ends_at"):
+        bounds = {key: offered[0][key] for key in ("starts_at", "ends_at")}
+        bounds[invalid_field] = "9999-12-31T23:59:00-02:00"
+        status, denied = booking_request(
+            clinic,
+            clinic.owner,
+            body=booking_body(
+                new_patient(clinic),
+                day=day,
+                expected_schedule_revision=3,
+                **bounds,
+            ),
+            key=str(uuid4()),
+        )
+        assert status == 422, denied
+        assert denied["error"]["code"] == "INVALID_INPUT"
+        assert booking_effects(clinic) == before
+
+
+def test_max_supported_date_signed_open_booking(booking_clinic):
+    clinic = booking_clinic
+    day = date.max
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _publish(
+            connection,
+            _actor(clinic.tenant, clinic.staff),
+            _config(mode="OPEN", working_weekdays=[day.isoweekday()]),
+            revision=2,
+        )
+    status, response = _slots_request(clinic, clinic.receptionist, day)
+    assert status == 200, response
+    assert response["data"]["open_eligible"] is True
+    assert response["data"]["candidates"] == []
+    status, confirmed = booking_request(
+        clinic,
+        clinic.receptionist,
+        body=booking_body(new_patient(clinic), day=day, expected_schedule_revision=3),
+        key=str(uuid4()),
+    )
+    assert status == 201, confirmed
 
 
 def test_foreign_tenant_identity_cannot_read_slots(patient_backend):

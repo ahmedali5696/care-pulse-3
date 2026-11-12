@@ -186,6 +186,51 @@ def new_patient(clinic):
         return _patient(connection, clinic.tenant)
 
 
+def test_signed_booking_rejects_unrepresentable_reason_then_replays_valid_receipt(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    body = booking_body(
+        new_patient(clinic),
+        discount={
+            "discount_type": "FIXED",
+            "discount_value": "5.00",
+            "discount_reason": None,
+        },
+        expected_net_egp="95.00",
+    )
+    key = str(uuid4())
+    before = booking_effects(clinic)
+    for invalid in ("Approved\x00reduction", "Approved\ud800reduction"):
+        body["discount"]["discount_reason"] = invalid
+        status, response = booking_request(clinic, clinic.owner, body=body, key=key)
+        assert status == 422, response
+        assert (response["error"]["code"], response["error"]["message"]) == (
+            "INVALID_INPUT",
+            "Invalid request",
+        )
+        assert booking_effects(clinic) == before
+
+    reason = "  approved hardship  "
+    body["discount"]["discount_reason"] = reason
+    status, response = booking_request(clinic, clinic.owner, body=body, key=key)
+    assert status == 201, response
+    with clinic.migration.connect() as connection:
+        assert (
+            connection.scalar(
+                text("""
+                SELECT discount_reason FROM public.appointment_price_snapshots
+                WHERE organization_id=:tenant AND appointment_id=:appointment
+            """),
+                {"tenant": clinic.tenant, "appointment": UUID(response["data"]["id"])},
+            )
+            == reason
+        )
+    after = booking_effects(clinic)
+    assert booking_request(clinic, clinic.owner, body=body, key=key) == (201, response)
+    assert booking_effects(clinic) == after
+
+
 @pytest.mark.parametrize("role", ["owner", "receptionist"])
 def test_signed_open_booking_commits_frozen_ledger_and_readback(booking_clinic, role):
     clinic = booking_clinic

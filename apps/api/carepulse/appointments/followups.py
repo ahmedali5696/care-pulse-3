@@ -112,6 +112,7 @@ def qualify_followup(
     expected_source_revision: int | None,
     now: datetime,
     *,
+    actor_role: str,
     expected_visit_revision: int | None = None,
     exception_declared: bool = False,
 ) -> Qualification:
@@ -240,7 +241,8 @@ def qualify_followup(
     if intended_date > deadline and (
         not exception_declared
         or (
-            source_state["decision_actor_role"] == "DOCTOR_OWNER"
+            actor_role == "RECEPTIONIST"
+            and source_state["decision_actor_role"] == "DOCTOR_OWNER"
             and isinstance(decision, dict)
             and decision.get("kind") == "DEADLINE"
         )

@@ -203,13 +203,25 @@ def followup_qualification(
     except (TypeError, ValueError) as invalid:
         raise ContractError(409) from invalid
     eligible = False
-    if (
+    valid_source = bool(
         source["status"] == "Completed"
         and source["service_type"] == "NEW_EXAMINATION"
         and source["classification"] in ("ROUTINE", "URGENT", "EMERGENCY")
         and evidence
         and evidence["completed_at"] is not None
-    ):
+        and evidence["provenance_state"] == "VERIFIED"
+        and evidence["patient_id"] == UUID(source["patient_id"])
+        and evidence["doctor_staff_id"] == UUID(source["doctor_staff_id"])
+        and connection.scalar(
+            text("""
+                SELECT EXISTS (SELECT 1 FROM public.completion_attestations
+                WHERE organization_id=:tenant AND visit_id=:visit
+                  AND examination_occurred)
+            """),
+            {"tenant": actor.organization_id, "visit": evidence["id"]},
+        )
+    )
+    if valid_source:
         decision = evidence["decision"]
         completed = evidence["completed_at"].astimezone(ZoneInfo("Africa/Cairo")).date()
         deadline = _approved_deadline(completed, decision, last_day)
@@ -235,17 +247,7 @@ def followup_qualification(
             )
             eligible = (
                 claim_state != "CONSUMED"
-                and evidence["patient_id"] == UUID(source["patient_id"])
-                and evidence["doctor_staff_id"] == UUID(source["doctor_staff_id"])
                 and evidence["doctor_staff_id"] == active_doctor
-                and connection.scalar(
-                    text("""
-                        SELECT EXISTS (SELECT 1 FROM public.completion_attestations
-                        WHERE organization_id=:tenant AND visit_id=:visit
-                          AND examination_occurred)
-                    """),
-                    {"tenant": actor.organization_id, "visit": evidence["id"]},
-                )
                 and intended_date_allowed(completed, intended_date, deadline)
             )
     service_type = "FOLLOW_UP" if eligible else "NEW_EXAMINATION"
@@ -306,8 +308,11 @@ def followup_qualification(
             ),
             "actor_role": author_role,
             "can_revise": (
-                source["status"] == "Completed"
-                and evidence["provenance_state"] == "VERIFIED"
+                valid_source
+                and (
+                    actor.role != "DOCTOR_OWNER"
+                    or evidence["doctor_staff_id"] == actor.staff_id
+                )
                 and (actor.role == "DOCTOR_OWNER" or not doctor_restriction)
             ),
             "completion_local_date": (
@@ -333,9 +338,31 @@ def confirmed_followup_control(
         connection.execute(
             text("""
                 SELECT c.id, c.source_visit_id, c.revision AS claim_revision,
-                       c.state, v.clinical_revision AS visit_revision,
+                       c.state, c.approved_deadline,
+                       v.clinical_revision AS visit_revision,
+                       v.doctor_staff_id AS source_doctor_id,
                        s.source_revision AS source_decision_revision,
                        s.provenance_state, s.decision, s.decision_actor_role,
+                       a.status AS source_status, a.service_type AS source_type,
+                       a.classification AS source_classification,
+                       (a.patient_id = v.patient_id AND a.doctor_staff_id = v.doctor_staff_id
+                        AND a.doctor_staff_id = (SELECT id FROM public.staff_accounts
+                            WHERE organization_id=c.organization_id AND role='DOCTOR_OWNER'
+                              AND enabled AND verified)) AS source_matches,
+                       (t.patient_id = v.patient_id AND t.doctor_staff_id = v.doctor_staff_id
+                        AND t.service_type = 'FOLLOW_UP'
+                        AND t.status IN ('Booked','Waiting','In Examination')) AS target_matches,
+                       (SELECT (completed_at AT TIME ZONE 'Africa/Cairo')::date
+                        FROM public.completion_attestations ca
+                        WHERE ca.organization_id=c.organization_id AND ca.visit_id=v.id
+                          AND ca.appointment_id=a.id AND ca.examination_occurred)
+                        AS completion_date,
+                       (SELECT max(new_deadline) FROM public.followup_authorization_events e
+                        WHERE e.organization_id=c.organization_id AND e.claim_id=c.id
+                          AND e.kind IN ('NEW_DATE','EXTENSION')) AS event_deadline,
+                       (SELECT max(extended_deadline) FROM public.followup_extensions e
+                        WHERE e.organization_id=c.organization_id AND e.claim_id=c.id)
+                        AS legacy_deadline,
                        (SELECT max(authorization_revision)
                         FROM public.followup_authorization_events e
                         WHERE e.organization_id=c.organization_id AND e.claim_id=c.id)
@@ -344,6 +371,10 @@ def confirmed_followup_control(
                 FROM public.followup_claims c
                 JOIN public.visits v
                   ON v.organization_id=c.organization_id AND v.id=c.source_visit_id
+                JOIN public.appointments a
+                  ON a.organization_id=v.organization_id AND a.id=v.appointment_id
+                JOIN public.appointments t
+                  ON t.organization_id=c.organization_id AND t.id=c.appointment_id
                 LEFT JOIN public.followup_source_state s
                   ON s.organization_id=v.organization_id AND s.visit_id=v.id
                 JOIN public.clinic_policy_heads h
@@ -375,6 +406,33 @@ def confirmed_followup_control(
         and isinstance(decision, dict)
         and decision.get("kind") in ("OPTED_OUT", "DEADLINE")
     )
+    effective_deadline = max(
+        value
+        for value in (
+            claim["approved_deadline"],
+            claim["event_deadline"],
+            claim["legacy_deadline"],
+        )
+        if value is not None
+    )
+    doctor_deadline = (
+        _approved_deadline(claim["completion_date"], decision, 7)
+        if restriction
+        and decision.get("kind") == "DEADLINE"
+        and claim["completion_date"]
+        else None
+    )
+    source_eligible = (
+        claim["source_status"] == "Completed"
+        and claim["source_type"] == "NEW_EXAMINATION"
+        and claim["source_classification"] in ("ROUTINE", "URGENT", "EMERGENCY")
+        and claim["source_matches"] is True
+        and claim["target_matches"] is True
+        and claim["completion_date"] is not None
+        and (
+            actor.role != "DOCTOR_OWNER" or actor.staff_id == claim["source_doctor_id"]
+        )
+    )
     return {
         "source_visit_id": str(claim["source_visit_id"]),
         "claim_id": str(claim["id"]),
@@ -397,8 +455,16 @@ def confirmed_followup_control(
         "can_extend": (
             claim["state"] == "ACTIVE"
             and claim["provenance_state"] == "VERIFIED"
+            and source_eligible
+            and effective_deadline < date.max
             and not (isinstance(decision, dict) and decision.get("kind") == "OPTED_OUT")
-            and (actor.role == "DOCTOR_OWNER" or not restriction)
+            and (
+                actor.role == "DOCTOR_OWNER"
+                or not restriction
+                or (
+                    doctor_deadline is not None and effective_deadline < doctor_deadline
+                )
+            )
         ),
     }
 

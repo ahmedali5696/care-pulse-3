@@ -41,7 +41,7 @@ from test_followup_persistence import (
 from test_followup_persistence import (
     _source as _legacy_source,
 )
-from test_followups import followup_body, terminal_claim
+from test_followups import doctor_decision, followup_body, terminal_claim
 from test_followups import followup_clinic as followup_clinic  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _patch, pricing_request
@@ -134,6 +134,182 @@ def _confirmed(clinic, source):
         )
     assert claim is not None
     return {"id": UUID(saved["id"]), "claim": claim, "saved": saved}
+
+
+def test_followup_read_flags_reject_completed_followup_source(followup_clinic):
+    clinic = followup_clinic
+    source = _source(clinic)
+    confirmed = _confirmed(clinic, source)
+    terminal_claim(clinic, confirmed["saved"], status="Completed")
+    status, response = booking_request(
+        clinic,
+        clinic.receptionist,
+        method="GET",
+        path=f"/v1/appointments/{confirmed['id']}",
+        query={
+            "intended_service_date": (source["day"] + timedelta(days=3)).isoformat()
+        },
+    )
+    assert status == 200, response
+    assert (
+        response["data"]["followup_qualification"]["decision_control"]["can_revise"]
+        is False
+    )
+    assert response["data"]["followup_control"]["can_extend"] is False
+
+
+def test_receptionist_extension_flag_tracks_doctor_deadline_and_effective_claim(
+    followup_clinic,
+):
+    clinic = followup_clinic
+    source = _source(clinic)
+    confirmed = _confirmed(clinic, source)
+    deadline = source["day"] + timedelta(days=10)
+    doctor_decision(
+        clinic,
+        source["visit"],
+        {
+            "kind": "DEADLINE",
+            "deadline_date": deadline.isoformat(),
+            "reason": "Reviewed window",
+        },
+    )
+    path = f"/v1/appointments/{confirmed['id']}"
+
+    def read(actor):
+        status, response = booking_request(clinic, actor, method="GET", path=path)
+        assert status == 200, response
+        return response["data"]["followup_control"]
+
+    assert read(clinic.receptionist)["can_extend"] is True
+    command = _extension(
+        source,
+        confirmed["id"],
+        source_revision=1,
+        deadline=source["day"] + timedelta(days=9),
+    )
+    endpoint = f"/v1/visits/{source['visit']}/extend-followup"
+    body = command.model_dump(mode="json", exclude_unset=True)
+    status, written = _signed_visit_request(
+        clinic,
+        clinic.receptionist,
+        path=endpoint,
+        method="POST",
+        body=body,
+        key=str(uuid4()),
+    )
+    assert status == 201, written
+    assert (
+        written["data"]["extended_deadline"]
+        == (source["day"] + timedelta(days=9)).isoformat()
+    )
+    assert read(clinic.receptionist)["can_extend"] is True
+    next_command = _extension(
+        source,
+        confirmed["id"],
+        source_revision=1,
+        authorization_revision=1,
+        deadline=deadline,
+    )
+    status, written = _signed_visit_request(
+        clinic,
+        clinic.receptionist,
+        path=endpoint,
+        method="POST",
+        body=next_command.model_dump(mode="json", exclude_unset=True),
+        key=str(uuid4()),
+    )
+    assert status == 201, written
+    assert read(clinic.receptionist)["can_extend"] is False
+    assert read(clinic.owner)["can_extend"] is True
+
+    before = _effects(clinic, source["visit"], "visits.extend_followup")
+    denied = _extension(
+        source,
+        confirmed["id"],
+        source_revision=1,
+        authorization_revision=2,
+        deadline=deadline + timedelta(days=1),
+    )
+    status, refusal = _signed_visit_request(
+        clinic,
+        clinic.receptionist,
+        path=endpoint,
+        method="POST",
+        body=denied.model_dump(mode="json", exclude_unset=True),
+        key=str(uuid4()),
+    )
+    assert status == 409, refusal
+    assert _effects(clinic, source["visit"], "visits.extend_followup") == before
+
+
+def test_receptionist_extension_flag_includes_frozen_new_date_authorization(
+    followup_clinic,
+):
+    clinic = followup_clinic
+    source = _source(clinic)
+    doctor_decision(
+        clinic,
+        source["visit"],
+        {
+            "kind": "DEADLINE",
+            "deadline_date": (source["day"] + timedelta(days=3)).isoformat(),
+            "reason": "Doctor-specific initial window",
+        },
+    )
+    later_day = source["day"] + timedelta(days=5)
+    status, booked = booking_request(
+        clinic,
+        clinic.owner,
+        body=followup_body(
+            source,
+            offset=5,
+            source_revision=1,
+            new_booking_date_exception={
+                "selected_service_date": later_day.isoformat(),
+                "reason": "Doctor-specific later review",
+            },
+        ),
+        key=str(uuid4()),
+    )
+    assert status == 201, booked
+    doctor_decision(
+        clinic,
+        source["visit"],
+        {
+            "kind": "DEADLINE",
+            "deadline_date": (source["day"] + timedelta(days=4)).isoformat(),
+            "reason": "Prospective decision change",
+        },
+    )
+    status, result = booking_request(
+        clinic,
+        clinic.receptionist,
+        method="GET",
+        path=f"/v1/appointments/{booked['data']['id']}",
+    )
+    assert status == 200, result
+    assert result["data"]["followup_control"]["can_extend"] is False
+    assert result["data"]["followup_control"]["authorization_revision"] == 1
+
+    before = _effects(clinic, source["visit"], "visits.extend_followup")
+    attempt = _extension(
+        source,
+        UUID(booked["data"]["id"]),
+        source_revision=2,
+        authorization_revision=1,
+        deadline=later_day + timedelta(days=1),
+    )
+    status, denial = _signed_visit_request(
+        clinic,
+        clinic.receptionist,
+        path=f"/v1/visits/{source['visit']}/extend-followup",
+        method="POST",
+        body=attempt.model_dump(mode="json", exclude_unset=True),
+        key=str(uuid4()),
+    )
+    assert status == 409, denial
+    assert _effects(clinic, source["visit"], "visits.extend_followup") == before
 
 
 def _signed_visit_request(
