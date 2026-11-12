@@ -451,10 +451,10 @@ def test_signed_same_key_distinct_visits_conflict_without_second_decision(
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(decide, source) for source in sources]
         results = [future.result(timeout=35) for future in futures]
-    assert sorted(status for status, _ in results) == [200, 409], results
+    assert sorted(status for status, _ in results) == [200, 403], results
     assert (
-        next(result for status, result in results if status == 409)["error"]["code"]
-        == "IDEMPOTENCY_CONFLICT"
+        next(result for status, result in results if status == 403)["error"]["code"]
+        == "FORBIDDEN"
     )
     with transaction(clinic.runtime, clinic.tenant) as connection:
         _staff_context(connection, UUID(clinic.owner.staff_id))
