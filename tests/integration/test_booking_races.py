@@ -3,7 +3,6 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event, get_ident
-from time import monotonic
 from uuid import UUID, uuid4
 
 import pytest
@@ -15,6 +14,7 @@ from carepulse.main import app
 from carepulse.policies.schedule_service import load_current_schedule
 from carepulse.policies.slots import candidates_for_date
 from carepulse.policies.versions import append_version
+from postgres_locks import wait_for_postgres_lock
 from sqlalchemy import event, text
 from test_booking import booking_body, booking_effects, booking_request, new_patient
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
@@ -43,23 +43,6 @@ def _concurrent(*actions):
     with ThreadPoolExecutor(max_workers=len(actions)) as pool:
         futures = [pool.submit(run, action) for action in actions]
         return [future.result(timeout=35) for future in futures]
-
-
-def _wait_for_postgres_lock(observer, waiter_pid, holder_pid):
-    deadline = monotonic() + 15
-    while monotonic() < deadline:
-        observer.execute(text("SELECT pg_stat_clear_snapshot()"))
-        waiting = observer.scalar(
-            text("""
-            SELECT count(*) FROM pg_stat_activity
-            WHERE pid = :waiter AND wait_event_type = 'Lock'
-              AND :holder = ANY(pg_blocking_pids(pid))
-        """),
-            {"waiter": waiter_pid, "holder": holder_pid},
-        )
-        if waiting:
-            return
-    pytest.fail("Expected competing PostgreSQL connection to wait on a row lock")
 
 
 def test_same_patient_and_same_key_races_have_one_committed_appointment(booking_clinic):
@@ -195,13 +178,13 @@ def test_direct_retry_waits_behind_archive_then_replays_committed_booking(
                 archive_future = pool.submit(archive)
                 assert archive_started.wait(timeout=15)
                 with transaction(clinic.runtime, clinic.tenant) as observer:
-                    _wait_for_postgres_lock(observer, archive_pid[0], holder_pid)
+                    wait_for_postgres_lock(observer, archive_pid[0], holder_pid)
                 replay_future = pool.submit(retry_after_first_receipt_miss)
                 assert receipt_read.wait(timeout=15)
             assert archive_updated.wait(timeout=15)
             resume_retry.set()
             with transaction(clinic.runtime, clinic.tenant) as observer:
-                _wait_for_postgres_lock(observer, retry_pid[0], archive_pid[0])
+                wait_for_postgres_lock(observer, retry_pid[0], archive_pid[0])
             release_archive.set()
             archive_future.result(timeout=30)
             assert replay_future.result(timeout=30) == saved
@@ -279,11 +262,11 @@ def test_signed_retry_waits_behind_archive_then_replays_committed_booking(
                 archive_future = pool.submit(archive)
                 assert archive_started.wait(timeout=15)
                 with transaction(clinic.runtime, clinic.tenant) as observer:
-                    _wait_for_postgres_lock(observer, archive_pid[0], holder_pid)
+                    wait_for_postgres_lock(observer, archive_pid[0], holder_pid)
                 retry_future = pool.submit(signed_retry)
                 assert signed_started.wait(timeout=15)
                 with transaction(clinic.runtime, clinic.tenant) as observer:
-                    _wait_for_postgres_lock(observer, signed_pid[0], holder_pid)
+                    wait_for_postgres_lock(observer, signed_pid[0], holder_pid)
                 assert not receipt_reached.is_set()
             archive_future.result(timeout=30)
             assert receipt_reached.wait(timeout=15)
@@ -392,7 +375,7 @@ def test_archive_and_booking_serialize_for_both_commit_orders(
             future = pool.submit(compete)
             assert ready.wait(timeout=15)
             with transaction(clinic.runtime, clinic.tenant) as observer:
-                _wait_for_postgres_lock(observer, waiter[0], holder_pid)
+                wait_for_postgres_lock(observer, waiter[0], holder_pid)
         if archive_first:
             with pytest.raises(ContractError) as denied:
                 future.result(timeout=30)
@@ -465,7 +448,7 @@ def test_price_policy_and_booking_freeze_only_confirmed_revision(
             future = pool.submit(compete)
             assert ready.wait(timeout=15)
             with transaction(clinic.runtime, clinic.tenant) as observer:
-                _wait_for_postgres_lock(observer, waiter[0], holder_pid)
+                wait_for_postgres_lock(observer, waiter[0], holder_pid)
         if price_first:
             with pytest.raises(ContractError) as denied:
                 future.result(timeout=30)
@@ -520,7 +503,7 @@ def test_schedule_activation_and_booking_serialize_on_first_date(
             future = pool.submit(compete)
             assert ready.wait(timeout=15)
             with transaction(clinic.runtime, clinic.tenant) as observer:
-                _wait_for_postgres_lock(observer, waiter[0], holder_pid)
+                wait_for_postgres_lock(observer, waiter[0], holder_pid)
         with pytest.raises(ContractError) as denied:
             future.result(timeout=30)
         assert denied.value.status_code == 409

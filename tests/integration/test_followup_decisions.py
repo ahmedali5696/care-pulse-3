@@ -25,12 +25,12 @@ from carepulse.visits.eligibility_contracts import (
     FollowupDecisionPatch,
     FollowupDecisionPatchV2,
 )
+from postgres_locks import wait_for_postgres_lock
 from pydantic import ValidationError
 from sqlalchemy import event, text
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_booking import booking_effects, booking_request
-from test_booking_races import _wait_for_postgres_lock
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
@@ -1147,7 +1147,7 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
                         in_flight = pool.submit(retry)
                         waiter_pid = runtime_pid.get(timeout=10)
                         with clinic.runtime.connect() as observer:
-                            _wait_for_postgres_lock(observer, waiter_pid, holder_pid)
+                            wait_for_postgres_lock(observer, waiter_pid, holder_pid)
                     finally:
                         tx.commit()
                 assert in_flight.result(timeout=15)[0] == 403
@@ -1158,7 +1158,7 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
                 revoked = pool.submit(revoke)
                 waiter_pid = revocation_started.get(timeout=10)
                 with clinic.migration.connect() as observer:
-                    _wait_for_postgres_lock(observer, waiter_pid, holder_pid)
+                    wait_for_postgres_lock(observer, waiter_pid, holder_pid)
                 allow_receipt.set()
                 assert in_flight.result(timeout=15) == accepted
                 revoked.result(timeout=15)

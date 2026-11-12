@@ -38,6 +38,7 @@ from carepulse.identity.signing import (
     raw_body_sha256,
 )
 from carepulse.notifications.evidence import append_outbox
+from postgres_locks import wait_for_postgres_lock
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 
@@ -475,18 +476,22 @@ def test_suspension_serializes_with_protected_mutation(boundary_data):
     entered = Event()
     release = Event()
     attempting_suspension = Event()
+    holder_pid = []
+    waiter_pid = []
 
     def operation():
         identity, _, _ = _signed(data)
         with protected_transaction(
             data.runtime, identity, data.config.policy.session_idle_minutes
-        ):
+        ) as (connection, _):
+            holder_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             entered.set()
             assert release.wait(timeout=10)
         return "authorized_committed"
 
     def suspension():
         with data.migration.begin() as connection:
+            waiter_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             attempting_suspension.set()
             connection.execute(
                 text(
@@ -498,13 +503,16 @@ def test_suspension_serializes_with_protected_mutation(boundary_data):
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(operation)
-        assert entered.wait(timeout=10)
-        second = pool.submit(suspension)
-        assert attempting_suspension.wait(timeout=10)
-        assert (
-            not second.done()
-        )  # The Organization row lock holds through the operation.
-        release.set()
+        try:
+            assert entered.wait(timeout=10), "Protected transaction did not enter"
+            second = pool.submit(suspension)
+            assert attempting_suspension.wait(timeout=10), "Suspension did not start"
+            with data.migration.connect() as observer:
+                wait_for_postgres_lock(
+                    observer, waiter_pid[0], holder_pid[0], timeout=4
+                )
+        finally:
+            release.set()
         assert first.result(timeout=10) == "authorized_committed"
         assert second.result(timeout=10) == "suspended_committed"
     identity, _, _ = _signed(data)

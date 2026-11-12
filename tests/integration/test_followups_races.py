@@ -19,11 +19,12 @@ from carepulse.visits.eligibility_contracts import (
     ExtendFollowupV2,
     FollowupDecisionPatchV2,
 )
+from postgres_locks import wait_for_postgres_lock
 from sqlalchemy import text
 from test_appointment_persistence import _admit_saved
 from test_booking import booking_body, booking_effects
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
-from test_booking_races import _concurrent, _wait_for_postgres_lock
+from test_booking_races import _concurrent
 from test_followup_persistence import _v2_source
 from test_followups import terminal_claim
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
@@ -212,7 +213,7 @@ def test_doctor_edit_first_makes_reviewed_source_stale_without_booking_writes(
         try:
             assert booking_started.wait(timeout=15)
             with transaction(clinic.runtime, clinic.tenant) as observer:
-                _wait_for_postgres_lock(observer, booking_pid[0], edit_pid[0])
+                wait_for_postgres_lock(observer, booking_pid[0], edit_pid[0])
         finally:
             permit_commit.set()
         editor.result(timeout=30)
@@ -263,7 +264,7 @@ def test_confirmation_first_freezes_claim_before_doctor_opt_out(followup_clinic)
         try:
             assert edit_started.wait(timeout=15)
             with transaction(clinic.runtime, clinic.tenant) as observer:
-                _wait_for_postgres_lock(observer, edit_pid[0], confirmation_pid[0])
+                wait_for_postgres_lock(observer, edit_pid[0], confirmation_pid[0])
         finally:
             commit_booking.set()
         saved = confirmed.result(timeout=30)
@@ -345,7 +346,7 @@ def test_release_or_consume_races_fresh_claim_without_double_use(
         try:
             assert replacement_started.wait(timeout=15)
             with transaction(clinic.runtime, clinic.tenant) as observer:
-                _wait_for_postgres_lock(
+                wait_for_postgres_lock(
                     observer,
                     replacement_pid[0],
                     terminal_pid[0],
@@ -416,7 +417,7 @@ def test_claim_confirmation_first_blocks_terminal_until_booking_commits(
             # pg_stat_activity masks another role's wait details; observe the
             # migration waiter using a separate migration-role connection.
             with clinic.migration.connect() as observer:
-                _wait_for_postgres_lock(observer, terminal_pid[0], booking_pid[0])
+                wait_for_postgres_lock(observer, terminal_pid[0], booking_pid[0])
             assert booking_effects(clinic) == before
             assert _claim_count(clinic, source) == 0
         finally:
@@ -514,7 +515,7 @@ def test_doctor_extension_and_new_claim_compete_for_same_source(followup_clinic)
         try:
             assert booking_started.wait(timeout=15)
             with transaction(clinic.runtime, clinic.tenant) as observer:
-                _wait_for_postgres_lock(observer, booking_pid[0], extension_pid[0])
+                wait_for_postgres_lock(observer, booking_pid[0], extension_pid[0])
         finally:
             release_extension.set()
         extended = extending.result(timeout=30)
@@ -607,9 +608,9 @@ def test_extension_locks_source_and_target_by_uuid_before_claim(
                 competing = pool.submit(extend)
                 assert started.wait(timeout=15)
                 with transaction(clinic.runtime, clinic.tenant) as observer:
-                    _wait_for_postgres_lock(observer, extension_pid[0], first_pid)
+                    wait_for_postgres_lock(observer, extension_pid[0], first_pid)
             with transaction(clinic.runtime, clinic.tenant) as observer:
-                _wait_for_postgres_lock(observer, extension_pid[0], second_pid)
+                wait_for_postgres_lock(observer, extension_pid[0], second_pid)
             with clinic.migration.connect() as observer:
                 assert (
                     observer.scalar(
@@ -680,7 +681,7 @@ def test_source_lock_is_acquired_after_day_counter_on_confirmation(followup_clin
             if future.done():
                 future.result(timeout=0)
             with transaction(clinic.runtime, clinic.tenant) as observer:
-                _wait_for_postgres_lock(observer, pid[0], holder_pid)
+                wait_for_postgres_lock(observer, pid[0], holder_pid)
             # A blocked booking has not made any committed number/claim/receipt.
             assert booking_effects(clinic) == before
         saved = future.result(timeout=30)
@@ -752,7 +753,7 @@ def test_timed_followup_rescans_capacity_after_waiting_for_day_allocator(
         try:
             assert second_started.wait(timeout=15)
             with transaction(clinic.runtime, clinic.tenant) as observer:
-                _wait_for_postgres_lock(observer, second_pid[0], first_pid[0])
+                wait_for_postgres_lock(observer, second_pid[0], first_pid[0])
             assert booking_effects(clinic) == before
         finally:
             allow_first_commit.set()
@@ -845,7 +846,7 @@ def test_followup_policy_publication_serializes_with_preferential_booking(
             waiter = pool.submit(book if policy_first else publish, False)
             assert waiter_started.wait(timeout=15)
             with transaction(clinic.runtime, clinic.tenant) as observer:
-                _wait_for_postgres_lock(
+                wait_for_postgres_lock(
                     observer,
                     booking_pid[0] if policy_first else publication_pid[0],
                     publication_pid[0] if policy_first else booking_pid[0],
