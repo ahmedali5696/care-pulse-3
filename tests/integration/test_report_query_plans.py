@@ -146,47 +146,117 @@ def _bounded_completed_value_plan(plan):
 
 def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage):
     runtime, migration, (tenant, other), (doctor, other_doctor) = appointment_storage
-    # Give PostgreSQL representative dated data and current statistics: without
-    # them, a tiny fixture can favor a tenant-only nested-loop cross product.
-    with transaction(runtime, tenant) as connection:
-        day = connection.scalar(
-            text("SELECT (clock_timestamp() AT TIME ZONE 'Africa/Cairo')::date")
+    # D-05's INSERT trigger replaces supplied occurred_at with clock_timestamp().
+    # Simulate the clock only while inserting disposable, immutable test evidence.
+    signature = "public.guard_appointment_history_insert()"
+    old_clock = "NEW.occurred_at := date_trunc('second', clock_timestamp());"
+    with migration.begin() as connection:
+        original = connection.scalar(
+            text("SELECT pg_get_functiondef(CAST(:signature AS regprocedure))"),
+            {"signature": signature},
         )
-        _persist_with_status(
-            connection,
-            tenant,
-            _patient(connection, tenant),
-            doctor,
-            "Completed",
-            service_date=day,
-        )
-        for offset in range(1, 65):
-            _appointment(
-                connection,
-                tenant,
-                doctor,
-                status="Booked",
-                service_date=day - timedelta(days=offset),
+        assert original is not None and original.count(old_clock) == 1
+        connection.exec_driver_sql(
+            original.replace(
+                old_clock,
+                "NEW.occurred_at := date_trunc('second', COALESCE("
+                "NULLIF(current_setting('cp.t158_asof', true), '')::timestamptz, "
+                "clock_timestamp()));",
             )
-        for offset in range(1, 25):
+        )
+    try:
+        with transaction(runtime, tenant) as connection:
+            day = connection.scalar(
+                text("SELECT (clock_timestamp() AT TIME ZONE 'Africa/Cairo')::date")
+            )
             _persist_with_status(
                 connection,
                 tenant,
                 _patient(connection, tenant),
                 doctor,
-                "Completed" if offset % 2 else "Cancelled",
-                service_date=day - timedelta(days=offset),
+                "Completed",
+                service_date=day,
             )
-    with transaction(runtime, other) as connection:
-        for offset in range(1, 25):
-            _persist_with_status(
-                connection,
-                other,
-                _patient(connection, other),
-                other_doctor,
-                "Completed" if offset % 2 else "Cancelled",
-                service_date=day - timedelta(days=offset),
+            for offset in range(1, 65):
+                _appointment(
+                    connection,
+                    tenant,
+                    doctor,
+                    status="Booked",
+                    service_date=day - timedelta(days=offset),
+                )
+            for offset in range(1, 25):
+                connection.execute(
+                    text("SELECT set_config('cp.t158_asof', :asof, true)"),
+                    {
+                        "asof": (
+                            datetime.combine(
+                                day - timedelta(days=offset),
+                                time(12),
+                                ZoneInfo("Africa/Cairo"),
+                            ).isoformat()
+                            if offset <= 20
+                            else ""
+                        )
+                    },
+                )
+                _persist_with_status(
+                    connection,
+                    tenant,
+                    _patient(connection, tenant),
+                    doctor,
+                    "Cancelled" if offset <= 20 or offset % 2 == 0 else "Completed",
+                    service_date=day - timedelta(days=offset),
+                )
+        with transaction(runtime, other) as connection:
+            for offset in range(1, 25):
+                connection.execute(
+                    text("SELECT set_config('cp.t158_asof', :asof, true)"),
+                    {
+                        "asof": (
+                            datetime.combine(
+                                day - timedelta(days=offset),
+                                time(12),
+                                ZoneInfo("Africa/Cairo"),
+                            ).isoformat()
+                            if offset <= 20
+                            else ""
+                        )
+                    },
+                )
+                _persist_with_status(
+                    connection,
+                    other,
+                    _patient(connection, other),
+                    other_doctor,
+                    "Cancelled" if offset <= 20 or offset % 2 == 0 else "Completed",
+                    service_date=day - timedelta(days=offset),
+                )
+    finally:
+        with migration.begin() as connection:
+            connection.exec_driver_sql(original)
+            assert (
+                connection.scalar(
+                    text("SELECT pg_get_functiondef(CAST(:signature AS regprocedure))"),
+                    {"signature": signature},
+                )
+                == original
             )
+
+    # Historical event dates must actually differ; service_date alone is insufficient.
+    with migration.begin() as connection:
+        date_counts = connection.execute(
+            text("""
+                SELECT organization_id,
+                       count(DISTINCT (occurred_at AT TIME ZONE 'Africa/Cairo')::date)
+                FROM public.appointment_history
+                WHERE organization_id IN (:tenant, :other)
+                  AND new_status IN ('Completed', 'Cancelled')
+                GROUP BY organization_id
+            """),
+            {"tenant": tenant, "other": other},
+        ).all()
+        assert dict(date_counts) == {tenant: 21, other: 21}
     with migration.begin() as connection:
         connection.execute(
             text("""
@@ -290,8 +360,8 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
         events = connection.scalars(
             text(queries["completion_cancellation_events"]), params
         ).all()
-        assert len(events) == 25 and len(set(events)) == 25
-        # All events were committed today, including services from earlier days.
+        assert len(events) == 5 and len(set(events)) == 5
+        # Today's events include services from earlier days; earlier events stay dated.
         assert (
             connection.scalar(
                 text("""
@@ -303,7 +373,7 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
         """),
                 params,
             )
-            == 25
+            == 5
         )
         index_requirements = {
             "appointments_day_status_lane": (
