@@ -309,6 +309,7 @@ def test_signed_retained_active_claim_denies_read_and_acknowledged_fallback(
                 )
                 assert changed.rowcount == 1
             finally:
+                connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
                 connection.execute(
                     text(
                         "ALTER TABLE public.followup_source_state ENABLE TRIGGER followup_source_state_guard"
