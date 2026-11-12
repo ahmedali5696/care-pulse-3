@@ -319,8 +319,13 @@ def update_pricing(
         if price["urgent_enabled"] and (
             standard is None
             or premium is None
+            or _noncanonical_legacy_money(standard) is not None
+            or _noncanonical_legacy_money(premium) is not None
             or Decimal(str(premium)) <= Decimal(str(standard))
-            or not _has_operating_periods(connection, tenant)
+            or (
+                not state["PRICE"]["payload"]["urgent_enabled"]
+                and not _has_operating_periods(connection, tenant)
+            )
         ):
             raise ValueError(
                 "Urgent requires a greater fixed premium and operating periods"

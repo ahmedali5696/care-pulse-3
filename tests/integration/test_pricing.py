@@ -1664,6 +1664,154 @@ def test_urgent_requires_operating_periods_and_valid_premium(patient_backend):
     )
 
 
+def test_signed_pricing_after_lawful_schedule_hours_removal(patient_backend):
+    from test_schedule import _config, _schedule_request
+    from test_schedule import _patch as schedule_patch
+
+    clinic = patient_backend
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+
+    def activate(config, revision):
+        body = schedule_patch(config, revision=revision).model_dump(mode="json")
+        status, staged = _schedule_request(
+            clinic, clinic.owner, method="PATCH", body=body, key=str(uuid4())
+        )
+        assert status == 200, staged
+        status, preview = _schedule_request(
+            clinic,
+            clinic.owner,
+            method="POST",
+            suffix="/preview",
+            body=body,
+            key=str(uuid4()),
+        )
+        assert status == 200 and preview["data"]["affected"] == [], preview
+        status, result = _schedule_request(
+            clinic,
+            clinic.owner,
+            method="POST",
+            suffix="/activate",
+            body={
+                "preview_id": preview["data"]["preview_id"],
+                "expected_schedule_revision": revision,
+                "expected_capacity_revision": 1,
+                "reason": "Authorized operating hours change",
+            },
+            key=str(uuid4()),
+        )
+        assert status == 200 and result["data"]["schedule_revision"] == revision + 1, (
+            result
+        )
+
+    open_hours = _config(
+        mode="OPEN",
+        working_weekdays=[1],
+        weekly_work_periods=[{"weekday": 1, "starts_at": "09:00", "ends_at": "17:00"}],
+    )
+    activate(open_hours, 1)
+    initial = _patch(
+        standard_new_exam_egp="100.00",
+        preferential_followup_egp="30.00",
+        urgent_base_egp="150.00",
+        urgent_enabled=True,
+    )
+    status, enabled = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=initial, key=str(uuid4())
+    )
+    assert status == 200, enabled
+    activate(_config(mode="OPEN", working_weekdays=[], weekly_work_periods=[]), 2)
+
+    followup = {
+        **_patch(followup_last_day_inclusive=6),
+        "expected_price_revision": 2,
+        "expected_followup_revision": 1,
+    }
+    key = str(uuid4())
+    status, changed = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=followup, key=key
+    )
+    assert status == 200 and changed["data"]["followup_revision"] == 2, changed
+    assert changed["data"]["price_revision"] == 2
+    assert pricing_request(
+        clinic, clinic.owner, method="PATCH", body=followup, key=key
+    ) == (status, changed)
+
+    before = _pricing_evidence(clinic)
+    invalid = {
+        **_patch(standard_new_exam_egp="150.00"),
+        "expected_price_revision": 2,
+    }
+    status, denied = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=invalid, key=str(uuid4())
+    )
+    assert status == 422 and denied["error"]["code"] == "INVALID_INPUT", denied
+    assert _pricing_evidence(clinic) == before
+
+    valid = {
+        **_patch(preferential_followup_egp="35.00"),
+        "expected_price_revision": 2,
+    }
+    status, price_changed = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=valid, key=str(uuid4())
+    )
+    assert status == 200 and price_changed["data"]["price_revision"] == 3, price_changed
+    assert price_changed["data"]["urgent_enabled"] is True
+    assert price_changed["data"]["urgent_base_egp"] == "150.00"
+
+
+def test_signed_enable_rejects_retained_noncanonical_urgent_premium(patient_backend):
+    clinic = patient_backend
+    with transaction(clinic.runtime, clinic.tenant) as conn:
+        append_version(
+            conn,
+            str(clinic.tenant),
+            "PRICE",
+            '{"standard_new_exam_egp":"100.00",'
+            '"preferential_followup_egp":"30.00",'
+            '"urgent_base_egp":150.123,"urgent_enabled":false}',
+            1,
+        )
+        append_version(
+            conn,
+            str(clinic.tenant),
+            "SCHEDULE",
+            {
+                "booking_mode": "OPEN",
+                "duration_minutes": None,
+                "holiday_booking_enabled": False,
+                "routine_walk_in_enabled": False,
+                "allow_overlap": False,
+                "no_show_cutoff": {"enabled": False, "local_time": None},
+            },
+            1,
+            intervals=[
+                {
+                    "interval_kind": "WORK",
+                    "weekday": 1,
+                    "service_date": None,
+                    "starts_at": "09:00",
+                    "ends_at": "17:00",
+                }
+            ],
+        )
+    before = _pricing_evidence(clinic)
+    body = {**_patch(urgent_enabled=True), "expected_price_revision": 2}
+    status, denied = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=body, key=str(uuid4())
+    )
+    assert status == 422 and denied["error"]["code"] == "INVALID_INPUT", denied
+    assert _pricing_evidence(clinic) == before
+    repaired = {
+        **_patch(urgent_enabled=True, urgent_base_egp="150.00"),
+        "expected_price_revision": 2,
+    }
+    status, result = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=repaired, key=str(uuid4())
+    )
+    assert status == 200 and result["data"]["urgent_enabled"] is True, result
+    assert result["data"]["urgent_base_egp"] == "150.00"
+
+
 @pytest.mark.parametrize(
     "service,base,standard,kind,discount",
     [
