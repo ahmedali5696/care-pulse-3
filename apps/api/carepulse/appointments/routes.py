@@ -56,7 +56,7 @@ async def _booking_body(request: Request) -> BookAppointment:
             parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
         )
         return BookAppointment.model_validate(body)
-    except (ValueError, UnicodeError, ValidationError) as invalid:
+    except (ValueError, UnicodeError, ValidationError, RecursionError) as invalid:
         raise ContractError(422) from invalid
 
 

@@ -197,6 +197,19 @@ def followup_qualification(
             "decision_actor_staff_id": proof.get("actor_staff_id"),
             "decision_actor_role": proof.get("actor_role"),
         }
+    claim_state = None
+    if evidence is not None:
+        claim_state = connection.scalar(
+            text("""
+                SELECT state FROM public.followup_claims
+                WHERE organization_id = :tenant AND source_visit_id = :visit
+                  AND state IN ('ACTIVE', 'CONSUMED')
+                LIMIT 1
+            """),
+            {"tenant": actor.organization_id, "visit": evidence["id"]},
+        )
+        if claim_state == "ACTIVE":
+            raise ContractError(409)
     pricing = current_price_state(connection, actor.organization_id)
     try:
         last_day = current_last_day_inclusive(pricing["FOLLOWUP"]["payload"])
@@ -225,17 +238,6 @@ def followup_qualification(
         decision = evidence["decision"]
         completed = evidence["completed_at"].astimezone(ZoneInfo("Africa/Cairo")).date()
         deadline = _approved_deadline(completed, decision, last_day)
-        claim_state = connection.scalar(
-            text("""
-                    SELECT state FROM public.followup_claims
-                    WHERE organization_id = :tenant AND source_visit_id = :visit
-                      AND state IN ('ACTIVE','CONSUMED')
-                    LIMIT 1
-                """),
-            {"tenant": actor.organization_id, "visit": evidence["id"]},
-        )
-        if claim_state == "ACTIVE":
-            raise ContractError(409)
         if deadline is not None and evidence["provenance_state"] == "VERIFIED":
             active_doctor = connection.scalar(
                 text("""

@@ -260,6 +260,93 @@ def test_active_claim_stays_busy_after_doctor_changes_source_decision(followup_c
     assert booking_effects(clinic) == before
 
 
+@pytest.mark.parametrize(
+    "retained_gap", ["missing_attestation", "unverified_provenance"]
+)
+def test_signed_retained_active_claim_denies_read_and_acknowledged_fallback(
+    followup_clinic, retained_gap
+):
+    clinic = followup_clinic
+    source, _ = _reserve(clinic)
+    # Simulate a retained predecessor row at head; real upgrade preservation
+    # is covered separately in test_followup_migration.py.
+    with clinic.migration.begin() as connection:
+        if retained_gap == "missing_attestation":
+            connection.execute(
+                text(
+                    "ALTER TABLE public.completion_attestations DISABLE TRIGGER completion_attestation_guard"
+                )
+            )
+            try:
+                removed = connection.execute(
+                    text("""
+                        DELETE FROM public.completion_attestations
+                        WHERE organization_id=:tenant AND visit_id=:visit
+                    """),
+                    {"tenant": clinic.tenant, "visit": source["visit"]},
+                )
+                assert removed.rowcount == 1
+            finally:
+                connection.execute(
+                    text(
+                        "ALTER TABLE public.completion_attestations ENABLE TRIGGER completion_attestation_guard"
+                    )
+                )
+        else:
+            connection.execute(
+                text(
+                    "ALTER TABLE public.followup_source_state DISABLE TRIGGER followup_source_state_guard"
+                )
+            )
+            try:
+                changed = connection.execute(
+                    text("""
+                        UPDATE public.followup_source_state
+                        SET provenance_state='ANCESTRY_UNKNOWN'
+                        WHERE organization_id=:tenant AND visit_id=:visit
+                    """),
+                    {"tenant": clinic.tenant, "visit": source["visit"]},
+                )
+                assert changed.rowcount == 1
+            finally:
+                connection.execute(
+                    text(
+                        "ALTER TABLE public.followup_source_state ENABLE TRIGGER followup_source_state_guard"
+                    )
+                )
+
+    before = booking_effects(clinic)
+    status, result = booking_request(
+        clinic,
+        clinic.receptionist,
+        method="GET",
+        path=f"/v1/appointments/{source['appointment']}",
+        query={"intended_service_date": SERVICE_DAY.isoformat()},
+    )
+    assert status == 409, result
+    assert result["error"]["code"] == "CONFLICT"
+    assert "decision" not in json.dumps(result)
+    assert booking_effects(clinic) == before
+
+    status, result = booking_request(
+        clinic,
+        clinic.receptionist,
+        body=followup_body(
+            source,
+            offset=2,
+            base="100.00",
+            fallback_acknowledgment={
+                "service_type": "NEW_EXAMINATION",
+                "discount_reaffirmed": True,
+            },
+        ),
+        key=str(uuid4()),
+    )
+    assert status == 409, result
+    assert result["error"]["code"] == "CONFLICT"
+    assert booking_effects(clinic) == before
+
+
 def test_receptionist_get_qualification_never_serializes_doctor_decision(
     booking_clinic,
 ):

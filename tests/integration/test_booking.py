@@ -231,6 +231,41 @@ def test_signed_booking_rejects_unrepresentable_reason_then_replays_valid_receip
     assert booking_effects(clinic) == after
 
 
+def test_signed_booking_deep_json_denies_before_receipt_and_replays_valid_body(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    body = booking_body(new_patient(clinic))
+    key = str(uuid4())
+    valid_json = json.dumps(body, separators=(",", ":"))
+    deeply_nested = b'{"deep_input":' + b"[" * 12000 + b"0" + b"]" * 12000 + b"}"
+    assert len(deeply_nested) == 24016
+    duplicate_key = (
+        valid_json[:-1] + ',"service_date":"' + body["service_date"] + '"}'
+    ).encode()
+    nonfinite = valid_json.replace(
+        '"expected_price_revision":2', '"expected_price_revision":NaN'
+    ).encode()
+    assert b'"expected_price_revision":NaN' in nonfinite
+    before = booking_effects(clinic)
+    for invalid in (deeply_nested, duplicate_key, nonfinite):
+        status, response = booking_request(
+            clinic, clinic.owner, raw_body=invalid, key=key
+        )
+        assert status == 422, response
+        assert (response["error"]["code"], response["error"]["message"]) == (
+            "INVALID_INPUT",
+            "Invalid request",
+        )
+        assert booking_effects(clinic) == before
+
+    status, saved = booking_request(clinic, clinic.owner, body=body, key=key)
+    assert status == 201, saved
+    after = booking_effects(clinic)
+    assert booking_request(clinic, clinic.owner, body=body, key=key) == (201, saved)
+    assert booking_effects(clinic) == after
+
+
 @pytest.mark.parametrize("role", ["owner", "receptionist"])
 def test_signed_open_booking_commits_frozen_ledger_and_readback(booking_clinic, role):
     clinic = booking_clinic

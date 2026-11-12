@@ -52,7 +52,7 @@ async def _strict_body(request: Request) -> dict:
         if not isinstance(body, dict):
             raise TypeError("Expected an object")
         return body
-    except (TypeError, ValueError, UnicodeError) as invalid:
+    except (TypeError, ValueError, UnicodeError, RecursionError) as invalid:
         raise ContractError(422) from invalid
 
 

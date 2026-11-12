@@ -2,15 +2,17 @@
 
 import runpy
 import shutil
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from carepulse.appointments.followups import qualify_followup
 from carepulse.appointments.persistence import persist_appointment
+from carepulse.appointments.queries import followup_qualification
 from carepulse.db import transaction
-from carepulse.identity.contracts import normalize_typed_body
+from carepulse.identity.contracts import ContractError, normalize_typed_body
 from carepulse.identity.receipts import Receipt, insert_tenant_receipt
 from carepulse.policies.versions import append_version
 from carepulse.visits.eligibility import extend_followup
@@ -109,6 +111,128 @@ def _d08_snapshot(connection):
             "completion_attestations",
         )
     }
+
+
+def test_retained_active_unattested_claim_conflicts_at_current_head(
+    admin, empty_database
+):
+    migration, runtime, tenant, doctor = _predecessor(admin, empty_database)
+    try:
+        _upgrade(migration, "0024_b06_followup_window")
+        with transaction(runtime, tenant) as connection:
+            active_source = _source(connection, tenant, doctor)
+            active = _claim(connection, tenant, active_source)
+            released_source = _source(connection, tenant, doctor)
+            released = _claim(connection, tenant, released_source)
+            _outcome(connection, tenant, doctor, released, status="Cancelled")
+            consumed_source = _source(connection, tenant, doctor)
+            consumed = _claim(connection, tenant, consumed_source)
+            _outcome(connection, tenant, doctor, consumed, status="Completed")
+
+        _upgrade(migration, "head")
+        with migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM public.completion_attestations WHERE organization_id=:tenant"
+                    ),
+                    {"tenant": tenant},
+                )
+                == 0
+            )
+            assert connection.execute(
+                text("""
+                    SELECT state FROM public.followup_claims
+                    WHERE organization_id=:tenant AND id IN (:active, :released, :consumed)
+                    ORDER BY state
+                """),
+                {
+                    "tenant": tenant,
+                    "active": active["claim"],
+                    "released": released["claim"],
+                    "consumed": consumed["claim"],
+                },
+            ).scalars().all() == ["ACTIVE", "CONSUMED", "RELEASED"]
+            tracked = (
+                "appointments",
+                "appointment_number_assignments",
+                "followup_claims",
+                "idempotency_receipts",
+                "completion_attestations",
+            )
+            before = {
+                name: connection.scalar(
+                    text(
+                        f"SELECT count(*) FROM public.{name} WHERE organization_id=:tenant"
+                    ),
+                    {"tenant": tenant},
+                )
+                for name in tracked
+            }
+
+        intended = active_source["day"] + timedelta(days=1)
+        with transaction(runtime, tenant) as connection:
+            with pytest.raises(ContractError) as conflict:
+                followup_qualification(
+                    connection,
+                    _actor(tenant, doctor),
+                    active_source["appointment"],
+                    intended,
+                )
+            assert conflict.value.status_code == 409
+            revision = connection.scalar(
+                text(
+                    "SELECT clinical_revision FROM public.visits WHERE organization_id=:tenant AND id=:visit"
+                ),
+                {"tenant": tenant, "visit": active_source["visit"]},
+            )
+            assert (
+                qualify_followup(
+                    connection,
+                    tenant,
+                    active_source["patient"],
+                    intended,
+                    active_source["visit"],
+                    revision,
+                    datetime.now(UTC),
+                    actor_role="RECEPTIONIST",
+                ).outcome
+                == "BUSY"
+            )
+            for source in (released_source, consumed_source):
+                result = followup_qualification(
+                    connection,
+                    _actor(tenant, doctor),
+                    source["appointment"],
+                    source["day"] + timedelta(days=1),
+                )
+                assert result["actual_service_type"] == "NEW_EXAMINATION"
+                assert result["preferential_available"] is False
+
+        foreign_tenant = uuid4()
+        with transaction(runtime, foreign_tenant) as connection:
+            with pytest.raises(ContractError) as foreign:
+                followup_qualification(
+                    connection,
+                    _actor(foreign_tenant, doctor),
+                    active_source["appointment"],
+                    intended,
+                )
+            assert foreign.value.status_code == 404
+
+        with migration.connect() as connection:
+            assert before == {
+                name: connection.scalar(
+                    text(
+                        f"SELECT count(*) FROM public.{name} WHERE organization_id=:tenant"
+                    ),
+                    {"tenant": tenant},
+                )
+                for name in tracked
+            }
+    finally:
+        runtime.dispose()
+        migration.dispose()
 
 
 def test_v2_populated_immediate_predecessor_preserves_legacy_evidence_and_denies_unattested_actions(

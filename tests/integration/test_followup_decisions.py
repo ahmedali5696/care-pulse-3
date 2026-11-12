@@ -29,7 +29,7 @@ from pydantic import ValidationError
 from sqlalchemy import event, text
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
-from test_booking import booking_request
+from test_booking import booking_effects, booking_request
 from test_booking_races import _wait_for_postgres_lock
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
@@ -425,6 +425,84 @@ def _effects(clinic, visit, operation):
         """),
             {"tenant": clinic.tenant, "visit": visit, "operation": operation},
         ).one()
+
+
+@pytest.mark.parametrize("operation", ["decision", "extension"])
+def test_signed_deep_json_denies_visit_mutation_without_evidence_or_receipt(
+    followup_clinic, operation
+):
+    clinic = followup_clinic
+    source = _source(clinic)
+    if operation == "decision":
+        method, path, command, expected_status = (
+            "PATCH",
+            f"/v1/visits/{source['visit']}",
+            _decision("DEFAULT"),
+            200,
+        )
+    else:
+        confirmed = _confirmed(clinic, source)
+        method, path, command, expected_status = (
+            "POST",
+            f"/v1/visits/{source['visit']}/extend-followup",
+            _extension(source, confirmed["id"]),
+            201,
+        )
+    body = command.model_dump(mode="json", exclude_unset=True)
+    valid_json = json.dumps(body, separators=(",", ":"))
+    deeply_nested = '{"deep_input":' + "[" * 12000 + "0" + "]" * 12000 + "}"
+    assert len(deeply_nested.encode()) == 24016
+    duplicate_key = valid_json[:-1] + ',"expected_visit_revision":0}'
+    nonfinite = valid_json.replace(
+        '"expected_visit_revision":0', '"expected_visit_revision":NaN'
+    )
+    assert '"expected_visit_revision":NaN' in nonfinite
+    key = str(uuid4())
+    receipt_operation = (
+        f"visits.followup_{operation}"
+        if operation == "decision"
+        else "visits.extend_followup"
+    )
+    before = _effects(clinic, source["visit"], receipt_operation)
+    before_booking = booking_effects(clinic)
+    with clinic.migration.connect() as connection:
+        before_audit = connection.scalar(
+            text(
+                "SELECT count(*) FROM public.sensitive_audit WHERE organization_id=:tenant"
+            ),
+            {"tenant": clinic.tenant},
+        )
+    for invalid in (deeply_nested, duplicate_key, nonfinite):
+        status, refused = _signed_visit_request(
+            clinic, clinic.owner, path=path, method=method, body=invalid, key=key
+        )
+        assert status == 422, refused
+        assert (refused["error"]["code"], refused["error"]["message"]) == (
+            "INVALID_INPUT",
+            "Invalid request",
+        )
+        assert _effects(clinic, source["visit"], receipt_operation) == before
+        assert booking_effects(clinic) == before_booking
+        with clinic.migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM public.sensitive_audit WHERE organization_id=:tenant"
+                    ),
+                    {"tenant": clinic.tenant},
+                )
+                == before_audit
+            )
+
+    status, saved = _signed_visit_request(
+        clinic, clinic.owner, path=path, method=method, body=body, key=key
+    )
+    assert status == expected_status, saved
+    after = _effects(clinic, source["visit"], receipt_operation)
+    assert _signed_visit_request(
+        clinic, clinic.owner, path=path, method=method, body=body, key=key
+    ) == (expected_status, saved)
+    assert _effects(clinic, source["visit"], receipt_operation) == after
 
 
 @pytest.mark.parametrize("operation", ["decision", "extension"])
