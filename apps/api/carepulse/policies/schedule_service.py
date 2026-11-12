@@ -4,7 +4,7 @@ import json
 import re
 from collections import defaultdict
 from dataclasses import replace
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -424,26 +424,34 @@ def _day_signature(config: ScheduleConfig, day: date):
     )
 
 
-def _inside_period(starts: time, ends: time, periods) -> bool:
-    return any(
-        period.starts_at <= starts and ends <= period.ends_at for period in periods
-    )
-
-
-def _intersects_local(starts: time, ends: time, slots) -> bool:
-    return any(starts < slot.ends_at and slot.starts_at < ends for slot in slots)
-
-
 def _timed_effects(appointment, config: ScheduleConfig) -> list[str]:
-    rules = date_rules(config, appointment["service_date"])
     if appointment["starts_at"] is None:
         return []
-    start = appointment["starts_at"].astimezone(CAIRO).time().replace(tzinfo=None)
-    end = appointment["ends_at"].astimezone(CAIRO).time().replace(tzinfo=None)
+    rules = date_rules(config, appointment["service_date"])
+    cursor = appointment["starts_at"].astimezone(UTC)
+    end = appointment["ends_at"].astimezone(UTC)
+    within_period = [True] * len(rules.periods)
+    in_break = False
+    # Walk real UTC minutes: Cairo's repeated fall hour must be checked twice.
+    while cursor < end:
+        local = cursor.astimezone(CAIRO)
+        wall = local.time().replace(tzinfo=None)
+        same_day = local.date() == appointment["service_date"]
+        if not same_day:
+            within_period = [False] * len(rules.periods)
+            break
+        for index, period in enumerate(rules.periods):
+            within_period[index] &= period.starts_at <= wall < period.ends_at
+        in_break |= any(
+            pause.starts_at <= wall < pause.ends_at for pause in rules.breaks
+        )
+        if not any(within_period) and in_break:
+            break
+        cursor = cursor.replace(second=0, microsecond=0) + timedelta(minutes=1)
     effects = []
-    if not _inside_period(start, end, rules.periods):
+    if not any(within_period):
         effects.append("OUTSIDE_PERIOD")
-    if _intersects_local(start, end, rules.breaks):
+    if in_break:
         effects.append("IN_BREAK")
     return effects
 

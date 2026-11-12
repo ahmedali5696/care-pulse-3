@@ -427,6 +427,99 @@ def _effects(clinic, visit, operation):
         ).one()
 
 
+@pytest.mark.parametrize("operation", ["decision", "extension"])
+def test_signed_followup_surrogate_reason_denies_without_receipt(
+    followup_clinic, operation
+):
+    clinic = followup_clinic
+    source = _source(clinic)
+    path = f"/v1/visits/{source['visit']}"
+    method = "PATCH"
+    if operation == "decision":
+        body = _decision("OPTED_OUT", reason="Valid documented reason").model_dump(
+            mode="json", exclude_unset=True
+        )
+        receipt_operation = "visits.followup_decision"
+    else:
+        confirmed = _confirmed(clinic, source)
+        path += "/extend-followup"
+        method = "POST"
+        body = _extension(source, confirmed["id"]).model_dump(
+            mode="json", exclude_unset=True
+        )
+        receipt_operation = "visits.extend_followup"
+    before = _effects(clinic, source["visit"], receipt_operation)
+    key = str(uuid4())
+    for surrogate in ("\ud800", "\udfff"):
+        bad = (
+            {
+                **body,
+                "followup_decision": {**body["followup_decision"], "reason": surrogate},
+            }
+            if operation == "decision"
+            else {**body, "reason": surrogate}
+        )
+        status, denied = _signed_visit_request(
+            clinic, clinic.owner, path=path, method=method, body=bad, key=key
+        )
+        assert status == 422 and denied["error"]["code"] == "INVALID_INPUT"
+        assert _effects(clinic, source["visit"], receipt_operation) == before
+
+    status, accepted = _signed_visit_request(
+        clinic, clinic.owner, path=path, method=method, body=body, key=key
+    )
+    assert status == (200 if operation == "decision" else 201), accepted
+    assert _signed_visit_request(
+        clinic, clinic.owner, path=path, method=method, body=body, key=key
+    ) == (status, accepted)
+
+
+@pytest.mark.parametrize("operation", ["opted_out", "deadline", "extension"])
+def test_signed_unicode_blank_followup_reason_denies_without_evidence(
+    followup_clinic, operation
+):
+    clinic = followup_clinic
+    source = _source(clinic)
+    path = f"/v1/visits/{source['visit']}"
+    method = "PATCH"
+    if operation == "extension":
+        confirmed = _confirmed(clinic, source)
+        path += "/extend-followup"
+        method = "POST"
+        body = _extension(source, confirmed["id"]).model_dump(
+            mode="json", exclude_unset=True
+        )
+        receipt_operation = "visits.extend_followup"
+        invalid = {**body, "reason": "\u3000"}
+    else:
+        body = _decision(
+            "DEADLINE" if operation == "deadline" else "OPTED_OUT",
+            deadline=source["day"] + timedelta(days=8)
+            if operation == "deadline"
+            else None,
+            reason="Approved clinical decision",
+        ).model_dump(mode="json", exclude_unset=True)
+        receipt_operation = "visits.followup_decision"
+        invalid = {
+            **body,
+            "followup_decision": {**body["followup_decision"], "reason": "\u3000"},
+        }
+    before = _effects(clinic, source["visit"], receipt_operation)
+    key = str(uuid4())
+    status, refused = _signed_visit_request(
+        clinic, clinic.owner, path=path, method=method, body=invalid, key=key
+    )
+    assert status == 422 and refused["error"]["code"] == "INVALID_INPUT"
+    assert _effects(clinic, source["visit"], receipt_operation) == before
+    status, accepted = _signed_visit_request(
+        clinic, clinic.owner, path=path, method=method, body=body, key=key
+    )
+    assert status == (201 if operation == "extension" else 200), accepted
+    assert _signed_visit_request(
+        clinic, clinic.owner, path=path, method=method, body=body, key=key
+    ) == (status, accepted)
+
+
 def _frozen_claim(connection, claim):
     return connection.execute(
         text("""

@@ -46,6 +46,8 @@ from test_request_boundary import boundary_data as boundary_data  # noqa: PLC041
 CAIRO = ZoneInfo("Africa/Cairo")
 SERVICE_DAY = datetime.now(CAIRO).date() + timedelta(days=28)
 WEEKDAY = SERVICE_DAY.isoweekday()
+FOLD_DAY = datetime(2030, 10, 31).date()
+FOLD_WEEKDAY = FOLD_DAY.isoweekday()
 
 
 def _actor(tenant, staff, role="DOCTOR_OWNER"):
@@ -160,6 +162,41 @@ def _booking(
     return saved
 
 
+def _timed_booking(connection, tenant, doctor, day, start, end, status="Booked"):
+    saved = persist_appointment(
+        connection,
+        _draft(
+            _patient(connection, tenant),
+            doctor,
+            status=status,
+            service_date=day,
+            booking_mode="EXACT_TIME",
+            starts_at=start,
+            ends_at=end,
+        ),
+        _query(tenant, doctor),
+    )
+    if status == "Waiting":
+        _seed_waiting_entry(connection, tenant, doctor, saved, doctor)
+    return saved
+
+
+def _fold_config(**changes):
+    return _config(
+        **{
+            "working_weekdays": [FOLD_WEEKDAY],
+            "weekly_work_periods": [
+                {
+                    "weekday": FOLD_WEEKDAY,
+                    "starts_at": "23:00",
+                    "ends_at": "23:59",
+                }
+            ],
+            **changes,
+        }
+    )
+
+
 def _frozen(connection, appointment_id):
     return connection.execute(
         text("""
@@ -248,6 +285,87 @@ def _schedule_request(
     asyncio.run(app(scope, receive, send))
     payload = b"".join(message.get("body", b"") for message in outgoing[1:])
     return outgoing[0]["status"], payload if raw_response else json.loads(payload)
+
+
+@pytest.mark.parametrize("operation", ["stage", "preview", "activate"])
+def test_signed_schedule_surrogate_reason_denies_without_receipt(
+    patient_backend, operation
+):
+    clinic = patient_backend
+    if operation == "activate":
+        body = {
+            "preview_id": str(uuid4()),
+            "expected_schedule_revision": 1,
+            "expected_capacity_revision": 1,
+            "reason": "Approved activation",
+        }
+        suffix, method = "/activate", "POST"
+    else:
+        body = _patch(_config(mode="OPEN")).model_dump(mode="json")
+        suffix, method = ("", "PATCH") if operation == "stage" else ("/preview", "POST")
+
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        before = connection.execute(
+            text("""
+            SELECT (SELECT revision FROM public.clinic_policy_heads
+                    WHERE organization_id=:tenant AND kind='SCHEDULE'),
+                   (SELECT count(*) FROM public.clinic_policy_previews
+                    WHERE organization_id=:tenant),
+                   (SELECT count(*) FROM public.sensitive_audit
+                    WHERE organization_id=:tenant),
+                   (SELECT count(*) FROM public.idempotency_receipts
+                    WHERE organization_id=:tenant)
+        """),
+            {"tenant": clinic.tenant},
+        ).one()
+    key = str(uuid4())
+    for reason in ("\ud800", "\udfff"):
+        status, denied = _schedule_request(
+            clinic,
+            clinic.owner,
+            method=method,
+            suffix=suffix,
+            body={**body, "reason": reason},
+            key=key,
+        )
+        assert status == 422 and denied["error"]["code"] == "INVALID_INPUT"
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            assert (
+                connection.execute(
+                    text("""
+                SELECT (SELECT revision FROM public.clinic_policy_heads
+                        WHERE organization_id=:tenant AND kind='SCHEDULE'),
+                       (SELECT count(*) FROM public.clinic_policy_previews
+                        WHERE organization_id=:tenant),
+                       (SELECT count(*) FROM public.sensitive_audit
+                        WHERE organization_id=:tenant),
+                       (SELECT count(*) FROM public.idempotency_receipts
+                        WHERE organization_id=:tenant)
+            """),
+                    {"tenant": clinic.tenant},
+                ).one()
+                == before
+            )
+
+    if operation != "activate":
+        accepted = {**body, "reason": "مراجعة الجدول"}
+        status, result = _schedule_request(
+            clinic,
+            clinic.owner,
+            method=method,
+            suffix=suffix,
+            body=accepted,
+            key=key,
+        )
+        assert status == 200, result
+        assert _schedule_request(
+            clinic,
+            clinic.owner,
+            method=method,
+            suffix=suffix,
+            body=accepted,
+            key=key,
+        ) == (status, result)
 
 
 def test_owner_patch_and_preview_stage_without_publication_then_activate(
@@ -587,6 +705,173 @@ def test_waiting_only_date_or_work_period_or_break_cannot_activate(
         assert denied.value.status_code == 409
         assert read_schedule(connection, owner)["schedule_revision"] == 2
         assert _frozen(connection, waiting["id"]) == frozen
+
+
+@pytest.mark.parametrize("status", ["Booked", "Waiting"])
+@pytest.mark.parametrize(
+    ("change", "conflict"),
+    [
+        (
+            {
+                "weekly_breaks": [
+                    {
+                        "weekday": FOLD_WEEKDAY,
+                        "starts_at": "23:20",
+                        "ends_at": "23:40",
+                    }
+                ]
+            },
+            "IN_BREAK",
+        ),
+        (
+            {
+                "weekly_work_periods": [
+                    {
+                        "weekday": FOLD_WEEKDAY,
+                        "starts_at": "23:45",
+                        "ends_at": "23:59",
+                    }
+                ]
+            },
+            "OUTSIDE_PERIOD",
+        ),
+    ],
+)
+def test_fall_fold_full_interval_conflicts_block_confirmed_booking(
+    appointment_storage, status, change, conflict
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    owner = _actor(tenant, doctor)
+    start = datetime.combine(FOLD_DAY, time(23, 45), CAIRO)
+    end = datetime.combine(FOLD_DAY, time(23, 55), CAIRO).replace(fold=1)
+    assert end.astimezone(UTC) - start.astimezone(UTC) == timedelta(minutes=70)
+    with transaction(runtime, tenant) as connection:
+        _publish(connection, owner, _fold_config())
+        booked = _timed_booking(
+            connection, tenant, doctor, FOLD_DAY, start, end, status
+        )
+        frozen = _frozen(connection, booked["id"])
+        preview = _stage(connection, owner, _fold_config(**change), revision=2)
+        assert preview["affected"] == [
+            {
+                "appointment_id": booked["id"],
+                "service_date": FOLD_DAY.isoformat(),
+                "effects": sorted({conflict, "OUTSIDE_PERIOD", "SLOTS_CHANGED"}),
+                "blocking": True,
+            }
+        ]
+        with pytest.raises(ContractError) as denied, connection.begin_nested():
+            _activate(connection, owner, preview)
+        assert denied.value.status_code == 409
+        assert read_schedule(connection, owner)["schedule_revision"] == 2
+        assert _frozen(connection, booked["id"]) == frozen
+
+
+def test_fall_fold_preserves_half_open_endpoint(
+    appointment_storage,
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    owner = _actor(tenant, doctor)
+    with transaction(runtime, tenant) as connection:
+        _publish(connection, owner, _fold_config())
+        safe = _timed_booking(
+            connection,
+            tenant,
+            doctor,
+            FOLD_DAY,
+            datetime.combine(FOLD_DAY, time(23), CAIRO),
+            datetime.combine(FOLD_DAY, time(23, 20), CAIRO),
+        )
+        before = _frozen(connection, safe["id"])
+        break_config = _fold_config(
+            weekly_breaks=[
+                {"weekday": FOLD_WEEKDAY, "starts_at": "23:20", "ends_at": "23:40"}
+            ]
+        )
+        preview = _stage(connection, owner, break_config, revision=2)
+        assert preview["affected"] == [
+            {
+                "appointment_id": safe["id"],
+                "service_date": FOLD_DAY.isoformat(),
+                "effects": ["SLOTS_CHANGED"],
+                "blocking": False,
+            }
+        ]
+        assert _activate(connection, owner, preview)["schedule_revision"] == 3
+        assert _frozen(connection, safe["id"]) == before
+
+
+def test_fall_fold_grid_change_does_not_require_new_candidate_membership(
+    appointment_storage,
+):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    owner = _actor(tenant, doctor)
+    with transaction(runtime, tenant) as connection:
+        _publish(connection, owner, _fold_config())
+        crossing = _timed_booking(
+            connection,
+            tenant,
+            doctor,
+            FOLD_DAY,
+            datetime.combine(FOLD_DAY, time(23, 35), CAIRO).replace(fold=1),
+            datetime.combine(FOLD_DAY, time(23, 45), CAIRO).replace(fold=1),
+        )
+        crossing_before = _frozen(connection, crossing["id"])
+        grid_preview = _stage(
+            connection, owner, _fold_config(duration_minutes="15"), revision=2
+        )
+        assert grid_preview["affected"] == [
+            {
+                "appointment_id": crossing["id"],
+                "service_date": FOLD_DAY.isoformat(),
+                "effects": ["SLOTS_CHANGED"],
+                "blocking": False,
+            },
+        ]
+        assert _activate(connection, owner, grid_preview)["schedule_revision"] == 3
+        assert _frozen(connection, crossing["id"]) == crossing_before
+
+
+def test_fall_fold_new_conflict_invalidates_pending_activation(appointment_storage):
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    owner = _actor(tenant, doctor)
+    with transaction(runtime, tenant) as connection:
+        _publish(connection, owner, _fold_config())
+        safe = _timed_booking(
+            connection,
+            tenant,
+            doctor,
+            FOLD_DAY,
+            datetime.combine(FOLD_DAY, time(23), CAIRO),
+            datetime.combine(FOLD_DAY, time(23, 20), CAIRO),
+        )
+        preview = _stage(
+            connection,
+            owner,
+            _fold_config(
+                weekly_breaks=[
+                    {"weekday": FOLD_WEEKDAY, "starts_at": "23:20", "ends_at": "23:40"}
+                ]
+            ),
+            revision=2,
+        )
+        assert preview["affected"][0]["blocking"] is False
+        crossed = _timed_booking(
+            connection,
+            tenant,
+            doctor,
+            FOLD_DAY,
+            datetime.combine(FOLD_DAY, time(23, 45), CAIRO),
+            datetime.combine(FOLD_DAY, time(23, 55), CAIRO).replace(fold=1),
+            status="Waiting",
+        )
+        frozen = [_frozen(connection, row["id"]) for row in (safe, crossed)]
+        with pytest.raises(ContractError) as denied, connection.begin_nested():
+            _activate(connection, owner, preview)
+        assert denied.value.status_code == 409
+        assert denied.value.code == "STALE_REVISION"
+        assert read_schedule(connection, owner)["schedule_revision"] == 2
+        assert [_frozen(connection, row["id"]) for row in (safe, crossed)] == frozen
 
 
 def test_counted_waiting_examination_completed_peak_blocks_unchanged_overlap_limit(

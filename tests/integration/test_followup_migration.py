@@ -632,6 +632,7 @@ def test_fresh_and_failed_following_migration_keep_one_head(
         scripts = tmp_path / "migrations"
         shutil.copytree(ROOT / "db/migrations", scripts)
         # Isolate D-08 from later M1/B-06 heads for this rollback proof.
+        (scripts / "versions/0037_t155_followup_reason.py").unlink()
         (scripts / "versions/0036_b10_confirmation_parity.py").unlink()
         (scripts / "versions/0035_t146_cairo_exact_schedule.py").unlink()
         (scripts / "versions/0034_t145_exact_percentage.py").unlink()
@@ -1153,7 +1154,7 @@ def test_final_head_source_and_extension_evidence_names_actual_staff(
     with migration.connect() as connection:
         assert (
             connection.scalar(text("SELECT version_num FROM public.alembic_version"))
-            == "0036_b10_confirmation_parity"
+            == "0037_t155_followup_reason"
         )
         if actor_kind == "manager":
             assert (

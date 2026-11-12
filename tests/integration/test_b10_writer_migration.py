@@ -23,6 +23,7 @@ GUARD_AFTER = "0031_b10_writer_guard"
 OFFSET_AFTER = "0032_b10_cairo_offset_guard"
 EXACT_AFTER = "0035_t146_cairo_exact_schedule"
 PARITY_AFTER = "0036_b10_confirmation_parity"
+UNICODE_AFTER = "0037_t155_followup_reason"
 
 
 def _publish_bookable_policies(
@@ -165,6 +166,169 @@ def _writer_effect_counts(connection, tenant):
         )
         for table in tables
     )
+
+
+def test_t155_unicode_blank_reasons_deny_new_evidence_and_preserve_history(
+    admin, empty_database
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    expected = {"source_revision": 0, "clinical_revision": 0, "policy_version": 1}
+
+    def decision(connection, source, reason):
+        connection.execute(
+            text("SELECT set_config('app.staff_id', :actor, true)"),
+            {"actor": str(doctor)},
+        )
+        return connection.scalar(
+            text("""
+                SELECT public.record_followup_source_decision(
+                    :tenant, :visit, CAST(:expected AS jsonb), CAST(:decision AS jsonb))
+            """),
+            {
+                "tenant": tenant,
+                "visit": source["visit"],
+                "expected": json.dumps(expected),
+                "decision": json.dumps({"kind": "OPTED_OUT", "reason": reason}),
+            },
+        )
+
+    try:
+        _upgrade(migration, PARITY_AFTER)
+        _publish_bookable_policies(migration, tenant)
+        with transaction(runtime, tenant) as connection:
+            historical_source = _v2_source(connection, tenant, doctor)
+            assert decision(connection, historical_source, "\u3000") == 1
+        with migration.connect() as connection:
+            old_evidence = connection.scalar(
+                text("""
+                    SELECT to_jsonb(e) FROM public.followup_source_decision_events e
+                    WHERE organization_id=:tenant AND source_visit_id=:visit
+                """),
+                {"tenant": tenant, "visit": historical_source["visit"]},
+            )
+        _upgrade(migration, UNICODE_AFTER)
+        _upgrade(migration, UNICODE_AFTER)
+        with migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT to_jsonb(e) FROM public.followup_source_decision_events e
+                    WHERE organization_id=:tenant AND source_visit_id=:visit
+                """),
+                    {"tenant": tenant, "visit": historical_source["visit"]},
+                )
+                == old_evidence
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                SELECT count(*) FROM pg_constraint
+                WHERE conname LIKE 'followup_%_t155_reason_nonblank'
+                  AND NOT convalidated
+            """)
+                )
+                == 2
+            )
+        with transaction(runtime, tenant) as connection:
+            source = _v2_source(connection, tenant, doctor)
+            before = _writer_effect_counts(connection, tenant)
+            for kind in ("OPTED_OUT", "DEADLINE"):
+                connection.execute(
+                    text("SELECT set_config('app.staff_id', :actor, true)"),
+                    {"actor": str(doctor)},
+                )
+                body = {"kind": kind, "reason": "\u3000"}
+                if kind == "DEADLINE":
+                    body["deadline_date"] = (
+                        source["day"] + timedelta(days=8)
+                    ).isoformat()
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    connection.scalar(
+                        text("""
+                        SELECT public.record_followup_source_decision(
+                            :tenant, :visit, CAST(:expected AS jsonb),
+                            CAST(:decision AS jsonb))
+                    """),
+                        {
+                            "tenant": tenant,
+                            "visit": source["visit"],
+                            "expected": json.dumps(expected),
+                            "decision": json.dumps(body),
+                        },
+                    )
+                assert denied.value.orig.sqlstate == "23514"
+                assert _writer_effect_counts(connection, tenant) == before
+                assert (
+                    connection.scalar(
+                        text("""
+                    SELECT count(*) FROM public.followup_source_decision_events
+                    WHERE organization_id=:tenant AND source_visit_id=:visit
+                """),
+                        {"tenant": tenant, "visit": source["visit"]},
+                    )
+                    == 0
+                )
+
+            day = (source["day"] + timedelta(days=10)).isoformat()
+            booking = _priced_booking(source, service_date=day)
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                _v2_command(
+                    connection,
+                    "create_followup_claim_ordered",
+                    source,
+                    **booking,
+                    new_booking_date_exception={
+                        "selected_service_date": day,
+                        "reason": "\u3000",
+                    },
+                )
+            assert denied.value.orig.sqlstate == "23514"
+            assert _writer_effect_counts(connection, tenant) == before
+
+            claim = _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                source,
+                **booking,
+                new_booking_date_exception={
+                    "selected_service_date": day,
+                    "reason": "Doctor-approved date",
+                },
+            )
+            approved = _writer_effect_counts(connection, tenant)
+            extension_expected = {
+                **expected,
+                "claim_revision": 1,
+                "appointment_revision": 0,
+                "authorization_revision": 1,
+            }
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                _v2_command(
+                    connection,
+                    "extend_followup_claim_ordered",
+                    source,
+                    reference=claim,
+                    expected=extension_expected,
+                    deadline_date=(source["day"] + timedelta(days=12)).isoformat(),
+                    reason="\u3000",
+                )
+            assert denied.value.orig.sqlstate == "23514"
+            assert _writer_effect_counts(connection, tenant) == approved
+            assert (
+                _v2_command(
+                    connection,
+                    "extend_followup_claim_ordered",
+                    source,
+                    reference=claim,
+                    expected=extension_expected,
+                    deadline_date=(source["day"] + timedelta(days=12)).isoformat(),
+                    reason="Doctor-approved extension",
+                )
+                == 2
+            )
+    finally:
+        runtime.dispose()
+        migration.dispose()
 
 
 def test_ordered_writer_guard_rejects_unset_policy_without_effects(

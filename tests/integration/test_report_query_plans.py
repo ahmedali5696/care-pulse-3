@@ -168,9 +168,31 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
                 status="Booked",
                 service_date=day - timedelta(days=offset),
             )
+        for offset in range(1, 25):
+            _persist_with_status(
+                connection,
+                tenant,
+                _patient(connection, tenant),
+                doctor,
+                "Completed" if offset % 2 else "Cancelled",
+                service_date=day - timedelta(days=offset),
+            )
+    with transaction(runtime, other) as connection:
+        for offset in range(1, 25):
+            _persist_with_status(
+                connection,
+                other,
+                _patient(connection, other),
+                other_doctor,
+                "Completed" if offset % 2 else "Cancelled",
+                service_date=day - timedelta(days=offset),
+            )
     with migration.begin() as connection:
         connection.execute(
-            text("ANALYZE public.appointments, public.appointment_price_snapshots")
+            text("""
+                ANALYZE public.appointments, public.appointment_price_snapshots,
+                        public.appointment_history
+            """)
         )
     with transaction(runtime, tenant) as connection:
         start = datetime.combine(day, time.min, ZoneInfo("Africa/Cairo")).astimezone(
@@ -245,6 +267,7 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
                 WHERE h.organization_id=:tenant
                   AND h.occurred_at>=:start AND h.occurred_at<:end
                   AND h.new_status IN ('Completed', 'Cancelled')
+                ORDER BY h.occurred_at
             """,
             "admission_events": """
                 SELECT v.id FROM public.visits v
@@ -264,6 +287,24 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
         assert connection.scalar(
             text(queries["completed_service_value"]), params
         ) == Decimal("100.00")
+        events = connection.scalars(
+            text(queries["completion_cancellation_events"]), params
+        ).all()
+        assert len(events) == 25 and len(set(events)) == 25
+        # All events were committed today, including services from earlier days.
+        assert (
+            connection.scalar(
+                text("""
+            SELECT count(DISTINCT new_service_date)
+            FROM public.appointment_history
+            WHERE organization_id=:tenant
+              AND occurred_at>=:start AND occurred_at<:end
+              AND new_status IN ('Completed','Cancelled')
+        """),
+                params,
+            )
+            == 25
+        )
         index_requirements = {
             "appointments_day_status_lane": (
                 ("appointments", ("organization_id", "service_date", "status", "lane")),

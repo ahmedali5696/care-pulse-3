@@ -115,13 +115,16 @@ def normalize_typed_body(body: BaseModel) -> bytes:
     """
     if body.model_config.get("extra") != "forbid":
         raise ValueError("Request DTO must reject unknown fields")
-    return json.dumps(
-        body.model_dump(mode="json", exclude_unset=True),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
+    try:
+        return json.dumps(
+            body.model_dump(mode="json", exclude_unset=True),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except UnicodeEncodeError as invalid:
+        raise ContractError(422) from invalid
 
 
 def normalized_request_digest(body: BaseModel) -> str:

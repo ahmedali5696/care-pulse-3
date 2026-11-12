@@ -18,7 +18,7 @@ TERMINAL_AUDIT_ACTIONS = (
     "VISIT_EXAMINATION_CANCELLED",
     "VISIT_EXAMINATION_COMPLETED",
 )
-CURRENT_HEAD = "0036_b10_confirmation_parity"
+CURRENT_HEAD = "0037_t155_followup_reason"
 
 
 @pytest.fixture(scope="module")

@@ -875,6 +875,40 @@ def test_doctor_deadline_new_date_exception_preserves_actor_authority(
     assert booking_request(clinic, actor, body=body, key=key) == (status, response)
 
 
+def test_signed_doctor_new_date_unicode_blank_reason_denies_without_booking_effects(
+    followup_clinic,
+):
+    clinic = followup_clinic
+    source = completed_source(clinic)
+    day = source["day"] + timedelta(days=8)
+    body = followup_body(
+        source,
+        offset=8,
+        new_booking_date_exception={
+            "selected_service_date": day.isoformat(),
+            "reason": "\u3000",
+        },
+    )
+    before = booking_effects(clinic)
+    key = str(uuid4())
+    status, refused = booking_request(clinic, clinic.owner, body=body, key=key)
+    assert status == 422 and refused["error"]["code"] == "INVALID_INPUT"
+    assert booking_effects(clinic) == before
+    accepted = {
+        **body,
+        "new_booking_date_exception": {
+            "selected_service_date": day.isoformat(),
+            "reason": "Doctor-approved later date",
+        },
+    }
+    status, saved = booking_request(clinic, clinic.owner, body=accepted, key=key)
+    assert status == 201, saved
+    assert booking_request(clinic, clinic.owner, body=accepted, key=key) == (
+        status,
+        saved,
+    )
+
+
 @pytest.mark.parametrize(
     ("case", "expected"),
     [
@@ -1340,7 +1374,7 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
                 == original_receipt
             )
         _upgrade(migration, "0034_t145_exact_percentage")
-        _upgrade(migration, "0036_b10_confirmation_parity")
+        _upgrade(migration, "0037_t155_followup_reason")
         with migration.connect() as connection:
             assert (
                 connection.execute(receipt_query, receipt_params).one()

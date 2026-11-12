@@ -227,6 +227,31 @@ def _pricing_evidence(clinic):
     return heads, counts
 
 
+def test_signed_pricing_surrogate_reason_is_422_before_receipt(patient_backend):
+    clinic = patient_backend
+    before = _pricing_evidence(clinic)
+    key = str(uuid4())
+    for surrogate in ("\ud800", "\udfff"):
+        status, refused = pricing_request(
+            clinic,
+            clinic.owner,
+            method="PATCH",
+            body=_patch(standard_new_exam_egp="100.00", reason=surrogate),
+            key=key,
+        )
+        assert status == 422 and refused["error"]["code"] == "INVALID_INPUT"
+        assert _pricing_evidence(clinic) == before
+
+    accepted = _patch(standard_new_exam_egp="100.00", reason="مراجعة معتمدة")
+    status, result = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=accepted, key=key
+    )
+    assert status == 200, result
+    assert pricing_request(
+        clinic, clinic.owner, method="PATCH", body=accepted, key=key
+    ) == (status, result)
+
+
 def _blocked_by(clinic, holder):
     deadline = monotonic() + 12
     with clinic.runtime.connect() as observer:
