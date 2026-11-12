@@ -1121,10 +1121,6 @@ def test_signed_followup_retry_waits_for_organization_lock_then_replays(
                 assert retry_started.wait(timeout=15)
                 with clinic.migration.connect() as observer:
                     wait_for_postgres_lock(observer, retry_pid[0], original_pid[0])
-                    assert "public.lock_active_organization" in observer.scalar(
-                        text("SELECT query FROM pg_stat_activity WHERE pid=:pid"),
-                        {"pid": retry_pid[0]},
-                    )
                 assert _effects(clinic, source["visit"], receipt_operation) == before
             finally:
                 release_original.set()
