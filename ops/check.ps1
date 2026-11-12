@@ -257,12 +257,20 @@ private="$RUNNER_TEMP/foundation-ci-private"
 test ! -e "$private"
 mkdir -m 0700 "$private"
 cleanup() {
-  code=$?
+  local code=$? cleanup_failed=0
   trap - EXIT
   if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" && "$private" = "$RUNNER_TEMP/foundation-ci-private" && -d "$private" && -O "$private" && ! -L "$private" ]]; then
-    if ! docker compose --profile mail --profile test --profile sender --profile operator down --remove-orphans --volumes; then code=1; fi
-    if ! rm -rf -- "$private" || test -e "$private"; then code=1; fi
-    if [ -n "$focused_target" ] && [ "$code" = 0 ]; then echo 'PASS scoped PostgreSQL volume and synthetic secret cleanup'; fi
+    if ! docker compose --profile mail --profile test --profile sender --profile operator down --remove-orphans --volumes; then
+      echo 'FAIL scoped Compose cleanup'; cleanup_failed=1
+    fi
+    if ! rm -rf -- "$private" || test -e "$private"; then
+      echo 'FAIL synthetic secret cleanup'; cleanup_failed=1
+    fi
+    if [ "$cleanup_failed" = 1 ]; then
+      code=1
+    elif [ -n "$focused_target" ]; then
+      echo 'PASS scoped PostgreSQL volume and synthetic secret cleanup'
+    fi
   else
     echo 'FAIL unsafe cleanup project'; code=1
   fi
@@ -314,13 +322,19 @@ if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e C
   echo "FAIL controlled roles (${roles_error:-SQLSTATE unavailable}; credential-bearing diagnostics withheld)"; exit 1
 fi
 unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_AUTH_DB_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD
-docker compose --profile test run --rm --no-deps \
-  -e CP_DB_HOST=db -e CP_DB_PORT=5432 -e CP_DB_NAME=carepulse \
-  -e CP_MIGRATION_PASSWORD_FILE=/run/secrets/migration_password \
-  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
-  test python -m alembic -c alembic.ini upgrade head
+upgrade_head() {
+  docker compose --profile test run --rm --no-deps \
+    -e CP_DB_HOST=db -e CP_DB_PORT=5432 -e CP_DB_NAME=carepulse \
+    -e CP_MIGRATION_PASSWORD_FILE=/run/secrets/migration_password \
+    -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+    test python -m alembic -c alembic.ini upgrade head
+}
 
 if [ -n "$focused_target" ]; then
+  if ! upgrade_head > "$private/focused-migration.log" 2>&1; then
+    echo 'FAIL focused PostgreSQL Alembic upgrade to head'; exit 1
+  fi
+  echo 'PASS focused PostgreSQL Alembic upgrade to head'
   docker compose exec -T db postgres --version | grep -F '17.11'
   docker compose --profile test run --rm --no-deps -T \
     -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
@@ -331,6 +345,7 @@ if [ -n "$focused_target" ]; then
   exit 0
 fi
 
+upgrade_head
 docker compose --profile test run --rm --no-deps \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
