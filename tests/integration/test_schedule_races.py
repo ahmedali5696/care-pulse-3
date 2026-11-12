@@ -201,21 +201,22 @@ def test_signed_identical_activation_waits_for_original_and_replays_receipt(
         assert (
             connection.scalar(
                 text(
-                    "SELECT count(*) FROM public.sensitive_audit "
-                    "WHERE organization_id=:tenant AND action='settings.schedule.activate'"
-                ),
-                {"tenant": clinic.tenant},
-            )
-            == 1
-        )
-        assert (
-            connection.scalar(
-                text(
                     "SELECT count(*) FROM public.idempotency_receipts "
                     "WHERE organization_id=:tenant AND operation='settings.schedule.activate' "
                     "AND idempotency_key=:key"
                 ),
                 {"tenant": clinic.tenant, "key": key},
+            )
+            == 1
+        )
+    with clinic.migration.connect() as observer:
+        assert (
+            observer.scalar(
+                text(
+                    "SELECT count(*) FROM public.sensitive_audit "
+                    "WHERE organization_id=:tenant AND action='settings.schedule.activate'"
+                ),
+                {"tenant": clinic.tenant},
             )
             == 1
         )
