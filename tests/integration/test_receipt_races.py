@@ -68,7 +68,8 @@ def test_direct_receipt_unique_insert_wait_rollback_and_fresh_signed_recovery(
                 # Earlier same-transaction effects must roll back after losing the insert.
                 updated = connection.execute(
                     text(
-                        "UPDATE public.patients SET lifecycle_revision=lifecycle_revision+1 "
+                        "UPDATE public.patients SET archived=true, "
+                        "lifecycle_revision=lifecycle_revision+1 "
                         "WHERE id=:patient"
                     ),
                     {"patient": patient},
