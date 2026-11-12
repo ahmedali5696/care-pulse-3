@@ -75,7 +75,7 @@ test "$(docker inspect "$db_container" --format '{{.State.Running}}')" = true ||
 test "$(docker inspect "$db_container" \
   --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}')" = "$volume" ||
   fail 'unexpected database data volume'
-test "$(sql -c 'SELECT version_num FROM public.alembic_version')" = 0033_d08_terminal_writer ||
+test "$(sql -c 'SELECT version_num FROM public.alembic_version')" = 0039_t160_capacity_numeric ||
   fail 'schema head mismatch'
 
 # The PostgreSQL system identifier is read from the actual running server;
