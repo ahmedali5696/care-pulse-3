@@ -174,10 +174,11 @@ def test_signed_retry_waits_behind_archive_then_replays_committed_booking(
                         text(
                             "SELECT count(*) FROM pg_stat_activity "
                             "WHERE wait_event_type='Lock' "
-                            "AND :holder = ANY(pg_blocking_pids(pid)) "
+                            "AND (:holder = ANY(pg_blocking_pids(pid)) "
+                            "OR :archive = ANY(pg_blocking_pids(pid))) "
                             "AND query LIKE '%SELECT archived, lifecycle_revision%'"
                         ),
-                        {"holder": holder_pid},
+                        {"holder": holder_pid, "archive": archive_pid[0]},
                     )
                     if blocked:
                         break
