@@ -1063,6 +1063,91 @@ def test_signed_v2_receipt_replay_conflict_and_revoked_session(
 
 
 @pytest.mark.parametrize(
+    ("operation", "method", "success_status"),
+    [("decision", "PATCH", 200), ("extension", "POST", 201)],
+)
+def test_signed_followup_retry_waits_for_organization_lock_then_replays(
+    followup_clinic, operation, method, success_status
+):
+    clinic = followup_clinic
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    source = _source(clinic)
+    path = f"/v1/visits/{source['visit']}"
+    if operation == "decision":
+        command = _decision("OPTED_OUT", reason="Reviewed decision")
+    else:
+        confirmed = _confirmed(clinic, source)
+        command = _extension(source, confirmed["id"])
+        path += "/extend-followup"
+    body = command.model_dump(mode="json", exclude_unset=True)
+    receipt_operation = f"visits.{'followup_decision' if operation == 'decision' else 'extend_followup'}"
+    before = _effects(clinic, source["visit"], receipt_operation)
+    key = str(uuid4())
+    receipt_inserted = Event()
+    release_original = Event()
+    retry_started = Event()
+    original_pid = []
+    retry_pid = []
+
+    def hold_original_receipt(connection, _cursor, statement, _params, _context, _many):
+        if (
+            "INSERT INTO public.idempotency_receipts" in statement
+            and not receipt_inserted.is_set()
+        ):
+            original_pid.append(
+                connection.connection.driver_connection.info.backend_pid
+            )
+            receipt_inserted.set()
+            assert release_original.wait(timeout=30)
+
+    def observe_signed_retry(connection, _cursor, statement, _params, _context, _many):
+        if receipt_inserted.is_set() and "public.lock_active_organization" in statement:
+            retry_pid.append(connection.connection.driver_connection.info.backend_pid)
+            retry_started.set()
+
+    def signed_request():
+        return _signed_visit_request(
+            clinic, clinic.owner, path=path, method=method, body=body, key=key
+        )
+
+    event.listen(clinic.runtime, "after_cursor_execute", hold_original_receipt)
+    event.listen(clinic.runtime, "before_cursor_execute", observe_signed_retry)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            original_future = pool.submit(signed_request)
+            try:
+                assert receipt_inserted.wait(timeout=15)
+                retry_future = pool.submit(signed_request)
+                assert retry_started.wait(timeout=15)
+                with clinic.migration.connect() as observer:
+                    wait_for_postgres_lock(observer, retry_pid[0], original_pid[0])
+                    assert "public.lock_active_organization" in observer.scalar(
+                        text("SELECT query FROM pg_stat_activity WHERE pid=:pid"),
+                        {"pid": retry_pid[0]},
+                    )
+                assert _effects(clinic, source["visit"], receipt_operation) == before
+            finally:
+                release_original.set()
+            original = original_future.result(timeout=30)
+            replay = retry_future.result(timeout=30)
+    finally:
+        release_original.set()
+        event.remove(clinic.runtime, "before_cursor_execute", observe_signed_retry)
+        event.remove(clinic.runtime, "after_cursor_execute", hold_original_receipt)
+
+    assert original == replay
+    assert original[0] == success_status
+    assert original[1]["revision"] == original[1]["data"]["revision"] == 1
+    assert _effects(clinic, source["visit"], receipt_operation) == (
+        before[0],
+        before[1],
+        before[2] + int(operation == "decision"),
+        before[3] + int(operation == "extension"),
+        before[4] + 1,
+    )
+
+
+@pytest.mark.parametrize(
     "revoke_first", [True, False], ids=["revoke-first", "retry-first"]
 )
 def test_signed_decision_receipt_replay_serializes_with_staff_revocation(

@@ -87,6 +87,74 @@ def test_signed_same_key_distinct_patient_insert_collision_rolls_back_loser(
     ) == (201, winner)
 
 
+@pytest.mark.parametrize("changed_body", [False, True], ids=["replay", "conflict"])
+def test_signed_same_key_booking_waits_at_live_organization_barrier(
+    booking_clinic, changed_body
+):
+    clinic = booking_clinic
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    body, key = booking_body(new_patient(clinic)), str(uuid4())
+    contender = {**body, "expected_net_egp": "99.00"} if changed_body else body
+    receipt_inserted = Event()
+    release_original = Event()
+    signed_started = Event()
+    original_pid = []
+    waiting_pid = []
+
+    def hold_original_receipt(
+        connection, _cursor, statement, _parameters, _context, _many
+    ):
+        if (
+            "INSERT INTO public.idempotency_receipts" in statement
+            and not receipt_inserted.is_set()
+        ):
+            original_pid.append(
+                connection.connection.driver_connection.info.backend_pid
+            )
+            receipt_inserted.set()
+            assert release_original.wait(timeout=30)
+
+    def observe_signed_wait(
+        connection, _cursor, statement, _parameters, _context, _many
+    ):
+        if receipt_inserted.is_set() and "public.lock_active_organization" in statement:
+            waiting_pid.append(connection.connection.driver_connection.info.backend_pid)
+            signed_started.set()
+
+    event.listen(clinic.runtime, "after_cursor_execute", hold_original_receipt)
+    event.listen(clinic.runtime, "before_cursor_execute", observe_signed_wait)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            original_future = pool.submit(
+                booking_request, clinic, clinic.owner, body=body, key=key
+            )
+            try:
+                assert receipt_inserted.wait(timeout=15)
+                contender_future = pool.submit(
+                    booking_request, clinic, clinic.owner, body=contender, key=key
+                )
+                assert signed_started.wait(timeout=15)
+                with transaction(clinic.runtime, clinic.tenant) as observer:
+                    wait_for_postgres_lock(observer, waiting_pid[0], original_pid[0])
+            finally:
+                release_original.set()
+            original = original_future.result(timeout=30)
+            contender_result = contender_future.result(timeout=30)
+    finally:
+        release_original.set()
+        event.remove(clinic.runtime, "before_cursor_execute", observe_signed_wait)
+        event.remove(clinic.runtime, "after_cursor_execute", hold_original_receipt)
+
+    assert original[0] == 201, original
+    if changed_body:
+        assert contender_result[0] == 409, contender_result
+        assert contender_result[1]["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+        assert "data" not in contender_result[1]
+    else:
+        assert contender_result == original
+    assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
+
+
 def test_signed_booked_receipt_survives_later_archive(booking_clinic):
     clinic = booking_clinic
     app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
