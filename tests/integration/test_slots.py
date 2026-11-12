@@ -328,7 +328,11 @@ def test_max_supported_date_signed_open_booking(booking_clinic):
         _publish(
             connection,
             _actor(clinic.tenant, clinic.staff),
-            _config(mode="OPEN", working_weekdays=[day.isoweekday()]),
+            _config(
+                mode="OPEN",
+                working_weekdays=[day.isoweekday()],
+                holiday_booking_enabled=True,
+            ),
             revision=2,
         )
     status, response = _slots_request(clinic, clinic.receptionist, day)
