@@ -25,6 +25,7 @@ from carepulse.identity.receipts import Receipt, insert_tenant_receipt
 from carepulse.main import app
 from carepulse.notifications.evidence import append_outbox, append_sensitive_audit
 from carepulse.policies.slots_service import list_slots
+from carepulse.policies.versions import append_version
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _admit_saved, _draft, _patient, _query
@@ -45,6 +46,7 @@ from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _patch, pricing_request
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 from test_schedule import _actor, _config, _publish
+from test_slots import _slots_request
 from test_visit_migration import _prepare, _upgrade
 
 
@@ -559,6 +561,210 @@ def test_timed_followup_manual_precedence_matches_offered_candidates(
     )
     assert status == 201, response
     assert claim_record(clinic, response["data"]["id"])["state"] == "ACTIVE"
+
+
+def test_t159_retained_numeric_duration_signed_slots_and_both_booking_paths(
+    followup_clinic,
+):
+    clinic = followup_clinic
+    source = completed_source(clinic)
+    second_source = completed_source(clinic)
+    day = source["day"] + timedelta(days=2)
+    weekday = day.isoweekday()
+    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _publish(
+            connection,
+            actor,
+            _config(
+                duration_minutes="30",
+                working_weekdays=[weekday],
+                weekly_work_periods=[
+                    {"weekday": weekday, "starts_at": "09:00", "ends_at": "12:00"}
+                ],
+                weekly_manual_slots=[
+                    {"weekday": weekday, "starts_at": "11:00", "ends_at": "11:45"}
+                ],
+            ),
+            revision=3,
+        )
+
+    def retain_duration(value):
+        # Preserve the previous version and all calendar rows; only the new
+        # immutable policy version carries the retained JSON number spelling.
+        with clinic.migration.begin() as connection:
+            old_version, revision = connection.execute(
+                text("""
+                    SELECT current_version, revision FROM public.clinic_policy_heads
+                    WHERE organization_id=:tenant AND kind='SCHEDULE'
+                """),
+                {"tenant": clinic.tenant},
+            ).one()
+            old_policy = connection.scalar(
+                text("""
+                    SELECT payload FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant AND kind='SCHEDULE' AND version=:version
+                """),
+                {"tenant": clinic.tenant, "version": old_version},
+            )
+            payload = connection.scalar(
+                text("""
+                    SELECT jsonb_set(payload,'{duration_minutes}',CAST(:value AS jsonb))::text
+                    FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant AND kind='SCHEDULE' AND version=:version
+                """),
+                {"tenant": clinic.tenant, "version": old_version, "value": value},
+            )
+            intervals = (
+                connection.execute(
+                    text("""
+                    SELECT interval_kind, weekday, service_date, starts_at, ends_at
+                    FROM public.clinic_schedule_intervals
+                    WHERE organization_id=:tenant AND policy_version=:version
+                """),
+                    {"tenant": clinic.tenant, "version": old_version},
+                )
+                .mappings()
+                .all()
+            )
+            assert (
+                append_version(
+                    connection,
+                    clinic.tenant,
+                    "SCHEDULE",
+                    payload,
+                    revision,
+                    intervals=[dict(interval) for interval in intervals],
+                )
+                == old_version + 1
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT payload FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant AND kind='SCHEDULE' AND version=:version
+                """),
+                    {"tenant": clinic.tenant, "version": old_version},
+                )
+                == old_policy
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT payload->>'duration_minutes' FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant AND kind='SCHEDULE' AND version=:version
+                """),
+                    {"tenant": clinic.tenant, "version": old_version + 1},
+                )
+                == value
+            )
+            return revision + 1
+
+    revision = retain_duration("30.0")
+    status, offered = _slots_request(clinic, clinic.receptionist, day)
+    assert status == 200, offered
+    assert offered["data"]["schedule_revision"] == revision
+    generated = [
+        candidate
+        for candidate in offered["data"]["candidates"]
+        if candidate["origin"] == "GENERATED" and candidate["available"]
+    ]
+    assert len(generated) >= 2
+    assert all(
+        datetime.fromisoformat(slot["ends_at"])
+        - datetime.fromisoformat(slot["starts_at"])
+        == timedelta(minutes=30)
+        for slot in generated
+    )
+
+    ordinary = booking_body(
+        new_patient(clinic),
+        day=day,
+        expected_price_revision=3,
+        expected_schedule_revision=revision,
+        starts_at=generated[0]["starts_at"],
+        ends_at=generated[0]["ends_at"],
+    )
+    status, saved = booking_request(
+        clinic, clinic.receptionist, body=ordinary, key=str(uuid4())
+    )
+    assert status == 201, saved
+    preferred = followup_body(
+        source,
+        offset=2,
+        expected_schedule_revision=revision,
+        starts_at=generated[1]["starts_at"],
+        ends_at=generated[1]["ends_at"],
+    )
+    status, saved = booking_request(
+        clinic, clinic.owner, body=preferred, key=str(uuid4())
+    )
+    assert status == 201, saved
+    assert claim_record(clinic, saved["data"]["id"])["state"] == "ACTIVE"
+
+    revision = retain_duration("2147483648.0")
+    status, offered = _slots_request(clinic, clinic.owner, day)
+    assert status == 200, offered
+    assert offered["data"]["schedule_revision"] == revision
+    assert [candidate["origin"] for candidate in offered["data"]["candidates"]] == [
+        "MANUAL"
+    ]
+    manual = offered["data"]["candidates"][0]
+    assert manual["available"] is True
+    manual_body = booking_body(
+        new_patient(clinic),
+        day=day,
+        expected_price_revision=3,
+        expected_schedule_revision=revision,
+        starts_at=manual["starts_at"],
+        ends_at=manual["ends_at"],
+    )
+    status, saved = booking_request(
+        clinic, clinic.receptionist, body=manual_body, key=str(uuid4())
+    )
+    assert status == 201, saved
+
+    cairo = ZoneInfo("Africa/Cairo")
+    forged = followup_body(
+        second_source,
+        offset=(day - second_source["day"]).days,
+        expected_schedule_revision=revision,
+        starts_at=datetime.combine(day, time(10), cairo).isoformat(),
+        ends_at=datetime.combine(day, time(10, 30), cairo).isoformat(),
+    )
+    before = booking_effects(clinic)
+    with clinic.migration.connect() as connection:
+        private_before = connection.execute(
+            text("""
+                SELECT (SELECT count(*) FROM public.followup_claims
+                        WHERE organization_id=:tenant),
+                       (SELECT count(*) FROM public.followup_authorization_events
+                        WHERE organization_id=:tenant),
+                       (SELECT count(*) FROM public.sensitive_audit
+                        WHERE organization_id=:tenant)
+            """),
+            {"tenant": clinic.tenant},
+        ).one()
+    status, denied = booking_request(
+        clinic, clinic.owner, body=forged, key=str(uuid4())
+    )
+    assert status == 409, denied
+    assert booking_effects(clinic) == before
+    with clinic.migration.connect() as connection:
+        assert (
+            connection.execute(
+                text("""
+                    SELECT (SELECT count(*) FROM public.followup_claims
+                            WHERE organization_id=:tenant),
+                           (SELECT count(*) FROM public.followup_authorization_events
+                            WHERE organization_id=:tenant),
+                           (SELECT count(*) FROM public.sensitive_audit
+                            WHERE organization_id=:tenant)
+                """),
+                {"tenant": clinic.tenant},
+            ).one()
+            == private_before
+        )
 
 
 @pytest.mark.parametrize(

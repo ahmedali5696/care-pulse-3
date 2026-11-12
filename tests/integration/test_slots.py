@@ -25,8 +25,17 @@ from test_booking import (
     booking_clinic as booking_clinic,  # noqa: PLC0414
 )
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
+from test_queue_capacity import _policy_capacity
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
-from test_schedule import SERVICE_DAY, _actor, _booking, _config, _publish
+from test_schedule import (
+    SERVICE_DAY,
+    _actor,
+    _booking,
+    _config,
+    _patch,
+    _publish,
+    _schedule_request,
+)
 
 
 def _slots_request(clinic, actor, day, *, other_fields=None):
@@ -146,6 +155,69 @@ def test_both_roles_see_occupied_candidates_without_settings_or_reservation(
             )
             == "Booked"
         )
+
+
+def test_retained_decimal_capacity_matches_signed_schedule_slots_and_booking(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _policy_capacity(connection, clinic.tenant, capacity=2.0)
+    config = _config(allow_overlap=True)
+    patch = _patch(
+        config, revision=2, confirmation={"capacity": 2, "capacity_revision": 2}
+    )
+    status, preview = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/preview",
+        body=patch.model_dump(mode="json"),
+        key=str(uuid4()),
+    )
+    assert status == 200, preview
+    status, result = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/activate",
+        body={
+            "preview_id": preview["data"]["preview_id"],
+            "expected_schedule_revision": 2,
+            "expected_capacity_revision": 2,
+            "reason": "Synthetic capacity activation",
+        },
+        key=str(uuid4()),
+    )
+    assert status == 200, result
+    status, response = _slots_request(clinic, clinic.owner, SERVICE_DAY)
+    assert status == 200, response
+    offered = next(slot for slot in response["data"]["candidates"] if slot["available"])
+    for expected in (201, 201, 409):
+        before = booking_effects(clinic)
+        status, booking = booking_request(
+            clinic,
+            clinic.owner,
+            body=booking_body(
+                new_patient(clinic),
+                expected_schedule_revision=3,
+                expected_capacity_revision=2,
+                starts_at=offered["starts_at"],
+                ends_at=offered["ends_at"],
+            ),
+            key=str(uuid4()),
+        )
+        assert status == expected, booking
+        if expected == 409:
+            assert booking_effects(clinic) == before
+    status, now_occupied = _slots_request(clinic, clinic.owner, SERVICE_DAY)
+    assert status == 200, now_occupied
+    assert not any(
+        slot["available"]
+        for slot in now_occupied["data"]["candidates"]
+        if slot["starts_at"] == offered["starts_at"]
+    )
 
 
 def test_open_mode_long_horizon_and_unknown_query_are_handled(patient_backend):

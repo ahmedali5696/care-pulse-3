@@ -126,8 +126,10 @@ def _consume(connection, tenant, confirmation, appointment):
     ).rowcount
 
 
+@pytest.mark.parametrize("saved_capacity", [2, 2.0])
 def test_scoped_confirmation_consumes_once_in_rolled_back_sql_simulation(
     appointment_storage,
+    saved_capacity,
 ):
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
@@ -135,7 +137,7 @@ def test_scoped_confirmation_consumes_once_in_rolled_back_sql_simulation(
         _arrive(connection, tenant, doctor, first)
         second = _appointment(connection, tenant, doctor)
         _arrive(connection, tenant, doctor, second)
-        _policy_capacity(connection, tenant)
+        _policy_capacity(connection, tenant, capacity=saved_capacity)
     # D-07 requires a matching Visit on COMMIT. Exercise real D-06 SQL
     # transitions and one-use guards inside a transaction that MUST roll back.
     with (

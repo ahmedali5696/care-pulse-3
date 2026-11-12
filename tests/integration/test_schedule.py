@@ -213,11 +213,25 @@ def _frozen(connection, appointment_id):
 
 
 def _schedule_request(
-    clinic, actor, *, method="GET", suffix="", body=None, key="", raw_response=False
+    clinic,
+    actor,
+    *,
+    method="GET",
+    suffix="",
+    body=None,
+    key="",
+    raw_response=False,
+    raw_body=None,
 ):
     path = "/v1/settings/schedule" + suffix
     encoded = (
-        json.dumps(body, separators=(",", ":")).encode() if body is not None else b""
+        raw_body
+        if raw_body is not None
+        else (
+            json.dumps(body, separators=(",", ":")).encode()
+            if body is not None
+            else b""
+        )
     )
     envelope = replace(
         actor,
@@ -285,6 +299,58 @@ def _schedule_request(
     asyncio.run(app(scope, receive, send))
     payload = b"".join(message.get("body", b"") for message in outgoing[1:])
     return outgoing[0]["status"], payload if raw_response else json.loads(payload)
+
+
+@pytest.mark.parametrize("operation", ["stage", "preview", "activate"])
+@pytest.mark.parametrize("raw_body", [b"\xff", b'{"reason":' + b"9" * 4301 + b"}"])
+def test_signed_schedule_malformed_json_denied_without_effects(
+    patient_backend, operation, raw_body
+):
+    clinic = patient_backend
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    suffix, method = {
+        "stage": ("", "PATCH"),
+        "preview": ("/preview", "POST"),
+        "activate": ("/activate", "POST"),
+    }[operation]
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        before = connection.execute(
+            text("""
+            SELECT (SELECT revision FROM public.clinic_policy_heads
+                    WHERE organization_id=:tenant AND kind='SCHEDULE'),
+                   (SELECT count(*) FROM public.clinic_policy_previews
+                    WHERE organization_id=:tenant),
+                   (SELECT count(*) FROM public.sensitive_audit
+                    WHERE organization_id=:tenant),
+                   (SELECT count(*) FROM public.idempotency_receipts
+                    WHERE organization_id=:tenant)
+        """),
+            {"tenant": clinic.tenant},
+        ).one()
+    status, denied = _schedule_request(
+        clinic,
+        clinic.owner,
+        method=method,
+        suffix=suffix,
+        raw_body=raw_body,
+        key=str(uuid4()),
+    )
+    assert status == 422 and denied["error"]["code"] == "INVALID_INPUT"
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        after = connection.execute(
+            text("""
+            SELECT (SELECT revision FROM public.clinic_policy_heads
+                    WHERE organization_id=:tenant AND kind='SCHEDULE'),
+                   (SELECT count(*) FROM public.clinic_policy_previews
+                    WHERE organization_id=:tenant),
+                   (SELECT count(*) FROM public.sensitive_audit
+                    WHERE organization_id=:tenant),
+                   (SELECT count(*) FROM public.idempotency_receipts
+                    WHERE organization_id=:tenant)
+        """),
+            {"tenant": clinic.tenant},
+        ).one()
+    assert after == before
 
 
 @pytest.mark.parametrize("operation", ["stage", "preview", "activate"])
@@ -978,6 +1044,44 @@ def test_disabling_overlap_blocks_existing_overlapping_booked_rows(appointment_s
         assert denied.value.status_code == 409
         assert read_schedule(connection, owner)["config"]["allow_overlap"] is True
         assert [_frozen(connection, row["id"]) for row in booked] == before
+
+
+def test_integral_json_capacity_decimal_keeps_saved_policy_and_overlap(
+    appointment_storage,
+):
+    from carepulse.policies.versions import append_version
+
+    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    owner = _actor(tenant, doctor)
+    with transaction(runtime, tenant) as connection:
+        append_version(
+            connection, tenant, "CAPACITY", {"capacity": 2.0, "paused": False}, 1
+        )
+        raw_before = connection.scalar(
+            text("""
+            SELECT payload::text FROM public.clinic_policy_versions
+            WHERE organization_id=:tenant AND kind='CAPACITY' AND version=2
+        """),
+            {"tenant": tenant},
+        )
+        preview = _stage(
+            connection,
+            owner,
+            _config(allow_overlap=True),
+            confirmation={"capacity": 2, "capacity_revision": 2},
+        )
+        assert _activate(connection, owner, preview)["schedule_revision"] == 2
+        assert read_schedule(connection, owner)["capacity"] == 2
+        assert (
+            connection.scalar(
+                text("""
+            SELECT payload::text FROM public.clinic_policy_versions
+            WHERE organization_id=:tenant AND kind='CAPACITY' AND version=2
+        """),
+                {"tenant": tenant},
+            )
+            == raw_before
+        )
 
 
 def test_mode_duration_and_manual_slot_changes_are_review_only_for_confirmed_time(

@@ -206,7 +206,7 @@ def _capacity_state(connection: Connection, tenant) -> dict:
     row = (
         connection.execute(
             text("""
-            SELECT h.revision, (v.payload->>'capacity')::integer AS capacity
+            SELECT h.revision, ((v.payload->>'capacity')::numeric)::integer AS capacity
             FROM public.clinic_policy_heads h
             JOIN public.clinic_policy_versions v
               ON (h.organization_id,h.kind,h.current_version) =

@@ -7,6 +7,8 @@ from re import compile
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.exc import SQLAlchemyError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import JSONResponse
 
 from carepulse.appointments.routes import router as appointment_router
 from carepulse.config import load_config
@@ -59,6 +61,26 @@ app.add_exception_handler(ContractError, contract_exception_handler)
 app.add_exception_handler(
     RequestValidationError, lambda _request, _error: error_response(422)
 )
+
+
+def _http_exception_handler(request, error: StarletteHTTPException):
+    malformed_json_routes = {
+        ("PATCH", "/v1/settings/pricing"),
+        ("PATCH", "/v1/settings/schedule"),
+        ("POST", "/v1/settings/schedule/preview"),
+        ("POST", "/v1/settings/schedule/activate"),
+    }
+    if (
+        error.status_code == 400
+        and (request.method, request.url.path) in malformed_json_routes
+    ):
+        return error_response(422)
+    return JSONResponse(
+        {"detail": error.detail}, status_code=error.status_code, headers=error.headers
+    )
+
+
+app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
 app.add_exception_handler(SQLAlchemyError, lambda _request, _error: error_response(503))
 app.add_exception_handler(
     ReceiptConflict,

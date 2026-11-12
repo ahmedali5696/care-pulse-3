@@ -41,10 +41,24 @@ PATH = "/v1/settings/pricing"
 
 
 def pricing_request(
-    clinic, actor, *, method="GET", body=None, key="", query=None, origin=None
+    clinic,
+    actor,
+    *,
+    method="GET",
+    body=None,
+    key="",
+    query=None,
+    origin=None,
+    raw_body=None,
 ):
     payload = (
-        json.dumps(body, separators=(",", ":")).encode() if body is not None else b""
+        raw_body
+        if raw_body is not None
+        else (
+            json.dumps(body, separators=(",", ":")).encode()
+            if body is not None
+            else b""
+        )
     )
     envelope = replace(
         actor,
@@ -124,6 +138,20 @@ def _patch(**changes):
         "reason": "Synthetic approved pricing change",
         **changes,
     }
+
+
+@pytest.mark.parametrize("raw_body", [b"\xff", b'{"reason":' + b"9" * 4301 + b"}"])
+def test_signed_pricing_malformed_json_denied_without_effects(
+    patient_backend, raw_body
+):
+    clinic = patient_backend
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    before = _pricing_evidence(clinic)
+    status, denied = pricing_request(
+        clinic, clinic.owner, method="PATCH", raw_body=raw_body, key=str(uuid4())
+    )
+    assert status == 422 and denied["error"]["code"] == "INVALID_INPUT"
+    assert _pricing_evidence(clinic) == before
 
 
 def _manager_change(connection, clinic, enabled, revision):

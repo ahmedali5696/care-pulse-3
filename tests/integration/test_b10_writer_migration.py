@@ -24,6 +24,7 @@ OFFSET_AFTER = "0032_b10_cairo_offset_guard"
 EXACT_AFTER = "0035_t146_cairo_exact_schedule"
 PARITY_AFTER = "0036_b10_confirmation_parity"
 UNICODE_AFTER = "0037_t155_followup_reason"
+DURATION_AFTER = "0038_t159_duration_numeric"
 
 
 def _publish_bookable_policies(
@@ -166,6 +167,119 @@ def _writer_effect_counts(connection, tenant):
         )
         for table in tables
     )
+
+
+def test_t159_duration_successor_preserves_saved_policy_and_private_guard(
+    admin, empty_database
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, UNICODE_AFTER)
+        day = date(2030, 5, 6)
+        _publish_bookable_policies(migration, tenant, timed_day=day)
+        with migration.begin() as connection:
+            connection.execute(
+                text("""
+                    INSERT INTO public.clinic_policy_versions
+                        (organization_id,kind,version,payload)
+                    SELECT organization_id,kind,3,
+                           jsonb_set(payload,'{duration_minutes}','30.0'::jsonb)
+                    FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant AND kind='SCHEDULE' AND version=2
+                """),
+                {"tenant": tenant},
+            )
+            connection.execute(
+                text("""
+                    INSERT INTO public.clinic_schedule_intervals
+                        (organization_id,policy_version,interval_kind,weekday,
+                         service_date,starts_at,ends_at)
+                    SELECT organization_id,3,interval_kind,weekday,
+                           service_date,starts_at,ends_at
+                    FROM public.clinic_schedule_intervals
+                    WHERE organization_id=:tenant AND policy_version=2
+                """),
+                {"tenant": tenant},
+            )
+            connection.execute(
+                text("""
+                    UPDATE public.clinic_policy_heads
+                    SET current_version=3,revision=revision+1
+                    WHERE organization_id=:tenant AND kind='SCHEDULE'
+                """),
+                {"tenant": tenant},
+            )
+        with transaction(runtime, tenant) as connection:
+            source = _v2_source(connection, tenant, doctor)
+        start = datetime.combine(day, time(9), ZoneInfo("Africa/Cairo"))
+        booking = _priced_booking(
+            source,
+            service_date=day.isoformat(),
+            booking_mode="EXACT_TIME",
+            starts_at=start.isoformat(),
+            ends_at=(start + timedelta(minutes=30)).isoformat(),
+            new_booking_date_exception={
+                "selected_service_date": day.isoformat(),
+                "reason": "Doctor reviewed future booking date",
+            },
+        )
+        with migration.connect() as connection:
+            saved = connection.execute(
+                text("""
+                    SELECT version,payload FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant AND kind='SCHEDULE' ORDER BY version
+                """),
+                {"tenant": tenant},
+            ).all()
+            signature = "public.b10_schedule_without_offset_guard(uuid,jsonb)"
+            identity = connection.execute(
+                text("""
+                    SELECT oid,proowner,prosecdef,
+                           has_function_privilege('carepulse_runtime',oid,'EXECUTE')
+                    FROM pg_proc WHERE oid=CAST(:signature AS regprocedure)
+                """),
+                {"signature": signature},
+            ).one()
+            assert identity.prosecdef and identity[3] is False
+        with transaction(runtime, tenant) as connection:
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                _v2_command(
+                    connection, "create_followup_claim_ordered", source, **booking
+                )
+            assert denied.value.orig.sqlstate == "22P02"
+
+        _upgrade(migration, DURATION_AFTER)
+        _upgrade(migration, DURATION_AFTER)
+        with migration.connect() as connection:
+            assert (
+                connection.execute(
+                    text("""
+                    SELECT version,payload FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant AND kind='SCHEDULE' ORDER BY version
+                """),
+                    {"tenant": tenant},
+                ).all()
+                == saved
+            )
+            assert (
+                connection.execute(
+                    text("""
+                    SELECT oid,proowner,prosecdef,
+                           has_function_privilege('carepulse_runtime',oid,'EXECUTE')
+                    FROM pg_proc WHERE oid=CAST(:signature AS regprocedure)
+                """),
+                    {"signature": signature},
+                ).one()
+                == identity
+            )
+        with transaction(runtime, tenant) as connection:
+            claim = _v2_command(
+                connection, "create_followup_claim_ordered", source, **booking
+            )
+            assert claim is not None
+    finally:
+        runtime.dispose()
+        migration.dispose()
 
 
 def test_t155_unicode_blank_reasons_deny_new_evidence_and_preserve_history(
