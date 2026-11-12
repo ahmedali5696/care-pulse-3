@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('inputs', 'python-quality', 'unit', 'web', 'imports', 'integration')]
+    [ValidateSet('inputs', 'python-quality', 'unit', 'web', 'imports', 'integration', 'integration-diagnostic')]
     [string]$Check
 )
 
@@ -68,7 +68,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'e516a7cf1cf469e5fe4a4f043e11f8acba627a3edb28a952038b4ada1e59f778',
+    '.github/workflows/foundation.yml': 'c8d43656f391254f8ff9c6dcb8c57d93c890643db649d05ae98584426e1ba01f',
     'apps/api/Dockerfile': '8465e11d5b90d94704ec63072180f10c56dcf4becf471da84258ea21de5208c8',
     'apps/web/Dockerfile': '933af52609f2a4eb638d048605ec555e2a3443cb25b3ba5d64d5a36ec585f02a',
 }
@@ -166,7 +166,7 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             if ($LASTEXITCODE -ne 0) { throw "Import and boundary validation failed (exit $LASTEXITCODE)" }
             Invoke-Checked python @('-m', 'alembic', 'heads')
         }
-        'integration' {
+        { $_ -in @('integration', 'integration-diagnostic') } {
             if (-not (Test-Path -LiteralPath 'tests/integration/test_auth_mail.py' -PathType Leaf)) {
                 throw 'Missing required F-07 integration test: tests/integration/test_auth_mail.py'
             }
@@ -240,15 +240,37 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             $integration = @'
 set -euo pipefail
 umask 077
+focused_target=
+if [ "$1" = integration-diagnostic ]; then
+  if [[ "${GITHUB_EVENT_NAME:-}" != workflow_dispatch || "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false || -n "${CP_T133_SHA:-}" ]]; then
+    echo 'FAIL focused diagnostics require a manual dispatch without experimental modes'; exit 1
+  fi
+  case "${CP_POSTGRES_DIAGNOSTIC:-}" in
+    authorization-lock) focused_target='tests/integration/test_request_boundary.py::test_suspension_serializes_with_protected_mutation' ;;
+    booking-races) focused_target='tests/integration/test_booking_races.py' ;;
+    followup-races) focused_target='tests/integration/test_followups_races.py' ;;
+    *) echo 'FAIL unapproved PostgreSQL diagnostic selection'; exit 1 ;;
+  esac
+  printf 'Focused PostgreSQL diagnostic only: %s (SHA %s, project %s)\n' "$focused_target" "$GITHUB_SHA" "$CP_CI_PROJECT"
+fi
 private="$RUNNER_TEMP/foundation-ci-private"
 test ! -e "$private"
 mkdir -m 0700 "$private"
 cleanup() {
-  code=$?
+  local code=$? cleanup_failed=0
   trap - EXIT
   if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" && "$private" = "$RUNNER_TEMP/foundation-ci-private" && -d "$private" && -O "$private" && ! -L "$private" ]]; then
-    if ! docker compose --profile mail --profile test --profile sender --profile operator down --remove-orphans --volumes; then code=1; fi
-    if ! rm -rf -- "$private" || test -e "$private"; then code=1; fi
+    if ! docker compose --profile mail --profile test --profile sender --profile operator down --remove-orphans --volumes; then
+      echo 'FAIL scoped Compose cleanup'; cleanup_failed=1
+    fi
+    if ! rm -rf -- "$private" || test -e "$private"; then
+      echo 'FAIL synthetic secret cleanup'; cleanup_failed=1
+    fi
+    if [ "$cleanup_failed" = 1 ]; then
+      code=1
+    elif [ -n "$focused_target" ]; then
+      echo 'PASS scoped PostgreSQL volume and synthetic secret cleanup'
+    fi
   else
     echo 'FAIL unsafe cleanup project'; code=1
   fi
@@ -277,7 +299,11 @@ do
   test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = linux/amd64
   docker image inspect --format '{{json .RepoDigests}} {{.Id}} {{.Os}}/{{.Architecture}}' "$image"
 done
-docker compose --profile test --profile sender --profile operator build --pull
+if [ -n "$focused_target" ]; then
+  docker compose --profile test build --pull test
+else
+  docker compose --profile test --profile sender --profile operator build --pull
+fi
 docker compose up -d --no-build db
 for attempt in $(seq 1 40); do
   # TCP readiness excludes the temporary Unix-socket-only bootstrap server.
@@ -296,12 +322,30 @@ if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e C
   echo "FAIL controlled roles (${roles_error:-SQLSTATE unavailable}; credential-bearing diagnostics withheld)"; exit 1
 fi
 unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_AUTH_DB_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD
-docker compose --profile test run --rm --no-deps \
-  -e CP_DB_HOST=db -e CP_DB_PORT=5432 -e CP_DB_NAME=carepulse \
-  -e CP_MIGRATION_PASSWORD_FILE=/run/secrets/migration_password \
-  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
-  test python -m alembic -c alembic.ini upgrade head
+upgrade_head() {
+  docker compose --profile test run --rm --no-deps \
+    -e CP_DB_HOST=db -e CP_DB_PORT=5432 -e CP_DB_NAME=carepulse \
+    -e CP_MIGRATION_PASSWORD_FILE=/run/secrets/migration_password \
+    -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+    test python -m alembic -c alembic.ini upgrade head
+}
 
+if [ -n "$focused_target" ]; then
+  if ! upgrade_head > "$private/focused-migration.log" 2>&1; then
+    echo 'FAIL focused PostgreSQL Alembic upgrade to head'; exit 1
+  fi
+  echo 'PASS focused PostgreSQL Alembic upgrade to head'
+  docker compose exec -T db postgres --version | grep -F '17.11'
+  docker compose --profile test run --rm --no-deps -T \
+    -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+    -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+    -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+    -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+    test python tests/integration/focused_postgres.py "$focused_target"
+  exit 0
+fi
+
+upgrade_head
 docker compose --profile test run --rm --no-deps \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
@@ -836,7 +880,7 @@ fi
   echo '- Synthetic development only; production and later Waves remain closed'
 } >> "$GITHUB_STEP_SUMMARY"
 '@
-            & bash -e -c $integration
+            & bash -e -c $integration -- $Check
             if ($LASTEXITCODE -ne 0) { throw "Integration failed (exit $LASTEXITCODE)" }
         }
     }

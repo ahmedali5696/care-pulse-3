@@ -8,6 +8,13 @@ Before declaring an authorized scope complete, report relevant open Issues and d
 
 Do not implement deferred work, modify approved decisions, or close Issues without verified evidence and appropriate authorization.
 
+## CI failure triage
+
+- Record the failing test or step, run, and exact SHA. Classify the failure as application, test, or environment, and establish the cause from logs, a reproduction, or observed transaction state before changing code.
+- Run the smallest supported check first. For PostgreSQL, dispatch Foundation with a listed `postgres_diagnostic` selection, then run full Foundation at the final executable SHA for acceptance. See [PostgreSQL CI diagnostics](docs/postgresql-ci.md).
+- After two speculative corrections for the same failure, stop guessing. Require new root-cause evidence before another correction. Continue justified diagnosis, scoped corrections supported by that evidence, and required CI retries.
+- Prove ordered races with transaction checkpoints and PostgreSQL lock observations. Never mask failures with retries, skips, relaxed assertions, or arbitrary timeout increases.
+
 <!-- CODEGRAPH_START -->
 ## CodeGraph
 

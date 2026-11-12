@@ -1,4 +1,5 @@
 name: Foundation
+run-name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'Foundation PostgreSQL diagnostic' || '' }}
 
 on:
   push:
@@ -18,11 +19,20 @@ on:
         description: Exact 40-character commit SHA authorized for T133
         type: string
         default: ''
+      postgres_diagnostic:
+        description: Focused PostgreSQL diagnostics (full is required for acceptance)
+        type: choice
+        default: full
+        options:
+          - full
+          - authorization-lock
+          - booking-races
+          - followup-races
 
 # Cancel superseded PR/push checks and duplicate manual runs of the same SHA/mode.
 # Keep manual runs for different commits and spike modes independent.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.sha || 'branch' }}-${{ inputs.b04_spike && 'spike' || 'standard' }}-${{ inputs.t133_terminal && 't133' || 'ordinary' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.sha || 'branch' }}-${{ inputs.b04_spike && 'spike' || 'standard' }}-${{ inputs.t133_terminal && 't133' || 'ordinary' }}-${{ inputs.postgres_diagnostic || 'full' }}
   cancel-in-progress: true
 
 permissions:
@@ -30,6 +40,8 @@ permissions:
 
 jobs:
   inputs-and-build:
+    name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'diagnostic-static-checks' || 'inputs-and-build' }}
+    if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -101,7 +113,9 @@ jobs:
           }
 
   compose-integration:
+    name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'postgres-diagnostic' || 'compose-integration' }}
     needs: inputs-and-build
+    if: ${{ !cancelled() && (needs.inputs-and-build.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && needs.inputs-and-build.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
@@ -191,6 +205,7 @@ jobs:
           test "$(dpkg-query -W -f='${Version}' containerd.io)" = '2.4.2-3~ubuntu.24.04~noble'
 
       - name: Install pinned Playwright browser on disposable runner
+        if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -205,8 +220,19 @@ jobs:
           pnpm --filter @carepulse/web exec playwright install --with-deps chromium
 
       - name: Disposable PostgreSQL, signed Patient API, invited-role acceptance and scoped cleanup
+        if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' }}
         shell: pwsh
         run: |
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
           & pwsh -NoProfile -File ops/check.ps1 integration
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Focused disposable PostgreSQL diagnostics and scoped cleanup
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' }}
+        shell: pwsh
+        env:
+          CP_POSTGRES_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
+        run: |
+          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
+          & pwsh -NoProfile -File ops/check.ps1 integration-diagnostic
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
