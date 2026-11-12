@@ -11,11 +11,12 @@ from carepulse.appointments.book import book_appointment
 from carepulse.appointments.booking_contracts import BookAppointment
 from carepulse.db import transaction
 from carepulse.identity.contracts import ContractError
+from carepulse.main import app
 from carepulse.policies.schedule_service import load_current_schedule
 from carepulse.policies.slots import candidates_for_date
 from carepulse.policies.versions import append_version
 from sqlalchemy import text
-from test_booking import booking_body, booking_effects, new_patient
+from test_booking import booking_body, booking_effects, booking_request, new_patient
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
@@ -71,6 +72,128 @@ def test_same_patient_and_same_key_races_have_one_committed_appointment(booking_
     )
     assert all(isinstance(outcome, dict) for outcome in outcomes), outcomes
     assert outcomes[0] == outcomes[1]
+    assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
+
+
+def test_signed_same_key_distinct_patient_insert_collision_rolls_back_loser(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    first, second = new_patient(clinic), new_patient(clinic)
+    key = str(uuid4())
+    results = _concurrent(
+        lambda: booking_request(
+            clinic, clinic.owner, body=booking_body(first), key=key
+        ),
+        lambda: booking_request(
+            clinic, clinic.owner, body=booking_body(second), key=key
+        ),
+    )
+    assert sorted(status for status, _ in results) == [201, 409], results
+    assert next(data for status, data in results if status == 409)["error"]["code"] == (
+        "IDEMPOTENCY_CONFLICT"
+    )
+    assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
+    winner = next(data for status, data in results if status == 201)
+    assert booking_request(
+        clinic,
+        clinic.owner,
+        body=booking_body(UUID(winner["data"]["patient_id"])),
+        key=key,
+    ) == (201, winner)
+
+
+def test_signed_booked_receipt_survives_later_archive(booking_clinic):
+    clinic = booking_clinic
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    patient = new_patient(clinic)
+    body, key = booking_body(patient), str(uuid4())
+    original = booking_request(clinic, clinic.owner, body=body, key=key)
+    assert original[0] == 201
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        connection.execute(
+            text(
+                "UPDATE public.patients SET archived=true, "
+                "lifecycle_revision=lifecycle_revision+1 WHERE id=:patient"
+            ),
+            {"patient": patient},
+        )
+    assert booking_request(clinic, clinic.owner, body=body, key=key) == original
+    changed = {**body, "expected_price_revision": 999}
+    denied = booking_request(clinic, clinic.owner, body=changed, key=key)
+    assert denied[0] == 409
+    assert denied[1]["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert booking_request(clinic, clinic.owner, body=body, key=str(uuid4()))[0] == 409
+    assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
+
+
+def test_signed_retry_waits_behind_archive_then_replays_committed_booking(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    patient, key = new_patient(clinic), str(uuid4())
+    body = booking_body(patient)
+    archive_started = Event()
+    archive_pid = []
+
+    def archive():
+        with transaction(clinic.runtime, clinic.tenant) as connection:
+            archive_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            archive_started.set()
+            connection.execute(
+                text(
+                    "UPDATE public.patients SET archived=true, "
+                    "lifecycle_revision=lifecycle_revision+1 WHERE id=:patient"
+                ),
+                {"patient": patient},
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        with transaction(clinic.runtime, clinic.tenant) as holder:
+            saved = book_appointment(
+                holder,
+                _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
+                BookAppointment.model_validate(body),
+                key,
+            )
+            holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
+            archive_future = pool.submit(archive)
+            assert archive_started.wait(timeout=15)
+            with transaction(clinic.runtime, clinic.tenant) as observer:
+                _wait_for_postgres_lock(observer, archive_pid[0], holder_pid)
+            replay_future = pool.submit(
+                booking_request, clinic, clinic.owner, body=body, key=key
+            )
+            deadline = monotonic() + 15
+            with transaction(clinic.runtime, clinic.tenant) as observer:
+                while monotonic() < deadline:
+                    observer.execute(text("SELECT pg_stat_clear_snapshot()"))
+                    blocked = observer.scalar(
+                        text(
+                            "SELECT count(*) FROM pg_stat_activity "
+                            "WHERE wait_event_type='Lock' "
+                            "AND :holder = ANY(pg_blocking_pids(pid)) "
+                            "AND query LIKE '%SELECT archived, lifecycle_revision%'"
+                        ),
+                        {"holder": holder_pid},
+                    )
+                    if blocked:
+                        break
+                else:
+                    pytest.fail(
+                        "Expected signed retry to wait for patient lifecycle lock"
+                    )
+        archive_future.result(timeout=30)
+        status, replay = replay_future.result(timeout=30)
+    assert status == 201 and replay["data"] == saved
+    assert replay["revision"] == saved["revision"]
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert connection.scalar(
+            text("SELECT archived FROM public.patients WHERE id=:patient"),
+            {"patient": patient},
+        )
     assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
 
 

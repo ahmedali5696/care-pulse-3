@@ -454,6 +454,8 @@ def test_owner_patch_and_preview_stage_without_publication_then_activate(
         clinic, clinic.owner, method="PATCH", body=body, key=key
     )
     assert status == 200 and staged["data"]["revisions"]["schedule"] == 1
+    assert staged["data"]["revisions"]["active_schedule"] == 1
+    assert staged["data"]["revisions"]["proposed_schedule"] == 2
     assert _schedule_request(
         clinic, clinic.owner, method="PATCH", body=body, key=key
     ) == (status, staged)
@@ -474,6 +476,8 @@ def test_owner_patch_and_preview_stage_without_publication_then_activate(
         key=str(uuid4()),
     )
     assert status == 200 and preview["data"]["affected"] == []
+    assert preview["data"]["revisions"]["active_schedule"] == 1
+    assert preview["data"]["revisions"]["proposed_schedule"] == 2
     assert preview["data"]["preview_id"] != staged["data"]["preview_id"]
     activation = {
         "preview_id": preview["data"]["preview_id"],
@@ -490,6 +494,10 @@ def test_owner_patch_and_preview_stage_without_publication_then_activate(
         key=str(uuid4()),
     )
     assert status == 200 and published["data"]["schedule_revision"] == 2
+    assert (
+        published["data"]["schedule_revision"]
+        == preview["data"]["revisions"]["proposed_schedule"]
+    )
     assert published["data"]["config"] == proposed
     assert published["data"]["routine_walk_in_enabled"] is False
     assert _schedule_request(clinic, clinic.owner)[1]["data"]["config"] == proposed

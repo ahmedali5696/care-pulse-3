@@ -232,6 +232,18 @@ def resolve_tenant_receipt(
     return stored["result_projection"], stored["result_revision"]
 
 
+def require_committed_tenant_receipt(
+    connection: Connection, query: TenantReceiptQuery
+) -> tuple[dict[str, Any], int]:
+    """Receipt-only recovery after a rolled-back competing transaction."""
+    stored = resolve_tenant_receipt(connection, query)
+    if stored is None:
+        from carepulse.identity.contracts import ContractError
+
+        raise ContractError(409, "IDEMPOTENCY_CONFLICT")
+    return stored
+
+
 def resolve_operator_create_receipt(
     connection: Connection, query: OperatorReceiptQuery, verified_operator_digest: str
 ) -> tuple[UUID, int] | None:

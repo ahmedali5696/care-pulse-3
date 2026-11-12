@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
 from queue import Queue
-from threading import Event
+from threading import Barrier, Event
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -425,6 +425,59 @@ def _effects(clinic, visit, operation):
         """),
             {"tenant": clinic.tenant, "visit": visit, "operation": operation},
         ).one()
+
+
+def test_signed_same_key_distinct_visits_conflict_without_second_decision(
+    followup_clinic,
+):
+    clinic = followup_clinic
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    sources = [_source(clinic), _source(clinic)]
+    key = str(uuid4())
+    body = _decision("DEFAULT").model_dump(mode="json", exclude_unset=True)
+    ready = Barrier(2)
+
+    def decide(source):
+        ready.wait(timeout=15)
+        return _signed_visit_request(
+            clinic,
+            clinic.owner,
+            path=f"/v1/visits/{source['visit']}",
+            method="PATCH",
+            body=body,
+            key=key,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(decide, source) for source in sources]
+        results = [future.result(timeout=35) for future in futures]
+    assert sorted(status for status, _ in results) == [200, 409], results
+    assert (
+        next(result for status, result in results if status == 409)["error"]["code"]
+        == "IDEMPOTENCY_CONFLICT"
+    )
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        _staff_context(connection, UUID(clinic.owner.staff_id))
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.followup_source_decision_events "
+                    "WHERE source_visit_id=ANY(:visits)"
+                ),
+                {"visits": [source["visit"] for source in sources]},
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.idempotency_receipts "
+                    "WHERE operation='visits.followup_decision' AND idempotency_key=:key"
+                ),
+                {"key": key},
+            )
+            == 1
+        )
 
 
 @pytest.mark.parametrize("operation", ["decision", "extension"])

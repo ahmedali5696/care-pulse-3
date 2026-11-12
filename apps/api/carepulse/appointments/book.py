@@ -31,7 +31,7 @@ from carepulse.identity.receipts import (
     lookup_tenant_receipt,
 )
 from carepulse.notifications.evidence import append_outbox, append_sensitive_audit
-from carepulse.patients.lifecycle import lock_patient_for_new_appointment
+from carepulse.patients.lifecycle import lock_patient_lifecycle
 from carepulse.policies.pricing import (
     parse_money,
     quote_price,
@@ -88,7 +88,9 @@ _CREATED_FIELDS = {
 }
 
 
-def _committed_booking(connection: Connection, receipt: TenantReceiptQuery):
+def _committed_booking(
+    connection: Connection, receipt: TenantReceiptQuery, requested_patient_id: UUID
+):
     """Check current resource and every saved field before disclosing a key conflict."""
     actor = receipt.actor
     stored = lookup_tenant_receipt(
@@ -100,6 +102,17 @@ def _committed_booking(connection: Connection, receipt: TenantReceiptQuery):
     )
     if stored is None:
         return None
+    if (
+        connection.scalar(
+            text(
+                "SELECT 1 FROM public.patients "
+                "WHERE organization_id=:tenant AND id=:patient"
+            ),
+            {"tenant": actor.organization_id, "patient": requested_patient_id},
+        )
+        is None
+    ):
+        raise ContractError(404)
     projection = stored["result_projection"]
     if (
         not isinstance(projection, dict)
@@ -366,16 +379,18 @@ def book_appointment(
         idempotency_key,
         digest,
     )
-    cached = _committed_booking(connection, receipt)
+    cached = _committed_booking(connection, receipt, command.patient_id)
     if cached is not None:
         return cached[0]
-    lock_patient_for_new_appointment(
+    patient = lock_patient_lifecycle(
         connection, actor.organization_id, command.patient_id
     )
     # A concurrent same-patient request may have committed while the row was locked.
-    cached = _committed_booking(connection, receipt)
+    cached = _committed_booking(connection, receipt, command.patient_id)
     if cached is not None:
         return cached[0]
+    if patient.archived:
+        raise ContractError(409)
     try:
         lock_policy_heads(
             connection,

@@ -9,7 +9,12 @@ from pydantic import ValidationError
 
 from carepulse.identity.authorization import protected_transaction
 from carepulse.identity.contracts import ContractError, success_response
-from carepulse.visits.eligibility import extend_followup, record_followup_decision
+from carepulse.identity.receipts import ReceiptConflict
+from carepulse.visits.eligibility import (
+    extend_followup,
+    record_followup_decision,
+    recover_followup_receipt,
+)
 from carepulse.visits.eligibility_contracts import (
     ExtendFollowup,
     ExtendFollowupV2,
@@ -93,15 +98,19 @@ def patch_followup_decision(
     ],
     request: Request,
 ):
-    with _transaction(request) as (connection, actor):
-        projection, revision = record_followup_decision(
-            connection,
-            actor,
-            visit_id,
-            command,
-            request.scope["carepulse.identity"].idempotency_key,
-        )
-        return success_response(projection, revision)
+    key = request.scope["carepulse.identity"].idempotency_key
+    try:
+        with _transaction(request) as (connection, actor):
+            projection, revision = record_followup_decision(
+                connection, actor, visit_id, command, key
+            )
+            return success_response(projection, revision)
+    except ReceiptConflict:
+        with _transaction(request) as (connection, actor):
+            projection, revision = recover_followup_receipt(
+                connection, actor, visit_id, command, key, "visits.followup_decision"
+            )
+            return success_response(projection, revision)
 
 
 @router.post("/{visit_id}/extend-followup")
@@ -110,12 +119,16 @@ def post_followup_extension(
     command: Annotated[ExtendFollowup | ExtendFollowupV2, Depends(_extension_body)],
     request: Request,
 ):
-    with _transaction(request) as (connection, actor):
-        projection, revision = extend_followup(
-            connection,
-            actor,
-            visit_id,
-            command,
-            request.scope["carepulse.identity"].idempotency_key,
-        )
-        return success_response(projection, revision, status_code=201)
+    key = request.scope["carepulse.identity"].idempotency_key
+    try:
+        with _transaction(request) as (connection, actor):
+            projection, revision = extend_followup(
+                connection, actor, visit_id, command, key
+            )
+            return success_response(projection, revision, status_code=201)
+    except ReceiptConflict:
+        with _transaction(request) as (connection, actor):
+            projection, revision = recover_followup_receipt(
+                connection, actor, visit_id, command, key, "visits.extend_followup"
+            )
+            return success_response(projection, revision, status_code=201)

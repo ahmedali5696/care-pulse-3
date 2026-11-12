@@ -3,8 +3,20 @@
 from fastapi import APIRouter, Request
 from pydantic import ValidationError
 
-from carepulse.identity.authorization import protected_transaction
-from carepulse.identity.contracts import ContractError, success_response
+from carepulse.identity.authorization import (
+    can_manage_operational_settings,
+    protected_transaction,
+)
+from carepulse.identity.contracts import (
+    ContractError,
+    normalized_request_digest,
+    success_response,
+)
+from carepulse.identity.receipts import (
+    ReceiptConflict,
+    TenantReceiptQuery,
+    require_committed_tenant_receipt,
+)
 from carepulse.policies.pricing_contracts import PricingPatch, QuoteQuery
 from carepulse.policies.pricing_service import read_pricing, update_pricing
 
@@ -40,11 +52,22 @@ def get_pricing(request: Request):
 
 @router.patch("")
 def patch_pricing(command: PricingPatch, request: Request):
-    with _transaction(request) as (connection, actor):
-        result = update_pricing(
-            connection,
-            actor,
-            command,
-            request.scope["carepulse.identity"].idempotency_key,
-        )
-        return success_response(result, result["price_revision"])
+    key = request.scope["carepulse.identity"].idempotency_key
+    try:
+        with _transaction(request) as (connection, actor):
+            result = update_pricing(connection, actor, command, key)
+            return success_response(result, result["price_revision"])
+    except ReceiptConflict:
+        with _transaction(request) as (connection, actor):
+            if not can_manage_operational_settings(actor):
+                raise ContractError(403)
+            result, revision = require_committed_tenant_receipt(
+                connection,
+                TenantReceiptQuery(
+                    actor,
+                    "settings.pricing.update",
+                    key,
+                    normalized_request_digest(command),
+                ),
+            )
+            return success_response(result, revision)

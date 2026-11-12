@@ -1,13 +1,15 @@
 """B-07 publication barrier races against real PostgreSQL booking transactions."""
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from threading import Barrier, Event
 from time import monotonic
+from uuid import uuid4
 
 import pytest
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
 from carepulse.identity.contracts import ContractError
+from carepulse.main import app
 from carepulse.policies.schedule import date_rules
 from carepulse.policies.schedule_service import load_current_schedule
 from carepulse.policies.versions import lock_schedule_barrier
@@ -15,7 +17,18 @@ from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _draft, _patient, _query
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
-from test_schedule import SERVICE_DAY, _activate, _actor, _config, _publish, _stage
+from test_patients import patient_backend as patient_backend  # noqa: PLC0414
+from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
+from test_schedule import (
+    SERVICE_DAY,
+    _activate,
+    _actor,
+    _config,
+    _patch,
+    _publish,
+    _schedule_request,
+    _stage,
+)
 
 
 def _blocked_query(observer, waiter_pid, holder_pid):
@@ -33,6 +46,56 @@ def _blocked_query(observer, waiter_pid, holder_pid):
         if query:
             return " ".join(query.split())
     pytest.fail("Expected PostgreSQL lock waiter was not observed")
+
+
+@pytest.mark.parametrize("method,suffix", [("PATCH", ""), ("POST", "/preview")])
+def test_signed_identical_concurrent_schedule_stage_reuses_one_preview(
+    patient_backend, method, suffix
+):
+    clinic = patient_backend
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    body = _patch(_config()).model_dump(mode="json")
+    key = str(uuid4())
+    barrier = Barrier(2)
+
+    def send():
+        barrier.wait(timeout=15)
+        return _schedule_request(
+            clinic, clinic.owner, method=method, suffix=suffix, body=body, key=key
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = [
+            future.result(timeout=35)
+            for future in (pool.submit(send), pool.submit(send))
+        ]
+    assert first == second
+    assert first[0] == 200
+    assert first[1]["data"]["revisions"]["active_schedule"] == 1
+    assert first[1]["data"]["revisions"]["proposed_schedule"] == 2
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM public.clinic_policy_previews WHERE id=:id"),
+                {"id": first[1]["data"]["preview_id"]},
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.idempotency_receipts "
+                    "WHERE operation=:operation AND idempotency_key=:key"
+                ),
+                {
+                    "operation": "settings.schedule.stage"
+                    if method == "PATCH"
+                    else "settings.schedule.preview",
+                    "key": key,
+                },
+            )
+            == 1
+        )
 
 
 def _setup(runtime, tenant, owner):

@@ -250,6 +250,9 @@ def update_pricing(
         )
     except StalePolicyRevision as invalid:
         raise ContractError(409, "STALE_REVISION") from invalid
+    stored = resolve_tenant_receipt(connection, receipt_query)
+    if stored is not None:
+        return stored[0]
     state = current_price_state(connection, tenant)
     require_matching_revision(
         command.expected_price_revision, state["PRICE"]["revision"]

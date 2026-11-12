@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Request
 from pydantic import ValidationError
 
-from carepulse.appointments.book import book_appointment
+from carepulse.appointments.book import _committed_booking, book_appointment
 from carepulse.appointments.booking_contracts import (
     AppointmentQuery,
     BookAppointment,
@@ -20,8 +20,16 @@ from carepulse.appointments.queries import (
     list_appointments,
 )
 from carepulse.identity.authorization import protected_transaction
-from carepulse.identity.contracts import ContractError, success_response
-from carepulse.identity.receipts import lookup_tenant_receipt
+from carepulse.identity.contracts import (
+    ContractError,
+    normalized_request_digest,
+    success_response,
+)
+from carepulse.identity.receipts import (
+    ReceiptConflict,
+    TenantReceiptQuery,
+    lookup_tenant_receipt,
+)
 
 router = APIRouter(prefix="/v1/appointments")
 
@@ -64,23 +72,32 @@ async def _booking_body(request: Request) -> BookAppointment:
 def create_appointment(
     request: Request, command: Annotated[BookAppointment, Depends(_booking_body)]
 ):
-    with _transaction(request) as (connection, actor):
-        projection = book_appointment(
-            connection,
-            actor,
-            command,
-            request.scope["carepulse.identity"].idempotency_key,
-        )
-        stored = lookup_tenant_receipt(
-            connection,
-            actor.organization_id,
-            actor.staff_id,
-            "appointments.book",
-            request.scope["carepulse.identity"].idempotency_key,
-        )
-        if stored is None:
-            raise ContractError(409)
-        return success_response(projection, stored["result_revision"], status_code=201)
+    key = request.scope["carepulse.identity"].idempotency_key
+    try:
+        with _transaction(request) as (connection, actor):
+            projection = book_appointment(connection, actor, command, key)
+            stored = lookup_tenant_receipt(
+                connection,
+                actor.organization_id,
+                actor.staff_id,
+                "appointments.book",
+                key,
+            )
+            if stored is None:
+                raise ContractError(409)
+            return success_response(
+                projection, stored["result_revision"], status_code=201
+            )
+    except ReceiptConflict:
+        # The losing write has rolled back; check live grants and resource visibility anew.
+        with _transaction(request) as (connection, actor):
+            query = TenantReceiptQuery(
+                actor, "appointments.book", key, normalized_request_digest(command)
+            )
+            cached = _committed_booking(connection, query, command.patient_id)
+            if cached is None:
+                raise ContractError(409, "IDEMPOTENCY_CONFLICT")
+            return success_response(cached[0], cached[1], status_code=201)
 
 
 @router.get("")

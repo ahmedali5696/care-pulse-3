@@ -8,6 +8,7 @@ from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
 from carepulse.identity.authorization import AuthorizedStaff, protected_transaction
 from carepulse.identity.contracts import ContractError
+from carepulse.main import app
 from carepulse.policies.pricing_contracts import PricingPatch
 from carepulse.policies.pricing_service import current_price_state, update_pricing
 from carepulse.policies.versions import append_version
@@ -82,6 +83,63 @@ def test_concurrent_owner_writes_same_revision_have_one_serial_winner(
         """)
             )
             == 2
+        )
+
+
+def test_signed_identical_pricing_retry_after_policy_lock_replays_original(
+    patient_backend,
+):
+    clinic = patient_backend
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    body = _patch(standard_new_exam_egp="125.00")
+    key = str(uuid4())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with protected_transaction(
+            clinic.runtime, clinic.owner, clinic.config.policy.session_idle_minutes
+        ) as (connection, live_actor):
+            published = update_pricing(
+                connection, live_actor, PricingPatch.model_validate(body), key
+            )
+            holder = connection.scalar(text("SELECT pg_backend_pid()"))
+            future = pool.submit(
+                pricing_request,
+                clinic,
+                clinic.owner,
+                method="PATCH",
+                body=body,
+                key=key,
+            )
+            _blocked_by(clinic, holder)
+        status, result = future.result(timeout=30)
+    assert status == 200 and result["data"] == published
+    assert (
+        pricing_request(
+            clinic,
+            clinic.owner,
+            method="PATCH",
+            body={**body, "expected_price_revision": 999},
+            key=key,
+        )[0]
+        == 409
+    )
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinic_policy_versions WHERE kind='PRICE'"
+                )
+            )
+            == 2
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.idempotency_receipts "
+                    "WHERE operation='settings.pricing.update' AND idempotency_key=:key"
+                ),
+                {"key": key},
+            )
+            == 1
         )
 
 

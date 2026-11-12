@@ -620,6 +620,9 @@ def stage_or_preview(
         lock_policy_heads(connection, tenant, {"CAPACITY": "SHARE"})
     except StalePolicyRevision as invalid:
         raise ContractError(409, "STALE_REVISION") from invalid
+    stored = resolve_tenant_receipt(connection, query)
+    if stored is not None:
+        return stored[0]
     head = _schedule_head(connection, tenant)
     require_matching_revision(command.expected_schedule_revision, head["revision"])
     capacity = _capacity_state(connection, tenant)
@@ -677,7 +680,12 @@ def stage_or_preview(
         "preview_id": str(preview_id),
         "affected": effects,
         "excluded": [],
-        "revisions": {"schedule": head["revision"], "capacity": capacity["revision"]},
+        "revisions": {
+            "schedule": head["revision"],
+            "capacity": capacity["revision"],
+            "active_schedule": head["revision"],
+            "proposed_schedule": head["revision"] + 1,
+        },
     }
     _store_receipt(connection, query, projection, head["revision"])
     return projection
@@ -702,6 +710,9 @@ def activate(
         lock_policy_heads(connection, tenant, {"CAPACITY": "SHARE"})
     except StalePolicyRevision as invalid:
         raise ContractError(409, "STALE_REVISION") from invalid
+    stored = resolve_tenant_receipt(connection, query)
+    if stored is not None:
+        return stored[0]
     preview = (
         connection.execute(
             text("""

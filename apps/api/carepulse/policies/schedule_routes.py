@@ -3,9 +3,19 @@
 from fastapi import APIRouter, Request
 
 from carepulse.identity.authorization import protected_transaction
-from carepulse.identity.contracts import ContractError, success_response
+from carepulse.identity.contracts import (
+    ContractError,
+    normalized_request_digest,
+    success_response,
+)
+from carepulse.identity.receipts import (
+    ReceiptConflict,
+    TenantReceiptQuery,
+    require_committed_tenant_receipt,
+)
 from carepulse.policies.schedule_contracts import ScheduleActivate, SchedulePatch
 from carepulse.policies.schedule_service import (
+    _require_schedule_manager,
     activate,
     read_schedule,
     stage_or_preview,
@@ -36,37 +46,39 @@ def get_schedule(request: Request):
 
 @router.patch("")
 def patch_schedule(command: SchedulePatch, request: Request):
-    with _transaction(request) as (connection, actor):
-        projection = stage_or_preview(
-            connection,
-            actor,
-            command,
-            request.scope["carepulse.identity"].idempotency_key,
-            "settings.schedule.stage",
-        )
-        return success_response(projection, projection["revisions"]["schedule"])
+    return _schedule_mutation(request, command, "settings.schedule.stage")
 
 
 @router.post("/preview")
 def preview_schedule(command: SchedulePatch, request: Request):
-    with _transaction(request) as (connection, actor):
-        projection = stage_or_preview(
-            connection,
-            actor,
-            command,
-            request.scope["carepulse.identity"].idempotency_key,
-            "settings.schedule.preview",
-        )
-        return success_response(projection, projection["revisions"]["schedule"])
+    return _schedule_mutation(request, command, "settings.schedule.preview")
 
 
 @router.post("/activate")
 def activate_schedule(command: ScheduleActivate, request: Request):
-    with _transaction(request) as (connection, actor):
-        projection = activate(
-            connection,
-            actor,
-            command,
-            request.scope["carepulse.identity"].idempotency_key,
-        )
-        return success_response(projection, projection["schedule_revision"])
+    return _schedule_mutation(request, command, "settings.schedule.activate")
+
+
+def _schedule_mutation(request: Request, command, operation: str):
+    key = request.scope["carepulse.identity"].idempotency_key
+    try:
+        with _transaction(request) as (connection, actor):
+            if operation == "settings.schedule.activate":
+                projection = activate(connection, actor, command, key)
+                revision = projection["schedule_revision"]
+            else:
+                projection = stage_or_preview(
+                    connection, actor, command, key, operation
+                )
+                revision = projection["revisions"]["schedule"]
+            return success_response(projection, revision)
+    except ReceiptConflict:
+        with _transaction(request) as (connection, actor):
+            _require_schedule_manager(actor)
+            projection, revision = require_committed_tenant_receipt(
+                connection,
+                TenantReceiptQuery(
+                    actor, operation, key, normalized_request_digest(command)
+                ),
+            )
+            return success_response(projection, revision)

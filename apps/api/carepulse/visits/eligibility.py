@@ -409,6 +409,30 @@ def _replay_receipt(
     return projection, revision
 
 
+def recover_followup_receipt(
+    connection: Connection,
+    actor: AuthorizedStaff,
+    visit_id: UUID,
+    command: FollowupDecisionPatch
+    | FollowupDecisionPatchV2
+    | ExtendFollowup
+    | ExtendFollowupV2,
+    idempotency_key: str,
+    operation: str,
+) -> tuple[dict, int]:
+    """Read the winner only after the caller has rolled back and reauthorized."""
+    query = _receipt_query(
+        actor,
+        operation,
+        idempotency_key,
+        sha256(visit_id.bytes + normalize_typed_body(command)).hexdigest(),
+    )
+    stored = _replay_receipt(connection, query, visit_id)
+    if stored is None:
+        raise ContractError(409, "IDEMPOTENCY_CONFLICT")
+    return stored
+
+
 def _event_uuid(identifier: str | None) -> UUID:
     try:
         return UUID(identifier)
