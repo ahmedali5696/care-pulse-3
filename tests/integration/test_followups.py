@@ -851,7 +851,7 @@ def test_doctor_deadline_new_date_exception_preserves_actor_authority(
     claim = claim_record(clinic, response["data"]["id"])
     assert claim["approved_deadline"] == source["day"] + timedelta(days=3)
     assert claim["policy_snapshot"]["new_booking_date_exception"] == declaration
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.connect() as connection:
         event = connection.execute(
             text("""
                 SELECT e.id, e.actor_staff_id, e.actor_role, e.reason, a.after_state
