@@ -619,6 +619,7 @@ def test_current_followup_qualification_uses_live_policy_window(
                 source["visit"],
                 0,
                 now,
+                actor_role="DOCTOR_OWNER",
                 expected_visit_revision=0,
             )
 
@@ -695,6 +696,7 @@ def test_v2_receptionist_completion_current_policy_and_extension_survive_denied_
                 source["visit"],
                 0,
                 now,
+                actor_role="RECEPTIONIST",
                 expected_visit_revision=0,
             )
             assert qualification.outcome == outcome

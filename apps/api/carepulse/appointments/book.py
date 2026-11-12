@@ -356,11 +356,15 @@ def book_appointment(
         raise ContractError(403)
     if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", idempotency_key):
         raise ContractError(422)
+    try:
+        digest = normalized_request_digest(command)
+    except UnicodeEncodeError as invalid:
+        raise ContractError(422) from invalid
     receipt = TenantReceiptQuery(
         actor,
         "appointments.book",
         idempotency_key,
-        normalized_request_digest(command),
+        digest,
     )
     cached = _committed_booking(connection, receipt)
     if cached is not None:
