@@ -164,6 +164,16 @@ def test_retained_decimal_capacity_matches_signed_schedule_slots_and_booking(
     app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
     with transaction(clinic.runtime, clinic.tenant) as connection:
         _policy_capacity(connection, clinic.tenant, capacity=2.0)
+        assert (
+            connection.scalar(
+                text("""
+                SELECT payload->>'capacity' FROM public.clinic_policy_versions
+                WHERE organization_id=:tenant AND kind='CAPACITY' AND version=2
+            """),
+                {"tenant": clinic.tenant},
+            )
+            == "2.0"
+        )
     config = _config(allow_overlap=True)
     patch = _patch(
         config, revision=2, confirmation={"capacity": 2, "capacity_revision": 2}

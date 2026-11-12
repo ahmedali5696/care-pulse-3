@@ -1,5 +1,6 @@
 """D-06 DoctorControl and approval SQL simulation; no Visit or admission API."""
 
+import json
 from datetime import timedelta
 from uuid import UUID, uuid4
 
@@ -18,9 +19,10 @@ def _policy_capacity(connection, tenant, *, capacity=2, paused=False):
             INSERT INTO public.clinic_policy_versions
                 (organization_id, kind, version, payload)
             VALUES (:tenant, 'CAPACITY', 2,
-                jsonb_build_object('capacity', :capacity, 'paused', :paused))
+                jsonb_build_object('capacity', CAST(:capacity_json AS jsonb),
+                                   'paused', :paused))
         """),
-        {"tenant": tenant, "capacity": capacity, "paused": paused},
+        {"tenant": tenant, "capacity_json": json.dumps(capacity), "paused": paused},
     )
     connection.execute(
         text("""
@@ -138,6 +140,13 @@ def test_scoped_confirmation_consumes_once_in_rolled_back_sql_simulation(
         second = _appointment(connection, tenant, doctor)
         _arrive(connection, tenant, doctor, second)
         _policy_capacity(connection, tenant, capacity=saved_capacity)
+        assert connection.scalar(
+            text("""
+                SELECT payload->>'capacity' FROM public.clinic_policy_versions
+                WHERE organization_id=:tenant AND kind='CAPACITY' AND version=2
+            """),
+            {"tenant": tenant},
+        ) == str(saved_capacity)
     # D-07 requires a matching Visit on COMMIT. Exercise real D-06 SQL
     # transitions and one-use guards inside a transaction that MUST roll back.
     with (
