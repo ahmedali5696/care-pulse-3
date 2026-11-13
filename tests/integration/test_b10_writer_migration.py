@@ -341,6 +341,12 @@ def test_t160_populated_schedule_guard_and_failed_successor_are_atomic(
             },
         )
         signature = "public.b10_schedule_without_offset_guard(uuid,jsonb)"
+        signatures = (
+            "public.lock_doctor_admission_capacity(uuid,uuid,date,text)",
+            "public.assert_confirmation_issued_scope(public.doctor_admission_confirmations)",
+            "public.assert_admission_confirmation_final()",
+            signature,
+        )
         function = text("""
             SELECT pg_get_functiondef(p.oid), p.oid, p.proowner, p.prosecdef,
                    p.proconfig, p.proacl::text,
@@ -349,9 +355,11 @@ def test_t160_populated_schedule_guard_and_failed_successor_are_atomic(
             FROM pg_proc p WHERE p.oid=CAST(:signature AS regprocedure)
         """)
         with migration.connect() as connection:
-            before_function = connection.execute(
-                function, {"signature": signature}
-            ).one()
+            before_functions = {
+                name: connection.execute(function, {"signature": name}).one()
+                for name in signatures
+            }
+            before_function = before_functions[signature]
             before_policies = connection.execute(
                 text("""
                     SELECT kind,version,payload::text FROM public.clinic_policy_versions
@@ -397,10 +405,10 @@ def test_t160_populated_schedule_guard_and_failed_successor_are_atomic(
                 )
                 == DURATION_AFTER
             )
-            assert (
-                connection.execute(function, {"signature": signature}).one()
-                == before_function
-            )
+            assert {
+                name: connection.execute(function, {"signature": name}).one()
+                for name in signatures
+            } == before_functions
             assert (
                 connection.execute(
                     text("""
