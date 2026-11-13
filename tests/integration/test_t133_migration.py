@@ -21,7 +21,7 @@ from test_followup_persistence import _v2_booking, _v2_command, _v2_record, _v2_
 ROOT = Path(__file__).resolve().parents[2]
 BEFORE = "0032_b10_cairo_offset_guard"
 AFTER = "0033_d08_terminal_writer"
-CURRENT_HEAD = "0039_t160_capacity_numeric"
+CURRENT_HEAD = "0040_t173_numeric_money"
 TERMINAL = "public.transition_terminal_appointment(uuid,uuid,bigint,jsonb)"
 LEGACY = "public.complete_examined_visit(uuid,uuid,bigint,boolean)"
 PRIVATE = "public.d07_complete_examined_visit_raw(uuid,uuid,bigint,boolean)"

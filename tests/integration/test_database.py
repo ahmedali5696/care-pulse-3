@@ -20,7 +20,7 @@ from sqlalchemy import URL, create_engine, text
 from sqlalchemy.exc import DBAPIError
 
 ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0039_t160_capacity_numeric"
+REVISION = "0040_t173_numeric_money"
 
 
 @pytest.fixture(scope="module", autouse=True)
