@@ -198,9 +198,10 @@ def new_patient(clinic):
         return _patient(connection, clinic.tenant)
 
 
-def test_signed_numeric_max_quote_booking_snapshot_and_receipt(booking_clinic):
+@pytest.mark.parametrize("cents", ("01", "99"))
+def test_signed_numeric_max_quote_booking_snapshot_and_receipt(booking_clinic, cents):
     clinic = booking_clinic
-    base = "9" * 131_072 + ".00"
+    base = "9" * 131_072 + f".{cents}"
     changed_status, _ = pricing_request(
         clinic,
         clinic.owner,
