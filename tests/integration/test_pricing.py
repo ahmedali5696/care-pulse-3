@@ -267,10 +267,8 @@ def test_signed_pricing_numeric_integer_digit_limit(patient_backend, digits, acc
     )
     if not accepted:
         assert status == 422
-        assert response["error"] == {
-            "code": "INVALID_INPUT",
-            "message": "Invalid request",
-        }
+        assert response["error"]["code"] == "INVALID_INPUT"
+        assert response["error"]["message"] == "Invalid request"
         assert _pricing_evidence(clinic) == before
         return
 

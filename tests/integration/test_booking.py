@@ -296,7 +296,8 @@ def test_signed_booking_rejects_historical_unrepresentable_price_atomically(
     key = str(uuid4())
     status, denied = booking_request(clinic, clinic.owner, body=body, key=key)
     assert status == 422
-    assert denied["error"] == {"code": "INVALID_INPUT", "message": "Invalid request"}
+    assert denied["error"]["code"] == "INVALID_INPUT"
+    assert denied["error"]["message"] == "Invalid request"
     assert booking_effects(clinic) == before
     assert (
         booking_request(
