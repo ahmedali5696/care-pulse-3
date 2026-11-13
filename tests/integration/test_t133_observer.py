@@ -18,7 +18,7 @@ TERMINAL_AUDIT_ACTIONS = (
     "VISIT_EXAMINATION_CANCELLED",
     "VISIT_EXAMINATION_COMPLETED",
 )
-CURRENT_HEAD = "0039_t160_capacity_numeric"
+CURRENT_HEAD = "0040_t173_numeric_money"
 
 
 @pytest.fixture(scope="module")

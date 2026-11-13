@@ -44,6 +44,8 @@ from test_followup_persistence import _v2_priced_followup
 MIGRATION = ROOT / "db/migrations/versions/0019_b06_price_policy_strings.py"
 T145_BEFORE = "0033_d08_terminal_writer"
 T145_AFTER = "0034_t145_exact_percentage"
+T173_BEFORE = "0039_t160_capacity_numeric"
+T173_AFTER = "0040_t173_numeric_money"
 
 
 def _revisions():
@@ -582,6 +584,192 @@ def test_t145_upgrade_preserves_historical_numeric_percentage_and_receipt(
                 {"appointment": appointment},
             )
         assert immutable.value.orig.sqlstate == "23514"
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
+def test_t173_populated_0039_money_successor_and_atomic_failed_upgrade(
+    admin, empty_database, tmp_path
+):
+    assert (
+        runpy.run_path(str(ROOT / "db/migrations/versions/0040_t173_numeric_money.py"))[
+            "down_revision"
+        ]
+        == T173_BEFORE
+    )
+    _create_empty_database(admin, empty_database)
+    migration = _engine("carepulse_migration", empty_database)
+    runtime = _engine("carepulse_runtime", empty_database)
+    functions = (
+        "public.t145_decimal_compare_rational(text,numeric,numeric)",
+        "public.t145_percent_net_matches(numeric,numeric,text)",
+    )
+    definition = text("""
+        SELECT pg_get_functiondef(p.oid), p.oid, p.proowner, p.prosecdef,
+               p.proconfig, p.proacl::text,
+               has_function_privilege('carepulse_runtime',p.oid,'EXECUTE'),
+               has_function_privilege('carepulse_operator',p.oid,'EXECUTE')
+        FROM pg_proc p WHERE p.oid=CAST(:signature AS regprocedure)
+    """)
+    try:
+        _at_revision(migration, T173_BEFORE)
+        operator, tenant = uuid4(), uuid4()
+        with migration.begin() as connection:
+            connection.execute(
+                text("""
+                    INSERT INTO public.operator_identities
+                        (id, credential_digest, issued_by_reference, issued_at)
+                    VALUES (:operator, :digest, 'synthetic-t173', clock_timestamp())
+                """),
+                {"operator": operator, "digest": f"synthetic:{operator}"},
+            )
+            connection.execute(
+                text("""
+                    INSERT INTO public.organizations (id, branch, created_by_operator_id)
+                    VALUES (:tenant, 'Synthetic T173 clinic', :operator)
+                """),
+                {"tenant": tenant, "operator": operator},
+            )
+            doctor = _activate_clinic(connection, tenant, operator)
+        with transaction(runtime, tenant) as connection:
+            saved = persist_appointment(
+                connection,
+                _draft(
+                    _patient(connection, tenant),
+                    doctor,
+                    price_snapshot={
+                        "discount_type": "PERCENT",
+                        "discount_value": "12.345",
+                        "discount_reason": "Historical approved percentage",
+                        "net_egp": "87.66",
+                    },
+                ),
+                _query(tenant, doctor),
+            )
+            assert saved["net_egp"] == "87.66"
+            assert (
+                append_version(
+                    connection,
+                    str(tenant),
+                    "PRICE",
+                    {
+                        "standard_new_exam_egp": "120.00",
+                        "preferential_followup_egp": "50.00",
+                        "urgent_base_egp": None,
+                        "urgent_enabled": False,
+                    },
+                    1,
+                )
+                == 2
+            )
+        with migration.connect() as connection:
+            before = _database_fingerprint(connection)
+            before_history = connection.execute(
+                text("""
+                    SELECT id, appointment_id, appointment_revision, action,
+                           row_to_json(h)::text
+                    FROM public.appointment_history h
+                    WHERE organization_id=:tenant ORDER BY id
+                """),
+                {"tenant": tenant},
+            ).all()
+            before_functions = {
+                signature: connection.execute(
+                    definition, {"signature": signature}
+                ).one()
+                for signature in functions
+            }
+            assert len(before["snapshots"]) == len(before["receipts"]) == 1
+            assert before_history
+            assert all(
+                row[1] and row[2]
+                for row in before["row_security"]
+                if row[0]
+                in (
+                    "appointment_price_snapshots",
+                    "idempotency_receipts",
+                    "clinic_policy_versions",
+                )
+            )
+
+        scripts = tmp_path / "migrations"
+        shutil.copytree(ROOT / "db/migrations", scripts)
+        successor = scripts / "versions/0040_t173_numeric_money.py"
+        source_text = successor.read_text(encoding="utf-8")
+        assert source_text.count("def downgrade()") == 1
+        successor.write_text(
+            source_text.replace(
+                "def downgrade()",
+                '    op.execute("SELECT 1 / 0")\n\n\ndef downgrade()',
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(DBAPIError) as failed:
+            _at_revision(migration, T173_AFTER, scripts)
+        assert failed.value.orig.sqlstate == "22012"
+        with migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT version_num FROM public.alembic_version")
+                )
+                == T173_BEFORE
+            )
+            assert _database_fingerprint(connection) == before
+            assert {
+                signature: connection.execute(
+                    definition, {"signature": signature}
+                ).one()
+                for signature in functions
+            } == before_functions
+
+        # 131071 integer digits fit NUMERIC; cent-scaling at 0039 overflows.
+        huge = "1" + "0" * 131070 + ".00"
+        huge_check = text("""
+            SELECT public.t145_percent_net_matches(
+                CAST(:amount AS numeric), CAST(:amount AS numeric), '0.0')
+        """)
+        with pytest.raises(DBAPIError) as legacy, migration.connect() as connection:
+            connection.scalar(huge_check, {"amount": huge})
+        assert legacy.value.orig.sqlstate == "22003"
+
+        _at_revision(migration, T173_AFTER)
+        _at_revision(migration, T173_AFTER)
+        with migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT version_num FROM public.alembic_version")
+                )
+                == T173_AFTER
+            )
+            assert _database_fingerprint(connection) == before
+            assert (
+                connection.execute(
+                    text("""
+                    SELECT id, appointment_id, appointment_revision, action,
+                           row_to_json(h)::text
+                    FROM public.appointment_history h
+                    WHERE organization_id=:tenant ORDER BY id
+                """),
+                    {"tenant": tenant},
+                ).all()
+                == before_history
+            )
+            for signature in functions:
+                upgraded = connection.execute(
+                    definition, {"signature": signature}
+                ).one()
+                assert upgraded[1:] == before_functions[signature][1:]
+                assert upgraded[0] != before_functions[signature][0]
+            assert connection.scalar(huge_check, {"amount": huge}) is True
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT public.t145_percent_net_matches(100.00, 87.66, '12.345')
+                """)
+                )
+                is True
+            )
     finally:
         runtime.dispose()
         migration.dispose()

@@ -14,6 +14,7 @@ from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
 from test_followup_persistence import _v2_booking, _v2_command, _v2_source
+from test_queue_capacity import _policy_capacity
 from test_visit_migration import ROOT, _prepare, _upgrade
 
 BEFORE = "0028_d08_followup_provenance"
@@ -25,6 +26,7 @@ EXACT_AFTER = "0035_t146_cairo_exact_schedule"
 PARITY_AFTER = "0036_b10_confirmation_parity"
 UNICODE_AFTER = "0037_t155_followup_reason"
 DURATION_AFTER = "0038_t159_duration_numeric"
+CAPACITY_AFTER = "0039_t160_capacity_numeric"
 
 
 def _publish_bookable_policies(
@@ -272,6 +274,164 @@ def test_t159_duration_successor_preserves_saved_policy_and_private_guard(
                 ).one()
                 == identity
             )
+        with transaction(runtime, tenant) as connection:
+            claim = _v2_command(
+                connection, "create_followup_claim_ordered", source, **booking
+            )
+            assert claim is not None
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
+def test_t160_populated_schedule_guard_and_failed_successor_are_atomic(
+    admin, empty_database, tmp_path
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, DURATION_AFTER)
+        day = date(2030, 5, 6)
+        _publish_bookable_policies(migration, tenant, timed_day=day)
+        with transaction(runtime, tenant) as connection:
+            source = _v2_source(connection, tenant, doctor)
+        with transaction(runtime, tenant) as connection:
+            _policy_capacity(connection, tenant, capacity=2.0)
+        with migration.begin() as connection:
+            connection.execute(
+                text("""
+                    INSERT INTO public.clinic_policy_versions
+                        (organization_id,kind,version,payload)
+                    SELECT organization_id,kind,3,
+                           jsonb_set(payload,'{allow_overlap}','true'::jsonb)
+                    FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant AND kind='SCHEDULE' AND version=2
+                """),
+                {"tenant": tenant},
+            )
+            connection.execute(
+                text("""
+                    INSERT INTO public.clinic_schedule_intervals
+                        (organization_id,policy_version,interval_kind,weekday,
+                         service_date,starts_at,ends_at)
+                    SELECT organization_id,3,interval_kind,weekday,
+                           service_date,starts_at,ends_at
+                    FROM public.clinic_schedule_intervals
+                    WHERE organization_id=:tenant AND policy_version=2
+                """),
+                {"tenant": tenant},
+            )
+            connection.execute(
+                text("""
+                    UPDATE public.clinic_policy_heads
+                    SET current_version=3,revision=revision+1
+                    WHERE organization_id=:tenant AND kind='SCHEDULE'
+                """),
+                {"tenant": tenant},
+            )
+        starts = datetime.combine(day, time(9), ZoneInfo("Africa/Cairo"))
+        booking = _priced_booking(
+            source,
+            service_date=day.isoformat(),
+            booking_mode="EXACT_TIME",
+            starts_at=starts.isoformat(),
+            ends_at=(starts + timedelta(minutes=60)).isoformat(),
+            new_booking_date_exception={
+                "selected_service_date": day.isoformat(),
+                "reason": "Approved future schedule",
+            },
+        )
+        signature = "public.b10_schedule_without_offset_guard(uuid,jsonb)"
+        function = text("""
+            SELECT pg_get_functiondef(p.oid), p.oid, p.proowner, p.prosecdef,
+                   p.proconfig, p.proacl::text,
+                   has_function_privilege('carepulse_runtime', p.oid, 'EXECUTE'),
+                   has_function_privilege('carepulse_operator', p.oid, 'EXECUTE')
+            FROM pg_proc p WHERE p.oid=CAST(:signature AS regprocedure)
+        """)
+        with migration.connect() as connection:
+            before_function = connection.execute(
+                function, {"signature": signature}
+            ).one()
+            before_policies = connection.execute(
+                text("""
+                    SELECT kind,version,payload::text FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant ORDER BY kind,version
+                """),
+                {"tenant": tenant},
+            ).all()
+            before_receipts = connection.execute(
+                text("""
+                    SELECT id,operation,result_projection::text FROM public.idempotency_receipts
+                    WHERE organization_id=:tenant ORDER BY id
+                """),
+                {"tenant": tenant},
+            ).all()
+            assert before_receipts
+        with transaction(runtime, tenant) as connection:
+            with pytest.raises(DBAPIError) as old_guard, connection.begin_nested():
+                _v2_command(
+                    connection, "create_followup_claim_ordered", source, **booking
+                )
+            assert old_guard.value.orig.sqlstate == "22P02"
+            before_effects = _writer_effect_counts(connection, tenant)
+
+        scripts = tmp_path / "migrations"
+        shutil.copytree(ROOT / "db/migrations", scripts)
+        successor = scripts / "versions/0039_t160_capacity_numeric.py"
+        source_text = successor.read_text(encoding="utf-8")
+        assert source_text.count("def downgrade()") == 1
+        successor.write_text(
+            source_text.replace(
+                "def downgrade()",
+                '    op.execute("SELECT 1 / 0")\n\n\ndef downgrade()',
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(DBAPIError) as failed:
+            _upgrade(migration, CAPACITY_AFTER, scripts)
+        assert failed.value.orig.sqlstate == "22012"
+        with migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT version_num FROM public.alembic_version")
+                )
+                == DURATION_AFTER
+            )
+            assert (
+                connection.execute(function, {"signature": signature}).one()
+                == before_function
+            )
+            assert (
+                connection.execute(
+                    text("""
+                    SELECT kind,version,payload::text FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant ORDER BY kind,version
+                """),
+                    {"tenant": tenant},
+                ).all()
+                == before_policies
+            )
+            assert (
+                connection.execute(
+                    text("""
+                    SELECT id,operation,result_projection::text FROM public.idempotency_receipts
+                    WHERE organization_id=:tenant ORDER BY id
+                """),
+                    {"tenant": tenant},
+                ).all()
+                == before_receipts
+            )
+        with transaction(runtime, tenant) as connection:
+            assert _writer_effect_counts(connection, tenant) == before_effects
+
+        _upgrade(migration, CAPACITY_AFTER)
+        _upgrade(migration, CAPACITY_AFTER)
+        with migration.connect() as connection:
+            after_function = connection.execute(
+                function, {"signature": signature}
+            ).one()
+            assert after_function[1:] == before_function[1:]
+            assert "::numeric)::integer" in after_function[0]
         with transaction(runtime, tenant) as connection:
             claim = _v2_command(
                 connection, "create_followup_claim_ordered", source, **booking

@@ -16,6 +16,15 @@ from test_database import ROOT, _create_empty_database, _engine
 from test_database import admin as admin  # noqa: PLC0414 - fixture export
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
+from test_queue_capacity import (
+    _doctor_context,
+    _issue,
+    _lock,
+    _policy_capacity,
+    _simulated_exam,
+)
+from test_queue_persistence import DAY, _appointment, _arrive
+from test_visit_migration import _prepare
 
 MIGRATION = ROOT / "db/migrations/versions/0025_d06_queue_foundations.py"
 BEFORE = "0024_b06_followup_window"
@@ -89,7 +98,7 @@ def _preserved_rows(connection):
     }
 
 
-def _predecessor_security(connection):
+def _predecessor_security(connection, tables=PRESERVED_TABLES):
     # Compare effective privileges, including column grants, not just relacl.
     return connection.execute(
         text("""
@@ -110,7 +119,7 @@ def _predecessor_security(connection):
               AND r.rolname IN ('carepulse_runtime', 'carepulse_operator')
             ORDER BY c.relname, r.rolname, a.attname, p.privilege
         """),
-        {"tables": list(PRESERVED_TABLES)},
+        {"tables": list(tables)},
     ).all()
 
 
@@ -430,4 +439,115 @@ def test_seed_function_trigger_and_effective_privileges(admin, empty_database):
                         {"table": f"public.{table}", "privilege": privilege},
                     )
     finally:
+        migration.dispose()
+
+
+def test_t160_populated_0038_capacity_and_queue_survive_numeric_upgrade(
+    admin, empty_database
+):
+    before_revision = "0038_t159_duration_numeric"
+    after_revision = "0039_t160_capacity_numeric"
+    assert (
+        runpy.run_path(
+            str(ROOT / "db/migrations/versions/0039_t160_capacity_numeric.py")
+        )["down_revision"]
+        == before_revision
+    )
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    tables = (*PRESERVED_TABLES, *QUEUE_TABLES)
+    try:
+        _upgrade(migration, before_revision)
+        with transaction(runtime, tenant) as connection:
+            first = _appointment(connection, tenant, doctor)
+            second = _appointment(connection, tenant, doctor)
+            _arrive(connection, tenant, doctor, first)
+            _arrive(connection, tenant, doctor, second)
+            _policy_capacity(connection, tenant, capacity=2.0)
+
+        def saved_rows(connection):
+            return {
+                table: connection.execute(
+                    text(
+                        f"SELECT row_to_json(t)::text FROM public.{table} t ORDER BY 1"
+                    )
+                )
+                .scalars()
+                .all()
+                for table in tables
+            }
+
+        with migration.connect() as connection:
+            before_rows = saved_rows(connection)
+            before_grants = _predecessor_security(connection, tables)
+            assert len(before_rows["queue_entries"]) == 2
+            assert len(before_rows["clinic_policy_versions"]) > 0
+            assert before_rows["idempotency_receipts"]
+            assert all(
+                row.relrowsecurity and row.relforcerowsecurity for row in before_grants
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                SELECT payload->>'capacity' FROM public.clinic_policy_versions
+                WHERE organization_id=:tenant AND kind='CAPACITY' AND version=2
+            """),
+                    {"tenant": tenant},
+                )
+                == "2.0"
+            )
+        with (
+            pytest.raises(DBAPIError) as old_guard,
+            transaction(runtime, tenant) as conn,
+        ):
+            _lock(conn, tenant, doctor)
+        assert old_guard.value.orig.sqlstate == "22P02"
+
+        _upgrade(migration, after_revision)
+        _upgrade(migration, after_revision)
+        with migration.connect() as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT version_num FROM public.alembic_version")
+                )
+                == after_revision
+            )
+            assert saved_rows(connection) == before_rows
+            assert _predecessor_security(connection, tables) == before_grants
+            for signature in (
+                "lock_doctor_admission_capacity(uuid,uuid,date,text)",
+                "assert_confirmation_issued_scope(public.doctor_admission_confirmations)",
+                "assert_admission_confirmation_final()",
+            ):
+                definition = connection.scalar(
+                    text("SELECT pg_get_functiondef(CAST(:signature AS regprocedure))"),
+                    {"signature": f"public.{signature}"},
+                )
+                assert "::numeric)::bigint" in definition
+
+        # D-07 requires a Visit on commit; prove approval guards on the real
+        # database and roll back this synthetic examination.
+        with (
+            pytest.raises(RuntimeError, match="rollback T160 simulation"),
+            transaction(runtime, tenant) as connection,
+        ):
+            _doctor_context(connection, doctor)
+            assert _lock(connection, tenant, doctor).configured_capacity == 2
+            _simulated_exam(connection, tenant, doctor, first)
+            approval = _issue(connection, tenant, doctor, second, "MAIN", DAY)
+            connection.execute(
+                text("SET CONSTRAINTS admission_confirmation_final IMMEDIATE")
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT state FROM public.doctor_admission_confirmations
+                    WHERE organization_id=:tenant AND id=:approval
+                """),
+                    {"tenant": tenant, "approval": approval},
+                )
+                == "ISSUED"
+            )
+            raise RuntimeError("rollback T160 simulation")
+    finally:
+        runtime.dispose()
         migration.dispose()
