@@ -3,7 +3,7 @@
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation, localcontext
 
-from carepulse.policies.pricing import exact_net
+from carepulse.policies.pricing import exact_net, require_numeric_money
 
 PENNY = Decimal("0.01")
 
@@ -16,6 +16,7 @@ def _decimal(amount: object, *, money: bool) -> Decimal:
         if not number.is_finite() or number < 0:
             raise ValueError("Nonfinite or negative amount")
         if money:
+            require_numeric_money(number)
             with localcontext() as context:
                 context.prec = max(
                     28,

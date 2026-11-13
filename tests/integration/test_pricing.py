@@ -255,6 +255,40 @@ def _pricing_evidence(clinic):
     return heads, counts
 
 
+@pytest.mark.parametrize("digits,accepted", [(131_072, True), (131_073, False)])
+def test_signed_pricing_numeric_integer_digit_limit(patient_backend, digits, accepted):
+    clinic = patient_backend
+    base = "9" * digits + ".00"
+    key = str(uuid4())
+    before = _pricing_evidence(clinic)
+    body = _patch(standard_new_exam_egp=base)
+    status, response = pricing_request(
+        clinic, clinic.owner, method="PATCH", body=body, key=key
+    )
+    if not accepted:
+        assert status == 422
+        assert response["error"] == {
+            "code": "INVALID_INPUT",
+            "message": "Invalid request",
+        }
+        assert _pricing_evidence(clinic) == before
+        return
+
+    assert status == 200
+    assert response["data"]["standard_new_exam_egp"] == base
+    assert pricing_request(
+        clinic, clinic.owner, method="PATCH", body=body, key=key
+    ) == (
+        status,
+        response,
+    )
+    assert (
+        pricing_request(clinic, clinic.receptionist)[1]["data"]["standard_new_exam_egp"]
+        == base
+    )
+    assert _pricing_evidence(clinic)[1]["receipts"] == before[1]["receipts"] + 1
+
+
 def test_signed_pricing_surrogate_reason_is_422_before_receipt(patient_backend):
     clinic = patient_backend
     before = _pricing_evidence(clinic)

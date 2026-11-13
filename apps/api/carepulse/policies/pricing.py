@@ -9,10 +9,18 @@ MONEY_PATTERN = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]{1,2})?\Z")
 PERCENT_PATTERN = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]+)?\Z")
 
 
+def require_numeric_money(value: Decimal) -> None:
+    # PostgreSQL unconstrained NUMERIC stores at most 131072 integer digits.
+    if value and value.adjusted() >= 131_072:
+        raise ValueError("EGP amount exceeds PostgreSQL NUMERIC range")
+
+
 def parse_money(value: str) -> Decimal:
     if not isinstance(value, str) or MONEY_PATTERN.fullmatch(value) is None:
         raise ValueError("Invalid EGP decimal string")
-    return Decimal(value)
+    amount = Decimal(value)
+    require_numeric_money(amount)
+    return amount
 
 
 def parse_percent(value: str) -> Decimal:
@@ -29,6 +37,7 @@ def _money(value: str | Decimal) -> Decimal:
         return parse_money(value)
     if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
         raise ValueError("Invalid EGP amount")
+    require_numeric_money(value)
     # Decimal can originate from a legacy JSON number in a trusted policy row.
     with localcontext() as ctx:
         ctx.prec = max(28, len(format(value, "f")) + 8)

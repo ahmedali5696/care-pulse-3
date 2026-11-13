@@ -198,6 +198,117 @@ def new_patient(clinic):
         return _patient(connection, clinic.tenant)
 
 
+def test_signed_numeric_max_quote_booking_snapshot_and_receipt(booking_clinic):
+    clinic = booking_clinic
+    base = "9" * 131_072 + ".00"
+    changed_status, _ = pricing_request(
+        clinic,
+        clinic.owner,
+        method="PATCH",
+        body=_patch(expected_price_revision=2, standard_new_exam_egp=base),
+        key=str(uuid4()),
+    )
+    assert changed_status == 200
+    percentage = "12.34567890123456789"
+    quote_status, quoted = pricing_request(
+        clinic,
+        clinic.receptionist,
+        query={
+            "service_type": "NEW_EXAMINATION",
+            "discount_type": "PERCENT",
+            "discount_value": percentage,
+        },
+    )
+    assert quote_status == 200
+    quote = quoted["data"]["price_quote"]
+    assert quote["base_egp"] == base
+    body = booking_body(
+        new_patient(clinic),
+        discount={
+            "discount_type": "PERCENT",
+            "discount_value": percentage,
+            "discount_reason": "Approved exact percentage",
+        },
+        expected_base_egp=quote["base_egp"],
+        expected_net_egp=quote["net_egp"],
+        expected_price_revision=quote["price_revision"],
+    )
+    key = str(uuid4())
+    status, saved = booking_request(clinic, clinic.owner, body=body, key=key)
+    assert status == 201
+    assert saved["data"]["base_egp"] == base
+    assert saved["data"]["net_egp"] == quote["net_egp"]
+    assert saved["data"]["discount_value"] == percentage
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        persisted = connection.execute(
+            text("""
+                SELECT base_egp, net_egp, creation_standard_base_egp,
+                       discount_percent_text
+                FROM public.appointment_price_snapshots
+                WHERE organization_id=:tenant AND appointment_id=:appointment
+            """),
+            {"tenant": clinic.tenant, "appointment": UUID(saved["data"]["id"])},
+        ).one()
+    assert persisted == (
+        Decimal(base),
+        Decimal(quote["net_egp"]),
+        Decimal(base),
+        percentage,
+    )
+    before = booking_effects(clinic)
+    assert booking_request(clinic, clinic.owner, body=body, key=key) == (status, saved)
+    assert booking_effects(clinic) == before
+
+
+def test_signed_booking_rejects_historical_unrepresentable_price_atomically(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    oversized = "1" + "0" * 131_072 + ".00"
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        append_version(
+            connection,
+            clinic.tenant,
+            "PRICE",
+            {
+                "standard_new_exam_egp": oversized,
+                "preferential_followup_egp": None,
+                "urgent_base_egp": None,
+                "urgent_enabled": False,
+            },
+            2,
+        )
+    before = booking_effects(clinic)
+    query_status, query_denied = pricing_request(
+        clinic,
+        clinic.receptionist,
+        query={
+            "service_type": "NEW_EXAMINATION",
+            "discount_type": "NONE",
+            "discount_value": "0",
+        },
+    )
+    assert query_status == 422
+    assert query_denied["error"]["code"] == "INVALID_INPUT"
+    patient = new_patient(clinic)
+    body = booking_body(patient, expected_price_revision=3)
+    key = str(uuid4())
+    status, denied = booking_request(clinic, clinic.owner, body=body, key=key)
+    assert status == 422
+    assert denied["error"] == {"code": "INVALID_INPUT", "message": "Invalid request"}
+    assert booking_effects(clinic) == before
+    assert (
+        booking_request(
+            clinic,
+            clinic.owner,
+            body={**body, "expected_base_egp": oversized},
+            key=str(uuid4()),
+        )[0]
+        == 422
+    )
+    assert booking_effects(clinic) == before
+
+
 def test_signed_booking_rejects_unrepresentable_reason_then_replays_valid_receipt(
     booking_clinic,
 ):
