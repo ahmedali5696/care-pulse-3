@@ -40,6 +40,8 @@ def booking_request(
     key="",
     query=None,
     raw_body=None,
+    stream_chunks=None,
+    declared_length=None,
 ):
     encoded = (
         raw_body
@@ -89,6 +91,8 @@ def booking_request(
             .encode(),
         ),
     ]
+    if declared_length is not None:
+        headers.append((b"content-length", str(declared_length).encode()))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -105,8 +109,16 @@ def booking_request(
     }
     messages = []
 
+    chunks = stream_chunks if stream_chunks is not None else [encoded]
+    cursor = iter(enumerate(chunks))
+
     async def receive():
-        return {"type": "http.request", "body": encoded, "more_body": False}
+        index, chunk = next(cursor)
+        return {
+            "type": "http.request",
+            "body": chunk,
+            "more_body": index < len(chunks) - 1,
+        }
 
     async def send(message):
         messages.append(message)
@@ -385,6 +397,32 @@ def test_signed_booking_roundtrips_16384_digit_percentage_and_receipt(booking_cl
         assert numeric_value is None
         assert text_value == percentage
         assert net == Decimal("99.99")
+
+
+def test_signed_booking_one_mib_boundary_and_oversized_denial_has_no_effects(
+    booking_clinic,
+):
+    clinic = booking_clinic
+    valid = json.dumps(
+        booking_body(new_patient(clinic)), separators=(",", ":")
+    ).encode()
+    exact = valid + b" " * (1_048_576 - len(valid))
+    assert len(exact) == 1_048_576
+    status, saved = booking_request(
+        clinic, clinic.owner, raw_body=exact, key=str(uuid4())
+    )
+    assert status == 201, saved
+    before = booking_effects(clinic)
+    oversized = exact + b" "
+    for extras in (
+        {"declared_length": len(oversized)},
+        {"stream_chunks": [oversized[:524_288], oversized[524_288:]]},
+    ):
+        status, denied = booking_request(
+            clinic, clinic.owner, raw_body=oversized, key=str(uuid4()), **extras
+        )
+        assert status == 422 and denied["error"]["code"] == "INVALID_INPUT"
+        assert booking_effects(clinic) == before
 
 
 def test_signed_appointment_list_keyset_cursor_and_strict_query_boundaries(

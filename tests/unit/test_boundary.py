@@ -13,7 +13,7 @@ from uuid import UUID
 
 import pytest
 from carepulse.config import ServiceConfig, _load_policy
-from carepulse.identity.boundary import ClosedServiceBoundary
+from carepulse.identity.boundary import ClosedServiceBoundary, _read_body
 from carepulse.identity.signing import (
     CanonicalEnvelope,
     canonical_path,
@@ -98,6 +98,48 @@ def test_unprotected_paths_keep_normal_routing(path):
         ClosedServiceBoundary(application)({"type": "http", "path": path}, None, None)
     )
     assert calls == [path]
+
+
+@pytest.mark.parametrize(
+    "declared", [b"1048577", b"999999999999999999999", b"-1", b"1, 2"]
+)
+def test_declared_oversize_or_invalid_length_does_not_consume_stream(declared):
+    async def forbidden_receive():
+        pytest.fail("Rejected declared length consumed body")
+
+    from carepulse.identity.boundary import BoundaryDenied
+
+    with pytest.raises(BoundaryDenied) as denied:
+        asyncio.run(
+            _read_body({"headers": [(b"content-length", declared)]}, forbidden_receive)
+        )
+    assert denied.value.status == 422
+
+
+@pytest.mark.parametrize("size", [1_048_576, 1_048_577])
+def test_streamed_body_stops_at_one_mib(size):
+    seen = 0
+
+    async def receive():
+        nonlocal seen
+        seen += 1
+        if seen > 2:
+            pytest.fail("Oversized stream was read past its first excessive chunk")
+        return {
+            "type": "http.request",
+            "body": b"a" * (1_048_575 if seen == 1 else size - 1_048_575),
+            "more_body": seen == 1,
+        }
+
+    if size == 1_048_576:
+        assert len(asyncio.run(_read_body({"headers": []}, receive))) == size
+    else:
+        from carepulse.identity.boundary import BoundaryDenied
+
+        with pytest.raises(BoundaryDenied) as denied:
+            asyncio.run(_read_body({"headers": []}, receive))
+        assert denied.value.status == 422
+    assert seen == 2
 
 
 @pytest.fixture(scope="module")

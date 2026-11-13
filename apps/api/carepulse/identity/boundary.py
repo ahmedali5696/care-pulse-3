@@ -36,6 +36,7 @@ _HEADER_FIELDS = (
     "service-key",
 )
 _EXPECTED_SERVICE = "web"
+_MAX_MUTATION_BODY_BYTES = 1_048_576
 
 
 class BoundaryDenied(Exception):
@@ -73,13 +74,31 @@ def _signed_headers(scope: Scope, secret: str, signing_key_id: str) -> dict[str,
     return headers
 
 
-async def _read_body(receive: Receive) -> bytes:
+async def _read_body(scope: Scope, receive: Receive) -> bytes:
+    declared = [
+        value
+        for name, value in scope.get("headers", ())
+        if name.lower() == b"content-length"
+    ]
+    if declared:
+        length = declared[0].lstrip(b"0") or b"0"
+        if (
+            len(declared) != 1
+            or not declared[0].isascii()
+            or not declared[0].isdigit()
+            or len(length) > 7
+            or (len(length) == 7 and length > b"1048576")
+        ):
+            raise BoundaryDenied(422)
     body = bytearray()
     while True:
         message = await receive()
         if message["type"] != "http.request":
             raise BoundaryDenied(401)
-        body.extend(message.get("body", b""))
+        chunk = message.get("body", b"")
+        if len(body) + len(chunk) > _MAX_MUTATION_BODY_BYTES:
+            raise BoundaryDenied(422)
+        body.extend(chunk)
         if not message.get("more_body", False):
             return bytes(body)
 
@@ -161,7 +180,7 @@ class ClosedServiceBoundary:
     ) -> tuple[CanonicalEnvelope, bytes]:
         config = scope["app"].state.service_config
         headers = _signed_headers(scope, config.service_key, config.signing_key_id)
-        payload = await _read_body(receive)
+        payload = await _read_body(scope, receive)
         envelope = _envelope(scope, headers, payload)
         mac = new(config.service_key.encode(), canonical_payload(envelope), sha256)
         if not compare_digest(headers["signature"], mac.hexdigest()):

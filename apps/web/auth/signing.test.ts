@@ -4,6 +4,34 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import { canonicalPath, canonicalQuery, signRequest } from "./signing.ts";
+import { boundedBody } from "./proxy.ts";
+
+test("BFF accepts one MiB and rejects declared or streamed oversize", async () => {
+  const limit = 1_048_576;
+  assert.equal((await boundedBody(new Request("http://localhost", {
+    method: "POST", body: new Uint8Array(limit),
+  })))?.byteLength, limit);
+
+  let pulled = 0;
+  const declared = new Request("http://localhost", {
+    method: "POST", body: "unused", headers: { "content-length": String(limit + 1) },
+  });
+  assert.equal(await boundedBody(declared), null);
+  assert.equal(declared.bodyUsed, false);
+
+  const streamed = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulled++;
+      controller.enqueue(new Uint8Array(524_289));
+      if (pulled === 2) controller.close();
+    },
+  });
+  const request = new Request("http://localhost", {
+    method: "POST", body: streamed, duplex: "half",
+  } as RequestInit & { duplex: string });
+  assert.equal(await boundedBody(request), null);
+  assert.equal(pulled, 2);
+});
 
 type GoldenVector = {
   name: string;
