@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from carepulse.appointments.persistence import persist_appointment
 from carepulse.config import ServiceConfig, _load_policy
 from carepulse.db import transaction
 from carepulse.identity.authorization import protected_transaction
@@ -42,6 +43,7 @@ from postgres_locks import wait_for_postgres_lock
 from pydantic import BaseModel, ConfigDict
 from runtime_identity_fixture import db_proof_headers, registered_test_request
 from sqlalchemy import text
+from test_appointment_persistence import _draft, _patient, _query
 
 _SECRET = "synthetic-B-01-key"
 _PATH = "/v1/patients"
@@ -166,14 +168,27 @@ def boundary_data(role_engine, tenant_factory, monkeypatch):
         migration.dispose()
 
 
-def _signed(data, *, tenant=None, session=None, nonce=None, key=None, value="first"):
-    body = json.dumps({"value": value}, separators=(",", ":")).encode()
+def _signed(
+    data,
+    *,
+    tenant=None,
+    session=None,
+    nonce=None,
+    key=None,
+    value="first",
+    command=None,
+    path=_PATH,
+    purpose=_PURPOSE,
+):
+    body = json.dumps(
+        {"value": value} if command is None else command, separators=(",", ":")
+    ).encode()
     identity = CanonicalEnvelope(
         PROTOCOL_VERSION,
         "v1",
         "web",
         "POST",
-        _PATH,
+        path,
         "",
         raw_body_sha256(body),
         str(tenant or data.tenant),
@@ -183,7 +198,7 @@ def _signed(data, *, tenant=None, session=None, nonce=None, key=None, value="fir
         "0",
         str(int(datetime.now(UTC).timestamp() * 1000)),
         nonce or f"synthetic_{uuid4().hex}",
-        _PURPOSE,
+        purpose,
         key or f"synthetic-{uuid4()}",
     )
     field_names = (
@@ -270,9 +285,13 @@ def _dispatch(data, payload, handle):
         messages.append(message)
 
     asyncio.run(
-        ClosedServiceBoundary(app, routes={("POST", _PATH): _PURPOSE})(
-            scope, receive, send
-        )
+        ClosedServiceBoundary(
+            app,
+            routes={
+                ("POST", _PATH): _PURPOSE,
+                ("POST", "/v1/appointments"): "APPOINTMENT_BOOKING",
+            },
+        )(scope, receive, send)
     )
     return messages[0]["status"], json.loads(messages[1]["body"])
 
@@ -397,21 +416,40 @@ def test_parallel_same_nonce_has_single_committed_winner(boundary_data):
 
 def test_nonce_replay_survives_rolled_back_business_transaction(boundary_data):
     data = boundary_data
-    payload = _signed(data)
+    # The historical synthetic event is not a permitted F-01 patient operation.
+    # Seed a real appointment; the rollback under test uses only the API login.
+    with transaction(data.migration, data.tenant) as connection:
+        patient = _patient(connection, data.tenant)
+        appointment = persist_appointment(
+            connection, _draft(patient, data.staff), _query(data.tenant, data.staff)
+        )["id"]
+    payload = _signed(
+        data,
+        command={"patient_id": str(patient)},
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+    )
 
     def failed(identity, _body):
         with protected_transaction(
             data.runtime, identity, data.config.policy.session_idle_minutes
         ) as (connection, actor):
-            append_outbox(
+            event_id = append_outbox(
                 connection,
                 {
                     "organization_id": actor.organization_id,
-                    "event_type": "SYNTHETIC_T023_ROLLBACK",
-                    "aggregate_type": "synthetic",
-                    "aggregate_id": str(uuid4()),
-                    "payload": {},
+                    "event_type": "APPOINTMENT_BOOKED",
+                    "aggregate_type": "APPOINTMENT",
+                    "aggregate_id": appointment,
+                    "payload": {"appointment_id": appointment},
                 },
+            )
+            assert (
+                connection.scalar(
+                    text("SELECT count(*) FROM public.outbox_events WHERE id=:id"),
+                    {"id": event_id},
+                )
+                == 1
             )
             raise ContractError(409)
 
@@ -422,9 +460,10 @@ def test_nonce_replay_survives_rolled_back_business_transaction(boundary_data):
             connection.scalar(
                 text("""
             SELECT count(*) FROM public.outbox_events
-            WHERE organization_id=:tenant AND event_type='SYNTHETIC_T023_ROLLBACK'
+            WHERE organization_id=:tenant AND event_type='APPOINTMENT_BOOKED'
+              AND aggregate_id=:appointment
         """),
-                {"tenant": data.tenant},
+                {"tenant": data.tenant, "appointment": appointment},
             )
             == 0
         )
@@ -441,7 +480,7 @@ def test_receipt_retry_changed_body_and_revoked_cache(boundary_data):
         ) as (connection, actor):
             query = TenantReceiptQuery(
                 actor=actor,
-                operation=_PURPOSE,
+                operation="patients.create",
                 idempotency_key=identity.idempotency_key,
                 request_digest=digest,
             )
@@ -453,7 +492,7 @@ def test_receipt_retry_changed_body_and_revoked_cache(boundary_data):
                 connection,
                 Receipt(
                     actor.staff_id,
-                    _PURPOSE,
+                    "patients.create",
                     identity.idempotency_key,
                     digest,
                     result,

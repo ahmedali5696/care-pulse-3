@@ -3,13 +3,21 @@
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 from carepulse.appointments.followups import qualify_followup
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
+from carepulse.identity.runtime_identity import bound_transaction
+from carepulse.identity.signing import (
+    PROTOCOL_VERSION,
+    CanonicalEnvelope,
+    raw_body_sha256,
+)
 from carepulse.policies.versions import append_version
+from runtime_identity_fixture import registered_test_request
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import (
@@ -1169,95 +1177,278 @@ def test_v2_effective_privileges_rls_reserved_audit_and_legacy_fences(
             denied_role.dispose()
 
 
-def test_runtime_direct_sql_can_spoof_tenant_and_doctor_context(appointment_storage):
-    """Issue #26: GUC-based DB checks do not authenticate an arbitrary SQL caller."""
-    runtime, migration, (tenant, other), (doctor, foreign_doctor) = appointment_storage
+def _f01_completed_source(connection, tenant, doctor):
+    """Seed history-backed completion as migration; runtime completion is not exposed."""
+    appointment = _admitted_source(connection, tenant, doctor)
+    visit = connection.scalar(
+        text("SELECT id FROM public.visits WHERE appointment_id=:appointment"),
+        {"appointment": appointment},
+    )
+    fields = {
+        "tenant": tenant,
+        "appointment": appointment,
+        "visit": visit,
+        "doctor": doctor,
+        "history": uuid4(),
+        "audit": uuid4(),
+        "attestation": uuid4(),
+    }
+    connection.execute(
+        text("""
+            UPDATE public.appointments SET status='Completed', revision=3
+            WHERE organization_id=:tenant AND id=:appointment
+        """),
+        fields,
+    )
+    fields["at"] = connection.scalar(
+        text("""
+            INSERT INTO public.appointment_history
+                (id, organization_id, appointment_id, appointment_revision,
+                 action, old_status, new_status, old_service_date, new_service_date,
+                 old_number, new_number, actor_staff_id, actor_role,
+                 reason, price_snapshot_appointment_id)
+            SELECT :history, organization_id, id, 3, 'STATUS',
+                   'In Examination', 'Completed', service_date, service_date,
+                   current_number, current_number, :doctor, 'DOCTOR_OWNER',
+                   'Examination completed', id
+            FROM public.appointments WHERE organization_id=:tenant AND id=:appointment
+            RETURNING occurred_at
+        """),
+        fields,
+    )
+    connection.execute(
+        text("""
+            INSERT INTO public.sensitive_audit
+                (id, organization_id, actor_staff_id, actor_role, action, reason,
+                 correlation_id, before_state, after_state, occurred_at)
+            VALUES (:audit, :tenant, :doctor, 'DOCTOR_OWNER',
+                    'VISIT_EXAMINATION_COMPLETED', 'Examination completion',
+                    CAST(:attestation AS text),
+                    jsonb_build_object('appointment_id', CAST(:appointment AS uuid),
+                        'visit_id', CAST(:visit AS uuid),
+                        'appointment_revision', 2, 'status', 'In Examination'),
+                    jsonb_build_object('appointment_id', CAST(:appointment AS uuid),
+                        'visit_id', CAST(:visit AS uuid),
+                        'appointment_revision', 3, 'status', 'Completed',
+                        'examination_occurred', true), :at)
+        """),
+        fields,
+    )
+    connection.execute(
+        text("""
+            INSERT INTO public.completion_attestations
+                (id, organization_id, appointment_id, visit_id,
+                 completion_history_revision, examination_occurred,
+                 actor_staff_id, actor_role, completed_at, sensitive_audit_id)
+            VALUES (:attestation, :tenant, :appointment, :visit, 3, true,
+                    :doctor, 'DOCTOR_OWNER', :at, :audit)
+        """),
+        fields,
+    )
+    return visit
+
+
+def _f01_followup_session(connection, staff):
+    session = f"synthetic-followup-{uuid4()}"
+    connection.execute(
+        text("""
+            INSERT INTO public."session"
+                (id, "userId", token, "expiresAt", "createdAt", "updatedAt",
+                 "securityRevision", "absoluteDeadline", "lastActivity")
+            SELECT :session, auth_user_id, :token,
+                   clock_timestamp() + interval '1 hour',
+                   clock_timestamp(), clock_timestamp(), security_revision,
+                   clock_timestamp() + interval '1 hour', clock_timestamp()
+            FROM public.staff_accounts WHERE id=:staff
+        """),
+        {"session": session, "token": str(uuid4()), "staff": staff},
+    )
+    return session
+
+
+def test_runtime_direct_sql_cannot_spoof_tenant_and_doctor_context(
+    appointment_storage, role_engine
+):
+    """Issue #26: only the activated request may supply runtime authority."""
+    _, migration, (tenant, other), (doctor, foreign_doctor) = appointment_storage
     receptionist = _receptionist(migration, tenant)
-    with transaction(runtime, tenant) as connection:
-        source = _v2_source(connection, tenant, doctor)
-        _v2_command(
-            connection,
-            "record_followup_source_decision",
-            source,
-            kind="OPTED_OUT",
-            reason="Doctor restriction",
+    with migration.begin() as connection:
+        visit = _f01_completed_source(connection, tenant, doctor)
+        foreign_visit = _f01_completed_source(connection, other, foreign_doctor)
+        sessions = {
+            staff: _f01_followup_session(connection, staff)
+            for staff in (doctor, receptionist)
+        }
+        policy_version = connection.scalar(
+            text("""
+                SELECT current_version FROM public.clinic_policy_heads
+                WHERE organization_id=:tenant AND kind='FOLLOWUP'
+            """),
+            {"tenant": tenant},
         )
-        assert (
-            connection.scalar(
-                text("SELECT count(*) FROM public.staff_accounts WHERE id=:id"),
-                {"id": foreign_doctor},
-            )
-            == 0
+    runtime, gate = role_engine("carepulse_api"), role_engine("carepulse_gate")
+    clinic = SimpleNamespace(gate=gate)
+    restriction = {"kind": "OPTED_OUT", "reason": "Doctor restriction"}
+    reset = {"kind": "DEFAULT"}
+
+    def signed(staff, role, revision, decision):
+        body = json.dumps(
+            {
+                "followup_decision": decision,
+                "expected_source_decision_revision": revision,
+                "expected_visit_revision": 0,
+                "expected_followup_revision": policy_version,
+            },
+            separators=(",", ":"),
+        ).encode()
+        identity = CanonicalEnvelope(
+            PROTOCOL_VERSION,
+            "v1",
+            "web",
+            "PATCH",
+            f"/v1/visits/{visit}",
+            "",
+            raw_body_sha256(body),
+            str(tenant),
+            str(staff),
+            sessions[staff],
+            role,
+            "0",
+            str(int(datetime.now(UTC).timestamp() * 1000)),
+            f"synthetic_{uuid4().hex}",
+            "VISIT_FOLLOWUP",
+            str(uuid4()),
         )
-        with connection.begin_nested() as spoofed_sql:
-            connection.execute(
-                text("SELECT set_config('app.organization_id', :org, true)"),
-                {"org": str(other)},
+        return identity, body
+
+    def decide(connection, org, target, revision, decision):
+        return connection.scalar(
+            text("""
+                SELECT public.record_followup_source_decision(
+                    :tenant, :visit, CAST(:expected AS jsonb), CAST(:decision AS jsonb))
+            """),
+            {
+                "tenant": org,
+                "visit": target,
+                "expected": json.dumps(
+                    {
+                        "source_revision": revision,
+                        "clinical_revision": 0,
+                        "policy_version": policy_version,
+                    }
+                ),
+                "decision": json.dumps(decision),
+            },
+        )
+
+    def forge(connection, org, actor):
+        connection.execute(
+            text("""
+                SELECT set_config('app.organization_id', :org, true),
+                       set_config('app.staff_id', :actor, true),
+                       set_config('app.staff_role', 'DOCTOR_OWNER', true)
+            """),
+            {"org": str(org), "actor": str(actor)},
+        )
+
+    def evidence():
+        with migration.connect() as connection:
+            scope = {"tenants": [tenant, other]}
+            return tuple(
+                connection.execute(
+                    text(f"""
+                        SELECT to_jsonb(evidence_row) FROM public.{relation} evidence_row
+                        WHERE organization_id=ANY(:tenants) ORDER BY {ordering}
+                    """),
+                    scope,
+                )
+                .scalars()
+                .all()
+                for relation, ordering in (
+                    ("followup_source_state", "visit_id"),
+                    ("followup_source_decision_events", "id"),
+                    ("sensitive_audit", "id"),
+                )
             )
+
+    try:
+        identity, body = signed(doctor, "DOCTOR_OWNER", 0, restriction)
+        with (
+            registered_test_request(clinic, identity, body),
+            bound_transaction(runtime, identity) as connection,
+        ):
+            assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+            assert decide(connection, tenant, visit, 0, restriction) == 1
+        before = evidence()
+        assert len(before[0]) == len(before[1]) == 1
+        assert before[0][0]["decision"] == restriction
+        assert before[1][0]["actor_staff_id"] == str(doctor)
+
+        with runtime.begin() as connection:
+            assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+            for org, actor, target, revision in (
+                (tenant, doctor, visit, 1),
+                (other, foreign_doctor, foreign_visit, 0),
+            ):
+                forge(connection, org, actor)
+                assert connection.scalar(text("SELECT public.f01_org()")) is None
+                assert (
+                    connection.scalar(
+                        text("SELECT count(*) FROM public.staff_accounts WHERE id=:id"),
+                        {"id": actor},
+                    )
+                    == 0
+                )
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    decide(connection, org, target, revision, reset)
+                assert denied.value.orig.sqlstate == "42501"
+
+        identity, body = signed(receptionist, "RECEPTIONIST", 1, reset)
+        with (
+            registered_test_request(clinic, identity, body),
+            bound_transaction(runtime, identity) as connection,
+        ):
+            assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+            forge(connection, tenant, doctor)
+            assert connection.execute(
+                text("SELECT organization_id, staff_id, role FROM public.f01_context()")
+            ).one() == (str(tenant), str(receptionist), "RECEPTIONIST")
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                decide(connection, tenant, visit, 1, reset)
+            assert denied.value.orig.sqlstate == "42501"
+            forge(connection, other, foreign_doctor)
             assert (
                 connection.scalar(
                     text("SELECT count(*) FROM public.staff_accounts WHERE id=:id"),
                     {"id": foreign_doctor},
                 )
-                == 1
-            )
-            connection.execute(
-                text("SELECT set_config('app.organization_id', :org, true)"),
-                {"org": str(tenant)},
-            )
-            connection.execute(
-                text("SELECT set_config('app.staff_id', :actor, true)"),
-                {"actor": str(receptionist)},
-            )
-            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
-                connection.execute(
-                    text("""
-                        SELECT public.record_followup_source_decision(
-                            :tenant, :visit, CAST(:expected AS jsonb), '{"kind":"DEFAULT"}'::jsonb)
-                    """),
-                    {
-                        "tenant": tenant,
-                        "visit": source["visit"],
-                        "expected": '{"source_revision":1,"clinical_revision":0,"policy_version":1}',
-                    },
-                )
-            assert denied.value.orig.sqlstate == "42501"
-            connection.execute(
-                text("SELECT set_config('app.staff_id', :actor, true)"),
-                {"actor": str(doctor)},
+                == 0
             )
             assert (
                 connection.scalar(
-                    text("""
-                    SELECT public.record_followup_source_decision(
-                        :tenant, :visit, CAST(:expected AS jsonb), CAST(:decision AS jsonb))
-                """),
-                    {
-                        "tenant": tenant,
-                        "visit": source["visit"],
-                        "expected": '{"source_revision":1,"clinical_revision":0,"policy_version":1}',
-                        "decision": '{"kind":"DEFAULT"}',
-                    },
+                    text("SELECT count(id) FROM public.visits WHERE id=:id"),
+                    {"id": foreign_visit},
                 )
-                == 2
+                == 0
             )
-            assert connection.execute(
-                text("""
-                    SELECT actor_staff_id, actor_role FROM public.followup_source_decision_events
-                    WHERE source_visit_id=:visit AND source_revision=2
-                """),
-                {"visit": source["visit"]},
-            ).one() == (doctor, "DOCTOR_OWNER")
-            spoofed_sql.rollback()
-        assert (
-            connection.scalar(
-                text(
-                    "SELECT count(*) FROM public.followup_source_decision_events WHERE source_visit_id=:visit"
-                ),
-                {"visit": source["visit"]},
-            )
-            == 1
-        )
+            with pytest.raises(DBAPIError) as cross_tenant, connection.begin_nested():
+                decide(connection, other, foreign_visit, 0, reset)
+            assert cross_tenant.value.orig.sqlstate == "42501"
+        assert evidence() == before
+
+        identity, body = signed(doctor, "DOCTOR_OWNER", 1, reset)
+        with (
+            registered_test_request(clinic, identity, body),
+            bound_transaction(runtime, identity) as connection,
+        ):
+            assert decide(connection, tenant, visit, 1, reset) == 2
+        after = evidence()
+        assert after[0][0]["decision"] == reset
+        assert len(after[1]) == 2
+        assert len(after[2]) == len(before[2]) + 1
+    finally:
+        runtime.dispose()
+        gate.dispose()
 
 
 def test_v2_creation_exception_cannot_authorize_same_date_interval_change(
