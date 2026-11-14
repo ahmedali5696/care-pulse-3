@@ -34,6 +34,11 @@ The database proof signs the canonical 16-field UTF-8 envelope with a separate
 DB key and domain separator. The HTTP key ID remains the replay namespace through
 DB-key rotation. A gate-committed stage record binds database/login OIDs, backend
 PID and top-level `xid8`; live activation happens inside the business transaction.
+Retiring keys accept only authenticated issuance timestamps strictly before the
+cutoff, at both registration and activation, within the existing freshness window.
+The verifier cannot establish the physical signing time of a backdated claim;
+the trusted signer must stop issuing with the retiring key. Rolling back to a
+pre-activation savepoint permits reactivation of the same binding only.
 Neither caller GUCs nor SET ROLE establish identity. A synthetic provider-invite
 credential and session rows stand in for external Better Auth/email flows; no
 production auth adapter, existing writer or migration is modified. The dummy

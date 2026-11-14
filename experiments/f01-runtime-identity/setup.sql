@@ -23,7 +23,10 @@ ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 CREATE TABLE f01_private.keys (
     key_id text PRIMARY KEY,
     secret bytea NOT NULL CHECK (octet_length(secret) = 32),
-    status text NOT NULL
+    status text NOT NULL,
+    issuance_cutoff_ms bigint,
+    CHECK (status <> 'RETIRING' OR issuance_cutoff_ms IS NOT NULL),
+    CHECK (status <> 'ACTIVE' OR issuance_cutoff_ms IS NULL)
 );
 CREATE TABLE f01_private.organizations (
     id text PRIMARY KEY,
@@ -69,6 +72,7 @@ CREATE TABLE f01_private.requests (
     purpose text NOT NULL,
     target text NOT NULL,
     body_sha256 text NOT NULL,
+    issued_at_ms bigint NOT NULL,
     expires_at timestamptz NOT NULL,
     FOREIGN KEY (http_key_id, nonce) REFERENCES f01_private.nonces(http_key_id, nonce)
 );
@@ -125,7 +129,7 @@ CREATE TABLE f01_data.patients (
     PRIMARY KEY (org, id)
 );
 
-INSERT INTO f01_private.keys VALUES
+INSERT INTO f01_private.keys (key_id, secret, status) VALUES
     ('db-a', convert_to(repeat('A', 32), 'UTF8'), 'ACTIVE'),
     ('db-b', convert_to(repeat('B', 32), 'UTF8'), 'ACTIVE');
 INSERT INTO f01_private.organizations VALUES ('A', 'ACTIVE'), ('B', 'ACTIVE'), ('C', 'PROVISIONING');
@@ -165,9 +169,12 @@ CREATE FUNCTION f01_api.register_proof(payload bytea, database_key_id text, mac 
 RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     key_secret bytea;
+    key_status text;
+    key_cutoff_ms bigint;
     blind bytea;
     expected bytea;
     envelope jsonb;
+    issued_at_ms bigint;
     issued_at timestamptz;
     result_id bigint;
 BEGIN
@@ -175,7 +182,8 @@ BEGIN
        OR mac IS NULL OR octet_length(mac) <> 32 OR octet_length(payload) > 8192 THEN
         RAISE EXCEPTION 'proof denied' USING ERRCODE = '42501';
     END IF;
-    SELECT k.secret INTO key_secret FROM f01_private.keys k
+    SELECT k.secret, k.status, k.issuance_cutoff_ms INTO key_secret, key_status, key_cutoff_ms
+    FROM f01_private.keys k
     WHERE k.key_id = register_proof.database_key_id AND k.status IN ('ACTIVE', 'RETIRING') FOR SHARE;
     IF NOT FOUND THEN RAISE EXCEPTION 'proof denied' USING ERRCODE = '42501'; END IF;
     expected := f01_crypto.hmac(convert_to('carepulse-db-context-v1', 'UTF8') || decode('00', 'hex')
@@ -208,13 +216,18 @@ BEGIN
            OR envelope->>15 NOT IN ('p1', 'p2') THEN
             RAISE EXCEPTION 'invalid envelope' USING ERRCODE = '22023';
         END IF;
-        issued_at := to_timestamp((envelope->>12)::bigint / 1000.0);
+        issued_at_ms := (envelope->>12)::bigint;
+        issued_at := to_timestamp(issued_at_ms / 1000.0);
     EXCEPTION WHEN data_exception THEN
         RAISE EXCEPTION 'invalid envelope' USING ERRCODE = '22023';
     END;
     IF issued_at <= clock_timestamp() - interval '60 seconds'
        OR issued_at > clock_timestamp() + interval '5 seconds' THEN
         RAISE EXCEPTION 'proof freshness denied' USING ERRCODE = '42501';
+    END IF;
+    -- The cutoff is exclusive and applies to the authenticated timestamp.
+    IF key_status = 'RETIRING' AND (key_cutoff_ms IS NULL OR issued_at_ms >= key_cutoff_ms) THEN
+        RAISE EXCEPTION 'proof issuance denied' USING ERRCODE = '42501';
     END IF;
     INSERT INTO f01_private.nonces VALUES (envelope->>1, envelope->>13);
     -- The nonce insert can wait behind cleanup or another registration.
@@ -223,10 +236,10 @@ BEGIN
     END IF;
     INSERT INTO f01_private.requests
         (http_key_id, nonce, database_key_id, organization_id, staff_id, session_id,
-         role, security_revision, purpose, target, body_sha256, expires_at)
+         role, security_revision, purpose, target, body_sha256, issued_at_ms, expires_at)
     VALUES (envelope->>1, envelope->>13, database_key_id, envelope->>7, envelope->>8,
             envelope->>9, envelope->>10, (envelope->>11)::bigint, envelope->>14,
-            envelope->>15, envelope->>6, issued_at + interval '60 seconds')
+            envelope->>15, envelope->>6, issued_at_ms, issued_at + interval '60 seconds')
     RETURNING id INTO result_id;
     RETURN result_id;
 END;
@@ -318,7 +331,8 @@ BEGIN
     IF NOT FOUND OR req.expires_at <= clock_timestamp() THEN
         RAISE EXCEPTION 'activation denied' USING ERRCODE = '42501';
     END IF;
-    PERFORM 1 FROM f01_private.keys k WHERE k.key_id = req.database_key_id AND k.status IN ('ACTIVE', 'RETIRING') FOR SHARE;
+    PERFORM 1 FROM f01_private.keys k WHERE k.key_id = req.database_key_id
+      AND (k.status = 'ACTIVE' OR (k.status = 'RETIRING' AND req.issued_at_ms < k.issuance_cutoff_ms)) FOR SHARE;
     IF NOT FOUND THEN RAISE EXCEPTION 'activation denied' USING ERRCODE = '42501'; END IF;
     -- Lock live authority in the same order for every stage.
     IF b.stage = 'INVITATION_APPLY' THEN

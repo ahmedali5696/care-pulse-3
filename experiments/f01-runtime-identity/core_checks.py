@@ -300,7 +300,10 @@ def criterion_5(a, g):
     p = payload()
     q = proof(g, p)
     with connect() as r:
-        bind(g, r, q)
+        original = bind(g, r, q)
+        binding_sql = "SELECT * FROM f01_private.bindings WHERE request_id=%s"
+        binding_before = a.execute(binding_sql, (q,)).fetchall()
+        assert len(binding_before) == 1
         r.execute("SAVEPOINT before_activate")
         activate(r)
         expected_actor(r)
@@ -313,7 +316,35 @@ def criterion_5(a, g):
         # Activation is transactional, but the gate-committed binding is not.
         # A savepoint rollback cannot bind/activate another tenant on this xid.
         pid, xid = transaction_id(r)
-        denied(g, "SELECT f01_api.bind(%s,'PRIMARY',%s,%s::xid8)", (proof(g), pid, xid))
+        assert (pid, xid) == original
+        replacement = proof(
+            g,
+            payload(
+                organization_id="B",
+                staff_id="doctor-b",
+                session_id="sb",
+                idempotency_key="p2",
+            ),
+        )
+        denied(
+            g, "SELECT f01_api.bind(%s,'PRIMARY',%s,%s::xid8)", (replacement, pid, xid)
+        )
+        assert a.execute(binding_sql, (q,)).fetchall() == binding_before
+        assert a.execute(binding_sql, (replacement,)).fetchall() == []
+        empty_context(r)
+        r.execute(
+            "SELECT set_config('app.organization_id','B',true), set_config('app.staff_id','doctor-b',true)"
+        )
+        activate(r)
+        expected_actor(r)
+        assert transaction_id(r) == original
+        assert a.execute(binding_sql, (q,)).fetchall() == binding_before
+        denied(r, "SELECT f01_api.activate()")
+        expected_actor(r)
+        print(
+            "C5 savepoint reactivation PASS: original binding, actor and xid preserved; replacement denied",
+            flush=True,
+        )
         r.rollback()
         assert scalar(a, "SELECT pg_xact_status(%s::xid8)", (xid,)) == "aborted"
         pid, xid = transaction_id(r)

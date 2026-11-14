@@ -1,6 +1,7 @@
 """Exercise live authorization, RLS, stage effects and ordered PostgreSQL races."""
 
 import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 from helper import (
@@ -557,20 +558,87 @@ def check_locks_and_cleanup(g, a):
             assert context(r) == []
         finally:
             r.rollback()
-            a.execute(
-                "UPDATE f01_private.keys SET status='RETIRING' WHERE key_id='db-a'"
-            )
-        try:
-            bind(g, r, proof(g))
-            activate(r)
-            assert patients(r) == [("A", "p1")]
-            r.commit()
-            bind(g, r, proof(g, key="db-b"))
-            activate(r)
-            assert patients(r) == [("A", "p1")]
-            r.commit()
-        finally:
             a.execute("UPDATE f01_private.keys SET status='ACTIVE' WHERE key_id='db-a'")
+
+        cutoff = int(
+            scalar(a, "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)")
+        )
+        prior = payload(timestamp=cutoff - 1)
+        prior_registered = proof(g, prior)
+        delayed = payload(timestamp=cutoff - 1)
+        at_cutoff = payload(timestamp=cutoff)
+        after_cutoff = payload(timestamp=cutoff + 1)
+        # A previously registered proof with a future-dated claim is still
+        # subject to the newly established issuance cutoff at activation.
+        late_payload = payload(timestamp=cutoff + 1)
+        late_registered = proof(g, late_payload)
+        register = "SELECT f01_api.register_proof(%s,%s,%s)"
+        changer.execute(
+            "UPDATE f01_private.keys SET status='RETIRING', issuance_cutoff_ms=%s WHERE key_id='db-a'",
+            (cutoff,),
+        )
+        gate_pid = scalar(g, "SELECT pg_backend_pid()")
+        future = pool.submit(
+            denied, g, register, (after_cutoff, "db-a", mac(after_cutoff))
+        )
+        try:
+            wait_blocked(a, gate_pid, cpid)
+        finally:
+            changer.commit()
+        try:
+            assert future.result(timeout=5) == "42501"
+            assert denied(g, register, (at_cutoff, "db-a", mac(at_cutoff))) == "42501"
+            for p in (at_cutoff, after_cutoff):
+                nonce = json.loads(p)[13]
+                assert not scalar(
+                    a,
+                    "SELECT EXISTS (SELECT 1 FROM f01_private.nonces WHERE http_key_id='http-a' AND nonce=%s)",
+                    (nonce,),
+                )
+                assert not scalar(
+                    a,
+                    "SELECT EXISTS (SELECT 1 FROM f01_private.requests WHERE http_key_id='http-a' AND nonce=%s)",
+                    (nonce,),
+                )
+            bind(g, r, prior_registered)
+            activate(r)
+            assert patients(r) == [("A", "p1")]
+            r.commit()
+            bind(g, r, late_registered)
+            assert denied(r, "SELECT f01_api.activate()") == "42501"
+            assert context(r) == []
+            r.rollback()
+            assert (
+                denied(g, register, (late_payload, "db-b", mac(late_payload, "db-b")))
+                == "23505"
+            )
+            bind(g, r, proof(g, delayed))
+            activate(r)
+            assert patients(r) == [("A", "p1")]
+            r.commit()
+            for p in (prior, delayed):
+                for key in ("db-a", "db-b"):
+                    assert denied(g, register, (p, key, mac(p, key))) == "23505"
+            bind(g, r, proof(g, after_cutoff, key="db-b"))
+            activate(r)
+            assert patients(r) == [("A", "p1")]
+            r.commit()
+            assert (
+                denied(g, register, (after_cutoff, "db-b", mac(after_cutoff, "db-b")))
+                == "23505"
+            )
+            assert (
+                denied(g, register, (after_cutoff, "db-a", mac(after_cutoff)))
+                == "42501"
+            )
+            print(
+                "C9 retiring cutoff PASS: pre-cutoff registration/activation accepted; at/after cutoff denied; rotation lock and cross-key replay verified",
+                flush=True,
+            )
+        finally:
+            a.execute(
+                "UPDATE f01_private.keys SET status='ACTIVE', issuance_cutoff_ms=NULL WHERE key_id='db-a'"
+            )
 
     exists = "SELECT EXISTS (SELECT 1 FROM f01_private.requests WHERE id=%s)"
     stamp = (
