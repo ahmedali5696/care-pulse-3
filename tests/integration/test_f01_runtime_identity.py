@@ -333,6 +333,37 @@ def test_session_cleanup_requires_committed_matching_revocation(
         if outcome != "committed":
             _deny_stage(clinic, request, "SESSION_CLEANUP")
         else:
+            # The earlier failed savepoint leaves a subtransaction active in PostgreSQL.
+            # Inspect committed evidence using the same restricted verifier role.
+            with clinic.migration.begin() as observer:
+                observer.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+                evidence = observer.execute(
+                    text("""
+                        SELECT pg_xact_status(b.xid), s.enabled, s.security_revision,
+                               a.before_state->>'enabled', a.after_state->>'enabled',
+                               a.xmin = b.xid::xid,
+                               f01_private.cleanup_proven(r, b.xid)
+                        FROM f01_private.requests r
+                        JOIN f01_private.bindings b ON b.request_id=r.id AND b.stage='PRIMARY'
+                        JOIN public.staff_accounts s ON s.id=r.target_id AND s.organization_id=r.organization_id
+                        JOIN public.sensitive_audit a ON a.organization_id=r.organization_id
+                            AND a.actor_staff_id=r.staff_id AND a.actor_role=r.role
+                            AND a.action='RECEPTIONIST_DISABLE'
+                            AND a.before_state->>'id'=r.target_id::text
+                            AND a.after_state->>'id'=r.target_id::text
+                        WHERE r.id=:request
+                    """),
+                    {"request": request},
+                ).one()
+                assert evidence == (
+                    "committed",
+                    False,
+                    1,
+                    "true",
+                    "false",
+                    False,
+                    False,
+                )
             with bound_transaction(
                 clinic.runtime, identity, stage="SESSION_CLEANUP"
             ) as connection:
@@ -575,6 +606,258 @@ def _spoof_gucs(connection, clinic):
         """),
         {"tenant": str(clinic.tenant), "staff": str(clinic.staff)},
     )
+
+
+@pytest.mark.parametrize(
+    ("resource", "first"),
+    [
+        ("organization", "revocation"),
+        ("staff", "activation"),
+        ("staff", "revocation"),
+        ("session", "activation"),
+        ("session", "revocation"),
+        ("key", "activation"),
+        ("key", "revocation"),
+    ],
+)
+def test_live_revocation_and_activation_serialize(
+    boundary_data, proof_keys, resource, first
+):
+    clinic = boundary_data
+    key = proof_keys[0]
+    update, params, sqlstate = {
+        "organization": (
+            "UPDATE public.organizations SET state='SUSPENDED' WHERE id=:id",
+            {"id": clinic.tenant},
+            "42501",
+        ),
+        "staff": (
+            "UPDATE public.staff_accounts SET security_revision=security_revision+1 WHERE id=:id",
+            {"id": clinic.staff},
+            "28000",
+        ),
+        "session": (
+            'DELETE FROM public."session" WHERE id=:id',
+            {"id": clinic.session},
+            "28000",
+        ),
+        "key": (
+            "UPDATE f01_private.keys SET status='REVOKED' WHERE key_id=:id",
+            {"id": key[0]},
+            "42501",
+        ),
+    }[resource]
+    identity, body, _ = _signed(clinic)
+    next_identity, next_body, _ = _signed(clinic)
+    with clinic.gate.begin() as gate:
+        request = _register(gate, identity, body, _proof_for(identity, key))
+        next_request = _register(
+            gate, next_identity, next_body, _proof_for(next_identity, key)
+        )
+
+    # Trusted migration fixture supplies an actual committed change to live authority;
+    # both activation attempts use the real API login and committed gate bindings.
+    def revoke(connection):
+        if resource == "key":
+            connection.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+        assert connection.execute(text(update), params).rowcount == 1
+
+    def denied_activation(connection):
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(text("SELECT public.f01_activate()"))
+        assert denied.value.orig.sqlstate == sqlstate
+        assert connection.scalar(text("SELECT public.f01_org()")) is None
+        assert connection.scalar(text("SELECT count(*) FROM public.organizations")) == 0
+
+    waiting_pid = Queue()
+
+    def revoke_later():
+        with clinic.migration.begin() as changer:
+            waiting_pid.put(changer.scalar(text("SELECT pg_backend_pid()")))
+            revoke(changer)
+
+    def activate_later():
+        with clinic.runtime.begin() as runtime:
+            pid, xid = _transaction_id(runtime)
+            _bind(clinic, request, pid, xid)
+            waiting_pid.put(pid)
+            denied_activation(runtime)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        if first == "activation":
+            with clinic.runtime.begin() as runtime:
+                pid, xid = _transaction_id(runtime)
+                _bind(clinic, request, pid, xid)
+                runtime.execute(text("SELECT public.f01_activate()"))
+                _assert_context(runtime, clinic, request)
+                future = pool.submit(revoke_later)
+                with clinic.migration.connect() as observer:
+                    wait_for_postgres_lock(
+                        observer, waiting_pid.get(timeout=5), pid, timeout=5
+                    )
+                _assert_context(runtime, clinic, request)
+        else:
+            with clinic.migration.begin() as changer:
+                pid = changer.scalar(text("SELECT pg_backend_pid()"))
+                revoke(changer)
+                future = pool.submit(activate_later)
+                with clinic.migration.connect() as observer:
+                    wait_for_postgres_lock(
+                        observer, waiting_pid.get(timeout=5), pid, timeout=5
+                    )
+        future.result(timeout=10)
+    with clinic.runtime.begin() as runtime:
+        _bind(clinic, next_request, *_transaction_id(runtime))
+        denied_activation(runtime)
+
+
+def test_cleanup_skips_locked_and_in_progress_bindings(boundary_data):
+    clinic = boundary_data
+    registered = {}
+    with clinic.gate.begin() as gate:
+        for label in ("active", "locked", "aborted", "committed", "live"):
+            identity, body, _ = _signed(clinic)
+            registered[label] = (
+                _register(gate, identity, body, db_proof_headers(identity)),
+                identity,
+            )
+    ids = {label: pair[0] for label, pair in registered.items()}
+    active, locked, aborted, committed, live = (
+        ids[label] for label in ("active", "locked", "aborted", "committed", "live")
+    )
+    with clinic.runtime.connect() as runtime:
+        _bind(clinic, aborted, *_transaction_id(runtime))
+        runtime.rollback()
+        _bind(clinic, committed, *_transaction_id(runtime))
+        runtime.commit()
+        _bind(clinic, active, *_transaction_id(runtime))
+        # Age only these isolated requests, after the gate has bound actual xids.
+        with clinic.migration.begin() as migration:
+            migration.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+            migration.execute(
+                text(
+                    "UPDATE f01_private.requests SET expires_at=clock_timestamp()-interval '1 second' WHERE id IN (:active,:locked,:aborted,:committed)"
+                ),
+                ids,
+            )
+
+        def remaining():
+            with clinic.migration.begin() as observer:
+                observer.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+                return set(
+                    observer.scalars(
+                        text(
+                            "SELECT id FROM f01_private.requests WHERE id IN (:active,:locked,:aborted,:committed,:live)"
+                        ),
+                        ids,
+                    )
+                )
+
+        with clinic.migration.begin() as lock_holder:
+            lock_holder.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+            assert (
+                lock_holder.scalar(
+                    text(
+                        "SELECT id FROM f01_private.requests WHERE id=:locked FOR UPDATE"
+                    ),
+                    ids,
+                )
+                == locked
+            )
+            with clinic.gate.begin() as gate:
+                # The cleanup must skip—not wait for—the locked request.
+                gate.execute(text("SET LOCAL lock_timeout='2s'"))
+                assert gate.scalar(text("SELECT public.f01_cleanup()")) >= 2
+            assert remaining() == {active, locked, live}
+            with pytest.raises(DBAPIError) as denied, runtime.begin_nested():
+                runtime.execute(text("SELECT public.f01_activate()"))
+            assert denied.value.orig.sqlstate == "42501"
+            assert runtime.scalar(text("SELECT public.f01_org()")) is None
+        runtime.rollback()
+    with clinic.gate.begin() as gate:
+        assert gate.scalar(text("SELECT public.f01_cleanup()")) >= 2
+    assert remaining() == {live}
+    for label, (_, identity) in registered.items():
+        assert _nonce_counts(clinic, identity) == (1, int(label == "live"))
+
+
+def test_persisted_clock_regression_denies_gate_activation_and_context(boundary_data):
+    clinic = boundary_data
+    active_identity, active_body, _ = _signed(clinic)
+    pending_identity, pending_body, _ = _signed(clinic)
+    unbound_identity, unbound_body, _ = _signed(clinic)
+    fresh_identity, fresh_body, _ = _signed(clinic)
+    with clinic.gate.begin() as gate:
+        active = _register(
+            gate, active_identity, active_body, db_proof_headers(active_identity)
+        )
+        pending = _register(
+            gate, pending_identity, pending_body, db_proof_headers(pending_identity)
+        )
+        unbound = _register(
+            gate, unbound_identity, unbound_body, db_proof_headers(unbound_identity)
+        )
+    with (
+        clinic.runtime.connect() as runtime,
+        clinic.runtime.connect() as pending_runtime,
+    ):
+        _bind(clinic, active, *_transaction_id(runtime))
+        _bind(clinic, pending, *_transaction_id(pending_runtime))
+        runtime.execute(text("SELECT public.f01_activate()"))
+        _assert_context(runtime, clinic, active)
+        # No OS clock change: inject a future trusted high-water mark in the disposable DB.
+        with clinic.migration.begin() as migration:
+            migration.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+            previous = migration.scalar(
+                text(
+                    "SELECT last_seen_at FROM f01_private.clock_state WHERE singleton FOR UPDATE"
+                )
+            )
+            migration.execute(
+                text(
+                    "UPDATE f01_private.clock_state SET last_seen_at=clock_timestamp()+interval '1 hour' WHERE singleton"
+                )
+            )
+        try:
+            assert runtime.scalar(text("SELECT public.f01_org()")) is None
+            assert (
+                runtime.scalar(text("SELECT count(*) FROM public.organizations")) == 0
+            )
+            with pytest.raises(DBAPIError) as denied, clinic.gate.begin() as gate:
+                _register(
+                    gate, fresh_identity, fresh_body, db_proof_headers(fresh_identity)
+                )
+            assert denied.value.orig.sqlstate == "42501"
+            assert _nonce_counts(clinic, fresh_identity) == (0, 0)
+            _deny_stage(clinic, unbound, "PRIMARY")
+            with pytest.raises(DBAPIError) as denied, clinic.gate.begin() as gate:
+                gate.scalar(text("SELECT public.f01_cleanup()"))
+            assert denied.value.orig.sqlstate == "42501"
+            runtime.rollback()
+            with pytest.raises(DBAPIError) as denied, pending_runtime.begin_nested():
+                pending_runtime.execute(text("SELECT public.f01_activate()"))
+            assert denied.value.orig.sqlstate == "42501"
+            assert pending_runtime.scalar(text("SELECT public.f01_org()")) is None
+        finally:
+            with clinic.migration.begin() as migration:
+                migration.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+                migration.execute(
+                    text(
+                        "UPDATE f01_private.clock_state SET last_seen_at=GREATEST(:previous,clock_timestamp()) WHERE singleton"
+                    ),
+                    {"previous": previous},
+                )
+    with clinic.gate.begin() as gate:
+        assert (
+            _register(
+                gate, fresh_identity, fresh_body, db_proof_headers(fresh_identity)
+            )
+            > 0
+        )
+    with clinic.runtime.begin() as runtime:
+        _bind(clinic, unbound, *_transaction_id(runtime))
+        runtime.execute(text("SELECT public.f01_activate()"))
+        _assert_context(runtime, clinic, unbound)
 
 
 def test_exact_head_restricts_legacy_login_and_service_role_elevation(role_engine):

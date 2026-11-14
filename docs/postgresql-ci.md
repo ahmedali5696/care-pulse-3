@@ -7,6 +7,7 @@ Dispatch **Foundation** on the candidate branch with `postgres_diagnostic` set t
 | `authorization-lock` | `test_request_boundary.py::test_suspension_serializes_with_protected_mutation` |
 | `booking-races` | `test_booking_races.py` |
 | `followup-races` | `test_followups_races.py` |
+| `f01-cleanup` | `test_f01_runtime_identity.py::test_session_cleanup_requires_committed_matching_revocation[committed]` |
 
 The diagnostic check uses the same pinned PostgreSQL, migrations, disposable Compose project and synthetic secret lifecycle as Foundation. Use a separate dispatch for each independent database. Check the run's SHA and project ID, pytest counts, and volume and secret cleanup. The log reports the failing phase and test location, plus SQLSTATE or expected and observed blocker PIDs when available. It omits exception text, query text, parameters, test output, and parameter IDs.
 

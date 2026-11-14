@@ -250,6 +250,7 @@ if [ "$1" = integration-diagnostic ]; then
     authorization-lock) focused_target='tests/integration/test_request_boundary.py::test_suspension_serializes_with_protected_mutation' ;;
     booking-races) focused_target='tests/integration/test_booking_races.py' ;;
     followup-races) focused_target='tests/integration/test_followups_races.py' ;;
+    f01-cleanup) focused_target='tests/integration/test_f01_runtime_identity.py::test_session_cleanup_requires_committed_matching_revocation[committed]' ;;
     *) echo 'FAIL unapproved PostgreSQL diagnostic selection'; exit 1 ;;
   esac
   printf 'Focused PostgreSQL diagnostic only: %s (SHA %s, project %s)\n' "$focused_target" "$GITHUB_SHA" "$CP_CI_PROJECT"
