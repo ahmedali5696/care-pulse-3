@@ -59,6 +59,8 @@ def upgrade() -> None:
         END $$;
         REVOKE ALL ON ALL TABLES IN SCHEMA public FROM carepulse_runtime;
         REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM carepulse_runtime;
+        REVOKE EXECUTE ON FUNCTION public.guard_recovery_operator_provenance(),
+            public.check_recovery_final_audit() FROM PUBLIC;
         DO $$ DECLARE item record; remaining text; BEGIN
           FOR item IN SELECT p.oid::regprocedure AS signature, r.rolname AS owner
             FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace

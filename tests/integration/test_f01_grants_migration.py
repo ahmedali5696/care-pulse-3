@@ -117,6 +117,17 @@ def test_f01_grants_cutover_is_atomic_repeatable_and_preserves_rows(
                 )
         with migration.connect() as connection:
             before = _snapshot(connection)
+            recovery_triggers = connection.execute(
+                text("""
+                SELECT p.oid, p.proowner, pg_get_functiondef(p.oid),
+                    t.oid, pg_get_triggerdef(t.oid), t.tgenabled
+                FROM pg_proc p JOIN pg_trigger t ON t.tgfoid=p.oid
+                WHERE p.oid IN ('public.guard_recovery_operator_provenance()'::regprocedure,
+                    'public.check_recovery_final_audit()'::regprocedure)
+                ORDER BY p.oid, t.oid
+            """)
+            ).all()
+            assert len(recovery_triggers) == 2
 
         scripts = tmp_path / "migrations"
         shutil.copytree(ROOT / "db/migrations", scripts)
@@ -141,6 +152,19 @@ def test_f01_grants_cutover_is_atomic_repeatable_and_preserves_rows(
             after = _snapshot(connection)
             assert after[0] == REVISION
             assert after[-2:] == before[-2:]
+            assert (
+                connection.execute(
+                    text("""
+                SELECT p.oid, p.proowner, pg_get_functiondef(p.oid),
+                    t.oid, pg_get_triggerdef(t.oid), t.tgenabled
+                FROM pg_proc p JOIN pg_trigger t ON t.tgfoid=p.oid
+                WHERE p.oid IN ('public.guard_recovery_operator_provenance()'::regprocedure,
+                    'public.check_recovery_final_audit()'::regprocedure)
+                ORDER BY p.oid, t.oid
+            """)
+                ).all()
+                == recovery_triggers
+            )
             assert connection.scalar(
                 text("""
                 SELECT NOT EXISTS (
