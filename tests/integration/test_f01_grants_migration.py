@@ -143,6 +143,21 @@ def test_f01_grants_cutover_is_atomic_repeatable_and_preserves_rows(
             assert after[-2:] == before[-2:]
             assert connection.scalar(
                 text("""
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+                    WHERE n.nspname='public'
+                      AND has_function_privilege('carepulse_runtime',p.oid,'EXECUTE')
+                )
+                AND (SELECT proowner='carepulse_policy_seed'::regrole
+                    FROM pg_proc WHERE oid='public.seed_policy_on_organization_insert()'::regprocedure)
+                AND NOT has_function_privilege('carepulse_migration',
+                    'public.seed_policy_on_organization_insert()','EXECUTE')
+                AND has_function_privilege('carepulse_migration',
+                    'public.seed_clinic_policy_defaults(uuid)','EXECUTE')
+            """)
+            )
+            assert connection.scalar(
+                text("""
                 SELECT has_function_privilege('carepulse_api',
                     'public.valid_clinic_policy(text,jsonb)','EXECUTE')
                 AND has_function_privilege('carepulse_api',

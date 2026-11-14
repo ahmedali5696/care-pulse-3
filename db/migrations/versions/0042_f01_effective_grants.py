@@ -59,7 +59,22 @@ def upgrade() -> None:
         END $$;
         REVOKE ALL ON ALL TABLES IN SCHEMA public FROM carepulse_runtime;
         REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM carepulse_runtime;
-        REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM carepulse_runtime;
+        DO $$ DECLARE item record; BEGIN
+          FOR item IN SELECT p.oid::regprocedure AS signature, r.rolname AS owner
+            FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+            JOIN pg_roles r ON r.oid=p.proowner
+            CROSS JOIN LATERAL aclexplode(p.proacl) acl
+            WHERE n.nspname='public' AND acl.grantee='carepulse_runtime'::regrole
+              AND p.prokind IN ('f','w')
+          LOOP
+            EXECUTE format('SET LOCAL ROLE %I', item.owner);
+            EXECUTE format('REVOKE ALL ON FUNCTION %s FROM carepulse_runtime', item.signature);
+            RESET ROLE;
+          END LOOP;
+          IF EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+            WHERE n.nspname='public' AND has_function_privilege('carepulse_runtime',p.oid,'EXECUTE'))
+          THEN RAISE EXCEPTION 'Legacy runtime retains public routine execution'; END IF;
+        END $$;
         REVOKE USAGE ON SCHEMA public FROM carepulse_runtime;
         GRANT USAGE ON SCHEMA public TO carepulse_api, carepulse_web, carepulse_worker;
         GRANT SELECT ON public.alembic_version TO carepulse_api, carepulse_web, carepulse_worker;
