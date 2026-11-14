@@ -178,6 +178,16 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
                 service_date=day,
             )
             for offset in range(1, 65):
+                connection.execute(
+                    text("SELECT set_config('cp.t158_asof', :asof, true)"),
+                    {
+                        "asof": datetime.combine(
+                            day - timedelta(days=offset),
+                            time(12),
+                            ZoneInfo("Africa/Cairo"),
+                        ).isoformat()
+                    },
+                )
                 _appointment(
                     connection,
                     tenant,
@@ -391,56 +401,6 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
         }
         # Inspect representative usable index access paths even with tiny data.
         connection.execute(text("SET LOCAL enable_seqscan=off"))
-        diagnostics = connection.execute(
-            text("""
-                SELECT c.relname, c.reltuples, c.relpages,
-                       s.attname, s.n_distinct, s.null_frac
-                FROM pg_class c
-                LEFT JOIN pg_stats s ON s.schemaname='public'
-                  AND s.tablename=c.relname
-                  AND s.attname IN ('organization_id','occurred_at')
-                WHERE c.oid='public.appointment_history'::regclass
-            """)
-        ).all()
-        indexes = connection.execute(
-            text("""
-                SELECT ic.relname, i.indisvalid, i.indisready, i.indpred IS NOT NULL,
-                       pg_get_indexdef(i.indexrelid)
-                FROM pg_index i JOIN pg_class ic ON ic.oid=i.indexrelid
-                WHERE i.indrelid='public.appointment_history'::regclass
-                ORDER BY ic.relname
-            """)
-        ).all()
-        counts = connection.execute(
-            text("""
-                SELECT organization_id, count(*),
-                       count(*) FILTER (WHERE occurred_at>=:start AND occurred_at<:end),
-                       count(DISTINCT (occurred_at AT TIME ZONE 'Africa/Cairo')::date)
-                FROM public.appointment_history GROUP BY organization_id
-            """),
-            params,
-        ).all()
-        settings = connection.execute(
-            text("""
-                SELECT name, setting FROM pg_settings
-                WHERE name IN ('enable_seqscan', 'enable_bitmapscan',
-                               'random_page_cost', 'seq_page_cost',
-                               'effective_cache_size', 'default_statistics_target')
-                ORDER BY name
-            """)
-        ).all()
-        print(
-            f"D-11 T176 diagnostic stats={diagnostics} indexes={indexes} counts={counts} settings={settings}"
-        )
-        print(
-            "D-11 T176 diagnostic cost plan:",
-            connection.scalar(
-                text(
-                    f"EXPLAIN (FORMAT JSON, COSTS TRUE) {queries['completion_cancellation_events']}"
-                ),
-                params,
-            ),
-        )
         for name, statement in queries.items():
             plan = connection.scalar(
                 text(f"EXPLAIN (FORMAT JSON, COSTS FALSE) {statement}"), params
