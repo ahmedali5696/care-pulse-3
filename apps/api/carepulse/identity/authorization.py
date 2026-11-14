@@ -9,8 +9,8 @@ from uuid import UUID
 
 from sqlalchemy import Connection, Engine, text
 
-from carepulse.db import lock_active_organization, transaction
 from carepulse.identity.contracts import ContractError
+from carepulse.identity.runtime_identity import bound_transaction
 
 if TYPE_CHECKING:
     from carepulse.identity.signing import CanonicalEnvelope
@@ -134,13 +134,15 @@ def _session_is_live(
 
 @contextmanager
 def protected_transaction(
-    engine: Engine, identity: "CanonicalEnvelope", idle_minutes: int
+    engine: Engine,
+    identity: "CanonicalEnvelope",
+    idle_minutes: int,
+    *,
+    stage: str = "PRIMARY",
 ) -> Iterator[tuple[Connection, AuthorizedStaff]]:
     """Only a verified signed clinic request may cross this authority barrier."""
     tenant, staff_id, captured_revision = _signed_actor(identity)
-    with transaction(engine, tenant) as connection:
-        if not lock_active_organization(connection, tenant):
-            raise AuthorizationDenied(403)
+    with bound_transaction(engine, identity, stage=stage) as connection:
         staff = _current_staff(connection, tenant, staff_id)
         if staff is None:
             raise AuthorizationDenied(401)
@@ -162,12 +164,6 @@ def protected_transaction(
             idle_minutes,
         ):
             raise AuthorizationDenied(401)
-        # Audited Doctor-only reads use this identity-bound transaction scope.
-        # Never set it before the current staff/session checks succeed.
-        connection.execute(
-            text("SELECT set_config('app.staff_id', :staff, true)"),
-            {"staff": str(staff_id)},
-        )
         yield (
             connection,
             AuthorizedStaff(

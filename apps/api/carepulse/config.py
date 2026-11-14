@@ -117,6 +117,7 @@ class ServiceConfig:
     delivery_max_attempts: int | None = None
     delivery_retry_seconds: int | None = None
     mail_base_url: str | None = None
+    gate_db_password: str | None = None
 
 
 def _required(name: str) -> str:
@@ -360,10 +361,8 @@ def load_config(consumer: Consumer) -> ServiceConfig:
     if delivery_key_id and not _DELIVERY_KEY_ID.fullmatch(delivery_key_id):
         raise ConfigError("Invalid CP_DELIVERY_KEY_ID")
     db_user = _required("CP_DB_USER")
-    if is_operator and db_user != "carepulse_operator":
-        raise ConfigError("Invalid operator database role")
-    if is_sender and db_user != "carepulse_sender":
-        raise ConfigError("Invalid sender database role")
+    if db_user != f"carepulse_{consumer}":
+        raise ConfigError("Invalid CP_DB_USER database role")
     db_password_source = (
         "CP_OPERATOR_DB_PASSWORD_FILE"
         if is_operator
@@ -403,6 +402,12 @@ def load_config(consumer: Consumer) -> ServiceConfig:
     mail = _endpoint("CP_SMTP", enabled=is_sender)
     if mail is not None and (mail.host != "mail" or mail.port != 1025):
         raise ConfigError("Unapproved synthetic SMTP")
+    db_password = _secret(db_password_source, minimum=16)
+    gate_db_password = (
+        _secret("CP_GATE_DB_PASSWORD_FILE", minimum=16) if consumer == "api" else None
+    )
+    if gate_db_password == db_password:
+        raise ConfigError("Invalid CP_GATE_DB_PASSWORD_FILE: reused database password")
     return ServiceConfig(
         environment=environment,
         policy=policy,
@@ -410,7 +415,7 @@ def load_config(consumer: Consumer) -> ServiceConfig:
         db_port=_port("CP_DB_PORT"),
         db_name=_required("CP_DB_NAME"),
         db_user=db_user,
-        db_password=_secret(db_password_source, minimum=16),
+        db_password=db_password,
         file_encryption_key=_secret("CP_FILE_ENCRYPTION_KEY_FILE", minimum=32)
         if consumer in ("api", "worker")
         else None,
@@ -434,4 +439,5 @@ def load_config(consumer: Consumer) -> ServiceConfig:
         delivery_max_attempts=max_attempts,
         delivery_retry_seconds=retry,
         mail_base_url=mail_base_url,
+        gate_db_password=gate_db_password,
     )

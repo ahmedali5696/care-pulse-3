@@ -27,6 +27,7 @@ from carepulse.visits.eligibility_contracts import (
 )
 from postgres_locks import wait_for_postgres_lock
 from pydantic import ValidationError
+from runtime_identity_fixture import db_proof_headers
 from sqlalchemy import event, text
 from test_appointment_persistence import _activate_clinic
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
@@ -503,6 +504,7 @@ def _signed_visit_request(
             ),
         )
     )
+    headers.extend(db_proof_headers(envelope))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},

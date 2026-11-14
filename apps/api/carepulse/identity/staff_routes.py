@@ -5,7 +5,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query, Request
 from sqlalchemy import text
 
-from carepulse.db import lock_active_organization, transaction
+from carepulse.db import lock_active_organization
 from carepulse.identity.authorization import protected_transaction
 from carepulse.identity.contracts import (
     ContractError,
@@ -17,6 +17,7 @@ from carepulse.identity.recovery import (
     finalize_recovery,
     reserve_recovery,
 )
+from carepulse.identity.runtime_identity import bound_transaction
 from carepulse.identity.staff import (
     _email,
     _owner,
@@ -60,18 +61,18 @@ def _recovery_identity(request: Request) -> tuple[UUID, UUID]:
 @router.post("/v1/staff/recovery/reserve")
 def reserve_staff_recovery(command: RecoveryCommand, request: Request):
     tenant, staff = _recovery_identity(request)
-    with transaction(request.app.state.db_engine, tenant) as connection:
+    with bound_transaction(request.app.state.db_engine) as connection:
         return reserve_recovery(connection, tenant, staff, command)
 
 
 @router.post("/v1/staff/recovery/finalize")
 def finalize_staff_recovery(command: RecoveryCommand, request: Request):
     tenant, staff = _recovery_identity(request)
-    with transaction(request.app.state.db_engine, tenant) as connection:
+    with bound_transaction(request.app.state.db_engine) as connection:
         return finalize_recovery(connection, tenant, staff, command)
 
 
-def _actor_transaction(request: Request):
+def _actor_transaction(request: Request, *, stage: str = "PRIMARY"):
     identity = request.scope.get("carepulse.identity")
     if identity is None:
         raise ContractError(403)
@@ -79,6 +80,7 @@ def _actor_transaction(request: Request):
         request.app.state.db_engine,
         identity,
         request.app.state.service_config.policy.session_idle_minutes,
+        stage=stage,
     )
 
 
@@ -160,14 +162,14 @@ def set_staff_permissions(
 
 @router.post("/v1/staff/receptionists/{staff_id}/invite")
 def invite_staff(staff_id: UUID, command: StaffCommand, request: Request):
-    with _actor_transaction(request) as (connection, actor):
+    with _actor_transaction(request, stage="INVITATION_PREPARE") as (connection, actor):
         _owner(actor)
         address = _email(_staff(connection, actor, staff_id)["verified_email"])
         clinic = actor.organization_id
     prepared = prepare_staff_invitation(
         request.app.state.service_config, clinic, address
     )
-    with _actor_transaction(request) as (connection, actor):
+    with _actor_transaction(request, stage="INVITATION_APPLY") as (connection, actor):
         projection, revision = change_staff_invitation(
             connection,
             actor,
@@ -208,7 +210,7 @@ def accept_staff_invite(command: AcceptReceptionist, request: Request):
         clinic = UUID(identity.organization_id)
     except (ValueError, TypeError) as invalid:
         raise ContractError(401) from invalid
-    with transaction(request.app.state.db_engine, clinic) as connection:
+    with bound_transaction(request.app.state.db_engine, identity) as connection:
         if not lock_active_organization(connection, clinic):
             raise ContractError(403)
         lifecycle = connection.scalar(

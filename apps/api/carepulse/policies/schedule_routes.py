@@ -24,7 +24,7 @@ from carepulse.policies.schedule_service import (
 router = APIRouter(prefix="/v1/settings/schedule")
 
 
-def _transaction(request: Request):
+def _transaction(request: Request, *, stage: str = "PRIMARY"):
     if request.query_params:
         raise ContractError(422)
     identity = request.scope.get("carepulse.identity")
@@ -34,6 +34,7 @@ def _transaction(request: Request):
         request.app.state.db_engine,
         identity,
         request.app.state.service_config.policy.session_idle_minutes,
+        stage=stage,
     )
 
 
@@ -73,7 +74,7 @@ def _schedule_mutation(request: Request, command, operation: str):
                 revision = projection["revisions"]["schedule"]
             return success_response(projection, revision)
     except ReceiptConflict:
-        with _transaction(request) as (connection, actor):
+        with _transaction(request, stage="RECEIPT_RECOVERY") as (connection, actor):
             _require_schedule_manager(actor)
             projection, revision = require_committed_tenant_receipt(
                 connection,

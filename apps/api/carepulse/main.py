@@ -12,7 +12,7 @@ from starlette.responses import JSONResponse
 
 from carepulse.appointments.routes import router as appointment_router
 from carepulse.config import load_config
-from carepulse.db import create_db_engine
+from carepulse.db import create_db_engine, create_gate_engine
 from carepulse.health import router as health_router
 from carepulse.identity.boundary import ClosedServiceBoundary
 from carepulse.identity.contracts import (
@@ -35,10 +35,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Refuse protected startup before initializing any operational capability."""
     app.state.service_config = load_config("api")
     app.state.db_engine = create_db_engine(app.state.service_config)
+    app.state.gate_engine = create_gate_engine(app.state.service_config)
     try:
         yield
     finally:
         app.state.db_engine.dispose()
+        app.state.gate_engine.dispose()
 
 
 app = FastAPI(

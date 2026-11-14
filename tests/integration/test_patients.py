@@ -21,6 +21,7 @@ from carepulse.patients.lifecycle import (
     lock_patient_for_existing_appointment,
     lock_patient_for_new_appointment,
 )
+from runtime_identity_fixture import db_proof_headers
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_request_boundary import _signed
@@ -68,6 +69,7 @@ def patient_backend(boundary_data):
         clinic.owner, staff_id=str(staff), session_id=session, role="RECEPTIONIST"
     )
     app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    app.state.gate_engine = clinic.gate
     return clinic
 
 
@@ -119,6 +121,7 @@ def private_request(
             .encode(),
         ),
     ]
+    headers.extend(db_proof_headers(identity))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},

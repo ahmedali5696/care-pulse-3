@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 import pytest
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
-from carepulse.identity.authorization import AuthorizedStaff, protected_transaction
+from carepulse.identity.authorization import AuthorizedStaff
 from carepulse.identity.contracts import ContractError
 from carepulse.main import app
 from carepulse.policies.pricing_contracts import PricingPatch
@@ -30,6 +30,7 @@ from test_pricing import (
     _owner_changes_manager,
     _patch,
     _pricing_evidence,
+    _pricing_transaction,
     pricing_request,
 )
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
@@ -95,9 +96,10 @@ def test_signed_identical_pricing_retry_after_policy_lock_replays_original(
     body = _patch(standard_new_exam_egp="125.00")
     key = str(uuid4())
     with ThreadPoolExecutor(max_workers=1) as pool:
-        with protected_transaction(
-            clinic.runtime, clinic.owner, clinic.config.policy.session_idle_minutes
-        ) as (connection, live_actor):
+        with _pricing_transaction(clinic, clinic.owner, body, key) as (
+            connection,
+            live_actor,
+        ):
             published = update_pricing(
                 connection, live_actor, PricingPatch.model_validate(body), key
             )
@@ -225,16 +227,16 @@ def test_live_owner_manager_followup_publication_serializes_stale_revision(
     second = "manager" if first == "owner" else "owner"
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        with protected_transaction(
-            clinic.runtime,
-            actors[first],
-            clinic.config.policy.session_idle_minutes,
-        ) as (connection, live_actor):
+        key = str(uuid4())
+        with _pricing_transaction(clinic, actors[first], first_body, key) as (
+            connection,
+            live_actor,
+        ):
             published = update_pricing(
                 connection,
                 live_actor,
                 PricingPatch.model_validate(first_body),
-                str(uuid4()),
+                key,
             )
             assert published["followup_revision"] == 2
             holder = connection.scalar(text("SELECT pg_backend_pid()"))

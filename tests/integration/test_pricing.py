@@ -16,7 +16,6 @@ from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
 from carepulse.identity.authorization import (
     can_manage_operational_settings,
-    protected_transaction,
 )
 from carepulse.identity.signing import canonical_payload, canonical_query
 from carepulse.main import app
@@ -24,6 +23,7 @@ from carepulse.policies.pricing import quote_price, validate_discount_reason
 from carepulse.policies.pricing_contracts import PricingPatch
 from carepulse.policies.pricing_service import update_pricing
 from carepulse.policies.versions import append_version
+from runtime_identity_fixture import db_proof_headers, signed_test_transaction
 from sqlalchemy import text
 from test_appointment_persistence import (
     _draft,
@@ -102,6 +102,7 @@ def pricing_request(
             .encode(),
         ),
     ]
+    headers.extend(db_proof_headers(envelope))
     if origin is not None:
         headers.append((b"origin", origin.encode()))
     scope = {
@@ -175,11 +176,37 @@ def _manager_change(connection, clinic, enabled, revision):
 
 
 def _owner_changes_manager(clinic, enabled, revision):
-    with protected_transaction(
-        clinic.runtime, clinic.owner, clinic.config.policy.session_idle_minutes
-    ) as (connection, actor):
+    with _manager_transaction(clinic, enabled, revision) as (connection, actor):
         assert actor.role == "DOCTOR_OWNER"
         _manager_change(connection, clinic, enabled, revision)
+
+
+def _manager_transaction(clinic, enabled, revision):
+    return signed_test_transaction(
+        clinic,
+        clinic.owner,
+        method="PATCH",
+        path=f"/v1/staff/receptionists/{clinic.receptionist.staff_id}/permissions",
+        purpose="STAFF_MANAGEMENT",
+        body={
+            "operational_manager": enabled,
+            "expected_staff_revision": revision,
+            "expected_security_revision": revision,
+            "reason": "Synthetic Owner operational Manager grant",
+        },
+    )
+
+
+def _pricing_transaction(clinic, actor, body, key):
+    return signed_test_transaction(
+        clinic,
+        actor,
+        method="PATCH",
+        path=PATH,
+        purpose="SETTINGS_PRICING",
+        body=body,
+        key=key,
+    )
 
 
 def _fresh_receptionist_session(clinic, revision):
@@ -685,9 +712,7 @@ def test_manager_receipt_recovery_serializes_with_revoke(patient_backend, first)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         if first == "revoke":
-            with protected_transaction(
-                clinic.runtime, clinic.owner, clinic.config.policy.session_idle_minutes
-            ) as (connection, _):
+            with _manager_transaction(clinic, False, 1) as (connection, _):
                 holder = connection.scalar(text("SELECT pg_backend_pid()"))
                 _manager_change(connection, clinic, False, 1)
                 future = pool.submit(
@@ -702,9 +727,10 @@ def test_manager_receipt_recovery_serializes_with_revoke(patient_backend, first)
             denied, response = future.result(timeout=30)
             assert denied == 401, response
         else:
-            with protected_transaction(
-                clinic.runtime, manager, clinic.config.policy.session_idle_minutes
-            ) as (connection, live_actor):
+            with _pricing_transaction(clinic, manager, body, key) as (
+                connection,
+                live_actor,
+            ):
                 holder = connection.scalar(text("SELECT pg_backend_pid()"))
                 future = pool.submit(_owner_changes_manager, clinic, False, 1)
                 _blocked_by(clinic, holder)
@@ -753,8 +779,8 @@ def test_manager_grant_revoke_serializes_signed_pricing_operations(
         "discount_value": "0",
     }
     with ThreadPoolExecutor(max_workers=2) as pool:
-        with protected_transaction(
-            clinic.runtime, clinic.owner, clinic.config.policy.session_idle_minutes
+        with _manager_transaction(
+            clinic, change == "grant", 0 if change == "grant" else 1
         ) as (connection, _):
             holder = connection.scalar(text("SELECT pg_backend_pid()"))
             _manager_change(
@@ -796,9 +822,7 @@ def test_manager_revoke_and_live_authorization_serialize_both_orders(
     body = _patch(standard_new_exam_egp="100.00")
     with ThreadPoolExecutor(max_workers=2) as pool:
         if winner == "revoke":
-            with protected_transaction(
-                clinic.runtime, clinic.owner, clinic.config.policy.session_idle_minutes
-            ) as (connection, _):
+            with _manager_transaction(clinic, False, 1) as (connection, _):
                 holder = connection.scalar(text("SELECT pg_backend_pid()"))
                 _manager_change(connection, clinic, False, 1)
                 pricing_future = pool.submit(
@@ -813,9 +837,11 @@ def test_manager_revoke_and_live_authorization_serialize_both_orders(
             status, response = pricing_future.result(timeout=30)
             assert status == 401, response
         else:
-            with protected_transaction(
-                clinic.runtime, manager, clinic.config.policy.session_idle_minutes
-            ) as (connection, actor):
+            key = str(uuid4())
+            with _pricing_transaction(clinic, manager, body, key) as (
+                connection,
+                actor,
+            ):
                 assert actor.role == "RECEPTIONIST"
                 assert can_manage_operational_settings(actor)
                 holder = connection.scalar(text("SELECT pg_backend_pid()"))
@@ -823,7 +849,7 @@ def test_manager_revoke_and_live_authorization_serialize_both_orders(
                 _blocked_by(clinic, holder)
                 # A checked mutation commits before a waiting revoke.
                 changed = update_pricing(
-                    connection, actor, PricingPatch.model_validate(body), str(uuid4())
+                    connection, actor, PricingPatch.model_validate(body), key
                 )
                 assert changed["price_revision"] == 2
             revoke_future.result(timeout=30)

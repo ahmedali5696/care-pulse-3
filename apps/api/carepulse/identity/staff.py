@@ -11,7 +11,6 @@ from sqlalchemy import Connection, Engine, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from carepulse.config import ServiceConfig
-from carepulse.db import transaction
 from carepulse.identity.authorization import AuthorizedStaff
 from carepulse.identity.contracts import (
     ContractError,
@@ -24,6 +23,7 @@ from carepulse.identity.receipts import (
     insert_tenant_receipt,
     resolve_tenant_receipt,
 )
+from carepulse.identity.runtime_identity import bound_transaction
 from carepulse.identity.staff_contracts import (
     AcceptReceptionist,
     CreateReceptionist,
@@ -611,10 +611,10 @@ def accept_receptionist(
 def cleanup_native_sessions(engine: Engine, tenant: UUID, native_user_id: str) -> None:
     """Best-effort cleanup; committed security_revision is the authority barrier."""
     try:
-        with transaction(engine, tenant) as connection:
+        with bound_transaction(engine, stage="SESSION_CLEANUP") as connection:
             connection.execute(
                 text("SELECT public.delete_staff_sessions(:tenant, :user)"),
                 {"tenant": tenant, "user": native_user_id},
             )
-    except SQLAlchemyError:
+    except (SQLAlchemyError, ContractError):
         pass

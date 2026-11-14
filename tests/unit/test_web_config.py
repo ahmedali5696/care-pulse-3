@@ -39,6 +39,9 @@ def web_env(tmp_path):
         secret_file.write_bytes(f"synthetic-web-{name}-secret-0123456789\r\n".encode())
         secret_file.chmod(0o600)
         secrets[name] = str(secret_file)
+    identity_key = tmp_path / "db-identity-key"
+    identity_key.write_text("ab" * 32, encoding="utf-8")
+    identity_key.chmod(0o600)
     return {
         **{
             name: setting
@@ -51,10 +54,12 @@ def web_env(tmp_path):
         "CP_DB_HOST": "db",
         "CP_DB_PORT": "5432",
         "CP_DB_NAME": "carepulse",
-        "CP_DB_USER": "carepulse_runtime",
+        "CP_DB_USER": "carepulse_web",
         "CP_AUTH_DB_USER": "carepulse_auth",
         "CP_INTERNAL_API_URL": "http://api:8000",
         "CP_SIGNING_KEY_ID": "synthetic-ci-v1",
+        "CP_DB_IDENTITY_KEY_ID": "synthetic-db-v1",
+        "CP_DB_IDENTITY_KEY_FILE": str(identity_key),
         **secrets,
         "CP_MAIL_ENABLED": "false",
         "CP_SCAN_ENABLED": "false",
@@ -257,3 +262,19 @@ def test_web_rejects_reused_auth_database_credentials(web_env):
     denied = _web_config(web_env)
     assert denied.returncode != 0
     assert denied.stderr == "Invalid CP_AUTH_DB_PASSWORD_FILE"
+
+
+@pytest.mark.parametrize("key", ["ab" * 31, "AB" * 32, "zz" * 32, "ab" * 33])
+def test_web_rejects_invalid_db_identity_key(web_env, key):
+    Path(web_env["CP_DB_IDENTITY_KEY_FILE"]).write_text(key, encoding="utf-8")
+    completed = _web_config(web_env)
+    assert completed.returncode != 0
+    assert completed.stderr == "Invalid CP_DB_IDENTITY_KEY_FILE"
+
+
+@pytest.mark.parametrize("name", ["CP_DB_IDENTITY_KEY_FILE", "CP_DB_IDENTITY_KEY_ID"])
+def test_web_requires_db_identity_signer(web_env, name):
+    del web_env[name]
+    completed = _web_config(web_env)
+    assert completed.returncode != 0
+    assert completed.stderr == f"Invalid {name}"

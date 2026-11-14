@@ -7,13 +7,14 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.parse import unquote
 from uuid import UUID
 
 import pytest
 from carepulse.config import ServiceConfig, _load_policy
 from carepulse.identity.boundary import ClosedServiceBoundary, _read_body
+from carepulse.identity.runtime_identity import current_request
 from carepulse.identity.signing import (
     CanonicalEnvelope,
     canonical_path,
@@ -35,7 +36,7 @@ def api_config(monkeypatch):
         db_host="db",
         db_port=5432,
         db_name="carepulse",
-        db_user="carepulse_runtime",
+        db_user="carepulse_api",
         db_password="synthetic-db-password",
         file_encryption_key="synthetic-file-key",
         service_key="synthetic-key",
@@ -186,6 +187,21 @@ def test_encoded_route_changes_and_malformed_escapes_are_denied(path):
         canonical_path(path)
 
 
+_DB_KEY_ID = "synthetic-db-v1"
+_DB_KEY = bytes(range(32))
+
+
+def _db_mac(envelope):
+    return hmac.new(
+        _DB_KEY,
+        b"carepulse-db-context-v1\x00"
+        + _DB_KEY_ID.encode()
+        + b"\x00"
+        + canonical_payload(envelope),
+        hashlib.sha256,
+    ).digest()
+
+
 def _signed_request(vector, api_config, changes=None):
     envelope = CanonicalEnvelope(*vector["canonical_fields"])
     field_names = (
@@ -219,6 +235,8 @@ def _signed_request(vector, api_config, changes=None):
     headers = {name: field.encode("utf-8") for name, field in zip(field_names, fields)}
     headers["signature"] = vector["signature"].encode("ascii")
     headers["service-key"] = api_config.service_key.encode("ascii")
+    headers["db-key-id"] = _DB_KEY_ID.encode("ascii")
+    headers["db-proof"] = _db_mac(envelope).hex().encode("ascii")
     if changes:
         headers.update(changes)
     return {
@@ -239,9 +257,33 @@ def _signed_request(vector, api_config, changes=None):
 def _run_signed(scope, body, routes, when_ms):
     delivered = []
     calls = []
+    gate = MagicMock()
+    gate_connection = gate.begin.return_value.__enter__.return_value
+
+    def register(statement, parameters):
+        assert (
+            str(statement)
+            == "SELECT public.f01_register_proof(:payload, :key, :proof, :body)"
+        )
+        envelope = CanonicalEnvelope(*json.loads(parameters["payload"]))
+        assert parameters == {
+            "payload": canonical_payload(envelope),
+            "key": _DB_KEY_ID,
+            "proof": _db_mac(envelope),
+            "body": body,
+        }
+        return 123
+
+    gate_connection.scalar.side_effect = register
+    scope["app"].state.gate_engine = gate
 
     async def authorized(request_scope, receive, send):
         calls.append(request_scope["carepulse.identity"])
+        registered = current_request.get()
+        assert registered is not None
+        assert registered.gate is gate and registered.request_id == 123
+        assert registered.identity == request_scope["carepulse.identity"]
+        gate.begin.return_value.__exit__.assert_called_once_with(None, None, None)
         assert (
             request_scope["query_string"]
             == request_scope["carepulse.identity"].query.encode()
@@ -260,14 +302,12 @@ def _run_signed(scope, body, routes, when_ms):
     async def send(message):
         delivered.append(message)
 
-    with (
-        patch("carepulse.identity.boundary.time_ns", return_value=when_ms * 1_000_000),
-        patch("carepulse.identity.boundary.accept_verified_nonce") as nonce,
-    ):
+    with patch("carepulse.identity.boundary.time_ns", return_value=when_ms * 1_000_000):
         asyncio.run(
             ClosedServiceBoundary(authorized, routes=routes)(scope, receive, send)
         )
-    return delivered[0]["status"], calls, nonce.call_count
+    assert current_request.get() is None
+    return delivered[0]["status"], calls, gate_connection.scalar.call_count
 
 
 @pytest.mark.parametrize("index", [0, 1])
@@ -295,6 +335,7 @@ def test_only_configured_signing_key_id_is_accepted(signing_vectors, api_config)
         config,
         {
             "key-id": configured_id.encode(),
+            "db-proof": _db_mac(envelope).hex().encode("ascii"),
             "signature": hmac.new(
                 config.service_key.encode(), canonical_payload(envelope), hashlib.sha256
             )

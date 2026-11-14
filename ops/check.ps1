@@ -68,7 +68,8 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'c8d43656f391254f8ff9c6dcb8c57d93c890643db649d05ae98584426e1ba01f',
+    '.github/workflows/foundation.yml': 'a72ca56bd397cae07ed6166dae881532c5f51c4814501681ee8967d8562a6aff',
+    'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'apps/api/Dockerfile': '8465e11d5b90d94704ec63072180f10c56dcf4becf471da84258ea21de5208c8',
     'apps/web/Dockerfile': '933af52609f2a4eb638d048605ec555e2a3443cb25b3ba5d64d5a36ec585f02a',
 }
@@ -277,7 +278,7 @@ cleanup() {
   exit "$code"
 }
 trap cleanup EXIT
-for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE"; do
+for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_API_DB_PASSWORD_SOURCE_FILE" "$CP_WEB_DB_PASSWORD_SOURCE_FILE" "$CP_WORKER_DB_PASSWORD_SOURCE_FILE" "$CP_GATE_DB_PASSWORD_SOURCE_FILE" "$CP_DB_IDENTITY_KEY_SOURCE_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE"; do
   test "$(dirname "$file")" = "$private"
   openssl rand -hex 32 > "$file"
   chmod 0444 "$file"
@@ -313,15 +314,25 @@ for attempt in $(seq 1 40); do
 done
 export CP_MIGRATION_PASSWORD="$(cat "$CP_MIGRATION_SECRET_FILE")"
 export CP_RUNTIME_PASSWORD="$(cat "$CP_RUNTIME_DB_PASSWORD_FILE")"
+export CP_API_DB_PASSWORD="$(cat "$CP_API_DB_PASSWORD_SOURCE_FILE")"
+export CP_WEB_DB_PASSWORD="$(cat "$CP_WEB_DB_PASSWORD_SOURCE_FILE")"
+export CP_WORKER_DB_PASSWORD="$(cat "$CP_WORKER_DB_PASSWORD_SOURCE_FILE")"
+export CP_GATE_DB_PASSWORD="$(cat "$CP_GATE_DB_PASSWORD_SOURCE_FILE")"
 export CP_AUTH_DB_PASSWORD="$(cat "$CP_AUTH_DB_PASSWORD_SOURCE_FILE")"
 export CP_OPERATOR_PASSWORD="$(cat "$CP_OPERATOR_SECRET_FILE")"
 export CP_SENDER_PASSWORD="$(cat "$CP_SENDER_DB_PASSWORD_SOURCE_FILE")"
-if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e CP_AUTH_DB_PASSWORD -e CP_OPERATOR_PASSWORD -e CP_SENDER_PASSWORD \
+if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e CP_AUTH_DB_PASSWORD -e CP_OPERATOR_PASSWORD -e CP_SENDER_PASSWORD -e CP_API_DB_PASSWORD -e CP_WEB_DB_PASSWORD -e CP_WORKER_DB_PASSWORD -e CP_GATE_DB_PASSWORD \
   db psql --no-psqlrc -v VERBOSITY=sqlstate -U carepulse_bootstrap -d carepulse < db/roles.sql > "$private/roles.log" 2>&1; then
   roles_error="$(sed -nE 's/^psql:[^:]+:([0-9]+): ERROR: +([A-Z0-9]{5}).*$/roles.sql:\1 SQLSTATE \2/p' "$private/roles.log" | head -n 1)"
   echo "FAIL controlled roles (${roles_error:-SQLSTATE unavailable}; credential-bearing diagnostics withheld)"; exit 1
 fi
-unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_AUTH_DB_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD
+unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_AUTH_DB_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD CP_API_DB_PASSWORD CP_WEB_DB_PASSWORD CP_WORKER_DB_PASSWORD CP_GATE_DB_PASSWORD
+identity_fixture_args=(
+  -e CP_DB_IDENTITY_KEY_ID
+  -v "$CP_DB_IDENTITY_KEY_SOURCE_FILE:/run/secrets/db_identity_key:ro"
+  -v "$CP_API_DB_PASSWORD_SOURCE_FILE:/run/secrets/api_db_password:ro"
+  -v "$CP_GATE_DB_PASSWORD_SOURCE_FILE:/run/secrets/gate_db_password:ro"
+)
 upgrade_head() {
   docker compose --profile test run --rm --no-deps \
     -e CP_DB_HOST=db -e CP_DB_PORT=5432 -e CP_DB_NAME=carepulse \
@@ -330,13 +341,30 @@ upgrade_head() {
     test python -m alembic -c alembic.ini upgrade head
 }
 
+# Synthetic-only custody setup. The ordinary runtime roles have no key-table
+# access. Provisioning is performed outside all application containers.
+seed_identity_policy() {
+  set +x
+  export CP_F01_SYNTHETIC_KEY="$(cat "$CP_DB_IDENTITY_KEY_SOURCE_FILE")"
+  export CP_F01_FRESHNESS="$(jq -er 'select(.profile == "synthetic") | .signed_request_freshness_seconds' tests/fixtures/foundation-policy.json)"
+  export CP_F01_SKEW="$(jq -er 'select(.profile == "synthetic") | .signed_request_max_skew_seconds' tests/fixtures/foundation-policy.json)"
+  export CP_F01_IDLE="$(jq -er 'select(.profile == "synthetic") | .session_idle_minutes' tests/fixtures/foundation-policy.json)"
+  docker compose exec -T -e CP_F01_SYNTHETIC_KEY -e CP_DB_IDENTITY_KEY_ID -e CP_F01_FRESHNESS -e CP_F01_SKEW -e CP_F01_IDLE \
+    db psql --no-psqlrc -v VERBOSITY=sqlstate -U carepulse_bootstrap -d carepulse < db/f01-synthetic-bootstrap.sql > "$private/f01-bootstrap.log" 2>&1 || {
+      unset CP_F01_SYNTHETIC_KEY CP_F01_FRESHNESS CP_F01_SKEW CP_F01_IDLE
+      echo 'FAIL F-01 synthetic identity provisioning'; return 1;
+    }
+  unset CP_F01_SYNTHETIC_KEY CP_F01_FRESHNESS CP_F01_SKEW CP_F01_IDLE
+}
+
 if [ -n "$focused_target" ]; then
   if ! upgrade_head > "$private/focused-migration.log" 2>&1; then
     echo 'FAIL focused PostgreSQL Alembic upgrade to head'; exit 1
   fi
   echo 'PASS focused PostgreSQL Alembic upgrade to head'
+  seed_identity_policy
   docker compose exec -T db postgres --version | grep -F '17.11'
-  docker compose --profile test run --rm --no-deps -T \
+  docker compose --profile test run --rm --no-deps -T "${identity_fixture_args[@]}" \
     -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
     -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
     -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -346,7 +374,20 @@ if [ -n "$focused_target" ]; then
 fi
 
 upgrade_head
-docker compose --profile test run --rm --no-deps \
+seed_identity_policy
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
+  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+  -v "$CP_WEB_DB_PASSWORD_SOURCE_FILE:/run/secrets/web_db_password:ro" \
+  -v "$CP_WORKER_DB_PASSWORD_SOURCE_FILE:/run/secrets/worker_db_password:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  -v "$CP_DB_PASSWORD_FILE:/run/secrets/postgres_password:ro" \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_f01_runtime_identity.py tests/integration/test_f01_grants_migration.py | tee "$private/f01-runtime-identity.log"
+if grep -Eq '[0-9]+ skipped|no tests ran' "$private/f01-runtime-identity.log"; then
+  echo 'FAIL mandatory F-01 runtime identity evidence skipped'; exit 1
+fi
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -372,7 +413,7 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d06-queue.log"; then
   echo 'FAIL mandatory D-06 real-PostgreSQL evidence skipped'; exit 1
 fi
 # All B-06 suites run against disposable PostgreSQL; no silent skip counts.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -383,7 +424,7 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b06-pricing.log"; then
   echo 'FAIL mandatory B-06 pricing evidence skipped'; exit 1
 fi
 # B-07 tests must run against disposable PostgreSQL, including preview races and migration.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -394,7 +435,7 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b07-schedule.log"; then
   echo 'FAIL mandatory B-07 schedule evidence skipped'; exit 1
 fi
 # B-08 tests exercise the real PostgreSQL booking-day lock and capacity races.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -405,7 +446,7 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b08-slots.log"; then
   echo 'FAIL mandatory B-08 slot evidence skipped'; exit 1
 fi
 # B-09 confirms atomic Booked-only creation and real-PostgreSQL races.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -416,7 +457,7 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b09-booking.log"; then
   echo 'FAIL mandatory B-09 booking evidence skipped'; exit 1
 fi
 # B-10 confirms Doctor decisions, exact extensions, bookings and denial/race evidence.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -443,7 +484,7 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d11-day-review.log"; then
   echo 'FAIL mandatory D-11 real-PostgreSQL evidence skipped'; exit 1
 fi
 # B-05 backend proof has no BFF/invitation prerequisite and cannot silently skip.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -594,7 +635,7 @@ docker compose exec -T web node -e 'fetch("http://api:8000/__foundation_network_
 docker compose --profile test run --rm --no-deps -e CI=true \
   -v "$GITHUB_WORKSPACE/tests:/srv/tests:ro" api python -m pytest -q -ra -p no:cacheprovider tests/integration/test_secrets.py
 : > "$private/denials.log"
-for key in CP_POLICY_FILE CP_DB_PASSWORD_FILE CP_AUTH_DB_PASSWORD_FILE CP_SERVICE_KEY_FILE CP_AUTH_SECRET_FILE; do
+for key in CP_POLICY_FILE CP_DB_PASSWORD_FILE CP_AUTH_DB_PASSWORD_FILE CP_SERVICE_KEY_FILE CP_AUTH_SECRET_FILE CP_DB_IDENTITY_KEY_FILE; do
   set +e
   timeout 15s docker compose run --rm --no-deps -e "$key=/run/secrets/missing" web > "$private/web-denial.log" 2>&1
   code=$?
@@ -617,10 +658,10 @@ for key in CP_POLICY_FILE CP_DB_PASSWORD_FILE CP_FILE_ENCRYPTION_KEY_FILE; do
   fi
   echo "PASS worker protected startup denies missing $key"
 done
-cat "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" \
+cat "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_API_DB_PASSWORD_SOURCE_FILE" "$CP_WEB_DB_PASSWORD_SOURCE_FILE" "$CP_WORKER_DB_PASSWORD_SOURCE_FILE" "$CP_GATE_DB_PASSWORD_SOURCE_FILE" "$CP_DB_IDENTITY_KEY_SOURCE_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" \
   "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" > "$private/canaries"
 chmod 0444 "$private/canaries"
-awk 'length($0) != 64 || $0 !~ /^[0-9a-f]+$/ { invalid=1 } END { if (NR != 10 || invalid) exit 1 }' "$private/canaries"
+awk 'length($0) != 64 || $0 !~ /^[0-9a-f]+$/ || seen[$0]++ { invalid=1 } END { if (NR != 15 || invalid) exit 1 }' "$private/canaries"
 if git grep -I -q -f "$private/canaries" -- apps tests ops compose.yaml; then
   echo 'FAIL synthetic key in tracked source'; exit 1
 else

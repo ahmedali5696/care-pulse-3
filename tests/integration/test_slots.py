@@ -14,6 +14,7 @@ import pytest
 from carepulse.db import transaction
 from carepulse.identity.signing import canonical_payload, canonical_query
 from carepulse.main import app
+from runtime_identity_fixture import db_proof_headers
 from sqlalchemy import text
 from test_booking import (
     booking_body,
@@ -83,6 +84,7 @@ def _slots_request(clinic, actor, day, *, other_fields=None):
             .encode(),
         ),
     ]
+    headers.extend(db_proof_headers(envelope))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},

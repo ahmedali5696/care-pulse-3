@@ -20,6 +20,7 @@ from carepulse.main import app
 from carepulse.policies.schedule_service import load_current_schedule
 from carepulse.policies.slots import candidates_for_date
 from carepulse.policies.versions import append_version
+from runtime_identity_fixture import db_proof_headers
 from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _patient, _persist_with_status
@@ -91,6 +92,7 @@ def booking_request(
             .encode(),
         ),
     ]
+    headers.extend(db_proof_headers(signed))
     if declared_length is not None:
         headers.append((b"content-length", str(declared_length).encode()))
     scope = {

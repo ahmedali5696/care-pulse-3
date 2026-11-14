@@ -128,8 +128,8 @@ def _locked_source(
     visit = (
         connection.execute(
             text("""
-            SELECT id, patient_id, appointment_id, doctor_staff_id, clinical_revision,
-                   followup_decision FROM public.visits
+            SELECT id, patient_id, appointment_id, doctor_staff_id, clinical_revision
+                   FROM public.visits
             WHERE organization_id=:tenant AND id=:visit FOR UPDATE
         """),
             {"tenant": tenant, "visit": visit_id},

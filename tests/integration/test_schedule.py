@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
-from carepulse.identity.authorization import AuthorizedStaff, protected_transaction
+from carepulse.identity.authorization import AuthorizedStaff
 from carepulse.identity.contracts import ContractError
 from carepulse.identity.signing import canonical_payload
 from carepulse.main import app
@@ -27,6 +27,7 @@ from carepulse.policies.schedule_service import (
     stage_or_preview,
 )
 from carepulse.policies.slots import candidates_for_date
+from runtime_identity_fixture import db_proof_headers, signed_test_transaction
 from sqlalchemy import text
 from test_appointment_persistence import (
     _admit_saved,
@@ -41,6 +42,7 @@ from test_pricing import (
     _blocked_by,
     _fresh_receptionist_session,
     _manager_change,
+    _manager_transaction,
     _owner_changes_manager,
 )
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
@@ -276,6 +278,7 @@ def _schedule_request(
             .encode(),
         ),
     ]
+    headers.extend(db_proof_headers(envelope))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -1797,10 +1800,17 @@ def test_manager_revoke_and_schedule_operations_serialize(
     body = _patch(_config(mode="OPEN")).model_dump(mode="json")
     prepared = None
     if operation == "activate":
-        with protected_transaction(
-            clinic.runtime, manager, clinic.config.policy.session_idle_minutes
+        preview_key = str(uuid4())
+        with signed_test_transaction(
+            clinic,
+            manager,
+            method="POST",
+            path="/v1/settings/schedule/preview",
+            purpose="SETTINGS_SCHEDULE",
+            body=body,
+            key=preview_key,
         ) as (connection, actor):
-            prepared = _stage(connection, actor, _config(mode="OPEN"))
+            prepared = _stage(connection, actor, _config(mode="OPEN"), key=preview_key)
         body = {
             "preview_id": prepared["preview_id"],
             "expected_schedule_revision": 1,
@@ -1811,9 +1821,7 @@ def test_manager_revoke_and_schedule_operations_serialize(
     key = str(uuid4())
     with ThreadPoolExecutor(max_workers=1) as pool:
         if winner == "revoke":
-            with protected_transaction(
-                clinic.runtime, clinic.owner, clinic.config.policy.session_idle_minutes
-            ) as (connection, _):
+            with _manager_transaction(clinic, False, 1) as (connection, _):
                 holder = connection.scalar(text("SELECT pg_backend_pid()"))
                 _manager_change(connection, clinic, False, 1)
                 operation_future = pool.submit(
@@ -1829,8 +1837,14 @@ def test_manager_revoke_and_schedule_operations_serialize(
             status, denied = operation_future.result(timeout=30)
             assert status == 401, denied
         else:
-            with protected_transaction(
-                clinic.runtime, manager, clinic.config.policy.session_idle_minutes
+            with signed_test_transaction(
+                clinic,
+                manager,
+                method="POST",
+                path=f"/v1/settings/schedule{suffix}",
+                purpose="SETTINGS_SCHEDULE",
+                body=body,
+                key=key,
             ) as (connection, actor):
                 holder = connection.scalar(text("SELECT pg_backend_pid()"))
                 revoke_future = pool.submit(_owner_changes_manager, clinic, False, 1)

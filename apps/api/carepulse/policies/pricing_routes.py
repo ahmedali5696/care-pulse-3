@@ -23,7 +23,7 @@ from carepulse.policies.pricing_service import read_pricing, update_pricing
 router = APIRouter(prefix="/v1/settings/pricing")
 
 
-def _transaction(request: Request):
+def _transaction(request: Request, *, stage: str = "PRIMARY"):
     if request.method != "GET" and request.query_params:
         raise ContractError(422)
     identity = request.scope.get("carepulse.identity")
@@ -33,6 +33,7 @@ def _transaction(request: Request):
         request.app.state.db_engine,
         identity,
         request.app.state.service_config.policy.session_idle_minutes,
+        stage=stage,
     )
 
 
@@ -58,7 +59,7 @@ def patch_pricing(command: PricingPatch, request: Request):
             result = update_pricing(connection, actor, command, key)
             return success_response(result, result["price_revision"])
     except ReceiptConflict:
-        with _transaction(request) as (connection, actor):
+        with _transaction(request, stage="RECEIPT_RECOVERY") as (connection, actor):
             if not can_manage_operational_settings(actor):
                 raise ContractError(403)
             result, revision = require_committed_tenant_receipt(

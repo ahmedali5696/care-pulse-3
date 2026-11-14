@@ -5,7 +5,7 @@ import type { loadWebConfig } from "./config.ts";
 let database: Pool | undefined;
 let authPool: Pool | undefined;
 
-function createPool(settings: ReturnType<typeof loadWebConfig>["database"]): Pool {
+function createPool(settings: ReturnType<typeof loadWebConfig>["database" | "authDatabase"]): Pool {
   const pool = new Pool({
     host: settings.host, port: settings.port,
     database: settings.name, user: settings.user,

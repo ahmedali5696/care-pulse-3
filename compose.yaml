@@ -18,12 +18,14 @@ services:
       CP_DB_HOST: ${CP_DB_HOST:?Set the runtime DB host}
       CP_DB_PORT: ${CP_DB_PORT:?Set the runtime DB port}
       CP_DB_NAME: ${CP_DB_NAME:?Set the runtime DB name}
-      CP_DB_USER: ${CP_DB_USER:?Set the runtime DB role}
-      CP_DB_PASSWORD_FILE: /run/secrets/runtime_db_password
+      CP_DB_USER: carepulse_web
+      CP_DB_PASSWORD_FILE: /run/secrets/web_db_password
       CP_AUTH_DB_USER: carepulse_auth
       CP_AUTH_DB_PASSWORD_FILE: /run/secrets/auth_db_password
       CP_INTERNAL_API_URL: ${CP_INTERNAL_API_URL:?Set the private API URL}
       CP_SIGNING_KEY_ID: ${CP_SIGNING_KEY_ID:?Set the active BFF signing key ID}
+      CP_DB_IDENTITY_KEY_ID: ${CP_DB_IDENTITY_KEY_ID:?Set the active DB identity key ID}
+      CP_DB_IDENTITY_KEY_FILE: /run/secrets/db_identity_key
       CP_DELIVERY_KEY_ID: ${CP_DELIVERY_KEY_ID:?Set issuer key ID}
       CP_DELIVERY_PUBLIC_KEY_FILE: /run/secrets/delivery_public_key
       CP_SERVICE_KEY_FILE: /run/secrets/service_key
@@ -36,7 +38,8 @@ services:
       CP_SMTP_PORT: ${CP_SMTP_PORT:-}
     secrets:
       - active_policy
-      - runtime_db_password
+      - web_db_password
+      - db_identity_key
       - auth_db_password
       - service_key
       - auth_secret
@@ -67,8 +70,9 @@ services:
       CP_DB_HOST: ${CP_DB_HOST:?Set the runtime DB host}
       CP_DB_PORT: ${CP_DB_PORT:?Set the runtime DB port}
       CP_DB_NAME: ${CP_DB_NAME:?Set the runtime DB name}
-      CP_DB_USER: ${CP_DB_USER:?Set the runtime DB role}
-      CP_DB_PASSWORD_FILE: /run/secrets/runtime_db_password
+      CP_DB_USER: carepulse_api
+      CP_DB_PASSWORD_FILE: /run/secrets/api_db_password
+      CP_GATE_DB_PASSWORD_FILE: /run/secrets/gate_db_password
       CP_SERVICE_KEY_FILE: /run/secrets/service_key
       CP_SIGNING_KEY_ID: ${CP_SIGNING_KEY_ID:?Set the active API signing key ID}
       CP_DELIVERY_KEY_ID: ${CP_DELIVERY_KEY_ID:?Set issuer key ID}
@@ -80,7 +84,8 @@ services:
       CP_SCAN_PORT: ${CP_SCAN_PORT:-}
     secrets:
       - active_policy
-      - runtime_db_password
+      - api_db_password
+      - gate_db_password
       - service_key
       - delivery_public_key
       - file_encryption_key
@@ -121,14 +126,14 @@ services:
       CP_DB_HOST: ${CP_DB_HOST:?Set the runtime DB host}
       CP_DB_PORT: ${CP_DB_PORT:?Set the runtime DB port}
       CP_DB_NAME: ${CP_DB_NAME:?Set the runtime DB name}
-      CP_DB_USER: ${CP_DB_USER:?Set the runtime DB role}
-      CP_DB_PASSWORD_FILE: /run/secrets/runtime_db_password
+      CP_DB_USER: carepulse_worker
+      CP_DB_PASSWORD_FILE: /run/secrets/worker_db_password
       CP_FILE_ENCRYPTION_KEY_FILE: /run/secrets/file_encryption_key
       CP_MAIL_ENABLED: ${CP_MAIL_ENABLED:?Set explicit mail enablement}
       CP_SCAN_ENABLED: ${CP_SCAN_ENABLED:?Set explicit scan enablement}
     secrets:
       - active_policy
-      - runtime_db_password
+      - worker_db_password
       - file_encryption_key
     healthcheck:
       test: ["CMD", "python", "apps/worker/status.py", "ready"]
@@ -275,8 +280,16 @@ volumes:
 secrets:
   postgres_password:
     file: ${CP_DB_PASSWORD_FILE:?Set a synthetic PostgreSQL password file path for CI}
-  runtime_db_password:
-    file: ${CP_RUNTIME_DB_PASSWORD_FILE:?Set a separate ignored runtime DB password file path}
+  web_db_password:
+    file: ${CP_WEB_DB_PASSWORD_SOURCE_FILE:?Set Web DB password file}
+  api_db_password:
+    file: ${CP_API_DB_PASSWORD_SOURCE_FILE:?Set API DB password file}
+  worker_db_password:
+    file: ${CP_WORKER_DB_PASSWORD_SOURCE_FILE:?Set worker DB password file}
+  gate_db_password:
+    file: ${CP_GATE_DB_PASSWORD_SOURCE_FILE:?Set API gate DB password file}
+  db_identity_key:
+    file: ${CP_DB_IDENTITY_KEY_SOURCE_FILE:?Set Web DB identity key file}
   auth_db_password:
     file: ${CP_AUTH_DB_PASSWORD_SOURCE_FILE:?Set a separate ignored Web auth DB password file path}
   service_key:

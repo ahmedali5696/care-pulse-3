@@ -186,6 +186,7 @@ async function activateOwner(body: Acceptance, invitation: Invitation, userId: s
     securityRevision: 0, purpose: receptionist ? "RECEPTIONIST_ACCEPT" : "OWNER_ACTIVATION",
     keyId: config.signingKeyId,
     serviceKey: config.serviceKey,
+    dbIdentityKeyId: config.dbIdentityKeyId, dbIdentityKey: config.dbIdentityKey,
   });
   signed.headers.set("Content-Type", "application/json");
   const response = await fetch(`${config.apiUrl}${signed.path}`, {

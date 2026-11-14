@@ -1,23 +1,23 @@
 """Signed, replay-resistant private BFF transport boundary."""
 
-from datetime import UTC, datetime
 from hashlib import sha256
 from hmac import compare_digest, new
 from re import Pattern
 from time import time_ns
 from urllib.parse import unquote
 
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from carepulse.identity.contracts import error_response
+from carepulse.identity.runtime_identity import RegisteredRequest, current_request
 from carepulse.identity.signing import (
     CanonicalEnvelope,
     canonical_path,
     canonical_payload,
     canonical_query,
 )
-from carepulse.notifications.evidence import accept_verified_nonce
 
 _HEADER_FIELDS = (
     "protocol-version",
@@ -34,6 +34,8 @@ _HEADER_FIELDS = (
     "idempotency-key",
     "signature",
     "service-key",
+    "db-key-id",
+    "db-proof",
 )
 _EXPECTED_SERVICE = "web"
 _MAX_MUTATION_BODY_BYTES = 1_048_576
@@ -151,7 +153,7 @@ class ClosedServiceBoundary:
             await self.app(scope, receive, send)
             return
         try:
-            envelope, payload = await self._authenticate(scope, receive)
+            envelope, payload, registered = await self._authenticate(scope, receive)
         except (KeyError, TypeError, ValueError, UnicodeError):
             await self._deny(401, scope, receive, send)
             return
@@ -173,11 +175,15 @@ class ClosedServiceBoundary:
                 return {"type": "http.request", "body": payload, "more_body": False}
             return {"type": "http.disconnect"}
 
-        await self.app(scope, replay_body, send)
+        token = current_request.set(registered)
+        try:
+            await self.app(scope, replay_body, send)
+        finally:
+            current_request.reset(token)
 
     async def _authenticate(
         self, scope: Scope, receive: Receive
-    ) -> tuple[CanonicalEnvelope, bytes]:
+    ) -> tuple[CanonicalEnvelope, bytes, RegisteredRequest]:
         config = scope["app"].state.service_config
         headers = _signed_headers(scope, config.service_key, config.signing_key_id)
         payload = await _read_body(scope, receive)
@@ -205,17 +211,39 @@ class ClosedServiceBoundary:
         if permitted_purpose != envelope.purpose:
             raise BoundaryDenied(403)
         try:
-            accept_verified_nonce(
-                scope["app"].state.db_engine,
-                envelope.key_id,
-                envelope.nonce,
-                datetime.fromtimestamp(signed_at_ms / 1000, UTC),
-            )
+            if not headers["db-key-id"] or len(headers["db-proof"]) != 64:
+                raise BoundaryDenied(401)
+            try:
+                proof = bytes.fromhex(headers["db-proof"])
+            except ValueError as malformed:
+                raise BoundaryDenied(401) from malformed
+            if len(proof) != 32:
+                raise BoundaryDenied(401)
+            gate_engine = scope["app"].state.gate_engine
+            with gate_engine.begin() as gate:
+                request_id = gate.scalar(
+                    text(
+                        "SELECT public.f01_register_proof(:payload, :key, :proof, :body)"
+                    ),
+                    {
+                        "payload": canonical_payload(envelope),
+                        "key": headers["db-key-id"],
+                        "proof": proof,
+                        "body": payload,
+                    },
+                )
+                if not isinstance(request_id, int):
+                    raise BoundaryDenied(401)
         except IntegrityError as replay:
             raise BoundaryDenied(401) from replay
         except SQLAlchemyError as unavailable:
+            if getattr(getattr(unavailable, "orig", None), "sqlstate", None) in (
+                "42501",
+                "22023",
+            ):
+                raise BoundaryDenied(401) from unavailable
             raise BoundaryDenied(503) from unavailable
-        return envelope, payload
+        return envelope, payload, RegisteredRequest(gate_engine, request_id, envelope)
 
     @staticmethod
     async def _deny(status: int, scope: Scope, receive: Receive, send: Send) -> None:

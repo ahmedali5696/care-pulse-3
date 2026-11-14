@@ -57,6 +57,7 @@ export async function forwardPrivate(request: Request, route: ApprovedRoute): Pr
       sessionId: actor.sessionId, role: actor.role,
       securityRevision: actor.securityRevision, purpose: route.purpose,
       idempotencyKey, keyId: config.signingKeyId, serviceKey: config.serviceKey,
+      dbIdentityKeyId: config.dbIdentityKeyId, dbIdentityKey: config.dbIdentityKey,
     });
     const headers = signed.headers;
     const contentType = request.headers.get("content-type");
