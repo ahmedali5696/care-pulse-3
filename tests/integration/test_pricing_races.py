@@ -1,7 +1,7 @@
 """B-06 conflicting pricing transactions and immutable frozen-price evidence."""
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,6 +11,7 @@ from carepulse.main import app
 from carepulse.policies.pricing_contracts import PricingPatch
 from carepulse.policies.pricing_service import current_price_state, update_pricing
 from carepulse.policies.versions import append_version
+from postgres_locks import wait_for_postgres_lock
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import (
@@ -18,9 +19,9 @@ from test_appointment_persistence import (
     _patient,
     _query,
 )
+from test_booking_races import _activation_checkpoint
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import (
-    _blocked_by,
     _fresh_receptionist_session,
     _owner_changes_manager,
     _patch,
@@ -86,6 +87,7 @@ def test_signed_identical_pricing_retry_after_policy_lock_replays_original(
     app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
     body = _patch(standard_new_exam_egp="125.00")
     key = str(uuid4())
+    waiting_pid, ready = [], Event()
     with ThreadPoolExecutor(max_workers=1) as pool:
         with _pricing_transaction(clinic, clinic.owner, body, key) as (
             connection,
@@ -95,15 +97,18 @@ def test_signed_identical_pricing_retry_after_policy_lock_replays_original(
                 connection, live_actor, PricingPatch.model_validate(body), key
             )
             holder = connection.scalar(text("SELECT pg_backend_pid()"))
-            future = pool.submit(
-                pricing_request,
-                clinic,
-                clinic.owner,
-                method="PATCH",
-                body=body,
-                key=key,
-            )
-            _blocked_by(clinic, holder)
+            with _activation_checkpoint(clinic, waiting_pid, ready):
+                future = pool.submit(
+                    pricing_request,
+                    clinic,
+                    clinic.owner,
+                    method="PATCH",
+                    body=body,
+                    key=key,
+                )
+                assert ready.wait(timeout=12)
+                with clinic.migration.connect() as observer:
+                    wait_for_postgres_lock(observer, waiting_pid[0], holder, timeout=12)
         status, result = future.result(timeout=30)
     assert status == 200 and result["data"] == published
     assert (
@@ -146,6 +151,7 @@ def test_direct_identical_pricing_rechecks_receipt_after_authority_lock(
     key = str(uuid4())
     change = _change(1, standard_new_exam_egp="125.00")
     body = change.model_dump(mode="json")
+    waiting_pid, ready = [], Event()
 
     def competing_update():
         with _pricing_transaction(clinic, clinic.owner, body, key) as (
@@ -166,15 +172,15 @@ def test_direct_identical_pricing_rechecks_receipt_after_authority_lock(
                 key,
             )
             holder_pid = connection.scalar(text("SELECT pg_backend_pid()"))
-            future = pool.submit(competing_update)
-            # F01 holds the organization lock before either request reaches policy locks.
-            blocked = _blocked_by(clinic, holder_pid)
-            with clinic.migration.connect() as observer:
-                blocked_sql = observer.scalar(
-                    text("SELECT query FROM pg_stat_activity WHERE pid=:pid"),
-                    {"pid": blocked},
-                )
-                assert blocked_sql and "public.f01_activate()" in blocked_sql
+            # Capture the actual activation statement on the waiter connection;
+            # cross-role pg_stat_activity.query is not visible to maintenance.
+            with _activation_checkpoint(clinic, waiting_pid, ready):
+                future = pool.submit(competing_update)
+                assert ready.wait(timeout=12)
+                with clinic.migration.connect() as observer:
+                    wait_for_postgres_lock(
+                        observer, waiting_pid[0], holder_pid, timeout=12
+                    )
         replay = future.result(timeout=30)
     assert replay == original
     with transaction(clinic.migration, clinic.tenant) as connection:
@@ -218,6 +224,7 @@ def test_live_owner_manager_followup_publication_serializes_stale_revision(
         "expected_followup_revision": 1,
     }
     second = "manager" if first == "owner" else "owner"
+    waiting_pid, ready = [], Event()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         key = str(uuid4())
@@ -233,15 +240,18 @@ def test_live_owner_manager_followup_publication_serializes_stale_revision(
             )
             assert published["followup_revision"] == 2
             holder = connection.scalar(text("SELECT pg_backend_pid()"))
-            future = pool.submit(
-                pricing_request,
-                clinic,
-                actors[second],
-                method="PATCH",
-                body=second_body,
-                key=str(uuid4()),
-            )
-            _blocked_by(clinic, holder)
+            with _activation_checkpoint(clinic, waiting_pid, ready):
+                future = pool.submit(
+                    pricing_request,
+                    clinic,
+                    actors[second],
+                    method="PATCH",
+                    body=second_body,
+                    key=str(uuid4()),
+                )
+                assert ready.wait(timeout=12)
+                with clinic.migration.connect() as observer:
+                    wait_for_postgres_lock(observer, waiting_pid[0], holder, timeout=12)
         status, response = future.result(timeout=30)
     assert status == 409 and response["error"]["code"] == "STALE_REVISION"
     after = _pricing_evidence(clinic)

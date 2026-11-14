@@ -367,14 +367,9 @@ def _current_v2_command(connection, routine, source, **command):
     )
 
 
-def _v2_priced_followup(connection, tenant, doctor, price_snapshot):
-    """Create a priced Follow-up through the post-cutover SQL writer for test fixtures."""
-    guarded = connection.scalar(
-        text("""
-        SELECT to_regprocedure('public.b10_assert_followup_price(uuid,jsonb)') IS NOT NULL
-        """)
-    )
-    if guarded:
+def _signed_v2_priced_followup(clinic, tenant, doctor, price_snapshot):
+    """Commit fixture provenance, then exercise the scoped current-head writer."""
+    with transaction(clinic.migration, tenant) as connection:
         head = connection.execute(
             text("""
                 SELECT h.revision, v.payload
@@ -399,39 +394,39 @@ def _v2_priced_followup(connection, tenant, doctor, price_snapshot):
             head.revision,
             actor_staff_id=str(doctor),
         )
-        quote = {
-            key: price_snapshot[key]
-            for key in (
-                "base_egp",
-                "discount_type",
-                "discount_value",
-                "discount_reason",
-                "is_free",
-                "net_egp",
-                "creation_standard_base_egp",
-            )
-        }
-        quote["pricing_version"] = version
-    else:
-        quote = price_snapshot
-    source = _v2_source(connection, tenant, doctor)
-    claim = _v2_command(
-        connection,
+        source = _v2_source(connection, tenant, doctor)
+    quote = {
+        key: price_snapshot[key]
+        for key in (
+            "base_egp",
+            "discount_type",
+            "discount_value",
+            "discount_reason",
+            "is_free",
+            "net_egp",
+            "creation_standard_base_egp",
+        )
+    }
+    quote["pricing_version"] = version
+    claim = _signed_v2_command(
+        clinic,
         "create_followup_claim",
         source,
+        actor=clinic.actors[tenant],
         **{**_v2_booking(source), "price_snapshot": quote},
     )
-    appointment, net, provenance = connection.execute(
-        text("""
+    with transaction(clinic.migration, tenant) as connection:
+        appointment, net, provenance = connection.execute(
+            text("""
             SELECT c.appointment_id, p.net_egp, p.entitlement_provenance
             FROM public.followup_claims c
             JOIN public.appointment_price_snapshots p
               ON (p.organization_id, p.appointment_id) =
                  (c.organization_id, c.appointment_id)
             WHERE c.organization_id=:tenant AND c.id=:claim
-        """),
-        {"tenant": tenant, "claim": claim},
-    ).one()
+            """),
+            {"tenant": tenant, "claim": claim},
+        ).one()
     return {
         "id": str(appointment),
         "net_egp": f"{net:.2f}",

@@ -30,10 +30,11 @@ from test_appointment_persistence import (
     _patient,
     _query,
 )
+from test_appointment_persistence import appointment_api as appointment_api  # noqa: PLC0414
 from test_appointment_persistence import (
     appointment_storage as appointment_storage,  # noqa: PLC0414 - fixture export
 )
-from test_followup_persistence import _v2_priced_followup
+from test_followup_persistence import _signed_v2_priced_followup
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414 - fixture export
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414 - fixture export
 
@@ -190,7 +191,7 @@ def _manager_transaction(clinic, enabled, revision):
         purpose="STAFF_MANAGEMENT",
         body={
             "operational_manager": enabled,
-            "expected_staff_revision": revision,
+            "expected_revision": revision,
             "expected_security_revision": revision,
             "reason": "Synthetic Owner operational Manager grant",
         },
@@ -341,13 +342,14 @@ def test_signed_pricing_surrogate_reason_is_422_before_receipt(patient_backend):
 
 def _blocked_by(clinic, holder):
     deadline = monotonic() + 12
-    with clinic.migration.connect() as observer:
+    # A different login cannot see the API backend's wait_event or query.
+    with clinic.runtime.connect() as observer:
         while monotonic() < deadline:
             observer.execute(text("SELECT pg_stat_clear_snapshot()"))
             blocked = observer.scalar(
                 text("""
                     SELECT pid FROM pg_stat_activity
-                     WHERE wait_event_type = 'Lock'
+                     WHERE datname = current_database() AND usename = session_user
                        AND :holder = ANY(pg_blocking_pids(pid))
                      LIMIT 1
                 """),
@@ -1895,27 +1897,28 @@ def test_signed_enable_rejects_retained_noncanonical_urgent_premium(patient_back
     ],
 )
 def test_quote_confirm_persist_and_read_preserves_full_percentage_and_service(
-    appointment_storage, service, base, standard, kind, discount
+    appointment_api, service, base, standard, kind, discount
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    clinic = appointment_api
+    runtime, tenant, doctor = clinic.migration, clinic.tenant, clinic.staff
     quote = quote_price(base, standard, service, "ROUTINE", kind, discount)
     reason = "Approved discount"
     validate_discount_reason(kind, reason)
-    with transaction(runtime, tenant) as conn:
-        snapshot = {
-            "base_egp": base,
-            "creation_standard_base_egp": standard,
-            "discount_type": kind,
-            "discount_value": discount,
-            "discount_reason": reason,
-            "net_egp": format(quote.net_egp, ".2f"),
-            "is_free": quote.is_free,
-            "pricing_version": 1,
-            "entitlement_provenance": None,
-        }
-        if service == "FOLLOW_UP":
-            saved = _v2_priced_followup(conn, tenant, doctor, snapshot)
-        else:
+    snapshot = {
+        "base_egp": base,
+        "creation_standard_base_egp": standard,
+        "discount_type": kind,
+        "discount_value": discount,
+        "discount_reason": reason,
+        "net_egp": format(quote.net_egp, ".2f"),
+        "is_free": quote.is_free,
+        "pricing_version": 1,
+        "entitlement_provenance": None,
+    }
+    if service == "FOLLOW_UP":
+        saved = _signed_v2_priced_followup(clinic, tenant, doctor, snapshot)
+    else:
+        with transaction(runtime, tenant) as conn:
             saved = persist_appointment(
                 conn,
                 _draft(
@@ -1926,7 +1929,7 @@ def test_quote_confirm_persist_and_read_preserves_full_percentage_and_service(
                 ),
                 _query(tenant, doctor),
             )
-        assert saved["net_egp"] == format(quote.net_egp, ".2f")
+    assert saved["net_egp"] == format(quote.net_egp, ".2f")
     with transaction(runtime, tenant) as conn:
         row = conn.execute(
             text("""

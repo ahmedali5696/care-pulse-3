@@ -32,6 +32,8 @@ on:
           - f01-followup-lock
           - f01-visit-lock
           - f01-followup-context
+          - f01-pricing
+          - f01-pricing-races
 
 # Cancel superseded PR/push checks and duplicate manual runs of the same SHA/mode.
 # Keep manual runs for different commits and spike modes independent.
