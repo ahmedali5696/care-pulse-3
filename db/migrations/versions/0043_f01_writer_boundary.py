@@ -61,7 +61,9 @@ def _rewrite(
         definition = definition.replace(
             "BEGIN\n", "BEGIN\n            " + _guard(guard), 1
         )
-    bind.exec_driver_sql(definition)
+    # pg_get_functiondef returns literal percent signs (e.g. %ROWTYPE).
+    # Do not send an empty parameter mapping to psycopg's placeholder parser.
+    bind.exec_driver_sql(definition, execution_options={"no_parameters": True})
 
 
 def upgrade() -> None:
