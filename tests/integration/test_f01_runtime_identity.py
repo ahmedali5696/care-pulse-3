@@ -1,5 +1,6 @@
 """F-01 adversarial evidence using real service logins in disposable CI."""
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from hashlib import sha256
@@ -7,6 +8,7 @@ from hmac import new
 from pathlib import Path
 from queue import Queue
 from secrets import token_bytes
+from time import monotonic, sleep
 from uuid import UUID, uuid4
 
 import pytest
@@ -596,6 +598,17 @@ def test_binding_and_savepoints_cannot_switch_request_or_transaction(boundary_da
             _bind(clinic, other_request, other_pid, xid)
         assert denied.value.orig.sqlstate == "42501"
         _bind(clinic, request, pid, xid)
+        with clinic.migration.begin() as observer:
+            observer.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+            assert observer.execute(
+                text("""
+                SELECT b.database_oid=(SELECT oid FROM pg_database WHERE datname=current_database()),
+                       b.login_oid='carepulse_api'::regrole::oid, b.pid, b.xid::text,
+                       pg_xact_status(b.xid)
+                FROM f01_private.bindings b WHERE b.request_id=:request AND b.stage='PRIMARY'
+            """),
+                {"request": request},
+            ).one() == (True, True, pid, xid, "in progress")
         with pytest.raises(DBAPIError) as denied:
             _bind(clinic, request, other_pid, other_xid)
         assert denied.value.orig.sqlstate in ("42501", "23505")
@@ -607,6 +620,12 @@ def test_binding_and_savepoints_cannot_switch_request_or_transaction(boundary_da
 
         before = connection.begin_nested()
         connection.execute(text("SELECT public.f01_activate()"))
+        _assert_context(connection, clinic, request)
+        connection.execute(text("SET LOCAL row_security=off"))
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(text("SELECT id FROM public.organizations"))
+        assert denied.value.orig.sqlstate == "42501"
+        connection.execute(text("SET LOCAL row_security=on"))
         _assert_context(connection, clinic, request)
         after = connection.begin_nested()
         connection.execute(
@@ -646,6 +665,48 @@ def test_binding_and_savepoints_cannot_switch_request_or_transaction(boundary_da
             _bind(clinic, request, new_pid, new_xid)
         assert denied.value.orig.sqlstate == "42501"
         assert connection.scalar(text("SELECT public.f01_org()")) is None
+
+
+def test_repeatable_read_cannot_activate_and_live_context_expires(boundary_data):
+    clinic = boundary_data
+    identity, body, _ = _signed(clinic)
+    with clinic.gate.begin() as gate:
+        request = _register(gate, identity, body, db_proof_headers(identity))
+    with clinic.runtime.begin() as runtime:
+        runtime.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        _bind(clinic, request, *_transaction_id(runtime))
+        with pytest.raises(DBAPIError) as denied, runtime.begin_nested():
+            runtime.execute(text("SELECT public.f01_activate()"))
+        assert denied.value.orig.sqlstate == "42501"
+        assert runtime.scalar(text("SELECT public.f01_org()")) is None
+
+    with clinic.migration.connect() as observer:
+        now_ms = observer.scalar(
+            text("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+        )
+    freshness = clinic.config.policy.signed_request_freshness_seconds
+    identity, body, _ = _signed(clinic)
+    identity = replace(identity, timestamp=str(now_ms - freshness * 1000 + 5000))
+    with (
+        registered_test_request(clinic, identity, body),
+        bound_transaction(clinic.runtime, identity) as runtime,
+    ):
+        request = current_request.get().request_id
+        _assert_context(runtime, clinic, request)
+        with clinic.migration.begin() as observer:
+            observer.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+            horizon = observer.scalar(
+                text("SELECT expires_at FROM f01_private.requests WHERE id=:id"),
+                {"id": request},
+            )
+            deadline = monotonic() + 10
+            while not observer.scalar(
+                text("SELECT clock_timestamp()>=:horizon"), {"horizon": horizon}
+            ):
+                assert monotonic() < deadline, "Database did not reach signed expiry"
+                sleep(0.05)
+        assert runtime.scalar(text("SELECT public.f01_org()")) is None
+        assert runtime.scalar(text("SELECT count(*) FROM public.organizations")) == 0
 
 
 def test_retiring_key_cutoff_is_rechecked_at_registration_and_activation(
@@ -1010,11 +1071,109 @@ def test_exact_head_restricts_legacy_login_and_service_role_elevation(role_engin
                     "SELECT NOT rolcanlogin FROM pg_roles WHERE rolname='carepulse_runtime'"
                 )
             )
+            assert connection.scalar(text("SHOW server_version")).split()[0] == "17.11"
+            assert connection.scalar(text("SHOW max_prepared_transactions")) == "0"
+            assert connection.scalar(
+                text("SELECT extversion FROM pg_extension WHERE extname='pgcrypto'")
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                SELECT NOT rolcanlogin AND NOT rolsuper AND NOT rolbypassrls
+                    AND NOT rolcreaterole AND NOT rolcreatedb
+                FROM pg_roles WHERE rolname='carepulse_identity_owner'
+            """)
+                )
+                is True
+            )
         with pytest.raises(OperationalError):
             legacy.connect()
     finally:
         migration.dispose()
         legacy.dispose()
+
+
+@pytest.mark.parametrize(
+    "role",
+    [
+        "carepulse_api",
+        "carepulse_web",
+        "carepulse_worker",
+        "carepulse_gate",
+        "carepulse_auth",
+        "carepulse_operator",
+        "carepulse_sender",
+    ],
+)
+def test_private_identity_acl_denies_all_service_logins(role_engine, role):
+    engine = role_engine(role)
+    try:
+        with engine.begin() as connection:
+            assert connection.execute(
+                text("SELECT session_user,current_user")
+            ).one() == (role, role)
+            assert (
+                connection.scalar(
+                    text("""
+                SELECT NOT rolsuper AND NOT rolbypassrls AND NOT rolcreaterole AND NOT rolcreatedb
+                FROM pg_roles WHERE rolname=session_user
+            """)
+                )
+                is True
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                SELECT count(*)>0 AND bool_and(
+                    NOT has_table_privilege(session_user,c.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+                    AND NOT has_any_column_privilege(session_user,c.oid,'SELECT,INSERT,UPDATE,REFERENCES'))
+                FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname='f01_private' AND c.relkind='r'
+            """)
+                )
+                is True
+            )
+            assert (
+                connection.scalar(
+                    text("""
+                SELECT NOT has_schema_privilege(session_user,'f01_private','USAGE,CREATE')
+                    AND NOT has_schema_privilege(session_user,'f01_crypto','USAGE,CREATE')
+                    AND NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+                        WHERE n.nspname='f01_private' AND has_function_privilege(session_user,p.oid,'EXECUTE'))
+                    AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                        WHERE n.nspname='f01_private' AND c.relkind='S'
+                          AND has_sequence_privilege(session_user,c.oid,'USAGE,SELECT,UPDATE'))
+            """)
+                )
+                is True
+            )
+            for statement in (
+                "SET ROLE carepulse_identity_owner",
+                "SET SESSION AUTHORIZATION carepulse_identity_owner",
+                "SELECT * FROM f01_private.keys",
+                "DELETE FROM f01_private.nonces",
+            ):
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    connection.execute(text(statement))
+                assert denied.value.orig.sqlstate == "42501"
+            for signature in (
+                "public.f01_register_proof(bytea,text,bytea,bytea)",
+                "public.f01_bind(bigint,text,integer,xid8)",
+                "public.f01_cleanup()",
+            ):
+                assert connection.scalar(
+                    text(
+                        "SELECT has_function_privilege(session_user,:signature,'EXECUTE')"
+                    ),
+                    {"signature": signature},
+                ) is (role == "carepulse_gate")
+            assert connection.scalar(
+                text(
+                    "SELECT has_function_privilege(session_user,'public.f01_activate()','EXECUTE')"
+                )
+            ) is (role == "carepulse_api")
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.parametrize(
@@ -1097,6 +1256,72 @@ def test_gate_rejects_valid_mac_for_unapproved_route_purpose(boundary_data):
     with pytest.raises(DBAPIError) as denied, clinic.gate.begin() as connection:
         _register(connection, identity, body, db_proof_headers(identity))
     assert denied.value.orig.sqlstate in ("42501", "22023")
+
+
+def test_malformed_proof_and_envelope_do_not_consume_valid_nonce(
+    boundary_data, proof_keys
+):
+    clinic = boundary_data
+    key_id, secret = proof_keys[0]
+    identity, body, _ = _signed(clinic)
+    payload = canonical_payload(identity)
+
+    def mac(data):
+        return new(
+            secret,
+            b"carepulse-db-context-v1\x00" + key_id.encode() + b"\x00" + data,
+            sha256,
+        ).digest()
+
+    invalid_protocol = json.loads(payload)
+    invalid_protocol[0] = "unexpected"
+    invalid_revision = json.loads(payload)
+    invalid_revision[11] = 0
+    with clinic.migration.connect() as observer:
+        now_ms = observer.scalar(
+            text("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
+        )
+    policy = clinic.config.policy
+    malformed = [
+        json.dumps(fields, separators=(",", ":")).encode()
+        for fields in (invalid_protocol, invalid_revision)
+    ]
+    malformed += [
+        canonical_payload(
+            replace(
+                identity,
+                timestamp=str(
+                    now_ms + (policy.signed_request_max_skew_seconds + 5) * 1000
+                ),
+            )
+        ),
+        canonical_payload(
+            replace(
+                identity,
+                timestamp=str(
+                    now_ms - (policy.signed_request_freshness_seconds + 5) * 1000
+                ),
+            )
+        ),
+    ]
+    attempts = [
+        (payload, bytes(32)),
+        (payload, mac(payload)[:-1]),
+        (payload, None),
+        (payload + b" ", mac(payload)),
+    ]
+    attempts += [(data, mac(data)) for data in malformed]
+    for data, proof in attempts:
+        with pytest.raises(DBAPIError) as denied, clinic.gate.begin() as gate:
+            gate.scalar(
+                text("SELECT public.f01_register_proof(:payload,:key,:mac,:body)"),
+                {"payload": data, "key": key_id, "mac": proof, "body": body},
+            )
+        assert denied.value.orig.sqlstate in ("42501", "22023")
+        assert _nonce_counts(clinic, identity) == (0, 0)
+    with clinic.gate.begin() as gate:
+        assert _register(gate, identity, body, _proof_for(identity, proof_keys[0])) > 0
+    assert _nonce_counts(clinic, identity) == (1, 1)
 
 
 @pytest.mark.parametrize("change", ["tenant", "staff", "session", "role"])

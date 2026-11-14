@@ -595,6 +595,9 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_WEB_DB_PASSWORD_SOURCE_FILE:/run/secrets/web_db_password:ro" \
   -v "$CP_WORKER_DB_PASSWORD_SOURCE_FILE:/run/secrets/worker_db_password:ro" \
+  -v "$CP_AUTH_DB_PASSWORD_SOURCE_FILE:/run/secrets/auth_db_password:ro" \
+  -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
+  -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_DB_PASSWORD_FILE:/run/secrets/postgres_password:ro" \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_f01_runtime_identity.py tests/integration/test_f01_grants_migration.py | tee "$private/f01-runtime-identity.log"
