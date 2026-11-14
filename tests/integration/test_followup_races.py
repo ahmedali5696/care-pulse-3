@@ -2,6 +2,7 @@
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import timedelta
 from threading import Barrier, Event
 from time import monotonic, sleep
@@ -15,6 +16,7 @@ from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _admit_saved, _draft, _query
 from test_appointment_persistence import appointment_api as appointment_api  # noqa: PLC0414
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
+from test_booking_races import _activation_checkpoint
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
@@ -297,6 +299,7 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
         record = _v2_record(connection, claim)
     held, release, started = Event(), Event(), Event()
     waiting_pid = []
+    holder_pid = []
     expected = {
         "source_revision": 0,
         "clinical_revision": 0,
@@ -334,6 +337,7 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
             else transaction(runtime, tenant)
         )
         with context as connection:
+            holder_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             if first in ("decision", "restriction"):
                 command(
                     connection,
@@ -375,9 +379,15 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
             if clinic
             else transaction(runtime, tenant)
         )
-        with context as connection:
-            waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            started.set()
+        checkpoint = (
+            _activation_checkpoint(clinic, waiting_pid, started)
+            if clinic
+            else nullcontext()
+        )
+        with checkpoint, context as connection:
+            if not clinic:
+                waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+                started.set()
             if first == "decision":
                 return command(
                     connection,
@@ -393,7 +403,7 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
         try:
             assert started.wait(timeout=10)
             with migration.connect() as observer:
-                assert _wait_for_pg_blocker(observer, waiting_pid[0])
+                assert holder_pid[0] in _wait_for_pg_blocker(observer, waiting_pid[0])
         finally:
             release.set()
         holder.result(timeout=20)
@@ -447,6 +457,7 @@ def test_v2_extension_first_remains_historical_after_later_restriction_or_termin
         record = _v2_record(connection, claim)
     held, release, started = Event(), Event(), Event()
     waiting_pid = []
+    holder_pid = []
 
     def extend_first():
         context = (
@@ -457,6 +468,7 @@ def test_v2_extension_first_remains_historical_after_later_restriction_or_termin
             else transaction(runtime, tenant)
         )
         with context as connection:
+            holder_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             command(
                 connection,
                 "extend_followup_claim",
@@ -483,11 +495,17 @@ def test_v2_extension_first_remains_historical_after_later_restriction_or_termin
             if clinic
             else transaction(runtime, tenant)
         )
-        with context as connection:
+        checkpoint = (
+            _activation_checkpoint(clinic, waiting_pid, started)
+            if clinic
+            else nullcontext()
+        )
+        with checkpoint, context as connection:
             connection.execute(text("SET LOCAL lock_timeout='5s'"))
             connection.execute(text("SET LOCAL statement_timeout='15s'"))
-            waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            started.set()
+            if not clinic:
+                waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+                started.set()
             if later == "restriction":
                 command(
                     connection,
@@ -511,7 +529,7 @@ def test_v2_extension_first_remains_historical_after_later_restriction_or_termin
         try:
             assert started.wait(timeout=10)
             with migration.connect() as observer:
-                assert _wait_for_pg_blocker(observer, waiting_pid[0])
+                assert holder_pid[0] in _wait_for_pg_blocker(observer, waiting_pid[0])
         finally:
             release.set()
         first.result(timeout=20)

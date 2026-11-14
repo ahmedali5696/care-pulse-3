@@ -424,25 +424,6 @@ def test_invalid_admission_shell_rejected_without_a_visit(
             defaults["doctor"] = other_doctor
         elif invalid == "wrong_admission_revision":
             defaults["revision"] = 1
-        elif invalid == "forged_actor":
-            # Maintenance is not runtime authority; forge GUCs only on the real API.
-            with signed_test_transaction(
-                appointment_api,
-                appointment_api.actors[tenant],
-                method="GET",
-                path="/v1/appointments",
-                purpose="APPOINTMENT_BOOKING",
-            ) as (api, _):
-                api.execute(
-                    text("SELECT set_config('app.staff_id', :id, true)"),
-                    {"id": str(other_doctor)},
-                )
-                with pytest.raises(DBAPIError) as denied, api.begin_nested():
-                    api.execute(
-                        text("INSERT INTO public.visits (id) VALUES (:visit)"),
-                        {"visit": defaults["visit"]},
-                    )
-                assert denied.value.orig.sqlstate == "42501"
         if invalid != "forged_actor":
             with pytest.raises(DBAPIError) as denied, connection.begin_nested():
                 connection.execute(
@@ -480,6 +461,33 @@ def test_invalid_admission_shell_rejected_without_a_visit(
             """),
             {"visit": uuid4(), "id": appointment},
         )
+    if invalid == "forged_actor":
+        # Commit fixture maintenance before signed activation locks the tenant.
+        with signed_test_transaction(
+            appointment_api,
+            appointment_api.actors[tenant],
+            method="GET",
+            path="/v1/appointments",
+            purpose="APPOINTMENT_BOOKING",
+        ) as (api, _):
+            api.execute(
+                text("SELECT set_config('app.staff_id', :id, true)"),
+                {"id": str(other_doctor)},
+            )
+            with pytest.raises(DBAPIError) as denied, api.begin_nested():
+                api.execute(
+                    text("INSERT INTO public.visits (id) VALUES (:visit)"),
+                    {"visit": defaults["visit"]},
+                )
+            assert denied.value.orig.sqlstate == "42501"
+        with transaction(runtime, tenant) as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT count(*) FROM public.visits WHERE id=:id"),
+                    {"id": defaults["visit"]},
+                )
+                == 0
+            )
 
 
 @pytest.mark.parametrize("status", ["Booked", "Waiting", "No-show", "Cancelled"])

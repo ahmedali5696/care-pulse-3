@@ -68,7 +68,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': '557cd943a888db11906d17c82fa4b2c1baa4ae6014cf2a28eb5b0a78f11f3df2',
+    '.github/workflows/foundation.yml': '6c4c2dd9905133208b42c0d604aaaec55b870b94e886a7c057f17f4a3d083ff2',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'apps/api/Dockerfile': '8465e11d5b90d94704ec63072180f10c56dcf4becf471da84258ea21de5208c8',
     'apps/web/Dockerfile': '933af52609f2a4eb638d048605ec555e2a3443cb25b3ba5d64d5a36ec585f02a',
@@ -251,6 +251,8 @@ if [ "$1" = integration-diagnostic ]; then
     booking-races) focused_target='tests/integration/test_booking_races.py' ;;
     followup-races) focused_target='tests/integration/test_followups_races.py' ;;
     f01-cleanup) focused_target='tests/integration/test_f01_runtime_identity.py::test_session_cleanup_requires_committed_matching_revocation[committed]' ;;
+    f01-followup-lock) focused_target='tests/integration/test_followup_persistence.py::test_v2_creation_exception_cannot_authorize_same_date_interval_change' ;;
+    f01-visit-lock) focused_target='tests/integration/test_visit_persistence.py::test_invalid_admission_shell_rejected_without_a_visit[forged_actor]' ;;
     *) echo 'FAIL unapproved PostgreSQL diagnostic selection'; exit 1 ;;
   esac
   printf 'Focused PostgreSQL diagnostic only: %s (SHA %s, project %s)\n' "$focused_target" "$GITHUB_SHA" "$CP_CI_PROJECT"

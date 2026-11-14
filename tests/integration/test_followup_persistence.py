@@ -1674,25 +1674,25 @@ def test_v2_creation_exception_cannot_authorize_same_date_interval_change(
                 },
             )
         assert denied.value.orig.sqlstate == "42501"
-        with pytest.raises(DBAPIError) as late, connection.begin_nested():
-            _signed_v2_command(
-                appointment_api,
-                "extend_followup_claim",
-                source,
-                reference=claim,
-                expected={
-                    "source_revision": 0,
-                    "clinical_revision": 0,
-                    "policy_version": 1,
-                    "claim_revision": 1,
-                    "appointment_revision": 0,
-                    "authorization_revision": 1,
-                },
-                kind="NEW_DATE",
-                deadline_date=(source["day"] + timedelta(days=12)).isoformat(),
-                reason="Late attachment",
-            )
-        assert late.value.orig.sqlstate == "23514"
+    with pytest.raises(DBAPIError) as late:
+        _signed_v2_command(
+            appointment_api,
+            "extend_followup_claim",
+            source,
+            reference=claim,
+            expected={
+                "source_revision": 0,
+                "clinical_revision": 0,
+                "policy_version": 1,
+                "claim_revision": 1,
+                "appointment_revision": 0,
+                "authorization_revision": 1,
+            },
+            kind="NEW_DATE",
+            deadline_date=(source["day"] + timedelta(days=12)).isoformat(),
+            reason="Late attachment",
+        )
+    assert late.value.orig.sqlstate == "23514"
 
 
 def test_v2_declared_new_date_without_event_rolls_back_all_creation_evidence(

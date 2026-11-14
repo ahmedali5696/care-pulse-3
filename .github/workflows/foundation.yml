@@ -29,6 +29,8 @@ on:
           - booking-races
           - followup-races
           - f01-cleanup
+          - f01-followup-lock
+          - f01-visit-lock
 
 # Cancel superseded PR/push checks and duplicate manual runs of the same SHA/mode.
 # Keep manual runs for different commits and spike modes independent.
