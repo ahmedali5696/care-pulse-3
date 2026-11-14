@@ -7,22 +7,27 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from carepulse.db import transaction
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _activate_clinic
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_b10_writer_migration import _t177_receipt, _t177_upgrade_proof
+from test_booking import booking_body, booking_request
+from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_database import _create_empty_database, _engine
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
 from test_followup_persistence import _v2_booking, _v2_command, _v2_record, _v2_source
+from test_patients import patient_backend as patient_backend  # noqa: PLC0414
+from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 from test_visit_migration import _prepare
 
 ROOT = Path(__file__).resolve().parents[2]
 BEFORE = "0032_b10_cairo_offset_guard"
 AFTER = "0033_d08_terminal_writer"
-CURRENT_HEAD = "0040_t173_numeric_money"
+CURRENT_HEAD = "0043_f01_writer_boundary"
 TERMINAL = "public.transition_terminal_appointment(uuid,uuid,bigint,jsonb)"
 LEGACY = "public.complete_examined_visit(uuid,uuid,bigint,boolean)"
 PRIVATE = "public.d07_complete_examined_visit_raw(uuid,uuid,bigint,boolean)"
@@ -58,8 +63,11 @@ def _acl(connection):
     ).one()
 
 
-def test_t133_existing_head_preserves_owner_only_terminal_writer(appointment_storage):
-    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
+def test_t133_existing_head_preserves_owner_only_terminal_writer(booking_clinic):
+    from test_booking import new_patient
+
+    clinic = booking_clinic
+    migration, tenant, doctor = clinic.migration, clinic.tenant, clinic.staff
     with migration.connect() as connection:
         assert (
             connection.scalar(text("SELECT version_num FROM public.alembic_version"))
@@ -82,7 +90,7 @@ def test_t133_existing_head_preserves_owner_only_terminal_writer(appointment_sto
                 SELECT NOT pg_has_role('carepulse_runtime','carepulse_migration','MEMBER')
             """)
         )
-        assert connection.scalar(
+        assert not connection.scalar(
             text(
                 "SELECT has_function_privilege('carepulse_runtime', :legacy, 'EXECUTE')"
             ),
@@ -94,12 +102,30 @@ def test_t133_existing_head_preserves_owner_only_terminal_writer(appointment_sto
             ),
             {"private": PRIVATE},
         )
-    with transaction(runtime, tenant) as connection:
-        source = _v2_source(connection, tenant, doctor)
-        claim = _v2_command(
-            connection, "create_followup_claim", source, **_v2_booking(source)
-        )
-        target = _v2_record(connection, claim)
+        for role in (
+            "carepulse_api",
+            "carepulse_web",
+            "carepulse_worker",
+            "carepulse_gate",
+        ):
+            for signature in (TERMINAL, LEGACY, PRIVATE):
+                assert not connection.scalar(
+                    text("SELECT has_function_privilege(:role, :signature, 'EXECUTE')"),
+                    {"role": role, "signature": signature},
+                )
+    body = booking_body(new_patient(clinic))
+    status, response = booking_request(
+        clinic, clinic.owner, body=body, key=str(uuid4())
+    )
+    assert status == 201, response
+    target = response["data"]
+    with signed_test_transaction(
+        clinic,
+        clinic.owner,
+        method="GET",
+        path=f"/v1/appointments/{target['id']}",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, _):
         with pytest.raises(DBAPIError) as forbidden, connection.begin_nested():
             connection.execute(
                 text("""

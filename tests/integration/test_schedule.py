@@ -128,6 +128,35 @@ def _publish(connection, actor, config, revision=1):
     return _activate(connection, actor, _stage(connection, actor, config, revision))
 
 
+def publish_signed_schedule(clinic, config, revision=1):
+    """Preview and activate as distinct, authenticated requests."""
+    status, response = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/preview",
+        body=_patch(config, revision).model_dump(mode="json"),
+        key=str(uuid4()),
+    )
+    assert status == 200, response
+    preview = response["data"]
+    status, response = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/activate",
+        body={
+            "preview_id": preview["preview_id"],
+            "expected_schedule_revision": preview["revisions"]["schedule"],
+            "expected_capacity_revision": preview["revisions"]["capacity"],
+            "reason": "Synthetic reviewed schedule publication",
+        },
+        key=str(uuid4()),
+    )
+    assert status == 200, response
+    return response["data"]
+
+
 def _booking(
     connection,
     tenant,

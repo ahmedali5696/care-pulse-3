@@ -6,9 +6,9 @@ from time import monotonic
 from uuid import UUID, uuid4
 
 import pytest
-from carepulse.db import transaction
 from carepulse.identity.contracts import ContractError
 from carepulse.patients.lifecycle import lock_patient_for_new_appointment
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import text
 from test_patients import PATIENT, create_patient, effects, private_request
 from test_patients import boundary_data as boundary_data  # noqa: PLC0414 - pytest fixture export
@@ -185,7 +185,9 @@ def test_archive_waits_for_internal_new_id_guard_and_then_blocks_new_ids(
         )
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        with transaction(clinic.runtime, clinic.tenant) as guard:
+        # Hold only the actual patient row, not the F-01 organization lock.
+        # The signed archive must therefore wait on the patient lifecycle guard.
+        with clinic.migration.begin() as guard:
             assert not lock_patient_for_new_appointment(
                 guard, clinic.tenant, UUID(patient["id"])
             ).archived
@@ -195,7 +197,15 @@ def test_archive_waits_for_internal_new_id_guard_and_then_blocks_new_ids(
             with clinic.migration.connect() as observer:
                 _wait_for_blocker(observer, pid)
         assert pending.result(timeout=10)[0] == 200
-    with transaction(clinic.runtime, clinic.tenant) as guard:
+    with signed_test_transaction(
+        clinic,
+        clinic.owner,
+        method="POST",
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+        body={"patient_id": patient["id"]},
+        key=str(uuid4()),
+    ) as (guard, _):
         with pytest.raises(ContractError) as denied:
             lock_patient_for_new_appointment(guard, clinic.tenant, UUID(patient["id"]))
         assert denied.value.status_code == 409

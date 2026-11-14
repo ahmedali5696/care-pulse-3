@@ -373,6 +373,188 @@ if [ -n "$focused_target" ]; then
   exit 0
 fi
 
+# Historical migration assertions use the accepted 0040 graph and a different
+# PostgreSQL cluster, never a re-enabled login in the current-head cluster.
+historical_nodes=(
+  'tests/integration/test_t133_migration.py::test_t133_populated_0032_upgrade_preserves_claim_and_new_exam'
+  'tests/integration/test_t133_migration.py::test_t133_failed_upgrade_0032_rolls_back_every_new_object'
+  'tests/integration/test_m1_migration.py'
+  'tests/integration/test_queue_migration.py'
+  'tests/integration/test_day_review_migration.py'
+  'tests/integration/test_schedule_migration.py'
+  'tests/integration/test_b10_writer_migration.py'
+  'tests/integration/test_visit_migration.py::test_version_and_fresh_upgrade_preserve_predecessor_records'
+  'tests/integration/test_visit_migration.py::test_existing_unbacked_admission_refuses_upgrade_atomically'
+  'tests/integration/test_visit_migration.py::test_failed_later_revision_rolls_back_and_keeps_d07'
+  'tests/integration/test_visit_migration.py::test_populated_0025_upgrade_preserves_legacy_clinical_history_and_receipts'
+  'tests/integration/test_visit_migration.py::test_failed_0026_upgrade_reverts_objects_and_predecessor_version'
+  'tests/integration/test_followup_migration.py::test_v2_populated_immediate_predecessor_preserves_legacy_evidence_and_denies_unattested_actions'
+  'tests/integration/test_followup_migration.py::test_v2_upgrade_replays_correction_ancestry_and_never_invents_doctor_default'
+  'tests/integration/test_followup_migration.py::test_v2_failed_populated_upgrade_rolls_back_and_repeat_upgrade_is_stable'
+  'tests/integration/test_followup_migration.py::test_v2_first_extension_uses_verified_legacy_deadline_without_rewriting_it'
+  'tests/integration/test_followup_migration.py::test_predecessor_data_and_security_survive_compatible_upgrade'
+  'tests/integration/test_followup_migration.py::test_incompatible_unpaired_predecessor_claim_refuses_atomically'
+  'tests/integration/test_followup_migration.py::test_fresh_and_failed_following_migration_keep_one_head'
+  'tests/integration/test_followup_migration.py::test_populated_0023_followup_evidence_survives_0024_and_new_claims_use_live_policy'
+  'tests/integration/test_pricing_migration.py::test_predecessor_legacy_numeric_null_snapshots_receipts_survive_upgrade'
+  'tests/integration/test_pricing_migration.py::test_fresh_install_and_repeated_upgrade_are_no_ops'
+  'tests/integration/test_pricing_migration.py::test_failed_following_revision_keeps_head_and_ddl_atomic'
+  'tests/integration/test_pricing_migration.py::test_t145_upgrade_preserves_historical_numeric_percentage_and_receipt'
+  'tests/integration/test_pricing_migration.py::test_t173_populated_0039_money_successor_and_atomic_failed_upgrade'
+  'tests/integration/test_policy_persistence.py::test_older_clinics_backfilled_and_new_clinics_triggered_in_both_orders'
+  'tests/integration/test_followup_persistence.py::test_v2_doctor_priority_blocks_receptionist_reset_exception_and_extension'
+  'tests/integration/test_followup_persistence.py::test_v2_declared_new_date_without_event_rolls_back_all_creation_evidence'
+  'tests/integration/test_followup_persistence.py::test_completed_new_examination_sources_create_active_claim'
+  'tests/integration/test_followup_persistence.py::test_nonqualifying_source_cannot_claim'
+  'tests/integration/test_followup_persistence.py::test_followup_target_must_match_source_tenant_patient_doctor'
+  'tests/integration/test_followup_persistence.py::test_one_active_source_across_different_service_dates'
+  'tests/integration/test_followup_persistence.py::test_claim_cannot_forge_frozen_authorization_evidence'
+  'tests/integration/test_followup_persistence.py::test_consumed_source_cannot_regain_active_or_second_consumed_claim'
+  'tests/integration/test_followup_persistence.py::test_released_prior_claim_cannot_become_second_consumption'
+  'tests/integration/test_followup_persistence.py::test_source_authorization_and_revision_required'
+  'tests/integration/test_followup_persistence.py::test_released_history_allows_fresh_eligibility_and_price_snapshot'
+  'tests/integration/test_followup_persistence.py::test_default_claim_uses_live_followup_window_and_rebook_freezes_new_policy'
+  'tests/integration/test_followup_persistence.py::test_zero_day_followup_policy_qualifies_and_confirms_only_completion_day'
+  'tests/integration/test_followup_persistence.py::test_integral_decimal_followup_policy_payload_is_accepted'
+  'tests/integration/test_followup_persistence.py::test_claim_and_preferential_appointment_must_both_exist_at_commit'
+  'tests/integration/test_followup_persistence.py::test_cancel_no_show_and_exceptional_admission_release_in_same_commit'
+  'tests/integration/test_followup_persistence.py::test_completed_followup_consumes_once_and_retains_immutable_history'
+  'tests/integration/test_followup_persistence.py::test_injected_failure_after_appointment_write_rolls_back_both_sides'
+  'tests/integration/test_followup_persistence.py::test_unpaired_terminal_transition_cannot_commit'
+  'tests/integration/test_followup_persistence.py::test_tenant_rls_no_context_operator_denied_and_narrow_runtime_grants'
+  'tests/integration/test_followup_races.py::test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger[release]'
+  'tests/integration/test_followup_races.py::test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger[consume]'
+  'tests/integration/test_followup_races.py::test_v2_extension_first_remains_historical_after_later_restriction_or_terminal[release]'
+  'tests/integration/test_followup_races.py::test_v2_extension_first_remains_historical_after_later_restriction_or_terminal[consume]'
+  'tests/integration/test_followup_races.py::test_v2_claim_waits_for_release_and_cannot_reuse_consumed_source'
+  'tests/integration/test_followup_races.py::test_two_simultaneous_claims_leave_one_active_and_no_orphan_appointment'
+  'tests/integration/test_followup_races.py::test_terminal_first_holds_claim_until_release_or_permanent_consumption'
+  'tests/integration/test_followup_races.py::test_claim_attempt_first_respects_later_terminal_outcome'
+  'tests/integration/test_followup_races.py::test_claim_first_staged_booking_contends_with_terminal_before_commit'
+  'tests/integration/test_followup_races.py::test_extension_and_competing_claim_serialize_without_new_reservation'
+  'tests/integration/test_followup_races.py::test_extension_rejects_unrelated_clinical_audit_evidence'
+  'tests/integration/test_followup_races.py::test_deadline_day_is_inclusive_but_next_day_loses_parallel_race'
+)
+historical_deselect=()
+ordinary_core_migration_files=(tests/integration/test_t133_migration.py tests/integration/test_m1_migration.py)
+ordinary_queue_migration_files=(tests/integration/test_queue_migration.py)
+ordinary_schedule_migration_files=(tests/integration/test_schedule_migration.py)
+ordinary_b10_migration_files=(tests/integration/test_b10_writer_migration.py)
+ordinary_day_review_migration_files=(tests/integration/test_day_review_migration.py)
+run_historical_migrations() (
+  set -euo pipefail
+  test "${CP_T133_MODE:-false}" = false
+  test -z "${CP_T133_SHA:-}"
+  local historical_sha=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
+  local historical_head=0040_t173_numeric_money
+  local historical_project="carepulse-ci-${GITHUB_RUN_ID}-0${GITHUB_RUN_ATTEMPT}"
+  local historical_dir="$private/historical"
+  local historical_root="$historical_dir/source"
+  local test_image="$COMPOSE_PROJECT_NAME-test"
+  [[ "$historical_project" =~ ^carepulse-ci-[0-9]+-[0-9]+$ ]]
+  test "$historical_project" != "$COMPOSE_PROJECT_NAME"
+  test ! -e "$historical_dir"
+  mkdir -m 0700 "$historical_dir" "$historical_root"
+  # Checkout is shallow; the public origin is fetched by immutable object ID only.
+  if ! git cat-file -e "$historical_sha^{commit}" 2>/dev/null; then
+    GIT_TERMINAL_PROMPT=0 git fetch --no-tags --depth=1 origin "$historical_sha"
+  fi
+  test "$(git rev-parse "$historical_sha^{commit}")" = "$historical_sha"
+  local -a historical_graph_files
+  mapfile -t historical_graph_files < <(git ls-tree -r --name-only "$historical_sha" -- db/migrations)
+  test "${#historical_graph_files[@]}" -gt 40
+  git diff --exit-code "$historical_sha" -- "${historical_graph_files[@]}"
+  git archive "$historical_sha" -- alembic.ini pyproject.toml db apps/api/carepulse apps/worker tests/integration tests/fixtures | tar -x -C "$historical_root"
+  mkdir "$historical_root/private-files"
+  chmod -R a+rX "$historical_root"
+  test "$(docker image inspect --format '{{.Id}}' "$test_image")" != ""
+  printf 'services:\n  test:\n    image: %s\n' "$test_image" > "$historical_dir/compose-override.yaml"
+  # Never share the active cluster's credentials, volumes or network.
+  export CP_DB_PASSWORD_FILE="$historical_dir/postgres-password"
+  export CP_RUNTIME_DB_PASSWORD_FILE="$historical_dir/runtime-password"
+  export CP_MIGRATION_SECRET_FILE="$historical_dir/migration-password"
+  export CP_AUTH_DB_PASSWORD_SOURCE_FILE="$historical_dir/auth-password"
+  export CP_OPERATOR_SECRET_FILE="$historical_dir/operator-password"
+  export CP_OPERATOR_DB_PASSWORD_SOURCE_FILE="$CP_OPERATOR_SECRET_FILE"
+  export CP_SENDER_DB_PASSWORD_SOURCE_FILE="$historical_dir/sender-password"
+  for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE"; do
+    openssl rand -hex 32 > "$file"
+    chmod 0444 "$file"
+  done
+  historical_compose() {
+    docker compose -p "$historical_project" -f "$PWD/compose.yaml" -f "$historical_dir/compose-override.yaml" "$@"
+  }
+  historical_compose --profile test config --format json > "$historical_dir/compose.json"
+  chmod 0444 "$historical_dir/compose.json"
+  jq -e --arg project "$historical_project" '
+    .name == $project and .services.db.environment.POSTGRES_DB == "carepulse" and
+    (.services.db.ports // [] | length == 0) and
+    .volumes.db_data.name == ($project + "_db_data") and
+    .networks.database.name == ($project + "_database") and .networks.database.internal == true
+  ' "$historical_dir/compose.json" > /dev/null
+  test -z "$(docker ps -aq --filter "label=com.docker.compose.project=$historical_project")"
+  test -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$historical_project")"
+  test -z "$(docker network ls -q --filter "label=com.docker.compose.project=$historical_project")"
+  historical_cleanup() {
+    local code=$?
+    trap - EXIT
+    if ! historical_compose --profile test down --remove-orphans --volumes; then
+      echo 'FAIL historical Compose cleanup'; code=1
+    fi
+    exit "$code"
+  }
+  trap historical_cleanup EXIT
+  historical_compose up -d --no-build db
+  for attempt in $(seq 1 40); do
+    if historical_compose exec -T db pg_isready -h 127.0.0.1 -U carepulse_bootstrap -d carepulse > /dev/null 2>&1; then break; fi
+    if [ "$attempt" = 40 ]; then echo 'FAIL historical database startup'; exit 1; fi
+    sleep 2
+  done
+  export CP_MIGRATION_PASSWORD="$(cat "$CP_MIGRATION_SECRET_FILE")"
+  export CP_RUNTIME_PASSWORD="$(cat "$CP_RUNTIME_DB_PASSWORD_FILE")"
+  export CP_AUTH_DB_PASSWORD="$(cat "$CP_AUTH_DB_PASSWORD_SOURCE_FILE")"
+  export CP_OPERATOR_PASSWORD="$(cat "$CP_OPERATOR_SECRET_FILE")"
+  export CP_SENDER_PASSWORD="$(cat "$CP_SENDER_DB_PASSWORD_SOURCE_FILE")"
+  if ! historical_compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e CP_AUTH_DB_PASSWORD -e CP_OPERATOR_PASSWORD -e CP_SENDER_PASSWORD \
+    db psql --no-psqlrc -v VERBOSITY=sqlstate -U carepulse_bootstrap -d carepulse < "$historical_root/db/roles.sql" > "$historical_dir/roles.log" 2>&1; then
+    echo 'FAIL historical controlled roles (credential-bearing diagnostics withheld)'; exit 1
+  fi
+  unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_AUTH_DB_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD
+  local -a historical_test_args=(
+    --profile test run --rm --no-deps -T
+    -e CP_CI_PROJECT="$historical_project" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json
+    -v "$historical_root:/srv:ro"
+    -v "$historical_dir/compose.json:/tmp/foundation-compose.json:ro"
+    -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro"
+    -v "$CP_AUTH_DB_PASSWORD_SOURCE_FILE:/run/secrets/auth_db_password:ro"
+    -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro"
+    -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro"
+    -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro"
+  )
+  test "$(historical_compose "${historical_test_args[@]}" test python -m alembic -c alembic.ini heads)" = "$historical_head (head)"
+  historical_compose "${historical_test_args[@]}" \
+    -e CP_DB_HOST=db -e CP_DB_PORT=5432 -e CP_DB_NAME=carepulse \
+    -e CP_MIGRATION_PASSWORD_FILE=/run/secrets/migration_password \
+    test python -m alembic -c alembic.ini upgrade "$historical_head"
+  test "$(historical_compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = "$historical_head"
+  echo "Historical migration evidence: $historical_sha ($historical_head), cluster $historical_project"
+  historical_compose "${historical_test_args[@]}" test python -m pytest -q -ra --tb=short -p no:cacheprovider "${historical_nodes[@]}" | tee "$historical_dir/tests.log"
+  if grep -Eq '[0-9]+ skipped|no tests ran' "$historical_dir/tests.log"; then
+    echo 'FAIL mandatory historical migration evidence skipped'; exit 1
+  fi
+)
+# Keep experimental/protected invocation and its original selection untouched.
+if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ] && [ "${CP_B04_SPIKE:-false}" = false ]; then
+  for node in "${historical_nodes[@]}"; do
+    if [[ "$node" = *::* ]]; then historical_deselect+=("--deselect=$node"); fi
+  done
+  ordinary_core_migration_files=(tests/integration/test_t133_migration.py)
+  ordinary_queue_migration_files=()
+  ordinary_schedule_migration_files=()
+  ordinary_b10_migration_files=()
+  ordinary_day_review_migration_files=()
+fi
+
 upgrade_head
 seed_identity_policy
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
@@ -387,6 +569,9 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/f01-runtime-identity.log"; then
   echo 'FAIL mandatory F-01 runtime identity evidence skipped'; exit 1
 fi
+if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ] && [ "${CP_B04_SPIKE:-false}" = false ]; then
+  run_historical_migrations
+fi
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
@@ -395,7 +580,7 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_patient_persistence.py tests/integration/test_policy_persistence.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py tests/integration/test_appointment_persistence.py tests/integration/test_appointment_races.py tests/integration/test_visit_persistence.py tests/integration/test_visit_revisions.py tests/integration/test_visit_migration.py tests/integration/test_followup_persistence.py tests/integration/test_followup_races.py tests/integration/test_followup_migration.py tests/integration/test_t133_migration.py tests/integration/test_m1_migration.py | tee "$private/d08-core.log"
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider "${historical_deselect[@]}" tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_patient_persistence.py tests/integration/test_policy_persistence.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py tests/integration/test_appointment_persistence.py tests/integration/test_appointment_races.py tests/integration/test_visit_persistence.py tests/integration/test_visit_revisions.py tests/integration/test_visit_migration.py tests/integration/test_followup_persistence.py tests/integration/test_followup_races.py tests/integration/test_followup_migration.py "${ordinary_core_migration_files[@]}" | tee "$private/d08-core.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d08-core.log"; then
   echo 'FAIL mandatory D-08 persistence evidence skipped'; exit 1
 fi
@@ -408,7 +593,7 @@ docker compose --profile test run --rm --no-deps \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   test python -m pytest -q -s -ra --tb=short -p no:cacheprovider \
   tests/integration/test_queue_persistence.py tests/integration/test_queue_capacity.py \
-  tests/integration/test_queue_races.py tests/integration/test_queue_migration.py | tee "$private/d06-queue.log"
+  tests/integration/test_queue_races.py "${ordinary_queue_migration_files[@]}" | tee "$private/d06-queue.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d06-queue.log"; then
   echo 'FAIL mandatory D-06 real-PostgreSQL evidence skipped'; exit 1
 fi
@@ -418,7 +603,7 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider "${historical_deselect[@]}" \
   tests/integration/test_pricing.py tests/integration/test_pricing_races.py tests/integration/test_pricing_migration.py | tee "$private/b06-pricing.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b06-pricing.log"; then
   echo 'FAIL mandatory B-06 pricing evidence skipped'; exit 1
@@ -430,7 +615,7 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider \
-  tests/integration/test_schedule.py tests/integration/test_schedule_races.py tests/integration/test_schedule_migration.py | tee "$private/b07-schedule.log"
+  tests/integration/test_schedule.py tests/integration/test_schedule_races.py "${ordinary_schedule_migration_files[@]}" | tee "$private/b07-schedule.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b07-schedule.log"; then
   echo 'FAIL mandatory B-07 schedule evidence skipped'; exit 1
 fi
@@ -465,7 +650,7 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider \
   tests/integration/test_followups.py tests/integration/test_followups_denial.py \
   tests/integration/test_followup_decisions.py tests/integration/test_followups_races.py \
-  tests/integration/test_b10_writer_migration.py | tee "$private/b10-followups.log"
+  "${ordinary_b10_migration_files[@]}" | tee "$private/b10-followups.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b10-followups.log"; then
   echo 'FAIL mandatory B-10 follow-up evidence skipped'; exit 1
 fi
@@ -479,7 +664,7 @@ docker compose --profile test run --rm --no-deps \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   test python -m pytest -q -s -ra --tb=short -p no:cacheprovider \
   tests/integration/test_day_review_persistence.py tests/integration/test_report_query_plans.py \
-  tests/integration/test_day_review_races.py tests/integration/test_day_review_migration.py | tee "$private/d11-day-review.log"
+  tests/integration/test_day_review_races.py "${ordinary_day_review_migration_files[@]}" | tee "$private/d11-day-review.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d11-day-review.log"; then
   echo 'FAIL mandatory D-11 real-PostgreSQL evidence skipped'; exit 1
 fi

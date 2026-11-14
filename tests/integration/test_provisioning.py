@@ -1,17 +1,27 @@
 """B-03: restricted operator privileges and atomic first-Owner activation."""
 
 import hashlib
+import json
 import secrets
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from carepulse.config import ServiceConfig, _load_policy
 from carepulse.db import transaction
+from carepulse.identity.contracts import ContractError
 from carepulse.identity.receipts import ReceiptConflict
+from carepulse.identity.runtime_identity import bound_transaction
+from carepulse.identity.signing import (
+    PROTOCOL_VERSION,
+    CanonicalEnvelope,
+    raw_body_sha256,
+)
 from carepulse.provisioning.invitations import (
     create_clinic,
     reissue_invitation,
@@ -21,6 +31,7 @@ from carepulse.provisioning.operators import OperatorDenied, authenticate_operat
 from carepulse.provisioning.service import change_clinic_state
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from runtime_identity_fixture import registered_test_request
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
@@ -420,8 +431,53 @@ def _prepared_owner(migration, actor):
     return clinic, invite, proof, user
 
 
-def _activate(runtime, clinic, invite, proof, user):
-    with transaction(runtime, clinic) as connection:
+@contextmanager
+def _activation_transaction(runtime, gate, clinic, invite, proof, user):
+    body = json.dumps(
+        {
+            "invitation_id": str(invite),
+            "proof": proof,
+            "prepared_user_id": user,
+            "expected_lifecycle_revision": 0,
+            "expected_invitation_revision": 0,
+        },
+        separators=(",", ":"),
+    ).encode()
+    identity = CanonicalEnvelope(
+        PROTOCOL_VERSION,
+        "v1",
+        "web",
+        "POST",
+        "/v1/provisioning/owner-activate",
+        "",
+        raw_body_sha256(body),
+        str(clinic),
+        "",
+        "",
+        "BOOTSTRAP",
+        "0",
+        str(int(datetime.now(UTC).timestamp() * 1000)),
+        f"synthetic_{uuid4().hex}",
+        "OWNER_ACTIVATION",
+        "",
+    )
+    try:
+        with (
+            registered_test_request(SimpleNamespace(gate=gate), identity, body),
+            bound_transaction(runtime, identity) as connection,
+        ):
+            yield connection
+    except ContractError as denied:
+        # Preserve the original database SQLSTATE assertions for activation denials.
+        if isinstance(denied.__cause__, DBAPIError):
+            raise denied.__cause__ from None
+        raise
+
+
+def _activate(runtime, gate, clinic, invite, proof, user):
+    with _activation_transaction(
+        runtime, gate, clinic, invite, proof, user
+    ) as connection:
         return connection.scalar(
             text("""
                 SELECT changed FROM public.activate_first_owner(
@@ -444,13 +500,15 @@ def test_first_owner_activation_serializes_with_operator_mutation(
     migration, operator, actor, secret = operator_identity
     verified = authenticate_operator(operator, actor, secret, _load_policy())
     clinic, invite, proof, user = _prepared_owner(migration, actor)
-    runtime = role_engine("carepulse_runtime")
+    runtime = role_engine("carepulse_api")
+    gate = role_engine("carepulse_gate")
+    auth = role_engine("carepulse_auth")
     start = Barrier(2)
 
     def accept():
         start.wait(timeout=10)
         try:
-            return ("accepted", _activate(runtime, clinic, invite, proof, user))
+            return ("accepted", _activate(runtime, gate, clinic, invite, proof, user))
         except DBAPIError as error:
             assert error.orig.sqlstate in {"40001", "42501"}
             return ("denied", None)
@@ -519,7 +577,7 @@ def test_first_owner_activation_serializes_with_operator_mutation(
                 0,
                 "REVOKED",
             )
-        with transaction(runtime, clinic) as connection:
+        with transaction(auth, clinic) as connection:
             assert (
                 connection.execute(
                     text(
@@ -535,11 +593,13 @@ def test_first_owner_activation_serializes_with_operator_mutation(
             )
         if mutation[0] == "changed":
             with pytest.raises(DBAPIError):
-                _activate(runtime, clinic, invite, proof, user)
+                _activate(runtime, gate, clinic, invite, proof, user)
         else:
-            assert _activate(runtime, clinic, invite, proof, user) is False
+            assert _activate(runtime, gate, clinic, invite, proof, user) is False
     finally:
         runtime.dispose()
+        gate.dispose()
+        auth.dispose()
 
 
 def test_operator_suspend_invalidates_persisted_recovery_without_clearing_block(
@@ -548,9 +608,10 @@ def test_operator_suspend_invalidates_persisted_recovery_without_clearing_block(
     migration, operator, actor, secret = operator_identity
     verified = authenticate_operator(operator, actor, secret, _load_policy())
     clinic, invite, proof, user = _prepared_owner(migration, actor)
-    runtime = role_engine("carepulse_runtime")
+    runtime = role_engine("carepulse_api")
+    gate = role_engine("carepulse_gate")
     try:
-        assert _activate(runtime, clinic, invite, proof, user) is True
+        assert _activate(runtime, gate, clinic, invite, proof, user) is True
         with pytest.raises(DBAPIError) as forged, runtime.begin() as connection:
             connection.execute(
                 text("SELECT set_config('app.organization_id', :tenant, true)"),
@@ -569,6 +630,7 @@ def test_operator_suspend_invalidates_persisted_recovery_without_clearing_block(
         assert forged.value.orig.sqlstate == "42501"
     finally:
         runtime.dispose()
+        gate.dispose()
     receptionist = uuid4()
     operation = uuid4()
     receptionist_user = f"synthetic-{uuid4()}"
@@ -626,7 +688,7 @@ def test_operator_suspend_invalidates_persisted_recovery_without_clearing_block(
             """),
             {"operation": operation, "staff": receptionist},
         )
-    runtime = role_engine("carepulse_runtime")
+    runtime = role_engine("carepulse_api")
     try:
         with pytest.raises(DBAPIError) as forged, runtime.begin() as connection:
             connection.execute(
@@ -783,9 +845,11 @@ def test_first_owner_proof_is_single_use_and_tenant_bound(
         """),
             {"id": prepared_user, "email": email},
         )
-    runtime = role_engine("carepulse_runtime")
+    runtime = role_engine("carepulse_api")
+    gate = role_engine("carepulse_gate")
+    auth = role_engine("carepulse_auth")
     try:
-        with transaction(runtime, other) as connection:
+        with transaction(auth, other) as connection:
             assert (
                 connection.execute(
                     text(
@@ -799,7 +863,7 @@ def test_first_owner_proof_is_single_use_and_tenant_bound(
                 ).all()
                 == []
             )
-        with transaction(runtime, clinic) as connection:
+        with transaction(auth, clinic) as connection:
             assert (
                 connection.execute(
                     text(
@@ -813,6 +877,9 @@ def test_first_owner_proof_is_single_use_and_tenant_bound(
                 ).one()[0]
                 == email
             )
+        with _activation_transaction(
+            runtime, gate, clinic, invite, proof, prepared_user
+        ) as connection:
             assert (
                 connection.scalar(
                     text("""
@@ -829,7 +896,7 @@ def test_first_owner_proof_is_single_use_and_tenant_bound(
                 )
                 is not None
             )
-        with transaction(runtime, clinic) as connection:
+        with transaction(auth, clinic) as connection:
             assert (
                 connection.execute(
                     text(
@@ -843,6 +910,7 @@ def test_first_owner_proof_is_single_use_and_tenant_bound(
                 ).all()
                 == []
             )
+        with migration.connect() as connection:
             assert (
                 connection.scalar(
                     text("""
@@ -853,7 +921,12 @@ def test_first_owner_proof_is_single_use_and_tenant_bound(
                 )
                 == 1
             )
-        with pytest.raises(DBAPIError), transaction(runtime, other) as connection:
+        with (
+            pytest.raises(DBAPIError),
+            _activation_transaction(
+                runtime, gate, other, invite, proof, prepared_user
+            ) as connection,
+        ):
             connection.execute(
                 text("""
                 SELECT * FROM public.activate_first_owner(
@@ -869,6 +942,8 @@ def test_first_owner_proof_is_single_use_and_tenant_bound(
             )
     finally:
         runtime.dispose()
+        gate.dispose()
+        auth.dispose()
 
     verified = authenticate_operator(operator, actor, secret, _load_policy())
     suspended = change_clinic_state(
@@ -941,10 +1016,13 @@ def test_concurrent_acceptance_cannot_create_second_owner(
     barrier = Barrier(2)
 
     def attempt():
-        engine = role_engine("carepulse_runtime")
+        engine = role_engine("carepulse_api")
+        gate = role_engine("carepulse_gate")
         try:
-            with transaction(engine, clinic) as connection:
-                barrier.wait(timeout=10)
+            barrier.wait(timeout=10)
+            with _activation_transaction(
+                engine, gate, clinic, invite, proof, prepared_user
+            ) as connection:
                 return connection.scalar(
                     text("""
                   SELECT changed FROM public.activate_first_owner(
@@ -960,6 +1038,7 @@ def test_concurrent_acceptance_cannot_create_second_owner(
                 )
         finally:
             engine.dispose()
+            gate.dispose()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         outcomes = [
