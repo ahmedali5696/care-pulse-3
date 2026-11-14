@@ -21,10 +21,15 @@ from carepulse.identity.receipts import (
 )
 from carepulse.identity.runtime_identity import bound_transaction, current_request
 from carepulse.identity.signing import canonical_payload
-from carepulse.identity.staff import change_receptionist
-from carepulse.identity.staff_contracts import StaffCommand
+from carepulse.identity.staff import change_receptionist, change_receptionist_manager
+from carepulse.identity.staff_contracts import SetReceptionistGrant, StaffCommand
+from carepulse.notifications.evidence import append_sensitive_audit
 from postgres_locks import wait_for_postgres_lock
-from runtime_identity_fixture import db_proof_headers, registered_test_request
+from runtime_identity_fixture import (
+    db_proof_headers,
+    registered_test_request,
+    signed_test_transaction,
+)
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, OperationalError
 from test_appointment_persistence import _patient
@@ -284,7 +289,17 @@ def test_invitation_apply_requires_committed_activated_prepare(
     _deny_stage(clinic, request, "INVITATION_APPLY")
 
 
-@pytest.mark.parametrize("outcome", ["aborted", "no_evidence", "committed"])
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "aborted",
+        "no_evidence",
+        "audit_only",
+        "write_only",
+        "savepoint_rollback",
+        "committed",
+    ],
+)
 def test_session_cleanup_requires_committed_matching_revocation(
     patient_backend, outcome
 ):
@@ -308,6 +323,15 @@ def test_session_cleanup_requires_committed_matching_revocation(
     )
     cleanup = text("SELECT public.delete_staff_sessions(:tenant, :user)")
     params = {"tenant": clinic.tenant, "user": user}
+    if outcome == "audit_only":
+        # A real prior withdrawal cannot authorize a different primary request.
+        with clinic.migration.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE public.staff_accounts SET enabled=false, security_revision=1 WHERE id=:id"
+                ),
+                {"id": target},
+            )
     with registered_test_request(clinic, identity, body):
         request = current_request.get().request_id
         _deny_stage(clinic, request, "SESSION_CLEANUP")
@@ -319,7 +343,38 @@ def test_session_cleanup_requires_committed_matching_revocation(
                 with pytest.raises(DBAPIError) as denied, connection.begin_nested():
                     connection.scalar(cleanup, params)
                 assert denied.value.orig.sqlstate == "42501"
-                if outcome != "no_evidence":
+                if outcome == "audit_only":
+                    append_sensitive_audit(
+                        connection,
+                        {
+                            "organization_id": clinic.tenant,
+                            "actor_staff_id": clinic.staff,
+                            "actor_role": "DOCTOR_OWNER",
+                            "action": "RECEPTIONIST_DISABLE",
+                            "reason": command.reason,
+                            "correlation_id": str(uuid4()),
+                            "before_state": {"id": str(target), "enabled": True},
+                            "after_state": {"id": str(target), "enabled": False},
+                        },
+                    )
+                elif outcome == "write_only":
+                    assert (
+                        connection.execute(
+                            text(
+                                "UPDATE public.staff_accounts SET enabled=false, security_revision=1 WHERE id=:id"
+                            ),
+                            {"id": target},
+                        ).rowcount
+                        == 1
+                    )
+                elif outcome == "savepoint_rollback":
+                    savepoint = connection.begin_nested()
+                    _, _, native_user = change_receptionist(
+                        connection, actor, target, command, "disable"
+                    )
+                    assert native_user == user
+                    savepoint.rollback()
+                elif outcome != "no_evidence":
                     _, _, native_user = change_receptionist(
                         connection, actor, target, command, "disable"
                     )
@@ -342,9 +397,11 @@ def test_session_cleanup_requires_committed_matching_revocation(
                         SELECT pg_xact_status(b.xid), s.enabled, s.security_revision,
                                a.before_state->>'enabled', a.after_state->>'enabled',
                                a.xmin = b.xid::xid,
-                               f01_private.cleanup_proven(r, b.xid)
+                               f01_private.cleanup_proven(r, b.xid),
+                               p.revoked_staff_id=s.id, p.revocation_audit_id=a.id
                         FROM f01_private.requests r
                         JOIN f01_private.bindings b ON b.request_id=r.id AND b.stage='PRIMARY'
+                        JOIN f01_private.activations p ON p.request_id=b.request_id AND p.stage=b.stage
                         JOIN public.staff_accounts s ON s.id=r.target_id AND s.organization_id=r.organization_id
                         JOIN public.sensitive_audit a ON a.organization_id=r.organization_id
                             AND a.actor_staff_id=r.staff_id AND a.actor_role=r.role
@@ -362,7 +419,9 @@ def test_session_cleanup_requires_committed_matching_revocation(
                     "true",
                     "false",
                     False,
-                    False,
+                    True,
+                    True,
+                    True,
                 )
             with bound_transaction(
                 clinic.runtime, identity, stage="SESSION_CLEANUP"
@@ -395,6 +454,77 @@ def test_session_cleanup_requires_committed_matching_revocation(
             text('SELECT count(*) FROM public."session" WHERE id=:id'),
             {"id": clinic.receptionist.session_id},
         ) == (0 if outcome == "committed" else 1)
+
+
+def test_manager_withdrawal_cleanup_uses_committed_primary_evidence(patient_backend):
+    clinic = patient_backend
+    target = UUID(clinic.receptionist.staff_id)
+    path = f"/v1/staff/receptionists/{target}/permissions"
+    grant = SetReceptionistGrant(
+        reason="Synthetic grant",
+        operational_manager=True,
+        expected_revision=0,
+        expected_security_revision=0,
+    )
+    with signed_test_transaction(
+        clinic,
+        clinic.owner,
+        method="PATCH",
+        path=path,
+        purpose="STAFF_MANAGEMENT",
+        body=grant.model_dump(),
+    ) as (connection, actor):
+        _, _, user = change_receptionist_manager(connection, actor, target, grant)
+        assert user is None
+        request = current_request.get().request_id
+    _deny_stage(clinic, request, "SESSION_CLEANUP")
+    revoke = SetReceptionistGrant(
+        reason="Synthetic withdrawal",
+        operational_manager=False,
+        expected_revision=1,
+        expected_security_revision=1,
+    )
+    identity, body, _ = _signed(
+        clinic, path=path, purpose="STAFF_MANAGEMENT", command=revoke.model_dump()
+    )
+    identity = replace(identity, method="PATCH")
+    with registered_test_request(clinic, identity, body):
+        request = current_request.get().request_id
+        with protected_transaction(
+            clinic.runtime, identity, clinic.config.policy.session_idle_minutes
+        ) as (connection, actor):
+            with connection.begin_nested():
+                _, _, user = change_receptionist_manager(
+                    connection, actor, target, revoke
+                )
+            assert user is not None
+            _deny_stage(clinic, request, "SESSION_CLEANUP")
+        with bound_transaction(
+            clinic.runtime, identity, stage="SESSION_CLEANUP"
+        ) as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT public.delete_staff_sessions(:tenant, :user)"),
+                    {"tenant": clinic.tenant, "user": user},
+                )
+                == 1
+            )
+        _deny_stage(clinic, request, "SESSION_CLEANUP")
+    with clinic.migration.connect() as connection:
+        assert (
+            connection.scalar(
+                text('SELECT count(*) FROM public."session" WHERE id=:id'),
+                {"id": clinic.session},
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text('SELECT count(*) FROM public."session" WHERE id=:id'),
+                {"id": clinic.receptionist.session_id},
+            )
+            == 0
+        )
 
 
 def _assert_context(connection, clinic, request):
@@ -922,6 +1052,11 @@ def test_real_service_logins_cannot_forge_authority_with_gucs(
                     text("SELECT pg_has_role(session_user, :role, 'MEMBER')"),
                     {"role": target},
                 )
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(
+                    text("UPDATE f01_private.activations SET revoked_staff_id=NULL")
+                )
+            assert denied.value.orig.sqlstate == "42501"
     finally:
         engine.dispose()
 

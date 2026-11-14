@@ -85,6 +85,30 @@ def _snapshot(connection):
         connection.scalar(
             text("SELECT pg_get_functiondef('public.f01_cleanup()'::regprocedure)")
         ),
+        connection.execute(
+            text("""
+            SELECT c.relname, a.attname, format_type(a.atttypid,a.atttypmod), a.attnotnull, a.attacl::text
+            FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
+            JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE n.nspname='f01_private' AND a.attnum>0 AND NOT a.attisdropped
+            ORDER BY c.relname,a.attnum
+        """)
+        ).all(),
+        connection.execute(
+            text("""
+            SELECT p.proname, p.proowner, p.proacl::text, pg_get_functiondef(p.oid)
+            FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+            WHERE n.nspname='f01_private' ORDER BY p.proname
+        """)
+        ).all(),
+        connection.execute(
+            text("""
+            SELECT t.tgname, pg_get_triggerdef(t.oid), t.tgenabled
+            FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid
+            JOIN pg_namespace n ON n.oid=p.pronamespace
+            WHERE n.nspname='f01_private' ORDER BY t.tgname
+        """)
+        ).all(),
         connection.execute(text("SELECT * FROM public.verification ORDER BY id")).all(),
         connection.execute(
             text(
@@ -106,6 +130,7 @@ def _snapshot(connection):
     [
         (PREVIOUS, REVISION),
         ("0043_f01_writer_boundary", "0044_f01_delivery_acl"),
+        ("0044_f01_delivery_acl", "0045_f01_revocation_evidence"),
     ],
 )
 def test_f01_grants_cutover_is_atomic_repeatable_and_preserves_rows(
@@ -240,6 +265,22 @@ def test_f01_grants_cutover_is_atomic_repeatable_and_preserves_rows(
                     AND roles=ARRAY['carepulse_sender']::name[])
             """)
             )
+            if revision == "0045_f01_revocation_evidence":
+                assert (
+                    connection.scalar(
+                        text("""
+                    SELECT (SELECT count(*)=2 FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid
+                        JOIN pg_namespace n ON n.oid=p.pronamespace
+                        WHERE n.nspname='f01_private' AND p.proowner='carepulse_identity_owner'::regrole
+                            AND p.prosecdef AND t.tgenabled='O'
+                            AND NOT has_function_privilege('carepulse_api',p.oid,'EXECUTE')
+                            AND NOT has_function_privilege('carepulse_gate',p.oid,'EXECUTE'))
+                        AND NOT has_table_privilege('carepulse_identity_owner','public.staff_accounts','TRIGGER')
+                        AND NOT has_table_privilege('carepulse_identity_owner','public.sensitive_audit','TRIGGER')
+                """)
+                    )
+                    is True
+                )
         _upgrade(migration, revision)
         with migration.connect() as connection:
             assert _snapshot(connection) == after

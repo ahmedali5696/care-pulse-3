@@ -35,7 +35,13 @@ from carepulse.visits.eligibility_contracts import FollowupDecisionPatchV2
 from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import DBAPIError
-from test_appointment_persistence import _admit_saved, _draft, _patient, _query
+from test_appointment_persistence import (
+    _admit_saved,
+    _draft,
+    _patient,
+    _query,
+    _seed_current_completion,
+)
 from test_booking import (
     booking_body,
     booking_effects,
@@ -45,16 +51,24 @@ from test_booking import (
 from test_booking import (
     booking_clinic as booking_clinic,  # noqa: PLC0414
 )
+from test_database import _password
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
-from test_followup_persistence import _source, _v2_booking, _v2_command, _v2_source
+from test_followup_persistence import (
+    _insert_claim,
+    _source,
+    _v2_booking,
+    _v2_command,
+    _v2_source,
+)
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _patch, pricing_request
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 from test_schedule import _actor, _config, publish_signed_schedule
 from test_slots import _slots_request
 from test_visit_migration import _prepare, _upgrade
+from test_visit_persistence import _seed
 
 
 @contextmanager
@@ -101,7 +115,10 @@ def signed_command_transaction(
 def upgrade_replay_clinic(clinic, backend, admin):
     """Retain predecessor receipts, then replay them through the current API login."""
     database = clinic.migration.url.database
-    with psycopg.connect(admin.info.dsn, dbname=database) as connection:
+    # ConnectionInfo.dsn deliberately omits passwords.
+    with psycopg.connect(
+        admin.info.dsn, dbname=database, password=_password("carepulse_bootstrap")
+    ) as connection:
         connection.execute("""
             CREATE SCHEMA f01_private AUTHORIZATION carepulse_identity_owner;
             CREATE SCHEMA f01_crypto AUTHORIZATION carepulse_migration;
@@ -120,7 +137,9 @@ def upgrade_replay_clinic(clinic, backend, admin):
         )
     _upgrade(clinic.migration, "head")
     policy = backend.config.policy
-    with psycopg.connect(admin.info.dsn, dbname=database) as connection:
+    with psycopg.connect(
+        admin.info.dsn, dbname=database, password=_password("carepulse_bootstrap")
+    ) as connection:
         connection.execute("SET LOCAL ROLE carepulse_identity_owner")
         connection.execute(
             """
@@ -1570,11 +1589,39 @@ def _pre_t145_appointment_detail(connection, tenant, appointment):
     return {**projection, "history": recorded}
 
 
-def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
+def test_f01_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
     patient_backend, admin, empty_database
 ):
     migration, runtime, tenant, doctor = _prepare(admin, empty_database)
     try:
+        # Seed real pre-0028 admission/completion rows; 0028 itself derives the
+        # VERIFIED baseline. Neither retired runtime writer can run in F-01 CI.
+        _upgrade(migration, "0027_d11_day_review")
+        with transaction(migration, tenant) as connection:
+            assert (
+                connection.scalar(text("SELECT session_user")) == "carepulse_migration"
+            )
+            source_appointment = _seed(connection, tenant, doctor)
+            source_visit = _seed_current_completion(
+                connection, tenant, source_appointment, doctor
+            )
+            patient, completed = connection.execute(
+                text("""
+                    SELECT v.patient_id, (c.completed_at AT TIME ZONE 'Africa/Cairo')::date
+                    FROM public.visits v JOIN public.completion_attestations c
+                      ON (c.organization_id,c.visit_id)=(v.organization_id,v.id)
+                    WHERE v.organization_id=:tenant AND v.id=:visit
+                """),
+                {"tenant": tenant, "visit": source_visit},
+            ).one()
+            source = {
+                "tenant": tenant,
+                "doctor": doctor,
+                "appointment": source_appointment,
+                "visit": source_visit,
+                "patient": patient,
+                "day": completed,
+            }
         _upgrade(migration, "0028_d08_followup_provenance")
         session = f"synthetic-b10-legacy-{uuid4()}"
         with migration.begin() as connection:
@@ -1610,16 +1657,45 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
             config=patient_backend.config,
         )
         with transaction(migration, tenant) as connection:
-            source = _v2_source(connection, tenant, doctor)
-            claim = _v2_command(
-                connection, "create_followup_claim", source, **_v2_booking(source, 2)
-            )
-            appointment = connection.scalar(
+            baseline = connection.execute(
                 text(
-                    "SELECT appointment_id FROM public.followup_claims WHERE id=:claim"
+                    "SELECT provenance_state, source_revision, baseline_clinical_revision, decision FROM public.followup_source_state WHERE organization_id=:tenant AND visit_id=:visit"
                 ),
-                {"claim": claim},
+                {"tenant": tenant, "visit": source_visit},
+            ).one()
+            assert baseline == ("VERIFIED", 0, 0, None)
+            day = completed + timedelta(days=2)
+            provenance = {
+                "schema_version": 2,
+                "source_visit_id": str(source_visit),
+                "source_decision_revision": 0,
+                "source_clinical_revision": 0,
+                "doctor_staff_id": str(doctor),
+                "actor_staff_id": str(doctor),
+                "actor_role": "DOCTOR_OWNER",
+                "authorized": True,
+                "policy_revision": 1,
+                "selected_date": day.isoformat(),
+                "booking_mode": "OPEN",
+                "starts_at": None,
+                "ends_at": None,
+            }
+            # Build the 0028 writer's exact committed row shape under maintenance;
+            # original runtime-writer assertions remain in the pinned lane.
+            draft = _draft(
+                patient,
+                doctor,
+                service_date=day,
+                service_type="FOLLOW_UP",
+                price_snapshot={"entitlement_provenance": provenance},
             )
+            appointment, _ = insert_appointment_records(
+                connection,
+                _actor(tenant, doctor),
+                draft,
+                allocate_day_number(connection, tenant, day),
+            )
+            _insert_claim(connection, tenant, source, appointment, provenance)
             body = booking_body(
                 source["patient"],
                 day=source["day"] + timedelta(days=2),
@@ -1705,6 +1781,13 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
                 == original_receipt
             )
         upgrade_replay_clinic(clinic, patient_backend, admin)
+        with clinic.runtime.connect() as connection:
+            assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+        with migration.connect() as connection:
+            assert (
+                connection.execute(receipt_query, receipt_params).one()
+                == original_receipt
+            )
         assert booking_request(clinic, actor, raw_body=legacy_raw, key=key) == (
             201,
             {"data": saved, "revision": 0},

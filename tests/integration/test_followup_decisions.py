@@ -1528,8 +1528,8 @@ def test_signed_committed_v1_replays_exact_original_digest_including_null_distin
     assert _effects(clinic, visit_id, "visits.followup_decision") == (0, 0, 0, 0, 1)
 
 
-def test_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_checks(
-    patient_backend, admin, empty_database, monkeypatch
+def test_f01_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_checks(
+    patient_backend, admin, empty_database
 ):
     # Local import avoids the historical migration test's fixture-helper import cycle.
     from test_followup_migration import _historical_extension, _predecessor
@@ -1559,6 +1559,9 @@ def test_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_chec
                 },
             )
         with transaction(migration, tenant) as connection:
+            assert (
+                connection.scalar(text("SELECT session_user")) == "carepulse_migration"
+            )
             source = _legacy_source(connection, tenant, doctor)
             claim = _claim(connection, tenant, source)
             key = str(uuid4())
@@ -1599,6 +1602,12 @@ def test_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_chec
             config=patient_backend.config,
         )
         upgrade_replay_clinic(clinic, patient_backend, admin)
+        with clinic.runtime.connect() as connection:
+            assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+        with migration.connect() as connection:
+            assert (
+                connection.execute(receipt_sql, receipt_args).one() == original_receipt
+            )
         path = f"/v1/visits/{source['visit']}/extend-followup"
         before = _effects(clinic, source["visit"], "visits.extend_followup")
         assert _signed_visit_request(
