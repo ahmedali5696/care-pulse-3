@@ -1,0 +1,87 @@
+name: F-01 isolated PostgreSQL proof
+
+on:
+  push:
+    branches: [experiment/f01-runtime-identity]
+
+permissions:
+  contents: read
+
+jobs:
+  feasibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      F01_PG: postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27
+      F01_PY: python:3.13.16-slim-bookworm@sha256:73aa5faee130c60da030e105ec971ccf57473fbd22ce73bd6fc9ba99a40b838d
+      F01_NODE: node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
+      F01_DB: f01-pg-${{ github.run_id }}-${{ github.run_attempt }}
+      F01_NET: f01-net-${{ github.run_id }}-${{ github.run_attempt }}
+      F01_RUNNER: f01-runner:${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact SHA and isolated scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          base=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
+          git merge-base --is-ancestor "$base" HEAD
+          git diff --name-only "$base" HEAD | tee "$RUNNER_TEMP/f01-files"
+          test -s "$RUNNER_TEMP/f01-files"
+          if grep -Ev '^(experiments/f01-runtime-identity/|\.github/workflows/f01-runtime-identity\.yml$)' "$RUNNER_TEMP/f01-files"; then exit 1; fi
+          test "$(awk '/^  db:/{found=1;next} found && /image:/{print $2;exit}' compose.yaml)" = "$F01_PG"
+          echo "EXACT_SHA=$GITHUB_SHA BASELINE=$base IMAGE=$F01_PG"
+      - name: Prepare pinned isolated clients
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/f01-build"
+          grep -E '^(psycopg|sqlalchemy|greenlet|typing-extensions)' requirements.lock > "$RUNNER_TEMP/f01-build/requirements.lock"
+          cat > "$RUNNER_TEMP/f01-build/Dockerfile" <<EOF
+          FROM $F01_PY
+          COPY requirements.lock /requirements.lock
+          RUN python -m pip install --require-hashes --only-binary=:all: -r /requirements.lock
+          ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+          EOF
+          docker build --tag "$F01_RUNNER" "$RUNNER_TEMP/f01-build"
+          docker pull "$F01_NODE"
+          docker pull "$F01_PG"
+          docker image inspect "$F01_PG" --format 'Image ID={{.Id}} RepoDigests={{json .RepoDigests}}'
+      - name: Start disposable PostgreSQL (no host port)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker network create --internal "$F01_NET"
+          docker run -d --name "$F01_DB" --network "$F01_NET" --network-alias pg \
+            --tmpfs /var/lib/postgresql/data -e POSTGRES_DB=f01 -e POSTGRES_PASSWORD=postgres-test \
+            "$F01_PG" -c max_prepared_transactions=0
+          for i in $(seq 1 60); do
+            if docker exec "$F01_DB" pg_isready -h 127.0.0.1 -U postgres -d f01; then break; fi
+            sleep 1
+          done
+          docker exec -i "$F01_DB" psql -X -v ON_ERROR_STOP=1 -U postgres -d f01 < experiments/f01-runtime-identity/setup.sql
+      - name: Execute all nine criteria
+        shell: bash
+        run: |
+          set -euo pipefail
+          proof="$GITHUB_WORKSPACE/experiments/f01-runtime-identity"
+          docker run --rm --network none -v "$proof:/proof:ro" "$F01_NODE" node /proof/node_vector.cjs > "$RUNNER_TEMP/f01-node.json"
+          docker run --rm --network "$F01_NET" -e F01_DB_HOST=pg -v "$proof:/proof:ro" \
+            -v "$RUNNER_TEMP/f01-node.json:/node.json:ro" -w /proof "$F01_RUNNER" python core_checks.py
+          docker run --rm --network "$F01_NET" -e F01_DB_HOST=pg -v "$proof:/proof:ro" \
+            -w /proof "$F01_RUNNER" python stage_checks.py
+      - name: Dispose database and network, verify removal
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker container inspect "$F01_DB" >/dev/null 2>&1; then docker rm -fv "$F01_DB"; fi
+          if docker network inspect "$F01_NET" >/dev/null 2>&1; then docker network rm "$F01_NET"; fi
+          if docker image inspect "$F01_RUNNER" >/dev/null 2>&1; then docker image rm "$F01_RUNNER"; fi
+          ! docker container inspect "$F01_DB" >/dev/null 2>&1
+          ! docker network inspect "$F01_NET" >/dev/null 2>&1
+          echo "DISPOSABLE_CLEANUP=PASS SHA=$GITHUB_SHA"
