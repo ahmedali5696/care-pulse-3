@@ -12,6 +12,7 @@ import pytest
 from carepulse.appointments.followups import qualify_followup
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
+from carepulse.identity.contracts import ContractError
 from carepulse.identity.runtime_identity import bound_transaction
 from carepulse.identity.signing import (
     PROTOCOL_VERSION,
@@ -1276,17 +1277,17 @@ def test_v2_writer_rejects_invalid_context_without_evidence(
                 ),
                 {"id": staff},
             )
-    with transaction(runtime, tenant) as connection:
-        actor = {
-            "foreign": replace(appointment_api.owner, staff_id=str(foreign_doctor)),
-            "disabled": staff_actor,
-            "missing": replace(appointment_api.owner, staff_id=""),
-            "forged_expected": staff_actor,
-        }[bad_actor]
-        expected = {"source_revision": 0, "clinical_revision": 0, "policy_version": 1}
-        if bad_actor == "forged_expected":
-            expected["actor_staff_id"] = str(doctor)
-        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+    actor = {
+        "foreign": replace(appointment_api.owner, staff_id=str(foreign_doctor)),
+        "disabled": staff_actor,
+        "missing": replace(appointment_api.owner, staff_id=""),
+        "forged_expected": staff_actor,
+    }[bad_actor]
+    expected = {"source_revision": 0, "clinical_revision": 0, "policy_version": 1}
+    if bad_actor == "forged_expected":
+        expected["actor_staff_id"] = str(doctor)
+    if bad_actor in ("foreign", "disabled"):
+        with pytest.raises(ContractError) as denied:
             _signed_v2_command(
                 appointment_api,
                 "record_followup_source_decision",
@@ -1295,7 +1296,40 @@ def test_v2_writer_rejects_invalid_context_without_evidence(
                 expected=expected,
                 kind="DEFAULT",
             )
+        # The live authority gate rejects these actors before the writer runs.
+        assert denied.value.status_code == (401 if bad_actor == "foreign" else 403)
+        cause = denied.value.__cause__
+        assert isinstance(cause, DBAPIError)
+        assert cause.orig.sqlstate == ("28000" if bad_actor == "foreign" else "42501")
+    else:
+        with pytest.raises(DBAPIError) as denied:
+            _signed_v2_command(
+                appointment_api,
+                "record_followup_source_decision",
+                source,
+                actor=actor,
+                expected=expected,
+                kind="DEFAULT",
+            )
+        assert denied.value.orig.sqlstate == (
+            "22023" if bad_actor == "missing" else "42501"
+        )
+    if bad_actor == "missing":
+        # A signed envelope without staff is malformed; also prove the writer
+        # itself rejects a real API login with no activated request.
+        with (
+            pytest.raises(DBAPIError) as denied,
+            transaction(appointment_api.runtime, tenant) as connection,
+        ):
+            _current_v2_command(
+                connection,
+                "record_followup_source_decision",
+                source,
+                expected=expected,
+                kind="DEFAULT",
+            )
         assert denied.value.orig.sqlstate == "42501"
+    with transaction(runtime, tenant) as connection:
         assert (
             connection.scalar(
                 text(

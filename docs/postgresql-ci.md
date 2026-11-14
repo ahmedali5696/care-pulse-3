@@ -10,6 +10,7 @@ Dispatch **Foundation** on the candidate branch with `postgres_diagnostic` set t
 | `f01-cleanup` | `test_f01_runtime_identity.py::test_session_cleanup_requires_committed_matching_revocation[committed]` |
 | `f01-followup-lock` | `test_followup_persistence.py::test_v2_creation_exception_cannot_authorize_same_date_interval_change` |
 | `f01-visit-lock` | `test_visit_persistence.py::test_invalid_admission_shell_rejected_without_a_visit[forged_actor]` |
+| `f01-followup-context` | `test_followup_persistence.py::test_v2_writer_rejects_invalid_context_without_evidence[missing]` |
 
 The diagnostic check uses the same pinned PostgreSQL, migrations, disposable Compose project and synthetic secret lifecycle as Foundation. Use a separate dispatch for each independent database. Check the run's SHA and project ID, pytest counts, and volume and secret cleanup. The log reports the failing phase and test location, plus SQLSTATE or expected and observed blocker PIDs when available. It omits exception text, query text, parameters, test output, and parameter IDs.
 
