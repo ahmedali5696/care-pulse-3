@@ -279,8 +279,10 @@ def test_failed_audit_rolls_back_patient_and_receipt_but_keeps_accepted_nonce(
                 f"CREATE TRIGGER {trigger} BEFORE INSERT ON public.sensitive_audit FOR EACH ROW EXECUTE FUNCTION public.{trigger}()"
             )
         )
+        # Observe the gate-owned nonce tombstones through the migration login.
+        connection.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
         nonce_before = connection.scalar(
-            text("SELECT count(*) FROM public.request_nonces")
+            text("SELECT count(*) FROM f01_private.nonces")
         )
     try:
         status, failed = private_request(
@@ -288,9 +290,10 @@ def test_failed_audit_rolls_back_patient_and_receipt_but_keeps_accepted_nonce(
         )
         assert status == 503 and "data" not in failed
         assert effects(clinic) == before
-        with clinic.migration.connect() as connection:
+        with clinic.migration.begin() as connection:
+            connection.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
             assert (
-                connection.scalar(text("SELECT count(*) FROM public.request_nonces"))
+                connection.scalar(text("SELECT count(*) FROM f01_private.nonces"))
                 == nonce_before + 1
             )
     finally:

@@ -12,7 +12,6 @@ from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 import pytest
-from carepulse.db import transaction
 from carepulse.identity.contracts import ContractError
 from carepulse.identity.signing import canonical_payload, canonical_query
 from carepulse.main import app
@@ -21,7 +20,7 @@ from carepulse.patients.lifecycle import (
     lock_patient_for_existing_appointment,
     lock_patient_for_new_appointment,
 )
-from runtime_identity_fixture import db_proof_headers
+from runtime_identity_fixture import db_proof_headers, signed_test_transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_request_boundary import _signed
@@ -531,7 +530,15 @@ def test_issue_12_owner_unarchive_restores_guard_and_retains_reference(patient_b
             == 409
         )
         assert effects(clinic) == before
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        with signed_test_transaction(
+            clinic,
+            clinic.owner,
+            method="POST",
+            path="/v1/appointments",
+            purpose="APPOINTMENT_BOOKING",
+            body={"patient_id": patient["id"]},
+            key=str(uuid4()),
+        ) as (connection, _):
             with pytest.raises(ContractError) as archived:
                 lock_patient_for_new_appointment(
                     connection, clinic.tenant, UUID(patient["id"])
@@ -568,7 +575,15 @@ def test_issue_12_owner_unarchive_restores_guard_and_retains_reference(patient_b
             and restored["data"]["lifecycle_revision"] == 2
             and not restored["data"]["archived"]
         )
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        with signed_test_transaction(
+            clinic,
+            clinic.owner,
+            method="POST",
+            path="/v1/appointments",
+            purpose="APPOINTMENT_BOOKING",
+            body={"patient_id": patient["id"]},
+            key=str(uuid4()),
+        ) as (connection, _):
             assert not lock_patient_for_new_appointment(
                 connection, clinic.tenant, UUID(patient["id"])
             ).archived

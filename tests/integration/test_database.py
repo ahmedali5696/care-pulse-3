@@ -6,18 +6,23 @@ import re
 import shutil
 from asyncio import CancelledError
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config
-from carepulse.config import ServiceConfig, _load_policy
-from carepulse.db import create_db_engine, transaction
+from alembic.script import ScriptDirectory
+from carepulse.db import create_db_engine
+from carepulse.identity.authorization import protected_transaction
 from psycopg import sql
+from runtime_identity_fixture import registered_test_request
 from sqlalchemy import URL, create_engine, text
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, OperationalError
+from test_request_boundary import _signed
+from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 
 ROOT = Path(__file__).resolve().parents[2]
 REVISION = "0040_t173_numeric_money"
@@ -132,15 +137,17 @@ def _create_empty_database(admin, name):
         connection.execute("GRANT USAGE ON SCHEMA public TO carepulse_auth")
 
 
-def test_organization_schema_owned_by_migration_role():
-    engine = _engine("carepulse_runtime")
+def test_organization_schema_owned_by_migration_role(role_engine):
+    engine = role_engine("carepulse_api")
+    expected_head = ScriptDirectory(str(ROOT / "db/migrations")).get_current_head()
     try:
         with engine.connect() as connection:
+            assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
             assert (
                 connection.scalar(
                     text("SELECT version_num FROM public.alembic_version")
                 )
-                == REVISION
+                == expected_head
             )
             owned_tables = dict(
                 connection.execute(
@@ -189,8 +196,12 @@ def test_organization_schema_owned_by_migration_role():
 
 
 def test_empty_database_forward_only_boundary_and_repeated_upgrade(
-    admin, empty_database
+    admin, empty_database, role_engine
 ):
+    from test_f01_grants_migration import _bootstrap
+
+    expected_head = ScriptDirectory(str(ROOT / "db/migrations")).get_current_head()
+    api_url = role_engine("carepulse_api").url.set(database=empty_database)
     for cycle in range(2):
         if cycle:
             admin.execute(
@@ -198,7 +209,12 @@ def test_empty_database_forward_only_boundary_and_repeated_upgrade(
                     sql.Identifier(empty_database)
                 )
             )
-        _create_empty_database(admin, empty_database)
+        _bootstrap(admin, empty_database)
+        admin.execute(
+            sql.SQL("GRANT CONNECT ON DATABASE {} TO carepulse_api").format(
+                sql.Identifier(empty_database)
+            )
+        )
         engine = _engine("carepulse_migration", empty_database)
         try:
             _upgrade(engine)
@@ -215,7 +231,7 @@ def test_empty_database_forward_only_boundary_and_repeated_upgrade(
                     connection.scalar(
                         text("SELECT version_num FROM public.alembic_version")
                     )
-                    == REVISION
+                    == expected_head
                 )
                 assert (
                     connection.scalar(
@@ -226,14 +242,15 @@ def test_empty_database_forward_only_boundary_and_repeated_upgrade(
             _upgrade(engine)
         finally:
             engine.dispose()
-        runtime = _engine("carepulse_runtime", empty_database)
+        runtime = create_engine(api_url, hide_parameters=True)
         try:
             with runtime.connect() as connection:
+                assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
                 assert (
                     connection.scalar(
                         text("SELECT version_num FROM public.alembic_version")
                     )
-                    == REVISION
+                    == expected_head
                 )
         finally:
             runtime.dispose()
@@ -242,12 +259,15 @@ def test_empty_database_forward_only_boundary_and_repeated_upgrade(
 def test_failed_isolated_migration_rolls_back_objects_and_version(
     admin, empty_database, tmp_path
 ):
-    _create_empty_database(admin, empty_database)
+    from test_f01_grants_migration import _bootstrap
+
+    expected_head = ScriptDirectory(str(ROOT / "db/migrations")).get_current_head()
+    _bootstrap(admin, empty_database)
     scripts = tmp_path / "migrations"
     shutil.copytree(ROOT / "db/migrations", scripts)
-    (scripts / "versions/0030_failure.py").write_text(
-        'from alembic import op\nrevision = "0030_failure"\n'
-        f'down_revision = "{REVISION}"\n'
+    (scripts / "versions/9999_f04_failure.py").write_text(
+        'from alembic import op\nrevision = "9999_f04_failure"\n'
+        f'down_revision = "{expected_head}"\n'
         "def upgrade():\n"
         '    op.execute("CREATE TABLE public.synthetic_partial (value integer)")\n'
         '    op.execute("SELECT 1 / 0")\n'
@@ -269,59 +289,76 @@ def test_failed_isolated_migration_rolls_back_objects_and_version(
                 connection.scalar(
                     text("SELECT version_num FROM public.alembic_version")
                 )
-                == REVISION
+                == expected_head
             )
     finally:
         engine.dispose()
 
 
-@pytest.mark.parametrize(
-    "role", ["carepulse_runtime", "carepulse_auth", "carepulse_operator"]
+SERVICE_ROLES = (
+    "carepulse_api",
+    "carepulse_gate",
+    "carepulse_auth",
+    "carepulse_operator",
+    "carepulse_sender",
 )
-def test_restricted_roles_have_no_ownership_or_privileged_membership(role):
-    engine = _engine(role)
+
+
+@pytest.mark.parametrize("role", ("carepulse_runtime", *SERVICE_ROLES))
+def test_restricted_roles_have_no_ownership_or_privileged_membership(role, role_engine):
+    retired = role == "carepulse_runtime"
+    engine = role_engine("carepulse_api" if retired else role)
     try:
         with engine.connect() as connection:
-            assert (
-                connection.execute(
-                    text(
-                        "SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolinherit "
-                        "FROM pg_roles WHERE rolname = current_user"
-                    )
-                ).one()
-                == (False,) * 6
+            assert connection.scalar(text("SELECT session_user")) == (
+                "carepulse_api" if retired else role
             )
+            assert connection.execute(
+                text(
+                    "SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolinherit, rolcanlogin "
+                    "FROM pg_roles WHERE rolname = :role"
+                ),
+                {"role": role},
+            ).one() == (False,) * 6 + (not retired,)
             assert (
                 connection.scalar(
                     text(
-                        "SELECT count(*) FROM pg_auth_members WHERE member = (SELECT oid FROM pg_roles WHERE rolname = current_user)"
-                    )
+                        "SELECT count(*) FROM pg_auth_members WHERE member = (SELECT oid FROM pg_roles WHERE rolname = :role)"
+                    ),
+                    {"role": role},
                 )
                 == 0
             )
             assert (
                 connection.scalar(
                     text(
-                        "SELECT count(*) FROM pg_database WHERE datdba = (SELECT oid FROM pg_roles WHERE rolname = current_user)"
-                    )
+                        "SELECT count(*) FROM pg_database WHERE datdba = (SELECT oid FROM pg_roles WHERE rolname = :role)"
+                    ),
+                    {"role": role},
                 )
                 == 0
             )
             assert (
                 connection.scalar(
                     text(
-                        "SELECT count(*) FROM pg_namespace WHERE nspowner = (SELECT oid FROM pg_roles WHERE rolname = current_user)"
-                    )
+                        "SELECT count(*) FROM pg_namespace WHERE nspowner = (SELECT oid FROM pg_roles WHERE rolname = :role)"
+                    ),
+                    {"role": role},
                 )
                 == 0
             )
     finally:
         engine.dispose()
+    if retired:
+        legacy = role_engine(role)
+        try:
+            with pytest.raises(OperationalError):
+                legacy.connect()
+        finally:
+            legacy.dispose()
 
 
-@pytest.mark.parametrize(
-    "role", ["carepulse_runtime", "carepulse_auth", "carepulse_operator"]
-)
+@pytest.mark.parametrize("role", SERVICE_ROLES)
 @pytest.mark.parametrize(
     "statement",
     [
@@ -335,14 +372,20 @@ def test_restricted_roles_have_no_ownership_or_privileged_membership(role):
         "ALTER ROLE CURRENT_USER SUPERUSER",
         "SET ROLE carepulse_migration",
         "SET ROLE carepulse_bootstrap",
+        "SET ROLE carepulse_identity_owner",
+        "SET ROLE carepulse_runtime",
     ],
 )
-def test_runtime_and_operator_cannot_ddl_write_version_or_escalate(role, statement):
-    engine = _engine(role)
+def test_runtime_and_operator_cannot_ddl_write_version_or_escalate(
+    role, statement, role_engine
+):
+    engine = role_engine(role)
     try:
-        with pytest.raises(DBAPIError) as denied, engine.begin() as connection:
-            connection.execute(text(statement))
-        assert denied.value.orig.sqlstate == "42501"
+        with engine.begin() as connection:
+            assert connection.scalar(text("SELECT session_user")) == role
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(text(statement))
+            assert denied.value.orig.sqlstate == "42501"
     finally:
         engine.dispose()
 
@@ -358,25 +401,12 @@ def test_operator_has_no_table_access():
 
 
 @pytest.mark.parametrize("outcome", ["commit", "rollback", "sql_error", "cancellation"])
-def test_reused_runtime_connection_has_no_prior_authority(outcome):
-    config = ServiceConfig(
-        environment="test",
-        policy=_load_policy(),
-        db_host="db",
-        db_port=5432,
-        db_name="carepulse",
-        db_user="carepulse_runtime",
-        db_password=_password("carepulse_runtime"),
-        file_encryption_key="synthetic-unused-by-database-check",
-        service_key=None,
-        signing_key_id=None,
-        mail_enabled=False,
-        scan_enabled=False,
-        mail=None,
-        scan=None,
+def test_reused_runtime_connection_has_no_prior_authority(outcome, boundary_data):
+    config = replace(
+        boundary_data.config, db_password=boundary_data.runtime.url.password
     )
     engine = create_db_engine(config)
-    organization = UUID(int=1)
+    identity, body, _ = _signed(boundary_data)
     expected = {
         "commit": nullcontext(),
         "rollback": pytest.raises(RuntimeError, match="Synthetic rollback"),
@@ -384,11 +414,27 @@ def test_reused_runtime_connection_has_no_prior_authority(outcome):
         "cancellation": pytest.raises(CancelledError, match="Synthetic cancellation"),
     }[outcome]
     try:
-        with expected as failed, transaction(engine, organization) as connection:
+        with (
+            registered_test_request(boundary_data, identity, body),
+            expected as failed,
+            protected_transaction(
+                engine, identity, config.policy.session_idle_minutes
+            ) as (connection, actor),
+        ):
             backend_pid = connection.scalar(text("SELECT pg_backend_pid()"))
+            assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+            assert actor.organization_id == boundary_data.tenant
+            # A legacy GUC must not change the verified tenant or survive reuse.
             assert connection.scalar(
-                text("SELECT current_setting('app.organization_id', true)")
-            ) == str(organization)
+                text("SELECT set_config('app.organization_id', :tenant, true)"),
+                {"tenant": str(boundary_data.other)},
+            ) == str(boundary_data.other)
+            assert connection.execute(
+                text("SELECT organization_id, staff_id FROM public.f01_context()")
+            ).one() == (str(boundary_data.tenant), str(boundary_data.staff))
+            assert connection.execute(
+                text("SELECT id FROM public.organizations")
+            ).scalars().all() == [boundary_data.tenant]
             if outcome == "rollback":
                 raise RuntimeError("Synthetic rollback")
             if outcome == "cancellation":
@@ -397,13 +443,27 @@ def test_reused_runtime_connection_has_no_prior_authority(outcome):
                 connection.execute(text("SELECT 1 / 0"))
         if outcome == "sql_error":
             assert failed.value.orig.sqlstate == "22012"
-        with transaction(engine) as next_connection:
+        with engine.begin() as next_connection:
             assert (
                 next_connection.scalar(text("SELECT pg_backend_pid()")) == backend_pid
             )
+            assert (
+                next_connection.scalar(
+                    text("SELECT count(*) FROM public.f01_context()")
+                )
+                == 0
+            )
+            assert next_connection.scalar(text("SELECT public.f01_org()")) is None
+            assert next_connection.scalar(text("SELECT public.f01_staff()")) is None
             assert next_connection.scalar(
                 text("SELECT current_setting('app.organization_id', true)")
             ) in (None, "")
+            assert (
+                next_connection.scalar(
+                    text("SELECT count(*) FROM public.organizations")
+                )
+                == 0
+            )
             assert next_connection.scalar(text("SELECT 1")) == 1
     finally:
         engine.dispose()
