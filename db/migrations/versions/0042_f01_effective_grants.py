@@ -193,6 +193,46 @@ def upgrade() -> None:
         True,
     )
     op.execute("GRANT SELECT, INSERT, UPDATE ON public.patients TO carepulse_api")
+    # RLS checks the resulting row only; the historical lifecycle trigger
+    # validates revisions but cannot distinguish signed demographic/archive routes.
+    op.execute("""
+        CREATE FUNCTION public.f01_guard_patient_operation() RETURNS trigger
+        LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+        DECLARE ctx record;
+        BEGIN
+            IF session_user <> 'carepulse_api' THEN RETURN NEW; END IF;
+            SELECT * INTO ctx FROM public.f01_context();
+            IF NOT FOUND OR ctx.purpose <> 'PATIENT_REGISTRY' OR ctx.stage <> 'PRIMARY'
+               OR ctx.organization_id IS DISTINCT FROM NEW.organization_id::text THEN
+                RAISE EXCEPTION 'Patient operation scope denied' USING ERRCODE = '42501';
+            END IF;
+            IF TG_OP = 'INSERT' THEN
+                IF ctx.method = 'POST' AND ctx.path = '/v1/patients'
+                   AND NOT NEW.archived AND NEW.archived_at IS NULL
+                   AND NEW.demographic_revision = 0 AND NEW.lifecycle_revision = 0
+                   AND NEW.created_at = transaction_timestamp()
+                   AND NEW.updated_at = NEW.created_at THEN RETURN NEW; END IF;
+            ELSIF ctx.target_id = OLD.id AND ctx.target_id = NEW.id THEN
+                IF ctx.method = 'PATCH'
+                   AND (NEW.archived,NEW.archived_at,NEW.lifecycle_revision,NEW.updated_at)
+                       IS NOT DISTINCT FROM
+                       (OLD.archived,OLD.archived_at,OLD.lifecycle_revision,OLD.updated_at)
+                THEN RETURN NEW;
+                ELSIF ctx.method = 'POST' AND ctx.role = 'DOCTOR_OWNER'
+                   AND ((ctx.path LIKE '%/archive' AND NOT OLD.archived AND NEW.archived)
+                     OR (ctx.path LIKE '%/unarchive' AND OLD.archived AND NOT NEW.archived))
+                   AND NEW.lifecycle_revision = OLD.lifecycle_revision + 1
+                   AND (to_jsonb(NEW) - 'archived' - 'lifecycle_revision')
+                       = (to_jsonb(OLD) - 'archived' - 'lifecycle_revision')
+                THEN RETURN NEW;
+                END IF;
+            END IF;
+            RAISE EXCEPTION 'Patient operation scope denied' USING ERRCODE = '42501';
+        END $$;
+        REVOKE ALL ON FUNCTION public.f01_guard_patient_operation() FROM PUBLIC;
+        CREATE TRIGGER patients_f01_operation_guard BEFORE INSERT OR UPDATE ON public.patients
+        FOR EACH ROW EXECUTE FUNCTION public.f01_guard_patient_operation();
+    """)
 
     # Settings locks remain available to booking/qualification; writes are
     # confined to their exact signed settings route and primary transaction.
