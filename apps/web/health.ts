@@ -17,7 +17,7 @@ async function databaseReady(config: WebConfig): Promise<boolean> {
       "SELECT version_num FROM public.alembic_version",
     );
     completed = true;
-    return revision.rows.length === 1 && revision.rows[0].version_num === "0043_f01_writer_boundary";
+    return revision.rows.length === 1 && revision.rows[0].version_num === "0044_f01_delivery_acl";
   } catch {
     return false;
   } finally {

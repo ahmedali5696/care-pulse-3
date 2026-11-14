@@ -341,7 +341,7 @@ def test_signed_pricing_surrogate_reason_is_422_before_receipt(patient_backend):
 
 def _blocked_by(clinic, holder):
     deadline = monotonic() + 12
-    with clinic.runtime.connect() as observer:
+    with clinic.migration.connect() as observer:
         while monotonic() < deadline:
             observer.execute(text("SELECT pg_stat_clear_snapshot()"))
             blocked = observer.scalar(
@@ -445,7 +445,7 @@ def test_manager_grant_enables_pricing_but_not_legacy_bulk(patient_backend):
         status,
         applied,
     )
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
                 text("""
@@ -517,7 +517,7 @@ def test_manager_can_publish_pricing_and_followup_policy_in_one_transaction(
         )[0]
         == 422
     ), "Urgent cannot be enabled without operating periods"
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert connection.execute(
             text("""
                 SELECT kind, revision FROM public.clinic_policy_heads
@@ -659,7 +659,7 @@ def test_disabled_manager_cannot_recover_prior_followup_receipt(patient_backend)
 
 def test_manager_cannot_remediate_noncanonical_legacy_price(patient_backend):
     clinic = patient_backend
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         append_version(
             connection,
             str(clinic.tenant),
@@ -862,7 +862,7 @@ def test_manager_revoke_and_live_authorization_serialize_both_orders(
         ]
         == 403
     )
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         actual = connection.execute(
             text("""
                 SELECT (SELECT revision FROM public.clinic_policy_heads
@@ -914,12 +914,13 @@ def test_owner_patch_replays_receipt_without_leaking_revoked_session(patient_bac
         key=key,
     )
     assert status == 409 and changed["error"]["code"] == "IDEMPOTENCY_CONFLICT"
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         rows = (
             conn.execute(
                 text("""
             SELECT payload::text FROM public.clinic_policy_versions
-            WHERE kind = 'PRICE' ORDER BY version
+            WHERE organization_id = current_setting('app.organization_id')::uuid
+              AND kind = 'PRICE' ORDER BY version
         """)
             )
             .scalars()
@@ -1041,11 +1042,12 @@ def test_operator_and_foreign_tenant_cannot_read_or_update_pricing(patient_backe
                 key=str(uuid4()) if method == "PATCH" else "",
             )[0] in (401, 403)
     assert _pricing_evidence(clinic) == before
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         assert (
             conn.scalar(
                 text(
-                    "SELECT revision FROM public.clinic_policy_heads WHERE kind = 'PRICE'"
+                    "SELECT revision FROM public.clinic_policy_heads "
+                    "WHERE organization_id = current_setting('app.organization_id')::uuid AND kind = 'PRICE'"
                 )
             )
             == 1
@@ -1064,7 +1066,7 @@ def test_legacy_numeric_null_and_mixed_string_versions_remain_readable(patient_b
         ]
         is None
     )
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         append_version(
             conn,
             str(clinic.tenant),
@@ -1108,12 +1110,13 @@ def test_legacy_numeric_null_and_mixed_string_versions_remain_readable(patient_b
     )
     assert status == 200, result
     assert result["data"]["price_revision"] == 3
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         types = conn.execute(
             text("""
             SELECT version, jsonb_typeof(payload->'standard_new_exam_egp')
             FROM public.clinic_policy_versions
-            WHERE kind = 'PRICE' ORDER BY version
+            WHERE organization_id = current_setting('app.organization_id')::uuid
+              AND kind = 'PRICE' ORDER BY version
         """)
         ).all()
     assert types == [(1, "null"), (2, "number"), (3, "string")]
@@ -1133,7 +1136,7 @@ def test_legacy_numeric_null_and_mixed_string_versions_remain_readable(patient_b
 
 def test_noncanonical_legacy_price_requires_explicit_owner_remediation(patient_backend):
     clinic = patient_backend
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         saved = persist_appointment(
             conn,
             _draft(
@@ -1142,7 +1145,7 @@ def test_noncanonical_legacy_price_requires_explicit_owner_remediation(patient_b
             ),
             _query(clinic.tenant, UUID(clinic.owner.staff_id)),
         )
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         append_version(
             conn,
             str(clinic.tenant),
@@ -1152,11 +1155,11 @@ def test_noncanonical_legacy_price_requires_explicit_owner_remediation(patient_b
             1,
         )
 
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         snapshot_before = conn.scalar(
             text("""
                 SELECT row_to_json(s)::text FROM public.appointment_price_snapshots s
-                WHERE appointment_id = :id
+                WHERE organization_id = current_setting('app.organization_id')::uuid AND appointment_id = :id
             """),
             {"id": saved["id"]},
         )
@@ -1267,13 +1270,14 @@ def test_noncanonical_legacy_price_requires_explicit_owner_remediation(patient_b
         == "100.12"
     )
 
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         versions = conn.execute(
             text("""
                 SELECT version, payload->>'standard_new_exam_egp',
                        jsonb_typeof(payload->'standard_new_exam_egp')
                 FROM public.clinic_policy_versions
-                WHERE kind = 'PRICE' ORDER BY version
+                WHERE organization_id = current_setting('app.organization_id')::uuid
+                  AND kind = 'PRICE' ORDER BY version
             """)
         ).all()
         assert versions == [
@@ -1286,7 +1290,7 @@ def test_noncanonical_legacy_price_requires_explicit_owner_remediation(patient_b
             conn.scalar(
                 text("""
                 SELECT row_to_json(s)::text FROM public.appointment_price_snapshots s
-                WHERE appointment_id = :id
+                WHERE organization_id = current_setting('app.organization_id')::uuid AND appointment_id = :id
             """),
                 {"id": saved["id"]},
             )
@@ -1296,7 +1300,8 @@ def test_noncanonical_legacy_price_requires_explicit_owner_remediation(patient_b
             conn.scalar(
                 text("""
             SELECT count(*) FROM public.idempotency_receipts
-            WHERE operation = 'settings.pricing.update'
+            WHERE organization_id = current_setting('app.organization_id')::uuid
+              AND operation = 'settings.pricing.update'
         """)
             )
             == 2
@@ -1305,7 +1310,7 @@ def test_noncanonical_legacy_price_requires_explicit_owner_remediation(patient_b
 
 def test_noncanonical_followup_legacy_blocks_only_followup_quotes(patient_backend):
     clinic = patient_backend
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         append_version(
             conn,
             str(clinic.tenant),
@@ -1344,7 +1349,7 @@ def test_legacy_numeric_trailing_zero_preserves_scale_without_blocking_quotes(
     patient_backend,
 ):
     clinic = patient_backend
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         append_version(
             conn,
             str(clinic.tenant),
@@ -1392,7 +1397,7 @@ def test_legacy_numeric_trailing_zero_preserves_scale_without_blocking_quotes(
         "preferential_followup_egp": "30.123"
     }
 
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         retained = conn.execute(
             text("""
                 SELECT version, payload->>'standard_new_exam_egp',
@@ -1400,7 +1405,8 @@ def test_legacy_numeric_trailing_zero_preserves_scale_without_blocking_quotes(
                        payload->>'preferential_followup_egp',
                        jsonb_typeof(payload->'preferential_followup_egp')
                 FROM public.clinic_policy_versions
-                WHERE kind = 'PRICE' AND version IN (2, 3) ORDER BY version
+                WHERE organization_id = current_setting('app.organization_id')::uuid
+                  AND kind = 'PRICE' AND version IN (2, 3) ORDER BY version
             """)
         ).all()
     assert retained == [
@@ -1411,7 +1417,7 @@ def test_legacy_numeric_trailing_zero_preserves_scale_without_blocking_quotes(
 
 def test_two_noncanonical_legacy_fields_are_corrected_independently(patient_backend):
     clinic = patient_backend
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         append_version(
             conn,
             str(clinic.tenant),
@@ -1487,7 +1493,7 @@ def test_two_noncanonical_legacy_fields_are_corrected_independently(patient_back
         )[1]["data"]["price_quote"]["net_egp"]
         == "30.12"
     )
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         retained = conn.execute(
             text("""
                 SELECT version, payload->>'standard_new_exam_egp',
@@ -1495,7 +1501,8 @@ def test_two_noncanonical_legacy_fields_are_corrected_independently(patient_back
                        jsonb_typeof(payload->'standard_new_exam_egp'),
                        jsonb_typeof(payload->'preferential_followup_egp')
                 FROM public.clinic_policy_versions
-                WHERE kind = 'PRICE' ORDER BY version
+                WHERE organization_id = current_setting('app.organization_id')::uuid
+                  AND kind = 'PRICE' ORDER BY version
             """)
         ).all()
         assert retained == [
@@ -1508,7 +1515,8 @@ def test_two_noncanonical_legacy_fields_are_corrected_independently(patient_back
             conn.scalar(
                 text("""
             SELECT count(*) FROM public.idempotency_receipts
-            WHERE operation = 'settings.pricing.update'
+            WHERE organization_id = current_setting('app.organization_id')::uuid
+              AND operation = 'settings.pricing.update'
         """)
             )
             == 2
@@ -1519,7 +1527,7 @@ def test_remediation_preserves_untouched_legacy_numeric_and_nested_precision(
     patient_backend,
 ):
     clinic = patient_backend
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         append_version(
             conn,
             str(clinic.tenant),
@@ -1544,7 +1552,7 @@ def test_remediation_preserves_untouched_legacy_numeric_and_nested_precision(
     assert result["data"]["standard_new_exam_egp"] == "100.12"
     assert result["data"]["preferential_followup_egp"] == "30.50"
     assert "legacy_price_remediation" not in result["data"]
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         retained = conn.execute(
             text("""
                 SELECT version, payload->>'standard_new_exam_egp',
@@ -1554,7 +1562,8 @@ def test_remediation_preserves_untouched_legacy_numeric_and_nested_precision(
                        payload->'nested_extra'->>'rate',
                        jsonb_typeof(payload->'nested_extra'->'rate')
                 FROM public.clinic_policy_versions
-                WHERE kind = 'PRICE' AND version IN (2, 3) ORDER BY version
+                WHERE organization_id = current_setting('app.organization_id')::uuid
+                  AND kind = 'PRICE' AND version IN (2, 3) ORDER BY version
             """)
         ).all()
     assert retained == [
@@ -1584,11 +1593,12 @@ def test_server_owned_and_untrusted_fields_rejected(patient_backend, bad):
         body={**_patch(standard_new_exam_egp="100.00"), **bad},
         key=str(uuid4()),
     )[0] in (403, 422)
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         assert (
             conn.scalar(
                 text("""
-            SELECT revision FROM public.clinic_policy_heads WHERE kind = 'PRICE'
+            SELECT revision FROM public.clinic_policy_heads
+            WHERE organization_id = current_setting('app.organization_id')::uuid AND kind = 'PRICE'
         """)
             )
             == 1
@@ -1653,7 +1663,7 @@ def test_urgent_requires_operating_periods_and_valid_premium(patient_backend):
     # Actual working period is published through the existing D-04 policy helper.
     from carepulse.policies.versions import append_version
 
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         assert (
             append_version(
                 conn,
@@ -1819,7 +1829,7 @@ def test_signed_pricing_after_lawful_schedule_hours_removal(patient_backend):
 
 def test_signed_enable_rejects_retained_noncanonical_urgent_premium(patient_backend):
     clinic = patient_backend
-    with transaction(clinic.runtime, clinic.tenant) as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         append_version(
             conn,
             str(clinic.tenant),

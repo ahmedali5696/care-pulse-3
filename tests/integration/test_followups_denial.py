@@ -408,12 +408,12 @@ def test_receptionist_get_qualification_never_serializes_doctor_decision(
 def test_archived_patient_cannot_use_acknowledged_fallback(booking_clinic):
     clinic = booking_clinic
     patient = new_patient(clinic)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         connection.execute(
             text(
-                "UPDATE public.patients SET archived=true, lifecycle_revision=lifecycle_revision+1 WHERE id=:patient"
+                "UPDATE public.patients SET archived=true, lifecycle_revision=lifecycle_revision+1 WHERE organization_id=:tenant AND id=:patient"
             ),
-            {"patient": patient},
+            {"tenant": clinic.tenant, "patient": patient},
         )
     before = booking_effects(clinic)
     status, _ = booking_request(
@@ -473,7 +473,7 @@ def test_consumed_source_cannot_book_second_preferential_followup(followup_clini
     assert status == 201, response
     assert response["data"]["service_type"] == "NEW_EXAMINATION"
     assert response["data"]["net_egp"] == "100.00"
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert connection.execute(
             text("""
                 SELECT state, count(*) FROM public.followup_claims
@@ -490,7 +490,7 @@ def test_completed_followup_visit_cannot_be_recursive_preferential_source(
     clinic = followup_clinic
     original, first = _reserve(clinic)
     terminal_claim(clinic, first, status="Completed")
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         recursive_visit = connection.scalar(
             text("""
                 SELECT id FROM public.visits
@@ -517,7 +517,7 @@ def test_completed_followup_visit_cannot_be_recursive_preferential_source(
     )
     assert status == 201, response
     assert response["data"]["service_type"] == "NEW_EXAMINATION"
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
                 text("""
@@ -574,7 +574,7 @@ def test_acknowledged_ordinary_fallback_reaffirms_discretionary_discount(
         booked["discount_type"],
         booked["discount_value"],
     ) == ("NEW_EXAMINATION", "100.00", net, discount_type, discount_value)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
                 text("""
@@ -591,7 +591,7 @@ def test_in_examination_source_requires_acknowledgment_to_book_ordinary(
     booking_clinic,
 ):
     clinic = booking_clinic
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         source = _source(
             connection, clinic.tenant, UUID(clinic.owner.staff_id), complete=False
         )
@@ -622,7 +622,7 @@ def test_in_examination_source_requires_acknowledgment_to_book_ordinary(
     assert status == 201, response
     assert response["data"]["service_type"] == "NEW_EXAMINATION"
     assert response["data"]["net_egp"] == "100.00"
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
                 text("""

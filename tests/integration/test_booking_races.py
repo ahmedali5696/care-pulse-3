@@ -2,13 +2,13 @@
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from threading import Barrier, Event, get_ident
 from uuid import UUID, uuid4
 
 import pytest
 from carepulse.appointments.book import book_appointment
 from carepulse.appointments.booking_contracts import BookAppointment
-from carepulse.db import transaction
 from carepulse.identity.contracts import ContractError, normalized_request_digest
 from carepulse.identity.receipts import Receipt, ReceiptConflict, insert_tenant_receipt
 from carepulse.main import app
@@ -16,19 +16,57 @@ from carepulse.policies.schedule_service import load_current_schedule
 from carepulse.policies.slots import candidates_for_date
 from carepulse.policies.versions import append_version
 from postgres_locks import wait_for_postgres_lock
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import event, text
 from test_booking import booking_body, booking_effects, booking_request, new_patient
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
-from test_schedule import SERVICE_DAY, _activate, _actor, _config, _publish, _stage
+from test_schedule import (
+    SERVICE_DAY,
+    _activate,
+    _actor,
+    _config,
+    _patch,
+    _publish,
+    _schedule_request,
+)
+
+
+@contextmanager
+def _booking_transaction(clinic, body, key):
+    with signed_test_transaction(
+        clinic,
+        clinic.owner,
+        method="POST",
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+        body=body,
+        key=key,
+    ) as (connection, _):
+        yield connection
+
+
+@contextmanager
+def _activation_checkpoint(clinic, waiter, ready):
+    def observe(connection, _cursor, statement, _parameters, _context, _many):
+        if "public.f01_activate()" in statement:
+            waiter.append(connection.connection.driver_connection.info.backend_pid)
+            ready.set()
+
+    event.listen(clinic.runtime, "before_cursor_execute", observe)
+    try:
+        yield
+    finally:
+        event.remove(clinic.runtime, "before_cursor_execute", observe)
 
 
 def _attempt(clinic, patient, key=None, **changes):
-    command = BookAppointment.model_validate(booking_body(patient, **changes))
+    body, key = booking_body(patient, **changes), key or str(uuid4())
+    command = BookAppointment.model_validate(body)
     actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        return book_appointment(connection, actor, command, key or str(uuid4()))
+    with _booking_transaction(clinic, body, key) as connection:
+        return book_appointment(connection, actor, command, key)
 
 
 def _concurrent(*actions):
@@ -118,7 +156,7 @@ def test_signed_same_key_booking_waits_at_live_organization_barrier(
     def observe_signed_wait(
         connection, _cursor, statement, _parameters, _context, _many
     ):
-        if receipt_inserted.is_set() and "public.lock_active_organization" in statement:
+        if receipt_inserted.is_set() and "public.f01_activate()" in statement:
             waiting_pid.append(connection.connection.driver_connection.info.backend_pid)
             signed_started.set()
 
@@ -135,7 +173,7 @@ def test_signed_same_key_booking_waits_at_live_organization_barrier(
                     booking_request, clinic, clinic.owner, body=contender, key=key
                 )
                 assert signed_started.wait(timeout=15)
-                with transaction(clinic.runtime, clinic.tenant) as observer:
+                with clinic.migration.connect() as observer:
                     wait_for_postgres_lock(observer, waiting_pid[0], original_pid[0])
             finally:
                 release_original.set()
@@ -163,7 +201,7 @@ def test_signed_booked_receipt_survives_later_archive(booking_clinic):
     body, key = booking_body(patient), str(uuid4())
     original = booking_request(clinic, clinic.owner, body=body, key=key)
     assert original[0] == 201
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.begin() as connection:
         connection.execute(
             text(
                 "UPDATE public.patients SET archived=true, "
@@ -209,7 +247,7 @@ def test_direct_retry_waits_behind_archive_then_replays_committed_booking(
             assert resume_retry.wait(timeout=30)
 
     def archive():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        with clinic.migration.begin() as connection:
             archive_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             archive_started.set()
             connection.execute(
@@ -223,7 +261,7 @@ def test_direct_retry_waits_behind_archive_then_replays_committed_booking(
             assert release_archive.wait(timeout=30)
 
     def retry_after_first_receipt_miss():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        with _booking_transaction(clinic, body, key) as connection:
             retry_thread.append(get_ident())
             retry_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             return book_appointment(
@@ -236,7 +274,8 @@ def test_direct_retry_waits_behind_archive_then_replays_committed_booking(
     event.listen(clinic.runtime, "after_cursor_execute", hold_first_receipt_read)
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            with transaction(clinic.runtime, clinic.tenant) as holder:
+            # Maintenance holds only the patient path; API activation must still run.
+            with clinic.migration.begin() as holder:
                 saved = book_appointment(
                     holder,
                     _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
@@ -246,13 +285,13 @@ def test_direct_retry_waits_behind_archive_then_replays_committed_booking(
                 holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
                 archive_future = pool.submit(archive)
                 assert archive_started.wait(timeout=15)
-                with transaction(clinic.runtime, clinic.tenant) as observer:
+                with clinic.migration.connect() as observer:
                     wait_for_postgres_lock(observer, archive_pid[0], holder_pid)
                 replay_future = pool.submit(retry_after_first_receipt_miss)
                 assert receipt_read.wait(timeout=15)
             assert archive_updated.wait(timeout=15)
             resume_retry.set()
-            with transaction(clinic.runtime, clinic.tenant) as observer:
+            with clinic.migration.connect() as observer:
                 wait_for_postgres_lock(observer, retry_pid[0], archive_pid[0])
             release_archive.set()
             archive_future.result(timeout=30)
@@ -264,7 +303,7 @@ def test_direct_retry_waits_behind_archive_then_replays_committed_booking(
     status, replay = booking_request(clinic, clinic.owner, body=body, key=key)
     assert status == 201 and replay["data"] == saved
     assert replay["revision"] == saved["revision"]
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.connect() as connection:
         assert connection.scalar(
             text("SELECT archived FROM public.patients WHERE id=:patient"),
             {"patient": patient},
@@ -291,7 +330,7 @@ def test_signed_retry_waits_behind_archive_then_replays_committed_booking(
         connection, _cursor, statement, _parameters, _context, _many
     ):
         pid = connection.connection.driver_connection.info.backend_pid
-        if "public.lock_active_organization" in statement:
+        if archive_started.is_set() and "public.f01_activate()" in statement:
             signed_pid.append(pid)
             signed_started.set()
         if (
@@ -303,7 +342,7 @@ def test_signed_retry_waits_behind_archive_then_replays_committed_booking(
             assert release_receipt.wait(timeout=30)
 
     def archive():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        with clinic.migration.begin() as connection:
             archive_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             archive_started.set()
             connection.execute(
@@ -320,7 +359,7 @@ def test_signed_retry_waits_behind_archive_then_replays_committed_booking(
     event.listen(clinic.runtime, "before_cursor_execute", observe_signed_sql)
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            with transaction(clinic.runtime, clinic.tenant) as holder:
+            with _booking_transaction(clinic, body, key) as holder:
                 saved = book_appointment(
                     holder,
                     _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
@@ -330,11 +369,11 @@ def test_signed_retry_waits_behind_archive_then_replays_committed_booking(
                 holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
                 archive_future = pool.submit(archive)
                 assert archive_started.wait(timeout=15)
-                with transaction(clinic.runtime, clinic.tenant) as observer:
+                with clinic.migration.connect() as observer:
                     wait_for_postgres_lock(observer, archive_pid[0], holder_pid)
                 retry_future = pool.submit(signed_retry)
                 assert signed_started.wait(timeout=15)
-                with transaction(clinic.runtime, clinic.tenant) as observer:
+                with clinic.migration.connect() as observer:
                     wait_for_postgres_lock(observer, signed_pid[0], holder_pid)
                 assert not receipt_reached.is_set()
             archive_future.result(timeout=30)
@@ -346,7 +385,7 @@ def test_signed_retry_waits_behind_archive_then_replays_committed_booking(
         event.remove(clinic.runtime, "before_cursor_execute", observe_signed_sql)
     assert status == 201 and replay["data"] == saved
     assert replay["revision"] == saved["revision"]
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.connect() as connection:
         assert connection.scalar(
             text("SELECT archived FROM public.patients WHERE id=:patient"),
             {"patient": patient},
@@ -380,16 +419,22 @@ def test_distinct_patients_race_for_unique_sequential_day_numbers(booking_clinic
     assert {outcome["number"] for outcome in outcomes} == {1, 2}
     assert {outcome["patient_id"] for outcome in outcomes} == set(map(str, patients))
     assert booking_effects(clinic) == (2, 1, 2, 2, 2, 2, 2, 2)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.connect() as connection:
         assert (
             connection.scalar(
-                text("SELECT last_number FROM public.appointment_day_counters")
+                text(
+                    "SELECT last_number FROM public.appointment_day_counters WHERE organization_id=:tenant"
+                ),
+                {"tenant": clinic.tenant},
             )
             == 2
         )
         assert set(
             connection.scalars(
-                text("SELECT number FROM public.appointment_number_assignments")
+                text(
+                    "SELECT number FROM public.appointment_number_assignments WHERE organization_id=:tenant"
+                ),
+                {"tenant": clinic.tenant},
             )
         ) == {1, 2}
 
@@ -401,20 +446,25 @@ def test_archive_and_booking_serialize_for_both_commit_orders(
 ):
     clinic = booking_clinic
     patient = new_patient(clinic)
+    body, key = booking_body(patient), str(uuid4())
     ready = Event()
     waiter = []
 
     def compete():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            waiter.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            ready.set()
+        with (
+            _booking_transaction(clinic, body, key)
+            if archive_first
+            else clinic.migration.begin()
+        ) as connection:
             if archive_first:
                 return book_appointment(
                     connection,
                     _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
-                    BookAppointment.model_validate(booking_body(patient)),
-                    str(uuid4()),
+                    BookAppointment.model_validate(body),
+                    key,
                 )
+            waiter.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            ready.set()
             connection.execute(
                 text("""
                 UPDATE public.patients SET archived=true,
@@ -424,7 +474,11 @@ def test_archive_and_booking_serialize_for_both_commit_orders(
             )
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        with transaction(clinic.runtime, clinic.tenant) as holder:
+        with (
+            clinic.migration.begin()
+            if archive_first
+            else _booking_transaction(clinic, body, key)
+        ) as holder:
             holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
             if archive_first:
                 holder.execute(
@@ -438,13 +492,14 @@ def test_archive_and_booking_serialize_for_both_commit_orders(
                 saved = book_appointment(
                     holder,
                     _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
-                    BookAppointment.model_validate(booking_body(patient)),
-                    str(uuid4()),
+                    BookAppointment.model_validate(body),
+                    key,
                 )
-            future = pool.submit(compete)
-            assert ready.wait(timeout=15)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
-                wait_for_postgres_lock(observer, waiter[0], holder_pid)
+            with _activation_checkpoint(clinic, waiter, ready):
+                future = pool.submit(compete)
+                assert ready.wait(timeout=15)
+                with clinic.migration.connect() as observer:
+                    wait_for_postgres_lock(observer, waiter[0], holder_pid)
         if archive_first:
             with pytest.raises(ContractError) as denied:
                 future.result(timeout=30)
@@ -454,7 +509,7 @@ def test_archive_and_booking_serialize_for_both_commit_orders(
             future.result(timeout=30)
             assert saved["number"] == 1
             assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.connect() as connection:
         assert (
             connection.scalar(
                 text("SELECT archived FROM public.patients WHERE id=:id"),
@@ -471,8 +526,9 @@ def _reprice(connection, clinic):
         JOIN public.clinic_policy_versions v
           ON (h.organization_id,h.kind,h.current_version)
            = (v.organization_id,v.kind,v.version)
-        WHERE h.kind='PRICE'
-    """)
+        WHERE h.kind='PRICE' AND h.organization_id=:tenant
+    """),
+        {"tenant": clinic.tenant},
     )
     payload = json.loads(raw)
     payload["standard_new_exam_egp"] = "150.00"
@@ -486,24 +542,33 @@ def test_price_policy_and_booking_freeze_only_confirmed_revision(
 ):
     clinic = booking_clinic
     patient = new_patient(clinic)
+    body, key = booking_body(patient), str(uuid4())
     ready = Event()
     waiter = []
 
     def compete():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            waiter.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            ready.set()
+        with (
+            _booking_transaction(clinic, body, key)
+            if price_first
+            else clinic.migration.begin()
+        ) as connection:
             if price_first:
                 return book_appointment(
                     connection,
                     _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
-                    BookAppointment.model_validate(booking_body(patient)),
-                    str(uuid4()),
+                    BookAppointment.model_validate(body),
+                    key,
                 )
+            waiter.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            ready.set()
             _reprice(connection, clinic)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        with transaction(clinic.runtime, clinic.tenant) as holder:
+        with (
+            clinic.migration.begin()
+            if price_first
+            else _booking_transaction(clinic, body, key)
+        ) as holder:
             holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
             if price_first:
                 _reprice(holder, clinic)
@@ -511,13 +576,14 @@ def test_price_policy_and_booking_freeze_only_confirmed_revision(
                 booked = book_appointment(
                     holder,
                     _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
-                    BookAppointment.model_validate(booking_body(patient)),
-                    str(uuid4()),
+                    BookAppointment.model_validate(body),
+                    key,
                 )
-            future = pool.submit(compete)
-            assert ready.wait(timeout=15)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
-                wait_for_postgres_lock(observer, waiter[0], holder_pid)
+            with _activation_checkpoint(clinic, waiter, ready):
+                future = pool.submit(compete)
+                assert ready.wait(timeout=15)
+                with clinic.migration.connect() as observer:
+                    wait_for_postgres_lock(observer, waiter[0], holder_pid)
         if price_first:
             with pytest.raises(ContractError) as denied:
                 future.result(timeout=30)
@@ -536,43 +602,64 @@ def test_schedule_activation_and_booking_serialize_on_first_date(
 ):
     clinic = booking_clinic
     patient = new_patient(clinic)
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        preview = _stage(
-            connection, actor, _config(mode="OPEN", working_weekdays=[]), revision=2
-        )
+    body, key = booking_body(patient), str(uuid4())
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    status, response = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/preview",
+        body=_patch(_config(mode="OPEN", working_weekdays=[]), revision=2).model_dump(
+            mode="json"
+        ),
+        key=str(uuid4()),
+    )
+    assert status == 200, response
+    preview = response["data"]
+    activation_key = str(uuid4())
+    activation_body = {
+        "preview_id": preview["preview_id"],
+        "expected_schedule_revision": preview["revisions"]["schedule"],
+        "expected_capacity_revision": preview["revisions"]["capacity"],
+        "reason": "Synthetic reviewed schedule publication",
+    }
     ready = Event()
     waiter = []
 
+    @contextmanager
+    def operation(activation):
+        with signed_test_transaction(
+            clinic,
+            clinic.owner,
+            method="POST",
+            path="/v1/settings/schedule/activate" if activation else "/v1/appointments",
+            purpose="SETTINGS_SCHEDULE" if activation else "APPOINTMENT_BOOKING",
+            body=activation_body if activation else body,
+            key=activation_key if activation else key,
+        ) as (connection, actor):
+            assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+            yield connection, actor
+
+    def execute(connection, actor, activation):
+        if activation:
+            return _activate(connection, actor, preview, activation_key)
+        return book_appointment(
+            connection, actor, BookAppointment.model_validate(body), key
+        )
+
     def compete():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            waiter.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            ready.set()
-            if activation_first:
-                return book_appointment(
-                    connection,
-                    actor,
-                    BookAppointment.model_validate(booking_body(patient)),
-                    str(uuid4()),
-                )
-            return _activate(connection, actor, preview)
+        with operation(not activation_first) as (connection, actor):
+            return execute(connection, actor, not activation_first)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        with transaction(clinic.runtime, clinic.tenant) as holder:
+        with operation(activation_first) as (holder, actor):
             holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
-            if activation_first:
-                _activate(holder, actor, preview)
-            else:
-                booked = book_appointment(
-                    holder,
-                    actor,
-                    BookAppointment.model_validate(booking_body(patient)),
-                    str(uuid4()),
-                )
-            future = pool.submit(compete)
-            assert ready.wait(timeout=15)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
-                wait_for_postgres_lock(observer, waiter[0], holder_pid)
+            booked = execute(holder, actor, activation_first)
+            with _activation_checkpoint(clinic, waiter, ready):
+                future = pool.submit(compete)
+                assert ready.wait(timeout=15)
+                with clinic.migration.connect() as observer:
+                    wait_for_postgres_lock(observer, waiter[0], holder_pid)
         with pytest.raises(ContractError) as denied:
             future.result(timeout=30)
         assert denied.value.status_code == 409
@@ -585,7 +672,7 @@ def test_schedule_activation_and_booking_serialize_on_first_date(
 
 def test_two_timed_confirmations_for_same_candidate_cannot_overbook(booking_clinic):
     clinic = booking_clinic
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.begin() as connection:
         _publish(
             connection,
             _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
@@ -651,7 +738,8 @@ def test_direct_receipt_unique_insert_wait_rollback_and_fresh_signed_recovery(
             loser_started.set()
 
     def winner():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        # This probe isolates the receipt constraint, not API operation authority.
+        with clinic.migration.begin() as connection:
             winner_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             insert_tenant_receipt(connection, receipt)
             inserted.set()
@@ -660,7 +748,7 @@ def test_direct_receipt_unique_insert_wait_rollback_and_fresh_signed_recovery(
     def loser():
         assert inserted.wait(timeout=15)
         try:
-            with transaction(clinic.runtime, clinic.tenant) as connection:
+            with clinic.migration.begin() as connection:
                 loser_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
                 # Earlier same-transaction effects must roll back after losing the insert.
                 updated = connection.execute(
@@ -677,12 +765,12 @@ def test_direct_receipt_unique_insert_wait_rollback_and_fresh_signed_recovery(
             return "rolled_back"
         return "unexpected_insert"
 
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.connect() as connection:
         revision_before = connection.scalar(
             text("SELECT lifecycle_revision FROM public.patients WHERE id=:patient"),
             {"patient": patient},
         )
-    event.listen(clinic.runtime, "before_cursor_execute", observe_loser_insert)
+    event.listen(clinic.migration, "before_cursor_execute", observe_loser_insert)
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
             winner_future = pool.submit(winner)
@@ -690,7 +778,7 @@ def test_direct_receipt_unique_insert_wait_rollback_and_fresh_signed_recovery(
                 assert inserted.wait(timeout=15)
                 loser_future = pool.submit(loser)
                 assert loser_started.wait(timeout=15)
-                with transaction(clinic.runtime, clinic.tenant) as observer:
+                with clinic.migration.connect() as observer:
                     wait_for_postgres_lock(observer, loser_pid[0], winner_pid[0])
             finally:
                 release_winner.set()
@@ -698,14 +786,14 @@ def test_direct_receipt_unique_insert_wait_rollback_and_fresh_signed_recovery(
             assert loser_future.result(timeout=30) == "rolled_back"
     finally:
         release_winner.set()
-        event.remove(clinic.runtime, "before_cursor_execute", observe_loser_insert)
+        event.remove(clinic.migration, "before_cursor_execute", observe_loser_insert)
 
     # New signed request enforces current authorization and resource visibility.
     assert booking_request(clinic, clinic.owner, body=body, key=key) == original
     changed = {**body, "expected_price_revision": 999}
     status, conflict = booking_request(clinic, clinic.owner, body=changed, key=key)
     assert status == 409 and conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.connect() as connection:
         assert (
             connection.scalar(
                 text(
@@ -719,9 +807,10 @@ def test_direct_receipt_unique_insert_wait_rollback_and_fresh_signed_recovery(
             connection.scalar(
                 text(
                     "SELECT count(*) FROM public.idempotency_receipts "
-                    "WHERE operation='appointments.book' AND idempotency_key=:key"
+                    "WHERE organization_id=:tenant AND operation='appointments.book' "
+                    "AND idempotency_key=:key"
                 ),
-                {"key": key},
+                {"tenant": clinic.tenant, "key": key},
             )
             == 1
         )

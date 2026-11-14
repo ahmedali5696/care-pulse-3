@@ -118,7 +118,7 @@ def _reset(token, password, *, timeout=6):
 
 
 def _wait_for_organization_waiters(
-    connection, count, role="carepulse_runtime", query="lock_active_organization"
+    connection, count, role="carepulse_api", query="f01_activate"
 ):
     deadline = monotonic() + 4
     while monotonic() < deadline:
@@ -182,7 +182,7 @@ def test_expiry_inside_native_transaction_rolls_back_every_auth_effect(recovery_
         ).fetchone()[0]
 
     with ThreadPoolExecutor(max_workers=1) as executor:
-        with _database() as blocker:
+        with _database(bootstrap=True) as blocker:
             blocker.execute('LOCK TABLE public."session" IN SHARE MODE')
             pending = executor.submit(
                 _reset, token, f"Synthetic-Expired-During-Auth-{uuid4()}!", timeout=20
@@ -251,7 +251,7 @@ def test_parallel_recovery_proof_has_one_credential_effect_and_audit(
         return _reset(token, password)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        with _database() as blocker:
+        with _database(bootstrap=True) as blocker:
             blocker.execute(
                 "SELECT id FROM public.organizations WHERE id = %s FOR UPDATE",
                 (owner.clinic,),
@@ -333,7 +333,7 @@ def test_committed_operator_suspend_wins_before_recovery_reservation(
         ).fetchone()[0]
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        with _database() as blocker:
+        with _database(bootstrap=True) as blocker:
             blocker.execute(
                 "SELECT id FROM public.organizations WHERE id = %s FOR UPDATE",
                 (owner.clinic,),
@@ -396,7 +396,7 @@ def test_operator_revocation_after_native_fence_blocks_stale_finalization(
         ).fetchone()[0]
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        with _database() as blocker:
+        with _database(bootstrap=True) as blocker:
             blocker.execute('LOCK TABLE public."session" IN SHARE MODE')
             reset = executor.submit(_reset, token, new_password)
             try:
@@ -463,7 +463,7 @@ def test_two_distinct_proofs_cannot_replace_unresolved_native_reset(recovery_own
         _reject_commit_for(owner.clinic, "sensitive_audit"),
         ThreadPoolExecutor(max_workers=2) as executor,
     ):
-        with _database() as blocker:
+        with _database(bootstrap=True) as blocker:
             blocker.execute('LOCK TABLE public."session" IN SHARE MODE')
             first = executor.submit(_reset, proof_a, password_a)
             try:
@@ -533,7 +533,7 @@ def test_duplicate_auth_done_finalizers_keep_one_success_and_revision(recovery_o
         return _reset(token, password)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        with _database() as blocker:
+        with _database(bootstrap=True) as blocker:
             blocker.execute(
                 "SELECT id FROM public.organizations WHERE id=%s FOR UPDATE",
                 (owner.clinic,),
@@ -606,7 +606,7 @@ def test_replacement_competes_with_suspension_and_stale_finalizer(
     completed_a_hash = _native(owner)[0]
 
     with ThreadPoolExecutor(max_workers=3) as executor:
-        with _database() as blocker:
+        with _database(bootstrap=True) as blocker:
             if first_winner == "operator":
                 blocker.execute(
                     "SELECT id FROM public.organizations WHERE id=%s FOR UPDATE",

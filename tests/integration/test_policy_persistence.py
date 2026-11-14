@@ -15,8 +15,11 @@ from alembic.config import Config
 from carepulse.db import transaction
 from carepulse.policies.versions import StalePolicyRevision, append_version
 from psycopg import sql
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import DBAPIError
+from test_patient_persistence import patient_storage as patient_storage  # noqa: PLC0414
+from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 
 DEFAULTS = {
     "PRICE": {
@@ -43,10 +46,15 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture
 def policy_storage(role_engine, tenant_factory):
+    """Verify current-head schema invariants as maintenance, not runtime authority.
+
+    The API cannot publish QUEUE/ADMISSION settings before their product routes
+    exist. Service-login RLS is checked separately with real signed requests.
+    """
     _, create_tenant = tenant_factory
     tenant_a = create_tenant("Synthetic D-04 clinic A")
     tenant_b = create_tenant("Synthetic D-04 clinic B")
-    runtime = role_engine("carepulse_runtime")
+    runtime = role_engine("carepulse_migration")
     migration = role_engine("carepulse_migration")
     operator = role_engine("carepulse_operator")
     try:
@@ -61,7 +69,9 @@ def _versions(connection):
     return connection.execute(
         text("""
             SELECT kind, version, payload
-            FROM public.clinic_policy_versions ORDER BY kind, version
+            FROM public.clinic_policy_versions
+            WHERE organization_id=COALESCE(public.f01_org(), NULLIF(current_setting('app.organization_id', true), ''))::uuid
+            ORDER BY kind, version
         """)
     ).all()
 
@@ -71,7 +81,9 @@ def _heads(connection):
         text("""
             SELECT kind, current_version, revision,
                    queue_effective_on, queue_pending
-            FROM public.clinic_policy_heads ORDER BY kind
+            FROM public.clinic_policy_heads
+            WHERE organization_id=COALESCE(public.f01_org(), NULLIF(current_setting('app.organization_id', true), ''))::uuid
+            ORDER BY kind
         """)
     ).all()
 
@@ -95,7 +107,13 @@ def test_new_organizations_get_one_complete_initial_version_per_kind(policy_stor
                 assert (effective, pending) == (None, False)
             for table in ("clinic_schedule_intervals", "clinic_schedule_holidays"):
                 assert (
-                    connection.scalar(text(f"SELECT count(*) FROM public.{table}")) == 0
+                    connection.scalar(
+                        text(
+                            f"SELECT count(*) FROM public.{table} WHERE organization_id=:tenant"
+                        ),
+                        {"tenant": tenant},
+                    )
+                    == 0
                 )
             initial.append({kind: payload for kind, _, payload in versions})
     assert initial == [DEFAULTS, DEFAULTS]
@@ -181,8 +199,10 @@ def test_enabled_no_show_without_explicit_cutoff_is_accepted(policy_storage):
         ] == (2, 2)
 
 
-def test_policy_rls_tenant_separation_and_operator_denial(policy_storage):
-    runtime, _, operator, tenant_a, tenant_b = policy_storage
+def test_policy_rls_tenant_separation_and_operator_denial(patient_storage, role_engine):
+    clinic, _, tenant_a, tenant_b = patient_storage
+    runtime = clinic.runtime
+    operator = role_engine("carepulse_operator")
     for table in (
         "clinic_policy_versions",
         "clinic_policy_heads",
@@ -204,7 +224,13 @@ def test_policy_rls_tenant_separation_and_operator_denial(policy_storage):
         )
     assert denied_insert.value.orig.sqlstate == "42501"
 
-    with transaction(runtime, tenant_a) as connection:
+    with signed_test_transaction(
+        clinic,
+        clinic.actors[tenant_a],
+        method="GET",
+        path="/v1/settings/pricing",
+        purpose="SETTINGS_PRICING",
+    ) as (connection, _):
         assert _versions(connection)
         assert (
             connection.scalar(
@@ -216,7 +242,13 @@ def test_policy_rls_tenant_separation_and_operator_denial(policy_storage):
             )
             == 0
         )
-    with transaction(runtime, tenant_b) as connection:
+    with signed_test_transaction(
+        clinic,
+        clinic.actors[tenant_b],
+        method="GET",
+        path="/v1/settings/pricing",
+        purpose="SETTINGS_PRICING",
+    ) as (connection, _):
         assert _versions(connection)
         assert (
             connection.scalar(
@@ -228,6 +260,7 @@ def test_policy_rls_tenant_separation_and_operator_denial(policy_storage):
             )
             == 0
         )
+    operator.dispose()
 
 
 def test_policy_seed_role_function_and_trigger_are_privilege_isolated(policy_storage):
@@ -248,6 +281,8 @@ def test_policy_seed_role_function_and_trigger_are_privilege_isolated(policy_sto
                            p.prosecdef, p.proconfig,
                            has_function_privilege('carepulse_runtime', p.oid, 'EXECUTE')
                                AS runtime_execute,
+                           has_function_privilege('carepulse_api', p.oid, 'EXECUTE')
+                               AS api_execute,
                            has_function_privilege('carepulse_operator', p.oid, 'EXECUTE')
                                AS operator_execute
                     FROM pg_proc p JOIN pg_roles owner ON owner.oid = p.proowner
@@ -267,6 +302,7 @@ def test_policy_seed_role_function_and_trigger_are_privilege_isolated(policy_sto
             assert function.prosecdef is True
             assert function.proconfig == ["search_path=pg_catalog"]
             assert function.runtime_execute is False
+            assert function.api_execute is False
             assert function.operator_execute is False
         assert (
             connection.scalar(
@@ -320,7 +356,26 @@ def test_policy_seed_role_function_and_trigger_are_privilege_isolated(policy_sto
         assert not any(operator_grants.values())
 
 
-def test_historical_policy_versions_cannot_be_mutated(policy_storage):
+def test_historical_policy_versions_cannot_be_mutated(policy_storage, patient_storage):
+    clinic, _, tenant, _ = patient_storage
+    with signed_test_transaction(
+        clinic,
+        clinic.actors[tenant],
+        method="PATCH",
+        path="/v1/settings/pricing",
+        purpose="SETTINGS_PRICING",
+        body={"expected_price_revision": 1},
+        key=str(uuid4()),
+    ) as (connection, _):
+        assert _versions(connection)
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(
+                text(
+                    "UPDATE public.clinic_policy_versions SET payload='{}'::jsonb WHERE organization_id=:tenant"
+                ),
+                {"tenant": tenant},
+            )
+        assert denied.value.orig.sqlstate == "42501"
     runtime, migration, _, tenant_a, _ = policy_storage
     with transaction(runtime, tenant_a) as connection:
         kind, version, _ = _versions(connection)[0]
@@ -642,7 +697,7 @@ def test_organization_rollback_discards_policy_initialization(
 ):
     operator_id, _ = tenant_factory
     migration = role_engine("carepulse_migration")
-    runtime = role_engine("carepulse_runtime")
+    runtime = role_engine("carepulse_api")
     tenant = uuid4()
     try:
         with (
@@ -677,6 +732,9 @@ def test_organization_rollback_discards_policy_initialization(
             )
         with transaction(runtime, tenant) as connection:
             assert _versions(connection) == []
+        with transaction(migration, tenant) as connection:
+            assert _versions(connection) == []
+            assert _heads(connection) == []
     finally:
         runtime.dispose()
         migration.dispose()

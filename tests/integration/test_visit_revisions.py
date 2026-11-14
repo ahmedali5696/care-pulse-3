@@ -4,8 +4,11 @@ from uuid import uuid4
 
 import pytest
 from carepulse.db import transaction
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
+from test_appointment_persistence import _api_actor
+from test_appointment_persistence import appointment_api as appointment_api  # noqa: PLC0414
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_visit_persistence import _complete, _receptionist, _seed, _visit
 
@@ -179,11 +182,16 @@ def test_terminal_doctor_correction_keeps_status_and_actual_revision(
     ],
 )
 def test_unauthorized_or_unjustified_correction_denied(
-    appointment_storage, actor_kind, reason, kind, expected_state
+    appointment_storage, appointment_api, actor_kind, reason, kind, expected_state
 ):
     runtime, migration, (tenant, _), (doctor, other_doctor) = appointment_storage
     receptionist = (
         _receptionist(migration, tenant) if actor_kind == "receptionist" else None
+    )
+    identity = (
+        _api_actor(appointment_api, tenant, receptionist)
+        if receptionist
+        else appointment_api.actors[appointment_api.other]
     )
     with transaction(runtime, tenant) as connection:
         appointment = _seed(connection, tenant, doctor, complete=True)
@@ -195,12 +203,31 @@ def test_unauthorized_or_unjustified_correction_denied(
         else:
             actor = doctor
         _actor(connection, actor, reason, kind)
-        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
-            connection.execute(
-                text("UPDATE public.visits SET diagnosis='Unauthorized' WHERE id=:id"),
-                {"id": visit.id},
-            )
-        assert denied.value.orig.sqlstate == expected_state
+        if actor_kind == "doctor":
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(
+                    text(
+                        "UPDATE public.visits SET diagnosis='Unauthorized' WHERE id=:id"
+                    ),
+                    {"id": visit.id},
+                )
+            assert denied.value.orig.sqlstate == expected_state
+        else:
+            with signed_test_transaction(
+                appointment_api,
+                identity,
+                method="GET",
+                path="/v1/appointments",
+                purpose="APPOINTMENT_BOOKING",
+            ) as (api, _):
+                with pytest.raises(DBAPIError) as denied, api.begin_nested():
+                    api.execute(
+                        text(
+                            "UPDATE public.visits SET diagnosis='Unauthorized' WHERE id=:id"
+                        ),
+                        {"id": visit.id},
+                    )
+                assert denied.value.orig.sqlstate == expected_state
         assert (
             connection.scalar(
                 text(
@@ -212,7 +239,9 @@ def test_unauthorized_or_unjustified_correction_denied(
         )
 
 
-def test_followup_decision_now_uses_separate_operational_writer(appointment_storage):
+def test_followup_decision_now_uses_separate_operational_writer(
+    appointment_storage, appointment_api
+):
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
         appointment = _seed(connection, tenant, doctor, complete=True)
@@ -236,6 +265,13 @@ def test_followup_decision_now_uses_separate_operational_writer(appointment_stor
             )
             == 0
         )
+    with signed_test_transaction(
+        appointment_api,
+        appointment_api.actors[tenant],
+        method="GET",
+        path=f"/v1/appointments/{appointment}",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, _):
         with pytest.raises(DBAPIError) as denied, connection.begin_nested():
             connection.execute(
                 text("""

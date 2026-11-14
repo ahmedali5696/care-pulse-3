@@ -173,13 +173,18 @@ def test_day_lock_serializes_intersections_and_allows_adjacent_intervals(
     assert attempts.count(True) == expected
     with transaction(runtime, tenant) as connection:
         assert (
-            connection.scalar(text("SELECT count(*) FROM public.appointments"))
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.appointments WHERE organization_id = current_setting('app.organization_id')::uuid"
+                )
+            )
             == expected
         )
         assert (
             connection.scalar(
                 text(
-                    "SELECT last_number FROM public.appointment_day_counters WHERE service_date=:day"
+                    "SELECT last_number FROM public.appointment_day_counters "
+                    "WHERE organization_id = current_setting('app.organization_id')::uuid AND service_date=:day"
                 ),
                 {"day": SERVICE_DAY},
             )
@@ -198,7 +203,14 @@ def test_capacity_two_rejects_third_concurrent_interval(appointment_storage):
     attempts = _compete(runtime, tenant, doctor, patients, [slot] * 3, revision=2)
     assert attempts.count(True) == 2
     with transaction(runtime, tenant) as connection:
-        assert connection.scalar(text("SELECT count(*) FROM public.appointments")) == 2
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.appointments WHERE organization_id = current_setting('app.organization_id')::uuid"
+                )
+            )
+            == 2
+        )
 
 
 @pytest.mark.parametrize("overlap", [False, True])
@@ -220,7 +232,9 @@ def test_cairo_postgres_session_normalizes_confirmed_intervals_for_both_paths(
         connection.execute(text("SET LOCAL TIME ZONE 'Africa/Cairo'"))
         assert connection.scalar(text("SHOW TIME ZONE")) == "Africa/Cairo"
         stored = connection.execute(
-            text("SELECT starts_at, ends_at FROM public.appointments LIMIT 1")
+            text(
+                "SELECT starts_at, ends_at FROM public.appointments WHERE organization_id = current_setting('app.organization_id')::uuid LIMIT 1"
+            )
         ).one()
         cairo_start = slots[0].starts_at.astimezone(CAIRO)
         cairo_end = slots[0].ends_at.astimezone(CAIRO)
@@ -384,7 +398,9 @@ def test_stale_capacity_revision_rolls_back_number_allocation(appointment_storag
     with transaction(runtime, tenant) as connection:
         assert (
             connection.scalar(
-                text("SELECT count(*) FROM public.appointment_day_counters")
+                text(
+                    "SELECT count(*) FROM public.appointment_day_counters WHERE organization_id = current_setting('app.organization_id')::uuid"
+                )
             )
             == 0
         )

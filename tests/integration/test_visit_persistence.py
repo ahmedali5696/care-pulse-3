@@ -5,15 +5,18 @@ from uuid import UUID, uuid4
 import pytest
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import (
     _admit_saved,
+    _api_actor,
     _draft,
     _patient,
     _query,
     _seed_waiting_entry,
 )
+from test_appointment_persistence import appointment_api as appointment_api  # noqa: PLC0414
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 
 
@@ -285,6 +288,7 @@ def test_direct_completion_without_attestation_rolls_back_at_commit(
 
 def test_completion_duplicate_and_direct_evidence_forgery_are_denied(
     appointment_storage,
+    appointment_api,
 ):
     runtime, migration, (tenant, _), (doctor, _) = appointment_storage
     receptionist = _receptionist(migration, tenant)
@@ -298,6 +302,21 @@ def test_completion_duplicate_and_direct_evidence_forgery_are_denied(
         with pytest.raises(DBAPIError) as denied, connection.begin_nested():
             _complete(connection, tenant, appointment)
         assert denied.value.orig.sqlstate == "40001"
+    with signed_test_transaction(
+        appointment_api,
+        appointment_api.actors[tenant],
+        method="GET",
+        path=f"/v1/appointments/{appointment}",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, _):
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(
+                text(
+                    "SELECT * FROM public.complete_examined_visit(:tenant,:id,3,true)"
+                ),
+                {"tenant": tenant, "id": appointment},
+            )
+        assert denied.value.orig.sqlstate == "42501"
         for statement in (
             "UPDATE public.completion_attestations SET actor_role='DOCTOR_OWNER' WHERE appointment_id=:id",
             "DELETE FROM public.completion_attestations WHERE appointment_id=:id",
@@ -368,7 +387,9 @@ def test_admission_shell_is_tied_to_real_history_and_live_actor(
         "forged_actor",
     ],
 )
-def test_invalid_admission_shell_rejected_without_a_visit(appointment_storage, invalid):
+def test_invalid_admission_shell_rejected_without_a_visit(
+    appointment_storage, appointment_api, invalid
+):
     runtime, _, (tenant, _other), (doctor, other_doctor) = appointment_storage
     with transaction(runtime, tenant) as connection:
         appointment = _seed(connection, tenant, doctor, insert_visit=False)
@@ -404,13 +425,28 @@ def test_invalid_admission_shell_rejected_without_a_visit(appointment_storage, i
         elif invalid == "wrong_admission_revision":
             defaults["revision"] = 1
         elif invalid == "forged_actor":
-            connection.execute(
-                text("SELECT set_config('app.staff_id', :id, true)"),
-                {"id": str(other_doctor)},
-            )
-        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
-            connection.execute(
-                text("""
+            # Maintenance is not runtime authority; forge GUCs only on the real API.
+            with signed_test_transaction(
+                appointment_api,
+                appointment_api.actors[tenant],
+                method="GET",
+                path="/v1/appointments",
+                purpose="APPOINTMENT_BOOKING",
+            ) as (api, _):
+                api.execute(
+                    text("SELECT set_config('app.staff_id', :id, true)"),
+                    {"id": str(other_doctor)},
+                )
+                with pytest.raises(DBAPIError) as denied, api.begin_nested():
+                    api.execute(
+                        text("INSERT INTO public.visits (id) VALUES (:visit)"),
+                        {"visit": defaults["visit"]},
+                    )
+                assert denied.value.orig.sqlstate == "42501"
+        if invalid != "forged_actor":
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(
+                    text("""
                     INSERT INTO public.visits (
                         id, organization_id, appointment_id, patient_id,
                         doctor_staff_id, service_date, admission_history_revision,
@@ -418,9 +454,9 @@ def test_invalid_admission_shell_rejected_without_a_visit(appointment_storage, i
                     ) VALUES (:visit, :tenant, :appointment, :patient, :doctor,
                               :day, :revision, now(), :clinical_revision, :diagnosis)
                 """),
-                defaults,
-            )
-        assert denied.value.orig.sqlstate in ("42501", "23514", "23503")
+                    defaults,
+                )
+            assert denied.value.orig.sqlstate in ("42501", "23514", "23503")
         assert (
             connection.scalar(
                 text("SELECT count(*) FROM public.visits WHERE appointment_id=:id"),
@@ -524,11 +560,12 @@ def test_required_visit_and_retained_exceptional_cancellation(appointment_storag
                 text("DELETE FROM public.visits WHERE appointment_id=:id"),
                 {"id": appointment},
             )
-        assert denied.value.orig.sqlstate == "42501"
+        assert denied.value.orig.sqlstate == "23514"
 
 
 def test_duplicate_visit_and_missing_actor_cannot_fabricate_admission(
     appointment_storage,
+    appointment_api,
 ):
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
@@ -548,6 +585,7 @@ def test_duplicate_visit_and_missing_actor_cannot_fabricate_admission(
             )
         assert duplicate.value.orig.sqlstate == "23505"
         visit = _visit(connection, appointment)
+    with transaction(appointment_api.runtime) as connection:
         connection.execute(text("SELECT set_config('app.staff_id', '', true)"))
         with pytest.raises(DBAPIError) as missing, connection.begin_nested():
             connection.execute(
@@ -612,7 +650,7 @@ def test_non_live_receptionist_cannot_insert_admission_shell(appointment_storage
         )
 
 
-def test_tenant_rls_and_effective_permissions(appointment_storage):
+def test_tenant_rls_and_effective_permissions(appointment_storage, appointment_api):
     runtime, migration, (tenant, other), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
         appointment = _seed(connection, tenant, doctor, complete=True)
@@ -629,7 +667,13 @@ def test_tenant_rls_and_effective_permissions(appointment_storage):
             """),
             {"tenant": tenant, "visit": visit.id},
         )
-    with transaction(runtime, tenant) as connection:
+    with signed_test_transaction(
+        appointment_api,
+        appointment_api.actors[tenant],
+        method="GET",
+        path=f"/v1/appointments/{appointment}",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, _):
         assert connection.execute(
             text("""
                 SELECT source_revision, provenance_state
@@ -637,16 +681,22 @@ def test_tenant_rls_and_effective_permissions(appointment_storage):
             """),
             {"visit": visit.id},
         ).one() == (0, "VERIFIED")
-    with transaction(runtime, other) as connection:
-        assert connection.scalar(text("SELECT count(*) FROM public.visits")) == 0
-        assert (
-            connection.scalar(text("SELECT count(*) FROM public.clinical_revisions"))
-            == 0
-        )
+        assert connection.scalar(text("SELECT id FROM public.visits")) == visit.id
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(text("SELECT * FROM public.clinical_revisions"))
+        assert denied.value.orig.sqlstate == "42501"
+    with signed_test_transaction(
+        appointment_api,
+        appointment_api.actors[other],
+        method="GET",
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, _):
+        assert connection.execute(text("SELECT id FROM public.visits")).all() == []
         for name in ("completion_attestations", "followup_source_state"):
             assert connection.scalar(text(f"SELECT count(*) FROM public.{name}")) == 0
-    with transaction(runtime) as connection:
-        assert connection.scalar(text("SELECT count(*) FROM public.visits")) == 0
+    with transaction(appointment_api.runtime) as connection:
+        assert connection.execute(text("SELECT id FROM public.visits")).all() == []
         for name in ("completion_attestations", "followup_source_state"):
             assert connection.scalar(text(f"SELECT count(*) FROM public.{name}")) == 0
     with migration.connect() as connection:
@@ -741,14 +791,14 @@ def test_tenant_rls_and_effective_permissions(appointment_storage):
                 """),
                 {"relation": relation},
             ).one() == (True, True)
-            for role in ("carepulse_operator", "carepulse_runtime"):
+            for role in ("carepulse_operator", "carepulse_runtime", "carepulse_api"):
                 for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
                     assert connection.scalar(
                         text(
                             "SELECT has_table_privilege(:role, :relation, :privilege)"
                         ),
                         {"role": role, "relation": relation, "privilege": privilege},
-                    ) is (role == "carepulse_runtime" and privilege == "SELECT")
+                    ) is (role == "carepulse_api" and privilege == "SELECT")
                 for privilege in ("INSERT", "UPDATE"):
                     assert (
                         connection.scalar(
@@ -792,7 +842,8 @@ def test_tenant_rls_and_effective_permissions(appointment_storage):
             {"routine": signature},
         ).one() == (True, ["search_path=pg_catalog"], False)
         for role, allowed in (
-            ("carepulse_runtime", True),
+            ("carepulse_runtime", False),
+            ("carepulse_api", False),
             ("carepulse_operator", False),
         ):
             assert (
@@ -806,18 +857,20 @@ def test_tenant_rls_and_effective_permissions(appointment_storage):
             )
 
 
-def test_runtime_without_tenant_context_cannot_write_visit(appointment_storage):
+def test_runtime_without_tenant_context_cannot_write_visit(
+    appointment_storage, appointment_api
+):
     runtime, migration, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
         appointment = _seed(connection, tenant, doctor)
         original = _visit(connection, appointment)
 
-    with transaction(runtime) as connection:
+    with transaction(appointment_api.runtime) as connection:
         connection.execute(
             text("SELECT set_config('app.staff_id', :actor, true)"),
             {"actor": str(doctor)},
         )
-        assert (
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
             connection.execute(
                 text("""
                     UPDATE public.visits SET diagnosis='No-tenant write'
@@ -825,8 +878,7 @@ def test_runtime_without_tenant_context_cannot_write_visit(appointment_storage):
                 """),
                 {"visit": original.id},
             ).all()
-            == []
-        )
+        assert denied.value.orig.sqlstate == "42501"
 
     with migration.connect() as connection:
         assert _visit(connection, appointment) == original
@@ -836,6 +888,90 @@ def test_runtime_without_tenant_context_cannot_write_visit(appointment_storage):
                     "SELECT count(*) FROM public.clinical_revisions WHERE visit_id=:visit"
                 ),
                 {"visit": original.id},
+            )
+            == 0
+        )
+
+
+@pytest.mark.parametrize("role", ["DOCTOR_OWNER", "RECEPTIONIST"])
+def test_f01_signed_staff_cannot_complete_visit_or_forge_evidence(
+    appointment_storage, appointment_api, role
+):
+    _, migration, (tenant, _), (doctor, _) = appointment_storage
+    staff = doctor if role == "DOCTOR_OWNER" else _receptionist(migration, tenant)
+    identity = (
+        appointment_api.actors[tenant]
+        if staff == doctor
+        else _api_actor(appointment_api, tenant, staff)
+    )
+    with transaction(migration, tenant) as connection:
+        appointment = _seed(connection, tenant, doctor)
+        visit = _visit(connection, appointment)
+    with signed_test_transaction(
+        appointment_api,
+        identity,
+        method="GET",
+        path=f"/v1/appointments/{appointment}",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, actor):
+        assert actor.staff_id == staff
+        assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+        assert (
+            connection.scalar(
+                text("SELECT id FROM public.visits WHERE id=:id"), {"id": visit.id}
+            )
+            == visit.id
+        )
+        for routine in ("complete_examined_visit", "d07_complete_examined_visit_raw"):
+            assert not connection.scalar(
+                text(
+                    "SELECT has_function_privilege(current_user, :signature, 'EXECUTE')"
+                ),
+                {"signature": f"public.{routine}(uuid,uuid,bigint,boolean)"},
+            )
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(
+                    text(
+                        f"SELECT * FROM public.{routine}(:tenant,:appointment,2,true)"
+                    ),
+                    {"tenant": tenant, "appointment": appointment},
+                )
+            assert denied.value.orig.sqlstate == "42501"
+        for statement in (
+            "UPDATE public.appointments SET status='Completed', revision=3 WHERE id=:appointment",
+            "INSERT INTO public.completion_attestations (id) VALUES (:appointment)",
+            "UPDATE public.completion_attestations SET actor_role='DOCTOR_OWNER' WHERE appointment_id=:appointment",
+            "DELETE FROM public.completion_attestations WHERE appointment_id=:appointment",
+            "UPDATE public.visits SET diagnosis='Forged correction' WHERE id=:visit",
+            "UPDATE public.visits SET followup_decision='{}'::jsonb WHERE id=:visit",
+            "INSERT INTO public.clinical_revisions (id) VALUES (:visit)",
+        ):
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(
+                    text(statement), {"appointment": appointment, "visit": visit.id}
+                )
+            assert denied.value.orig.sqlstate == "42501"
+    with migration.connect() as connection:
+        assert _visit(connection, appointment) == visit
+        assert connection.execute(
+            text("SELECT status, revision FROM public.appointments WHERE id=:id"),
+            {"id": appointment},
+        ).one() == ("In Examination", 2)
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.completion_attestations WHERE appointment_id=:id"
+                ),
+                {"id": appointment},
+            )
+            == 0
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinical_revisions WHERE visit_id=:id"
+                ),
+                {"id": visit.id},
             )
             == 0
         )

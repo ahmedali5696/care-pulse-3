@@ -13,6 +13,7 @@ from test_database import ROOT, _create_empty_database, _engine, _password
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
+from test_evidence_persistence import _new_delivery
 
 PREVIOUS = "0041_f01_runtime_identity"
 REVISION = "0042_f01_effective_grants"
@@ -81,23 +82,39 @@ def _snapshot(connection):
             WHERE n.nspname='public' ORDER BY 1
         """)
         ).all(),
+        connection.scalar(
+            text("SELECT pg_get_functiondef('public.f01_cleanup()'::regprocedure)")
+        ),
         connection.execute(text("SELECT * FROM public.verification ORDER BY id")).all(),
         connection.execute(
             text(
                 "SELECT * FROM public.auth_login_attempts ORDER BY dimension,scope_digest"
             )
         ).all(),
+        connection.execute(
+            text("SELECT * FROM public.delivery_jobs ORDER BY id")
+        ).all(),
+        connection.execute(
+            text("SELECT * FROM public.protected_delivery_material ORDER BY job_id")
+        ).all(),
     )
 
 
 @pytest.mark.parametrize("populated", [False, True])
+@pytest.mark.parametrize(
+    "predecessor,revision",
+    [
+        (PREVIOUS, REVISION),
+        ("0043_f01_writer_boundary", "0044_f01_delivery_acl"),
+    ],
+)
 def test_f01_grants_cutover_is_atomic_repeatable_and_preserves_rows(
-    admin, empty_database, tmp_path, populated
+    admin, empty_database, tmp_path, populated, predecessor, revision
 ):
     _bootstrap(admin, empty_database)
     migration = _engine("carepulse_migration", empty_database)
     try:
-        _upgrade(migration, PREVIOUS)
+        _upgrade(migration, predecessor)
         if populated:
             with migration.begin() as connection:
                 connection.execute(
@@ -115,6 +132,14 @@ def test_f01_grants_cutover_is_atomic_repeatable_and_preserves_rows(
                     VALUES ('identity',repeat('a',64),1,clock_timestamp())
                 """)
                 )
+                operator = uuid4()
+                connection.execute(
+                    text(
+                        "INSERT INTO public.operator_identities (id, credential_digest, issued_by_reference, issued_at) VALUES (:id, :digest, 'synthetic-acl-migration', clock_timestamp())"
+                    ),
+                    {"id": operator, "digest": f"synthetic:{operator}"},
+                )
+                _new_delivery(connection, operator)
         with migration.connect() as connection:
             before = _snapshot(connection)
             recovery_triggers = connection.execute(
@@ -131,7 +156,7 @@ def test_f01_grants_cutover_is_atomic_repeatable_and_preserves_rows(
 
         scripts = tmp_path / "migrations"
         shutil.copytree(ROOT / "db/migrations", scripts)
-        target = scripts / "versions/0042_f01_effective_grants.py"
+        target = scripts / f"versions/{revision}.py"
         contents = target.read_text(encoding="utf-8")
         assert contents.count("\ndef downgrade() -> None:") == 1
         target.write_text(
@@ -142,16 +167,29 @@ def test_f01_grants_cutover_is_atomic_repeatable_and_preserves_rows(
             encoding="utf-8",
         )
         with pytest.raises(DBAPIError) as failed:
-            _upgrade(migration, REVISION, scripts)
+            _upgrade(migration, revision, scripts)
         assert failed.value.orig.sqlstate == "22012"
         with migration.connect() as connection:
             assert _snapshot(connection) == before
 
-        _upgrade(migration, REVISION)
+        _upgrade(migration, revision)
         with migration.connect() as connection:
             after = _snapshot(connection)
-            assert after[0] == REVISION
-            assert after[-2:] == before[-2:]
+            assert after[0] == revision
+            assert after[-4:] == before[-4:]
+            assert connection.scalar(
+                text(
+                    "SELECT has_column_privilege('carepulse_api','public.delivery_jobs','claim_owner','SELECT')"
+                )
+            ) is (revision == REVISION)
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT has_column_privilege('carepulse_sender','public.delivery_jobs','claim_owner','SELECT')"
+                    )
+                )
+                is True
+            )
             assert (
                 connection.execute(
                     text("""
@@ -202,7 +240,7 @@ def test_f01_grants_cutover_is_atomic_repeatable_and_preserves_rows(
                     AND roles=ARRAY['carepulse_sender']::name[])
             """)
             )
-        _upgrade(migration, REVISION)
+        _upgrade(migration, revision)
         with migration.connect() as connection:
             assert _snapshot(connection) == after
     finally:

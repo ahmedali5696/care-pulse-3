@@ -9,9 +9,11 @@ import pytest
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
 from carepulse.policies.versions import append_version
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _draft, _patient, _query
+from test_appointment_persistence import appointment_api as appointment_api  # noqa: PLC0414
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 
 DAY = date(2026, 10, 27)
@@ -300,7 +302,7 @@ def test_queue_day_uses_effective_original_date_policy_not_latest_head(
             """),
                 day_identity,
             )
-        assert immutable.value.orig.sqlstate == "42501"
+        assert immutable.value.orig.sqlstate == "23514"
         assert connection.execute(snapshot, day_identity).one() == original
         assert len({old_day, current_day, future_day}) == 3
 
@@ -366,6 +368,7 @@ def test_rank_change_must_invalidate_queue_revision_at_commit(appointment_storag
 
 def test_direct_sql_cannot_supply_attestation_identity_time_or_arrival(
     appointment_storage,
+    appointment_api,
 ):
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
@@ -388,6 +391,13 @@ def test_direct_sql_cannot_supply_attestation_identity_time_or_arrival(
         assert actor == doctor
         assert sequence == actual_sequence == 1
         assert before <= instant <= datetime.now(UTC)
+    with signed_test_transaction(
+        appointment_api,
+        appointment_api.actors[tenant],
+        method="GET",
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, _):
         for column, forged in (
             ("arrival_sequence", 900),
             ("attested_by_staff_id", fake_actor),
@@ -481,7 +491,15 @@ def test_one_queue_day_per_clinic_date_lane_with_independent_arrival_order(
             _appointment(connection, other, other_doctor),
         )
         assert other_entry[2] == 1
-        assert connection.scalar(text("SELECT count(*) FROM public.queue_days")) == 1
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.queue_days WHERE organization_id=:tenant"
+                ),
+                {"tenant": other},
+            )
+            == 1
+        )
 
 
 @pytest.mark.parametrize("invalid", ["missing", "ghost", "patient", "date", "lane"])
@@ -792,6 +810,7 @@ def test_cursor_rejects_unsupported_advancement_and_accepts_real_head_evidence(
 
 def test_queue_rls_tenant_isolation_no_context_and_operator_grants(
     appointment_storage,
+    appointment_api,
     role_engine,
 ):
     runtime, _, (tenant, other), (doctor, other_doctor) = appointment_storage
@@ -807,13 +826,31 @@ def test_queue_rls_tenant_isolation_no_context_and_operator_grants(
         with transaction(runtime, organization) as connection:
             for table in ("queue_days", "queue_entries", "doctor_controls"):
                 assert (
-                    connection.scalar(text(f"SELECT count(*) FROM public.{table}")) == 1
+                    connection.scalar(
+                        text(
+                            f"SELECT count(*) FROM public.{table} WHERE organization_id=:tenant"
+                        ),
+                        {"tenant": organization},
+                    )
+                    == 1
                 )
-        with transaction(runtime) as connection:
+        # Wave 3 queue access is unsupported, even for a genuinely bound Owner.
+        with signed_test_transaction(
+            appointment_api,
+            appointment_api.actors[organization],
+            method="GET",
+            path="/v1/appointments",
+            purpose="APPOINTMENT_BOOKING",
+        ) as (connection, _):
             for table in ("queue_days", "queue_entries", "doctor_controls"):
-                assert (
-                    connection.scalar(text(f"SELECT count(*) FROM public.{table}")) == 0
-                )
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    connection.execute(text(f"SELECT * FROM public.{table}"))
+                assert denied.value.orig.sqlstate == "42501"
+    with transaction(appointment_api.runtime) as connection:
+        for table in ("queue_days", "queue_entries", "doctor_controls"):
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(text(f"SELECT * FROM public.{table}"))
+            assert denied.value.orig.sqlstate == "42501"
     operator = role_engine("carepulse_operator")
     try:
         with pytest.raises(DBAPIError) as denied, operator.connect() as connection:

@@ -1,15 +1,19 @@
 """B-10 real-PostgreSQL acceptance of preferential booking and receipts."""
 
 import json
-from contextlib import nullcontext
+import os
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from hashlib import sha256
+from pathlib import Path
+from threading import get_ident
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
+import psycopg
 import pytest
 from carepulse.appointments.book import book_appointment
 from carepulse.appointments.booking_contracts import BookAppointment
@@ -24,9 +28,12 @@ from carepulse.identity.contracts import normalized_request_digest
 from carepulse.identity.receipts import Receipt, insert_tenant_receipt
 from carepulse.main import app
 from carepulse.notifications.evidence import append_outbox, append_sensitive_audit
+from carepulse.policies.pricing_contracts import PricingPatch
 from carepulse.policies.slots_service import list_slots
 from carepulse.policies.versions import append_version
-from sqlalchemy import text
+from carepulse.visits.eligibility_contracts import FollowupDecisionPatchV2
+from runtime_identity_fixture import signed_test_transaction
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _admit_saved, _draft, _patient, _query
 from test_booking import (
@@ -45,9 +52,102 @@ from test_followup_persistence import _source, _v2_booking, _v2_command, _v2_sou
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _patch, pricing_request
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
-from test_schedule import _actor, _config, _publish
+from test_schedule import _actor, _config, publish_signed_schedule
 from test_slots import _slots_request
 from test_visit_migration import _prepare, _upgrade
+
+
+@contextmanager
+def signed_command_transaction(
+    clinic, command, *, visit=None, actor=None, key=None, pid=None, started=None
+):
+    """Keep race checkpoints before live authority can wait on another transaction."""
+    if isinstance(command, BookAppointment):
+        method, path, purpose = "POST", "/v1/appointments", "APPOINTMENT_BOOKING"
+    elif isinstance(command, PricingPatch):
+        method, path, purpose = "PATCH", "/v1/settings/pricing", "SETTINGS_PRICING"
+    else:
+        method = "PATCH" if isinstance(command, FollowupDecisionPatchV2) else "POST"
+        path = f"/v1/visits/{visit}"
+        if method == "POST":
+            path += "/extend-followup"
+        purpose = "VISIT_FOLLOWUP"
+    key = key or str(uuid4())
+    thread = get_ident()
+
+    def observe(connection, _cursor, statement, _params, _context, _many):
+        if get_ident() == thread and statement.startswith("SELECT pg_backend_pid(),"):
+            if pid is not None:
+                pid.append(connection.connection.driver_connection.info.backend_pid)
+            if started is not None:
+                started.set()
+
+    event.listen(clinic.runtime, "before_cursor_execute", observe)
+    try:
+        with signed_test_transaction(
+            clinic,
+            actor or clinic.owner,
+            method=method,
+            path=path,
+            purpose=purpose,
+            body=command.model_dump(mode="json", exclude_unset=True),
+            key=key,
+        ) as (connection, authorized):
+            yield connection, authorized, key
+    finally:
+        event.remove(clinic.runtime, "before_cursor_execute", observe)
+
+
+def upgrade_replay_clinic(clinic, backend, admin):
+    """Retain predecessor receipts, then replay them through the current API login."""
+    database = clinic.migration.url.database
+    with psycopg.connect(admin.info.dsn, dbname=database) as connection:
+        connection.execute("""
+            CREATE SCHEMA f01_private AUTHORIZATION carepulse_identity_owner;
+            CREATE SCHEMA f01_crypto AUTHORIZATION carepulse_migration;
+            CREATE EXTENSION pgcrypto WITH SCHEMA f01_crypto;
+            REVOKE ALL ON SCHEMA f01_private, f01_crypto FROM PUBLIC;
+            REVOKE ALL ON ALL FUNCTIONS IN SCHEMA f01_crypto FROM PUBLIC;
+            GRANT USAGE ON SCHEMA f01_crypto TO carepulse_identity_owner;
+            GRANT EXECUTE ON FUNCTION f01_crypto.hmac(bytea,bytea,text),
+                f01_crypto.digest(bytea,text), f01_crypto.gen_random_bytes(integer)
+                TO carepulse_identity_owner;
+        """)
+        connection.execute(
+            psycopg.sql.SQL(
+                "GRANT CONNECT ON DATABASE {} TO carepulse_api, carepulse_gate"
+            ).format(psycopg.sql.Identifier(database))
+        )
+    _upgrade(clinic.migration, "head")
+    policy = backend.config.policy
+    with psycopg.connect(admin.info.dsn, dbname=database) as connection:
+        connection.execute("SET LOCAL ROLE carepulse_identity_owner")
+        connection.execute(
+            """
+            INSERT INTO f01_private.policy (signed_request_freshness_seconds,
+                signed_request_max_skew_seconds, session_idle_minutes)
+            VALUES (%s, %s, %s)
+        """,
+            (
+                policy.signed_request_freshness_seconds,
+                policy.signed_request_max_skew_seconds,
+                policy.session_idle_minutes,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO f01_private.keys (key_id, secret, status) VALUES (%s, %s, 'ACTIVE')",
+            (
+                os.environ["CP_DB_IDENTITY_KEY_ID"],
+                bytes.fromhex(Path("/run/secrets/db_identity_key").read_text().strip()),
+            ),
+        )
+    clinic.runtime = create_engine(
+        backend.runtime.url.set(database=database), hide_parameters=True
+    )
+    clinic.gate = create_engine(
+        backend.gate.url.set(database=database), hide_parameters=True
+    )
+    app.state.db_engine, app.state.gate_engine = clinic.runtime, clinic.gate
 
 
 @pytest.fixture
@@ -61,18 +161,14 @@ def followup_clinic(booking_clinic):
         key=str(uuid4()),
     )
     assert status == 200, response
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(
-            connection,
-            _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
-            _config(mode="OPEN", working_weekdays=list(range(1, 8))),
-            revision=2,
-        )
+    publish_signed_schedule(
+        clinic, _config(mode="OPEN", working_weekdays=list(range(1, 8))), revision=2
+    )
     return clinic
 
 
 def completed_source(clinic, *, classification="ROUTINE"):
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         doctor = UUID(clinic.owner.staff_id)
         source = (
             _v2_source(connection, clinic.tenant, doctor)
@@ -99,7 +195,7 @@ def same_day_completed_source(clinic):
     doctor = UUID(clinic.owner.staff_id)
     patient = new_patient(clinic)
     today = datetime.now(ZoneInfo("Africa/Cairo")).date()
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         saved = persist_appointment(
             connection,
             _draft(patient, doctor, service_date=today),
@@ -142,7 +238,7 @@ def followup_body(source, *, offset=0, base="30.00", source_revision=0, **change
 
 
 def claim_record(clinic, appointment_id):
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         return (
             connection.execute(
                 text("""
@@ -164,11 +260,7 @@ def claim_record(clinic, appointment_id):
 
 
 def doctor_decision(clinic, visit_id, decision):
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        connection.execute(
-            text("SELECT set_config('app.staff_id', :actor, true)"),
-            {"actor": clinic.owner.staff_id},
-        )
+    with transaction(clinic.migration, clinic.tenant) as connection:
         current = connection.execute(
             text("""
                 SELECT COALESCE(s.source_revision,0), v.clinical_revision,
@@ -181,6 +273,21 @@ def doctor_decision(clinic, visit_id, decision):
             """),
             {"tenant": clinic.tenant, "visit": visit_id},
         ).one()
+    body = {
+        "expected_source_decision_revision": current[0],
+        "expected_visit_revision": current[1],
+        "expected_followup_revision": current[2],
+        "followup_decision": decision,
+    }
+    with signed_test_transaction(
+        clinic,
+        clinic.owner,
+        method="PATCH",
+        path=f"/v1/visits/{visit_id}",
+        purpose="VISIT_FOLLOWUP",
+        body=body,
+        key=str(uuid4()),
+    ) as (connection, _):
         return connection.scalar(
             text("""
                 SELECT public.record_followup_source_decision(
@@ -211,7 +318,7 @@ def terminal_claim(
     if status == "Completed" and not pre_admitted:
         # Admission is real; B-17 has no terminal endpoint yet, so migration
         # writes the matched completion and claim evidence in one transaction.
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        with transaction(clinic.migration, clinic.tenant) as connection:
             _admit_saved(connection, clinic.tenant, doctor, booked, complete=False)
     with (
         nullcontext(migration_connection)
@@ -499,8 +606,8 @@ def test_timed_followup_manual_precedence_matches_offered_candidates(
         config["manual_slots_by_date"] = {
             day.isoformat(): [{"starts_at": "11:00", "ends_at": "12:00"}]
         }
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(connection, actor, config, revision=3)
+    publish_signed_schedule(clinic, config, revision=3)
+    with transaction(clinic.migration, clinic.tenant) as connection:
         offered = {
             (
                 datetime.fromisoformat(slot["starts_at"]).astimezone(cairo).isoformat(),
@@ -528,7 +635,17 @@ def test_timed_followup_manual_precedence_matches_offered_candidates(
     }
     direct = {**_v2_booking(source, offset), **fields, "booking_mode": "EXACT_TIME"}
     before = booking_effects(clinic)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with signed_test_transaction(
+        clinic,
+        clinic.owner,
+        method="POST",
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+        body=followup_body(
+            source, offset=offset, expected_schedule_revision=4, **fields
+        ),
+        key=str(uuid4()),
+    ) as (connection, _):
         if suppressed:
             with pytest.raises(DBAPIError) as denied, connection.begin_nested():
                 _v2_command(
@@ -571,23 +688,20 @@ def test_t159_retained_numeric_duration_signed_slots_and_both_booking_paths(
     second_source = completed_source(clinic)
     day = source["day"] + timedelta(days=2)
     weekday = day.isoweekday()
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(
-            connection,
-            actor,
-            _config(
-                duration_minutes="30",
-                working_weekdays=[weekday],
-                weekly_work_periods=[
-                    {"weekday": weekday, "starts_at": "09:00", "ends_at": "12:00"}
-                ],
-                weekly_manual_slots=[
-                    {"weekday": weekday, "starts_at": "11:00", "ends_at": "11:45"}
-                ],
-            ),
-            revision=3,
-        )
+    publish_signed_schedule(
+        clinic,
+        _config(
+            duration_minutes="30",
+            working_weekdays=[weekday],
+            weekly_work_periods=[
+                {"weekday": weekday, "starts_at": "09:00", "ends_at": "12:00"}
+            ],
+            weekly_manual_slots=[
+                {"weekday": weekday, "starts_at": "11:00", "ends_at": "11:45"}
+            ],
+        ),
+        revision=3,
+    )
 
     def retain_duration(value):
         # Preserve the previous version and all calendar rows; only the new
@@ -863,7 +977,7 @@ def test_preferential_booking_roundtrips_16384_digit_percentage_and_receipt(
     before = booking_effects(clinic)
     assert booking_request(clinic, clinic.owner, body=body, key=key) == (201, first)
     assert booking_effects(clinic) == before
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         numeric_value, text_value, net = connection.execute(
             text("""
                 SELECT discount_value, discount_percent_text, net_egp
@@ -1150,7 +1264,7 @@ def test_signed_new_date_rejects_missing_reason_unneeded_or_restricted_exception
     denied, refusal = booking_request(clinic, clinic.owner, body=body, key=str(uuid4()))
     assert denied == expected, refusal
     assert booking_effects(clinic) == before
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
                 text("""
@@ -1333,14 +1447,18 @@ def test_preferential_lost_response_recovered_by_original_key(followup_clinic):
     clinic = followup_clinic
     source = completed_source(clinic)
     body, key = followup_body(source, offset=2), str(uuid4())
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        connection.execute(
-            text("SELECT set_config('app.staff_id', :actor, true)"),
-            {"actor": clinic.owner.staff_id},
-        )
+    with signed_test_transaction(
+        clinic,
+        clinic.owner,
+        method="POST",
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+        body=body,
+        key=key,
+    ) as (connection, actor):
         first = book_appointment(
             connection,
-            _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
+            actor,
             BookAppointment.model_validate(body),
             key,
         )
@@ -1358,7 +1476,7 @@ def _seed_historical_booking_receipt(clinic, appointment, source, *, unsafe=Fals
     body.pop("expected_source_decision_revision")
     key = str(uuid4())
     actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         connection.execute(
             text("SELECT set_config('app.staff_id', :actor, true)"),
             {"actor": clinic.owner.staff_id},
@@ -1491,7 +1609,7 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
             owner=actor,
             config=patient_backend.config,
         )
-        with transaction(runtime, tenant) as connection:
+        with transaction(migration, tenant) as connection:
             source = _v2_source(connection, tenant, doctor)
             claim = _v2_command(
                 connection, "create_followup_claim", source, **_v2_booking(source, 2)
@@ -1586,7 +1704,7 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
                 connection.execute(receipt_query, receipt_params).one()
                 == original_receipt
             )
-        app.state.db_engine = runtime
+        upgrade_replay_clinic(clinic, patient_backend, admin)
         assert booking_request(clinic, actor, raw_body=legacy_raw, key=key) == (
             201,
             {"data": saved, "revision": 0},
@@ -1623,6 +1741,10 @@ def test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay(
             )
     finally:
         app.state.db_engine = patient_backend.runtime
+        app.state.gate_engine = patient_backend.gate
+        if "clinic" in locals() and hasattr(clinic, "gate"):
+            clinic.runtime.dispose()
+            clinic.gate.dispose()
         runtime.dispose()
         migration.dispose()
 
@@ -1751,7 +1873,7 @@ def test_signed_saved_receipt_hidden_appointment_is_non_oracular(followup_clinic
     assert foreign_before["history"][0]["action"] == "CREATED"
     key = str(uuid4())
     actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         insert_tenant_receipt(
             connection,
             Receipt(

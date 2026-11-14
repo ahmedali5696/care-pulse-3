@@ -434,6 +434,37 @@ historical_nodes=(
   'tests/integration/test_followup_races.py::test_extension_and_competing_claim_serialize_without_new_reservation'
   'tests/integration/test_followup_races.py::test_extension_rejects_unrelated_clinical_audit_evidence'
   'tests/integration/test_followup_races.py::test_deadline_day_is_inclusive_but_next_day_loses_parallel_race'
+  # Pre-cutover writer contracts: the current API has no permitted Wave 3 writer path.
+  'tests/integration/test_visit_persistence.py::test_new_completion_attests_actual_staff_and_history_without_clinical_revision'
+  'tests/integration/test_visit_persistence.py::test_completion_rejects_invalid_assertion_actor_scope_and_revision'
+  'tests/integration/test_visit_persistence.py::test_completion_duplicate_and_direct_evidence_forgery_are_denied'
+  'tests/integration/test_visit_revisions.py::test_receptionist_completion_preserves_independent_doctor_corrections'
+  'tests/integration/test_visit_revisions.py::test_terminal_doctor_correction_keeps_status_and_actual_revision'
+  'tests/integration/test_visit_revisions.py::test_unauthorized_or_unjustified_correction_denied'
+  'tests/integration/test_visit_revisions.py::test_disabled_doctor_cannot_edit_clinical_content'
+  'tests/integration/test_visit_migration.py::test_competing_completions_consume_one_visit_revision'
+  'tests/integration/test_visit_migration.py::test_concurrent_clinical_correction_and_completion_preserve_both_evidence'
+  'tests/integration/test_day_review_persistence.py::test_all_six_states_and_retained_visit_survive_cairo_midnight_and_day_close'
+  'tests/integration/test_day_review_persistence.py::test_review_amendments_append_history_and_stale_revision_cannot_overwrite'
+  'tests/integration/test_day_review_persistence.py::test_verified_receptionist_can_record_initial_day_reviews_but_cannot_amend'
+  'tests/integration/test_day_review_persistence.py::test_day_reviews_enforce_tenant_actor_context_and_operator_denial'
+  'tests/integration/test_day_review_races.py::test_direct_waiting_transition_serializes_with_final_close'
+  'tests/integration/test_day_review_races.py::test_first_queue_day_insert_waits_on_final_close_barrier_in_both_orders'
+  'tests/integration/test_day_review_races.py::test_direct_active_queue_entry_update_uses_same_barrier'
+  'tests/integration/test_day_review_races.py::test_direct_active_entry_insert_waits_for_barrier_before_rejecting_booked_source'
+  'tests/integration/test_followup_races.py::test_current_head_doctor_clinical_correction_and_extension_preserve_independent_revisions'
+  'tests/integration/test_followups_races.py::test_release_or_consume_races_fresh_claim_without_double_use'
+  'tests/integration/test_followups_races.py::test_claim_confirmation_first_blocks_terminal_until_booking_commits'
+  'tests/integration/test_queue_capacity.py::test_scoped_confirmation_consumes_once_in_rolled_back_sql_simulation'
+  'tests/integration/test_queue_capacity.py::test_one_shared_doctor_control_across_lane_and_original_date'
+  'tests/integration/test_queue_capacity.py::test_doctor_scoped_confirmation_validates_revision_and_one_use_transition'
+  'tests/integration/test_queue_capacity.py::test_non_doctor_cannot_revoke_scoped_approval'
+  'tests/integration/test_queue_races.py::test_shared_doctor_control_blocks_alternate_lane_and_original_date'
+  'tests/integration/test_queue_races.py::test_cross_date_cross_lane_provisional_admission_serializes_then_rolls_back'
+  'tests/integration/test_queue_races.py::test_provisional_confirmation_is_one_use_and_invisible_until_rollback'
+  'tests/integration/test_followups.py::test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay'
+  'tests/integration/test_followup_decisions.py::test_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_checks'
+  'tests/integration/test_followup_migration.py::test_retained_active_unattested_claim_conflicts_at_current_head'
 )
 historical_deselect=()
 ordinary_core_migration_files=(tests/integration/test_t133_migration.py tests/integration/test_m1_migration.py)
@@ -585,13 +616,13 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d08-core.log"; then
   echo 'FAIL mandatory D-08 persistence evidence skipped'; exit 1
 fi
 # Independent D-06 suite must remain executable without D-07/Visit imports.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
-  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider \
+  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider "${historical_deselect[@]}" \
   tests/integration/test_queue_persistence.py tests/integration/test_queue_capacity.py \
   tests/integration/test_queue_races.py "${ordinary_queue_migration_files[@]}" | tee "$private/d06-queue.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d06-queue.log"; then
@@ -647,7 +678,7 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider "${historical_deselect[@]}" \
   tests/integration/test_followups.py tests/integration/test_followups_denial.py \
   tests/integration/test_followup_decisions.py tests/integration/test_followups_races.py \
   "${ordinary_b10_migration_files[@]}" | tee "$private/b10-followups.log"
@@ -656,13 +687,13 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b10-followups.log"; then
 fi
 # D-11 remains mandatory, but runs after the T145-owned pricing/booking/follow-up
 # suites so an unrelated fail-fast plan assertion cannot mask their evidence.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
-  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider \
+  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider "${historical_deselect[@]}" \
   tests/integration/test_day_review_persistence.py tests/integration/test_report_query_plans.py \
   tests/integration/test_day_review_races.py "${ordinary_day_review_migration_files[@]}" | tee "$private/d11-day-review.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d11-day-review.log"; then
@@ -944,7 +975,7 @@ docker compose --profile test run --rm --no-deps \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_SERVICE_KEY_SOURCE_FILE:/run/secrets/service_key:ro" \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_auth_mail.py
-if ! docker compose --profile test run --rm --no-deps \
+if ! docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" \
   -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
@@ -980,6 +1011,7 @@ if ! docker compose --profile sender run --rm --no-deps -T --entrypoint python \
   -v "$PWD/tests:/srv/tests:ro" \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_DB_PASSWORD_FILE:/run/secrets/postgres_password:ro" \
+  -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   sender -m pytest -q -ra --tb=short -p no:cacheprovider \
   tests/integration/test_recovery.py; then
   docker compose logs --no-color web 2>&1 | grep -aE 'B04_SYNTHETIC_ISSUE' || true

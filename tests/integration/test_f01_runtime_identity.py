@@ -1,18 +1,34 @@
 """F-01 adversarial evidence using real service logins in disposable CI."""
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from hashlib import sha256
+from hmac import new
 from pathlib import Path
-from uuid import uuid4
+from queue import Queue
+from secrets import token_bytes
+from uuid import UUID, uuid4
 
 import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from carepulse.identity.authorization import protected_transaction
 from carepulse.identity.contracts import ContractError
-from carepulse.identity.runtime_identity import bound_transaction
+from carepulse.identity.receipts import (
+    Receipt,
+    insert_tenant_receipt,
+    lookup_tenant_receipt,
+)
+from carepulse.identity.runtime_identity import bound_transaction, current_request
 from carepulse.identity.signing import canonical_payload
+from carepulse.identity.staff import change_receptionist
+from carepulse.identity.staff_contracts import StaffCommand
+from postgres_locks import wait_for_postgres_lock
 from runtime_identity_fixture import db_proof_headers, registered_test_request
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, OperationalError
+from test_appointment_persistence import _patient
+from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_request_boundary import _signed
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 
@@ -28,6 +44,526 @@ def _register(connection, envelope, body, headers):
             "body": body,
         },
     )
+
+
+@pytest.fixture
+def proof_keys(boundary_data):
+    clinic = boundary_data
+    keys = [(f"synthetic-{uuid4().hex}", token_bytes(32)) for _ in range(2)]
+    with clinic.migration.begin() as connection:
+        connection.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+        connection.execute(
+            text(
+                "INSERT INTO f01_private.keys (key_id, secret, status) VALUES (:id, :secret, 'ACTIVE')"
+            ),
+            [{"id": key, "secret": secret} for key, secret in keys],
+        )
+    try:
+        yield keys
+    finally:
+        with clinic.migration.begin() as connection:
+            connection.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+            for key, _ in keys:
+                connection.execute(
+                    text("DELETE FROM f01_private.requests WHERE database_key_id=:key"),
+                    {"key": key},
+                )
+                connection.execute(
+                    text("DELETE FROM f01_private.keys WHERE key_id=:key"), {"key": key}
+                )
+
+
+def _proof_for(envelope, key):
+    key_id, secret = key
+    payload = (
+        b"carepulse-db-context-v1\x00"
+        + key_id.encode()
+        + b"\x00"
+        + canonical_payload(envelope)
+    )
+    return [
+        (b"x-carepulse-db-key-id", key_id.encode()),
+        (b"x-carepulse-db-proof", new(secret, payload, sha256).hexdigest().encode()),
+    ]
+
+
+def _nonce_counts(clinic, identity):
+    with clinic.migration.begin() as connection:
+        connection.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+        return connection.execute(
+            text("""
+                SELECT (SELECT count(*) FROM f01_private.nonces WHERE http_key_id=:key AND nonce=:nonce),
+                       (SELECT count(*) FROM f01_private.requests WHERE http_key_id=:key AND nonce=:nonce)
+            """),
+            {"key": identity.key_id, "nonce": identity.nonce},
+        ).one()
+
+
+def _bind(clinic, request, pid, xid, stage="PRIMARY"):
+    with clinic.gate.begin() as gate:
+        gate.execute(
+            text("SELECT public.f01_bind(:request, :stage, :pid, CAST(:xid AS xid8))"),
+            {"request": request, "stage": stage, "pid": pid, "xid": xid},
+        )
+
+
+def _transaction_id(connection):
+    return connection.execute(
+        text("SELECT pg_backend_pid(), pg_current_xact_id()::text")
+    ).one()
+
+
+def _deny_stage(clinic, request, stage):
+    with clinic.runtime.begin() as connection:
+        with pytest.raises(DBAPIError) as denied:
+            _bind(clinic, request, *_transaction_id(connection), stage=stage)
+        assert denied.value.orig.sqlstate == "42501"
+        assert connection.scalar(text("SELECT public.f01_org()")) is None
+
+
+def _assert_stage(connection, clinic, request, stage):
+    assert connection.execute(
+        text(
+            "SELECT organization_id, staff_id, session_id, request_id, stage FROM public.f01_context()"
+        )
+    ).one() == (str(clinic.tenant), str(clinic.staff), clinic.session, request, stage)
+
+
+@pytest.mark.parametrize("outcome", ["aborted", "committed"])
+def test_receipt_recovery_requires_aborted_primary_and_is_read_only(
+    boundary_data, outcome
+):
+    clinic = boundary_data
+    with clinic.migration.begin() as connection:
+        patient = _patient(connection, clinic.tenant)
+    identity, body, _ = _signed(
+        clinic,
+        command={"patient_id": str(patient)},
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+    )
+    receipt = Receipt(
+        actor_id=clinic.staff,
+        staff_id=clinic.staff,
+        organization_id=clinic.tenant,
+        operation="appointments.book",
+        idempotency_key=identity.idempotency_key,
+        request_digest=sha256(body).hexdigest(),
+        result_projection={"id": str(uuid4())},
+        result_revision=0,
+    )
+    # A separate successful request owns the receipt; recovery must only read it.
+    winner = replace(identity, nonce=f"synthetic_{uuid4().hex}")
+    with (
+        registered_test_request(clinic, winner, body),
+        bound_transaction(clinic.runtime, winner) as connection,
+    ):
+        insert_tenant_receipt(connection, receipt)
+    with clinic.gate.begin() as gate:
+        request = _register(gate, identity, body, db_proof_headers(identity))
+    for stage in (
+        "RECEIPT_RECOVERY",
+        "INVITATION_PREPARE",
+        "INVITATION_APPLY",
+        "SESSION_CLEANUP",
+    ):
+        _deny_stage(clinic, request, stage)
+    with clinic.runtime.connect() as primary:
+        _bind(clinic, request, *_transaction_id(primary))
+        primary.execute(text("SELECT public.f01_activate()"))
+        _assert_stage(primary, clinic, request, "PRIMARY")
+        _deny_stage(clinic, request, "RECEIPT_RECOVERY")
+        if outcome == "aborted":
+            primary.rollback()
+        else:
+            primary.commit()
+    _deny_stage(clinic, request, "PRIMARY")
+    if outcome == "committed":
+        _deny_stage(clinic, request, "RECEIPT_RECOVERY")
+        return
+    with clinic.runtime.begin() as connection:
+        _bind(clinic, request, *_transaction_id(connection), stage="RECEIPT_RECOVERY")
+        connection.execute(text("SELECT public.f01_activate()"))
+        _assert_stage(connection, clinic, request, "RECEIPT_RECOVERY")
+        stored = lookup_tenant_receipt(
+            connection,
+            clinic.tenant,
+            clinic.staff,
+            receipt.operation,
+            receipt.idempotency_key,
+        )
+        assert (
+            stored is not None
+            and stored["result_projection"] == receipt.result_projection
+        )
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            insert_tenant_receipt(connection, receipt)
+        assert denied.value.orig.sqlstate == "42501"
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(
+                text("""INSERT INTO public.appointment_day_counters
+                    (organization_id, service_date, last_number)
+                    VALUES (:tenant, CURRENT_DATE, 1)"""),
+                {"tenant": clinic.tenant},
+            )
+        assert denied.value.orig.sqlstate == "42501"
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM public.appointment_day_counters")
+            )
+            == 0
+        )
+    _deny_stage(clinic, request, "RECEIPT_RECOVERY")
+
+
+@pytest.mark.parametrize("outcome", ["aborted", "unactivated", "committed"])
+def test_invitation_apply_requires_committed_activated_prepare(
+    patient_backend, outcome
+):
+    clinic = patient_backend
+    target = UUID(clinic.receptionist.staff_id)
+    with clinic.migration.begin() as connection:
+        patient = _patient(connection, clinic.tenant)
+    identity, body, _ = _signed(
+        clinic,
+        path=f"/v1/staff/receptionists/{target}/invite",
+        purpose="STAFF_MANAGEMENT",
+        command={
+            "expected_revision": 0,
+            "expected_security_revision": 0,
+            "reason": "Synthetic invitation stage",
+        },
+    )
+    with clinic.gate.begin() as gate:
+        request = _register(gate, identity, body, db_proof_headers(identity))
+    for stage in ("PRIMARY", "INVITATION_APPLY", "RECEIPT_RECOVERY", "SESSION_CLEANUP"):
+        _deny_stage(clinic, request, stage)
+    with clinic.runtime.connect() as prepare:
+        _bind(clinic, request, *_transaction_id(prepare), stage="INVITATION_PREPARE")
+        if outcome != "unactivated":
+            prepare.execute(text("SELECT public.f01_activate()"))
+            _assert_stage(prepare, clinic, request, "INVITATION_PREPARE")
+            assert prepare.scalar(
+                text("SELECT verified_email FROM public.staff_accounts WHERE id=:id"),
+                {"id": target},
+            )
+            with pytest.raises(DBAPIError) as denied, prepare.begin_nested():
+                prepare.execute(
+                    text(
+                        "UPDATE public.staff_accounts SET updated_at=clock_timestamp() WHERE id=:id"
+                    ),
+                    {"id": target},
+                )
+            assert denied.value.orig.sqlstate == "42501"
+        _deny_stage(clinic, request, "INVITATION_APPLY")
+        if outcome == "aborted":
+            prepare.rollback()
+        else:
+            prepare.commit()
+    _deny_stage(clinic, request, "INVITATION_PREPARE")
+    if outcome != "committed":
+        _deny_stage(clinic, request, "INVITATION_APPLY")
+        return
+    with clinic.runtime.begin() as apply:
+        _bind(clinic, request, *_transaction_id(apply), stage="INVITATION_APPLY")
+        apply.execute(text("SELECT public.f01_activate()"))
+        _assert_stage(apply, clinic, request, "INVITATION_APPLY")
+        assert (
+            apply.scalar(
+                text("SELECT count(*) FROM public.patients WHERE id=:id"),
+                {"id": patient},
+            )
+            == 0
+        )
+        with pytest.raises(DBAPIError) as denied, apply.begin_nested():
+            apply.scalar(
+                text("SELECT public.delete_staff_sessions(:tenant, :user)"),
+                {"tenant": clinic.tenant, "user": clinic.native_user},
+            )
+        assert denied.value.orig.sqlstate == "42501"
+    _deny_stage(clinic, request, "INVITATION_APPLY")
+
+
+@pytest.mark.parametrize("outcome", ["aborted", "no_evidence", "committed"])
+def test_session_cleanup_requires_committed_matching_revocation(
+    patient_backend, outcome
+):
+    clinic = patient_backend
+    target = UUID(clinic.receptionist.staff_id)
+    with clinic.migration.connect() as connection:
+        user = connection.scalar(
+            text("SELECT auth_user_id FROM public.staff_accounts WHERE id=:id"),
+            {"id": target},
+        )
+    command = StaffCommand(
+        expected_revision=0,
+        expected_security_revision=0,
+        reason="Synthetic stage withdrawal",
+    )
+    identity, body, _ = _signed(
+        clinic,
+        path=f"/v1/staff/receptionists/{target}/disable",
+        purpose="STAFF_MANAGEMENT",
+        command=command.model_dump(),
+    )
+    cleanup = text("SELECT public.delete_staff_sessions(:tenant, :user)")
+    params = {"tenant": clinic.tenant, "user": user}
+    with registered_test_request(clinic, identity, body):
+        request = current_request.get().request_id
+        _deny_stage(clinic, request, "SESSION_CLEANUP")
+        try:
+            with protected_transaction(
+                clinic.runtime, identity, clinic.config.policy.session_idle_minutes
+            ) as (connection, actor):
+                _assert_stage(connection, clinic, request, "PRIMARY")
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    connection.scalar(cleanup, params)
+                assert denied.value.orig.sqlstate == "42501"
+                if outcome != "no_evidence":
+                    _, _, native_user = change_receptionist(
+                        connection, actor, target, command, "disable"
+                    )
+                    assert native_user == user
+                _deny_stage(clinic, request, "SESSION_CLEANUP")
+                if outcome == "aborted":
+                    raise RuntimeError("synthetic primary abort")
+        except RuntimeError as error:
+            assert outcome == "aborted" and str(error) == "synthetic primary abort"
+        _deny_stage(clinic, request, "PRIMARY")
+        if outcome != "committed":
+            _deny_stage(clinic, request, "SESSION_CLEANUP")
+        else:
+            with bound_transaction(
+                clinic.runtime, identity, stage="SESSION_CLEANUP"
+            ) as connection:
+                _assert_stage(connection, clinic, request, "SESSION_CLEANUP")
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    connection.scalar(
+                        cleanup, {"tenant": clinic.tenant, "user": clinic.native_user}
+                    )
+                assert denied.value.orig.sqlstate == "42501"
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    connection.execute(
+                        text(
+                            "UPDATE public.staff_accounts SET updated_at=clock_timestamp() WHERE id=:id"
+                        ),
+                        {"id": target},
+                    )
+                assert denied.value.orig.sqlstate == "42501"
+                assert connection.scalar(cleanup, params) == 1
+            _deny_stage(clinic, request, "SESSION_CLEANUP")
+    with clinic.migration.connect() as connection:
+        assert (
+            connection.scalar(
+                text('SELECT count(*) FROM public."session" WHERE id=:id'),
+                {"id": clinic.session},
+            )
+            == 1
+        )
+        assert connection.scalar(
+            text('SELECT count(*) FROM public."session" WHERE id=:id'),
+            {"id": clinic.receptionist.session_id},
+        ) == (0 if outcome == "committed" else 1)
+
+
+def _assert_context(connection, clinic, request):
+    assert connection.execute(
+        text(
+            "SELECT organization_id, staff_id, stage, request_id FROM public.f01_context()"
+        )
+    ).one() == (str(clinic.tenant), str(clinic.staff), "PRIMARY", request)
+    assert connection.scalars(text("SELECT id FROM public.organizations")).all() == [
+        clinic.tenant
+    ]
+
+
+def test_cross_key_nonce_registration_serializes_and_rolls_back(
+    boundary_data, proof_keys
+):
+    clinic = boundary_data
+    first_key, second_key = proof_keys
+    identity, body, _ = _signed(clinic)
+    waiting_pid = Queue()
+
+    def compete():
+        with pytest.raises(DBAPIError) as denied, clinic.gate.begin() as connection:
+            waiting_pid.put(connection.scalar(text("SELECT pg_backend_pid()")))
+            _register(connection, identity, body, _proof_for(identity, second_key))
+        return denied.value.orig.sqlstate
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with clinic.gate.begin() as first:
+            holder = first.scalar(text("SELECT pg_backend_pid()"))
+            request = _register(first, identity, body, _proof_for(identity, first_key))
+            future = pool.submit(compete)
+            with clinic.migration.connect() as observer:
+                wait_for_postgres_lock(
+                    observer, waiting_pid.get(timeout=5), holder, timeout=5
+                )
+        assert future.result(timeout=10) == "23505"
+    assert request > 0
+    assert _nonce_counts(clinic, identity) == (1, 1)
+
+    rolled_back, body, _ = _signed(clinic)
+    with clinic.gate.connect() as connection:
+        _register(connection, rolled_back, body, _proof_for(rolled_back, first_key))
+        connection.rollback()
+    assert _nonce_counts(clinic, rolled_back) == (0, 0)
+    with clinic.gate.begin() as connection:
+        assert (
+            _register(
+                connection, rolled_back, body, _proof_for(rolled_back, second_key)
+            )
+            > 0
+        )
+    assert _nonce_counts(clinic, rolled_back) == (1, 1)
+
+
+def test_binding_and_savepoints_cannot_switch_request_or_transaction(boundary_data):
+    clinic = boundary_data
+    identity, body, _ = _signed(clinic)
+    replacement, replacement_body, _ = _signed(clinic, tenant=clinic.other)
+    with clinic.gate.begin() as gate:
+        request = _register(gate, identity, body, db_proof_headers(identity))
+        other_request = _register(
+            gate, replacement, replacement_body, db_proof_headers(replacement)
+        )
+    with clinic.runtime.connect() as connection, clinic.runtime.connect() as other:
+        pid, xid = _transaction_id(connection)
+        other_pid, other_xid = _transaction_id(other)
+        with pytest.raises(DBAPIError) as denied:
+            _bind(clinic, other_request, other_pid, xid)
+        assert denied.value.orig.sqlstate == "42501"
+        _bind(clinic, request, pid, xid)
+        with pytest.raises(DBAPIError) as denied:
+            _bind(clinic, request, other_pid, other_xid)
+        assert denied.value.orig.sqlstate in ("42501", "23505")
+        with pytest.raises(DBAPIError) as denied, other.begin_nested():
+            other.execute(text("SELECT public.f01_activate()"))
+        assert denied.value.orig.sqlstate == "42501"
+        assert other.scalar(text("SELECT public.f01_org()")) is None
+        assert connection.scalar(text("SELECT public.f01_org()")) is None
+
+        before = connection.begin_nested()
+        connection.execute(text("SELECT public.f01_activate()"))
+        _assert_context(connection, clinic, request)
+        after = connection.begin_nested()
+        connection.execute(
+            text("SELECT set_config('app.organization_id', :tenant, true)"),
+            {"tenant": str(clinic.other)},
+        )
+        after.rollback()
+        _assert_context(connection, clinic, request)
+        before.rollback()
+        assert connection.scalar(text("SELECT public.f01_org()")) is None
+        assert connection.scalar(text("SELECT count(*) FROM public.organizations")) == 0
+        assert _transaction_id(connection) == (pid, xid)
+        with pytest.raises(DBAPIError) as denied:
+            _bind(clinic, other_request, pid, xid)
+        assert denied.value.orig.sqlstate in ("42501", "23505")
+        connection.execute(
+            text("SELECT set_config('app.organization_id', :tenant, true)"),
+            {"tenant": str(clinic.other)},
+        )
+        connection.execute(text("SELECT public.f01_activate()"))
+        _assert_context(connection, clinic, request)
+        assert _transaction_id(connection) == (pid, xid)
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(text("SELECT public.f01_activate()"))
+        assert denied.value.orig.sqlstate == "23505"
+        _assert_context(connection, clinic, request)
+        connection.rollback()
+        assert (
+            connection.scalar(
+                text("SELECT pg_xact_status(CAST(:xid AS xid8))"), {"xid": xid}
+            )
+            == "aborted"
+        )
+        new_pid, new_xid = _transaction_id(connection)
+        assert new_pid == pid and new_xid != xid
+        with pytest.raises(DBAPIError) as denied:
+            _bind(clinic, request, new_pid, new_xid)
+        assert denied.value.orig.sqlstate == "42501"
+        assert connection.scalar(text("SELECT public.f01_org()")) is None
+
+
+def test_retiring_key_cutoff_is_rechecked_at_registration_and_activation(
+    boundary_data, proof_keys
+):
+    clinic = boundary_data
+    retiring, active = proof_keys
+    with clinic.migration.connect() as connection:
+        cutoff = connection.scalar(
+            text("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+        )
+
+    def issued(offset):
+        envelope, body, _ = _signed(clinic)
+        return replace(envelope, timestamp=str(cutoff + offset)), body
+
+    prior, prior_body = issued(-1)
+    late, late_body = issued(1)
+    delayed, delayed_body = issued(-1)
+    exact, exact_body = issued(0)
+    after, after_body = issued(1)
+    with clinic.gate.begin() as gate:
+        prior_id = _register(gate, prior, prior_body, _proof_for(prior, retiring))
+        late_id = _register(gate, late, late_body, _proof_for(late, retiring))
+    waiting_pid = Queue()
+
+    def register_after_cutoff():
+        with pytest.raises(DBAPIError) as denied, clinic.gate.begin() as gate:
+            waiting_pid.put(gate.scalar(text("SELECT pg_backend_pid()")))
+            _register(gate, after, after_body, _proof_for(after, retiring))
+        return denied.value.orig.sqlstate
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with clinic.migration.begin() as changer:
+            changer.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+            holder = changer.scalar(text("SELECT pg_backend_pid()"))
+            changer.execute(
+                text(
+                    "UPDATE f01_private.keys SET status='RETIRING', issuance_cutoff_ms=:cutoff WHERE key_id=:key"
+                ),
+                {"cutoff": cutoff, "key": retiring[0]},
+            )
+            future = pool.submit(register_after_cutoff)
+            with clinic.migration.connect() as observer:
+                wait_for_postgres_lock(
+                    observer, waiting_pid.get(timeout=5), holder, timeout=5
+                )
+        assert future.result(timeout=10) == "42501"
+
+    with pytest.raises(DBAPIError) as denied, clinic.gate.begin() as gate:
+        _register(gate, exact, exact_body, _proof_for(exact, retiring))
+    assert denied.value.orig.sqlstate == "42501"
+    assert _nonce_counts(clinic, exact) == _nonce_counts(clinic, after) == (0, 0)
+    with clinic.gate.begin() as gate:
+        delayed_id = _register(
+            gate, delayed, delayed_body, _proof_for(delayed, retiring)
+        )
+        active_id = _register(gate, after, after_body, _proof_for(after, active))
+    for request in (prior_id, delayed_id, active_id):
+        with clinic.runtime.begin() as connection:
+            _bind(clinic, request, *_transaction_id(connection))
+            connection.execute(text("SELECT public.f01_activate()"))
+            _assert_context(connection, clinic, request)
+    with clinic.runtime.begin() as connection:
+        _bind(clinic, late_id, *_transaction_id(connection))
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(text("SELECT public.f01_activate()"))
+        assert denied.value.orig.sqlstate == "42501"
+        assert connection.scalar(text("SELECT public.f01_org()")) is None
+    for envelope, body in (
+        (prior, prior_body),
+        (delayed, delayed_body),
+        (late, late_body),
+        (after, after_body),
+    ):
+        with pytest.raises(DBAPIError) as denied, clinic.gate.begin() as gate:
+            _register(gate, envelope, body, _proof_for(envelope, active))
+        assert denied.value.orig.sqlstate == "23505"
+        assert _nonce_counts(clinic, envelope) == (1, 1)
 
 
 def _spoof_gucs(connection, clinic):
@@ -219,3 +755,63 @@ def test_bound_identity_is_transaction_local_and_replay_is_denied(
     with pytest.raises(DBAPIError) as denied, clinic.gate.begin() as connection:
         _register(connection, identity, body, db_proof_headers(identity))
     assert denied.value.orig.sqlstate in ("23505", "42501", "22023")
+
+
+def test_cleanup_retains_unknown_transaction_and_nonce_tombstones(boundary_data):
+    clinic = boundary_data
+    unknown, unknown_body, _ = _signed(clinic)
+    idle, idle_body, _ = _signed(clinic)
+    with clinic.gate.begin() as connection:
+        unknown_id = _register(
+            connection, unknown, unknown_body, db_proof_headers(unknown)
+        )
+        idle_id = _register(connection, idle, idle_body, db_proof_headers(idle))
+
+    # Only the trusted test migration role can inject unavailable xid status.
+    with clinic.migration.begin() as connection:
+        connection.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+        assert connection.scalar(text("SELECT pg_xact_status('0'::xid8)")) is None
+        connection.execute(
+            text("""
+                INSERT INTO f01_private.bindings
+                    (request_id, stage, database_oid, login_oid, pid, xid)
+                VALUES (:id, 'PRIMARY',
+                    (SELECT oid FROM pg_database WHERE datname=current_database()),
+                    'carepulse_api'::regrole::oid, pg_backend_pid(), '0'::xid8)
+            """),
+            {"id": unknown_id},
+        )
+        connection.execute(
+            text("""
+                UPDATE f01_private.requests SET expires_at=clock_timestamp()-interval '1 second'
+                WHERE id IN (:unknown, :idle)
+            """),
+            {"unknown": unknown_id, "idle": idle_id},
+        )
+    try:
+        with clinic.gate.begin() as connection:
+            assert connection.scalar(text("SELECT public.f01_cleanup()")) >= 1
+        with clinic.migration.begin() as connection:
+            connection.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+            assert connection.scalars(
+                text(
+                    "SELECT id FROM f01_private.requests WHERE id IN (:unknown,:idle)"
+                ),
+                {"unknown": unknown_id, "idle": idle_id},
+            ).all() == [unknown_id]
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM f01_private.nonces WHERE nonce IN (:unknown,:idle)"
+                    ),
+                    {"unknown": unknown.nonce, "idle": idle.nonce},
+                )
+                == 2
+            )
+    finally:
+        with clinic.migration.begin() as connection:
+            connection.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+            connection.execute(
+                text("DELETE FROM f01_private.requests WHERE id=:id"),
+                {"id": unknown_id},
+            )

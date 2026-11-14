@@ -1,14 +1,12 @@
 """B-06 conflicting pricing transactions and immutable frozen-price evidence."""
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from threading import Barrier
 from uuid import UUID, uuid4
 
 import pytest
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
-from carepulse.identity.authorization import AuthorizedStaff
-from carepulse.identity.contracts import ContractError
 from carepulse.main import app
 from carepulse.policies.pricing_contracts import PricingPatch
 from carepulse.policies.pricing_service import current_price_state, update_pricing
@@ -19,9 +17,6 @@ from test_appointment_persistence import (
     _draft,
     _patient,
     _query,
-)
-from test_appointment_persistence import (
-    appointment_storage as appointment_storage,  # noqa: PLC0414 - fixture export
 )
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import (
@@ -36,10 +31,6 @@ from test_pricing import (
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 
 
-def _owner(tenant, staff):
-    return AuthorizedStaff(tenant, staff, "DOCTOR_OWNER", False, 0, 0, 0)
-
-
 def _change(revision, **fields):
     return PricingPatch(
         expected_price_revision=revision,
@@ -49,30 +40,29 @@ def _change(revision, **fields):
 
 
 def test_concurrent_owner_writes_same_revision_have_one_serial_winner(
-    appointment_storage, two_transactions
+    patient_backend,
 ):
-    _, _, (tenant, _), (doctor, _) = appointment_storage
-    actor = _owner(tenant, doctor)
-    changes = iter(("100.00", "120.00"))
+    clinic = patient_backend
+    ready = Barrier(2)
 
-    def patch(connection):
-        connection.execute(
-            text("SELECT set_config('app.organization_id', :tenant, true)"),
-            {"tenant": str(tenant)},
-        )
-        value = next(changes)
-        return update_pricing(
-            connection, actor, _change(1, standard_new_exam_egp=value), str(uuid4())
+    def patch(value):
+        ready.wait(timeout=15)
+        return pricing_request(
+            clinic,
+            clinic.owner,
+            method="PATCH",
+            body=_patch(standard_new_exam_egp=value),
+            key=str(uuid4()),
         )
 
-    results = two_transactions("carepulse_runtime", patch)
-    successes = [item for item in results if isinstance(item, dict)]
-    stale = [item for item in results if isinstance(item, ContractError)]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(patch, ("100.00", "120.00")))
+    successes = [item for item in results if item[0] == 200]
+    stale = [item for item in results if item[0] == 409]
     assert len(successes) == len(stale) == 1, results
-    assert stale[0].status_code == 409 and stale[0].code == "STALE_REVISION"
-    runtime = appointment_storage[0]
-    with transaction(runtime, tenant) as conn:
-        state = current_price_state(conn, tenant)
+    assert stale[0][1]["error"]["code"] == "STALE_REVISION"
+    with transaction(clinic.migration, clinic.tenant) as conn:
+        state = current_price_state(conn, clinic.tenant)
         assert state["PRICE"]["revision"] == 2
         assert state["PRICE"]["payload"]["standard_new_exam_egp"] in (
             "100.00",
@@ -81,7 +71,8 @@ def test_concurrent_owner_writes_same_revision_have_one_serial_winner(
         assert (
             conn.scalar(
                 text("""
-            SELECT count(*) FROM public.clinic_policy_versions WHERE kind = 'PRICE'
+            SELECT count(*) FROM public.clinic_policy_versions
+            WHERE organization_id = current_setting('app.organization_id')::uuid AND kind = 'PRICE'
         """)
             )
             == 2
@@ -125,11 +116,12 @@ def test_signed_identical_pricing_retry_after_policy_lock_replays_original(
         )[0]
         == 409
     )
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
                 text(
-                    "SELECT count(*) FROM public.clinic_policy_versions WHERE kind='PRICE'"
+                    "SELECT count(*) FROM public.clinic_policy_versions "
+                    "WHERE organization_id = current_setting('app.organization_id')::uuid AND kind='PRICE'"
                 )
             )
             == 2
@@ -138,7 +130,8 @@ def test_signed_identical_pricing_retry_after_policy_lock_replays_original(
             connection.scalar(
                 text(
                     "SELECT count(*) FROM public.idempotency_receipts "
-                    "WHERE operation='settings.pricing.update' AND idempotency_key=:key"
+                    "WHERE organization_id = current_setting('app.organization_id')::uuid "
+                    "AND operation='settings.pricing.update' AND idempotency_key=:key"
                 ),
                 {"key": key},
             )
@@ -146,51 +139,50 @@ def test_signed_identical_pricing_retry_after_policy_lock_replays_original(
         )
 
 
-def test_direct_identical_pricing_rechecks_receipt_after_policy_lock(patient_backend):
+def test_direct_identical_pricing_rechecks_receipt_after_authority_lock(
+    patient_backend,
+):
     clinic = patient_backend
     key = str(uuid4())
     change = _change(1, standard_new_exam_egp="125.00")
-    retry_started = Event()
-    retry_pid = []
+    body = change.model_dump(mode="json")
 
     def competing_update():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            retry_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            retry_started.set()
-            return update_pricing(
-                connection,
-                _owner(clinic.tenant, UUID(clinic.owner.staff_id)),
-                change,
-                key,
-            )
+        with _pricing_transaction(clinic, clinic.owner, body, key) as (
+            connection,
+            actor,
+        ):
+            return update_pricing(connection, actor, change, key)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        with _pricing_transaction(clinic, clinic.owner, body, key) as (
+            connection,
+            actor,
+        ):
             original = update_pricing(
                 connection,
-                _owner(clinic.tenant, UUID(clinic.owner.staff_id)),
+                actor,
                 change,
                 key,
             )
             holder_pid = connection.scalar(text("SELECT pg_backend_pid()"))
             future = pool.submit(competing_update)
-            assert retry_started.wait(timeout=15)
+            # F01 holds the organization lock before either request reaches policy locks.
             blocked = _blocked_by(clinic, holder_pid)
-            assert blocked == retry_pid[0]
-            with clinic.runtime.connect() as observer:
+            with clinic.migration.connect() as observer:
                 blocked_sql = observer.scalar(
                     text("SELECT query FROM pg_stat_activity WHERE pid=:pid"),
                     {"pid": blocked},
                 )
-                assert blocked_sql and "public.clinic_policy_heads" in blocked_sql
-                assert "FOR UPDATE" in blocked_sql
+                assert blocked_sql and "public.f01_activate()" in blocked_sql
         replay = future.result(timeout=30)
     assert replay == original
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
                 text(
-                    "SELECT count(*) FROM public.clinic_policy_versions WHERE kind='PRICE'"
+                    "SELECT count(*) FROM public.clinic_policy_versions "
+                    "WHERE organization_id = current_setting('app.organization_id')::uuid AND kind='PRICE'"
                 )
             )
             == 2
@@ -199,7 +191,8 @@ def test_direct_identical_pricing_rechecks_receipt_after_policy_lock(patient_bac
             connection.scalar(
                 text(
                     "SELECT count(*) FROM public.idempotency_receipts "
-                    "WHERE operation='settings.pricing.update' AND idempotency_key=:key"
+                    "WHERE organization_id = current_setting('app.organization_id')::uuid "
+                    "AND operation='settings.pricing.update' AND idempotency_key=:key"
                 ),
                 {"key": key},
             )
@@ -277,14 +270,13 @@ def test_live_owner_manager_followup_publication_serializes_stale_revision(
 
 
 def test_standard_raise_and_urgent_enable_cannot_publish_invalid_mixed_state(
-    appointment_storage, two_transactions
+    patient_backend,
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
-    actor = _owner(tenant, doctor)
-    with transaction(runtime, tenant) as conn:
+    clinic = patient_backend
+    with transaction(clinic.migration, clinic.tenant) as conn:
         append_version(
             conn,
-            str(tenant),
+            str(clinic.tenant),
             "SCHEDULE",
             {
                 "booking_mode": "OPEN",
@@ -305,40 +297,37 @@ def test_standard_raise_and_urgent_enable_cannot_publish_invalid_mixed_state(
                 },
             ],
         )
-        update_pricing(
-            conn,
-            actor,
-            _change(1, standard_new_exam_egp="100.00", urgent_base_egp="120.00"),
-            str(uuid4()),
-        )
-
-    changes = iter(
-        (
-            {"standard_new_exam_egp": "130.00"},
-            {"urgent_enabled": True},
-        )
+    status, result = pricing_request(
+        clinic,
+        clinic.owner,
+        method="PATCH",
+        body=_patch(standard_new_exam_egp="100.00", urgent_base_egp="120.00"),
+        key=str(uuid4()),
     )
+    assert status == 200, result
 
-    def patch(connection):
-        connection.execute(
-            text("SELECT set_config('app.organization_id', :tenant, true)"),
-            {"tenant": str(tenant)},
-        )
-        return update_pricing(
-            connection, actor, _change(2, **next(changes)), str(uuid4())
+    changes = (
+        {"standard_new_exam_egp": "130.00"},
+        {"urgent_enabled": True},
+    )
+    ready = Barrier(2)
+
+    def patch(change):
+        ready.wait(timeout=15)
+        return pricing_request(
+            clinic,
+            clinic.owner,
+            method="PATCH",
+            body=_patch(expected_price_revision=2, **change),
+            key=str(uuid4()),
         )
 
-    outcomes = two_transactions("carepulse_runtime", patch)
-    assert sum(isinstance(outcome, dict) for outcome in outcomes) == 1, outcomes
-    assert (
-        sum(
-            isinstance(outcome, ContractError) and outcome.status_code == 409
-            for outcome in outcomes
-        )
-        == 1
-    ), outcomes
-    with transaction(runtime, tenant) as conn:
-        price = current_price_state(conn, tenant)["PRICE"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(patch, changes))
+    assert sum(outcome[0] == 200 for outcome in outcomes) == 1, outcomes
+    assert sum(outcome[0] == 409 for outcome in outcomes) == 1, outcomes
+    with transaction(clinic.migration, clinic.tenant) as conn:
+        price = current_price_state(conn, clinic.tenant)["PRICE"]
         assert price["revision"] == 3
         payload = price["payload"]
         assert not (
@@ -348,14 +337,17 @@ def test_standard_raise_and_urgent_enable_cannot_publish_invalid_mixed_state(
 
 
 def test_existing_snapshot_remains_byte_identical_after_price_and_followup_edits(
-    appointment_storage,
+    patient_backend,
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
-    actor = _owner(tenant, doctor)
-    with transaction(runtime, tenant) as conn:
-        update_pricing(
-            conn, actor, _change(1, standard_new_exam_egp="100.00"), str(uuid4())
-        )
+    clinic = patient_backend
+    tenant, doctor = clinic.tenant, UUID(clinic.owner.staff_id)
+    change = _change(1, standard_new_exam_egp="100.00")
+    key = str(uuid4())
+    with _pricing_transaction(
+        clinic, clinic.owner, change.model_dump(mode="json"), key
+    ) as (conn, actor):
+        update_pricing(conn, actor, change, key)
+    with transaction(clinic.migration, tenant) as conn:
         saved = persist_appointment(
             conn,
             _draft(
@@ -369,26 +361,27 @@ def test_existing_snapshot_remains_byte_identical_after_price_and_followup_edits
             text("""
             SELECT row_to_json(s)::text
             FROM public.appointment_price_snapshots AS s
-            WHERE appointment_id = :id
+            WHERE organization_id = :tenant AND appointment_id = :id
         """),
-            {"id": saved["id"]},
+            {"tenant": tenant, "id": saved["id"]},
         )
 
-    with transaction(runtime, tenant) as conn:
+    with transaction(clinic.migration, tenant) as conn:
         before = snapshot(conn)
-        update_pricing(
-            conn,
-            actor,
-            _change(
-                2,
-                standard_new_exam_egp="200.00",
-                followup_last_day_inclusive=9,
-                expected_followup_revision=1,
-            ),
-            str(uuid4()),
-        )
+    assert before is not None
+    change = _change(
+        2,
+        standard_new_exam_egp="200.00",
+        followup_last_day_inclusive=9,
+        expected_followup_revision=1,
+    )
+    key = str(uuid4())
+    with _pricing_transaction(
+        clinic, clinic.owner, change.model_dump(mode="json"), key
+    ) as (conn, actor):
+        update_pricing(conn, actor, change, key)
         assert snapshot(conn) == before
-    with transaction(runtime, tenant) as conn:
+    with transaction(clinic.migration, tenant) as conn:
         assert snapshot(conn) == before
         state = current_price_state(conn, tenant)
         assert state["PRICE"]["revision"] == 3
@@ -396,33 +389,39 @@ def test_existing_snapshot_remains_byte_identical_after_price_and_followup_edits
 
 
 def test_sql_failure_rolls_back_versions_heads_audit_outbox_and_receipt(
-    appointment_storage,
+    patient_backend,
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
-    actor = _owner(tenant, doctor)
+    clinic = patient_backend
+    tenant = clinic.tenant
     sql_counts = {
-        "versions": "SELECT count(*) FROM public.clinic_policy_versions",
-        "audit": "SELECT count(*) FROM public.sensitive_audit",
-        "outbox": "SELECT count(*) FROM public.outbox_events",
-        "receipts": "SELECT count(*) FROM public.idempotency_receipts",
+        "versions": "SELECT count(*) FROM public.clinic_policy_versions WHERE organization_id = current_setting('app.organization_id')::uuid",
+        "audit": "SELECT count(*) FROM public.sensitive_audit WHERE organization_id = current_setting('app.organization_id')::uuid",
+        "outbox": "SELECT count(*) FROM public.outbox_events WHERE organization_id = current_setting('app.organization_id')::uuid",
+        "receipts": "SELECT count(*) FROM public.idempotency_receipts WHERE organization_id = current_setting('app.organization_id')::uuid",
     }
-    with transaction(runtime, tenant) as conn:
+    with transaction(clinic.migration, tenant) as conn:
         before = {name: conn.scalar(text(sql)) for name, sql in sql_counts.items()}
         heads = tuple(
             conn.execute(
                 text("""
             SELECT kind, current_version, revision
-            FROM public.clinic_policy_heads ORDER BY kind
+            FROM public.clinic_policy_heads
+            WHERE organization_id = current_setting('app.organization_id')::uuid ORDER BY kind
         """)
             ).all()
         )
-    with pytest.raises(DBAPIError) as error, transaction(runtime, tenant) as conn:
-        update_pricing(
-            conn, actor, _change(1, standard_new_exam_egp="100.00"), str(uuid4())
-        )
+    change = _change(1, standard_new_exam_egp="100.00")
+    key = str(uuid4())
+    with (
+        pytest.raises(DBAPIError) as error,
+        _pricing_transaction(
+            clinic, clinic.owner, change.model_dump(mode="json"), key
+        ) as (conn, actor),
+    ):
+        update_pricing(conn, actor, change, key)
         conn.execute(text("SELECT 1/0"))
     assert error.value.orig.sqlstate == "22012"
-    with transaction(runtime, tenant) as conn:
+    with transaction(clinic.migration, tenant) as conn:
         assert {
             name: conn.scalar(text(sql)) for name, sql in sql_counts.items()
         } == before
@@ -431,7 +430,8 @@ def test_sql_failure_rolls_back_versions_heads_audit_outbox_and_receipt(
                 conn.execute(
                     text("""
             SELECT kind, current_version, revision
-            FROM public.clinic_policy_heads ORDER BY kind
+            FROM public.clinic_policy_heads
+            WHERE organization_id = current_setting('app.organization_id')::uuid ORDER BY kind
         """)
                 ).all()
             )

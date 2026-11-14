@@ -236,10 +236,11 @@ def _frozen(connection, appointment_id):
         SELECT a.status, a.booking_mode, a.service_date, a.starts_at, a.ends_at,
                a.revision, row_to_json(s)::text AS snapshot,
                (SELECT count(*) FROM public.appointment_history h
-                WHERE h.appointment_id = a.id) AS history_count
+                WHERE h.organization_id = a.organization_id AND h.appointment_id = a.id) AS history_count
         FROM public.appointments a
         JOIN public.appointment_price_snapshots s ON s.appointment_id = a.id
-        WHERE a.id = :id
+            AND s.organization_id = a.organization_id
+        WHERE a.organization_id = current_setting('app.organization_id')::uuid AND a.id = :id
     """),
         {"id": appointment_id},
     ).one()
@@ -347,7 +348,7 @@ def test_signed_schedule_malformed_json_denied_without_effects(
         "preview": ("/preview", "POST"),
         "activate": ("/activate", "POST"),
     }[operation]
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         before = connection.execute(
             text("""
             SELECT (SELECT revision FROM public.clinic_policy_heads
@@ -370,7 +371,7 @@ def test_signed_schedule_malformed_json_denied_without_effects(
         key=str(uuid4()),
     )
     assert status == 422 and denied["error"]["code"] == "INVALID_INPUT"
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         after = connection.execute(
             text("""
             SELECT (SELECT revision FROM public.clinic_policy_heads
@@ -404,7 +405,7 @@ def test_signed_schedule_surrogate_reason_denies_without_receipt(
         body = _patch(_config(mode="OPEN")).model_dump(mode="json")
         suffix, method = ("", "PATCH") if operation == "stage" else ("/preview", "POST")
 
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         before = connection.execute(
             text("""
             SELECT (SELECT revision FROM public.clinic_policy_heads
@@ -429,7 +430,7 @@ def test_signed_schedule_surrogate_reason_denies_without_receipt(
             key=key,
         )
         assert status == 422 and denied["error"]["code"] == "INVALID_INPUT"
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        with transaction(clinic.migration, clinic.tenant) as connection:
             assert (
                 connection.execute(
                     text("""
@@ -535,12 +536,13 @@ def test_owner_patch_and_preview_stage_without_publication_then_activate(
     assert published["data"]["config"] == proposed
     assert published["data"]["routine_walk_in_enabled"] is False
     assert _schedule_request(clinic, clinic.owner)[1]["data"]["config"] == proposed
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
                 text("""
             SELECT count(*) FROM public.clinic_schedule_intervals
-            WHERE interval_kind = 'MANUAL_SLOT' AND weekday = :weekday
+            WHERE organization_id = current_setting('app.organization_id')::uuid
+              AND interval_kind = 'MANUAL_SLOT' AND weekday = :weekday
         """),
                 {"weekday": WEEKDAY},
             )
@@ -550,7 +552,8 @@ def test_owner_patch_and_preview_stage_without_publication_then_activate(
             connection.scalar(
                 text("""
             SELECT count(*) FROM public.clinic_schedule_intervals
-            WHERE interval_kind = 'MANUAL_SLOT' AND service_date = :day
+            WHERE organization_id = current_setting('app.organization_id')::uuid
+              AND interval_kind = 'MANUAL_SLOT' AND service_date = :day
         """),
                 {"day": SERVICE_DAY},
             )
@@ -640,7 +643,7 @@ def test_duration_string_survives_signed_http_activation_and_preserves_history(
         body=activation,
         key=activation_key,
     ) == (status, published)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             candidates_for_date(
                 load_current_schedule(connection, clinic.tenant), SERVICE_DAY
@@ -710,13 +713,14 @@ def test_duration_string_survives_signed_http_activation_and_preserves_history(
     assert published_again["data"]["config"] == later_config
     assert _schedule_request(clinic, clinic.owner)[1]["data"]["config"] == later_config
 
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert connection.execute(
             text("""
             SELECT version, jsonb_typeof(payload->'duration_minutes'),
                    payload->>'duration_minutes'
             FROM public.clinic_policy_versions
-            WHERE kind='SCHEDULE' ORDER BY version
+            WHERE organization_id = current_setting('app.organization_id')::uuid
+              AND kind='SCHEDULE' ORDER BY version
         """)
         ).all() == [
             (1, "null", None),
@@ -860,11 +864,12 @@ def test_schedule_routes_deny_ungranted_roles(
         key=str(uuid4()),
     )
     assert status in (401, 403)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
                 text("""
-            SELECT count(*) FROM public.clinic_policy_previews WHERE policy_kind='SCHEDULE'
+            SELECT count(*) FROM public.clinic_policy_previews
+            WHERE organization_id = current_setting('app.organization_id')::uuid AND policy_kind='SCHEDULE'
         """)
             )
             == 0
@@ -1129,7 +1134,9 @@ def test_disjoint_over_limit_peaks_capture_every_contributor_and_block_activatio
         expected_revisions = {
             str(row.id): row.revision
             for row in connection.execute(
-                text("SELECT id, revision FROM public.appointments")
+                text(
+                    "SELECT id, revision FROM public.appointments WHERE organization_id = current_setting('app.organization_id')::uuid"
+                )
             )
         }
         preview = _stage(connection, owner, _config(duration_minutes="15"), revision=2)
@@ -1142,7 +1149,8 @@ def test_disjoint_over_limit_peaks_capture_every_contributor_and_block_activatio
         stored = connection.execute(
             text("""
                 SELECT affected_refs, record_revisions
-                FROM public.clinic_policy_previews WHERE id = :preview
+                FROM public.clinic_policy_previews
+                WHERE organization_id = current_setting('app.organization_id')::uuid AND id = :preview
             """),
             {"preview": preview["preview_id"]},
         ).one()
@@ -1375,7 +1383,8 @@ def test_weekly_manual_slots_inherit_except_explicit_date_replacements(
             connection.scalar(
                 text("""
             SELECT count(*) FROM public.clinic_schedule_intervals
-            WHERE policy_version=2 AND interval_kind='MANUAL_SLOT' AND weekday = :weekday
+            WHERE organization_id = current_setting('app.organization_id')::uuid
+              AND policy_version=2 AND interval_kind='MANUAL_SLOT' AND weekday = :weekday
         """),
                 {"weekday": WEEKDAY},
             )
@@ -1385,7 +1394,8 @@ def test_weekly_manual_slots_inherit_except_explicit_date_replacements(
             connection.scalar(
                 text("""
             SELECT count(*) FROM public.clinic_schedule_intervals
-            WHERE policy_version=2 AND interval_kind='MANUAL_SLOT' AND service_date IS NOT NULL
+            WHERE organization_id = current_setting('app.organization_id')::uuid
+              AND policy_version=2 AND interval_kind='MANUAL_SLOT' AND service_date IS NOT NULL
         """)
             )
             == 1
@@ -1393,7 +1403,8 @@ def test_weekly_manual_slots_inherit_except_explicit_date_replacements(
         payload = connection.scalar(
             text("""
             SELECT payload FROM public.clinic_policy_versions
-            WHERE kind='SCHEDULE' AND version=2
+            WHERE organization_id = current_setting('app.organization_id')::uuid
+              AND kind='SCHEDULE' AND version=2
         """)
         )
         assert payload["manual_slot_dates"] == [empty_date, replaced_date]
@@ -1542,7 +1553,7 @@ def test_owner_preview_captures_revision_and_can_activate(
     )
     assert status == 200, prepared
     preview_id = UUID(prepared["data"]["preview_id"])
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         captured = connection.execute(
             text("""
                 SELECT actor_staff_id, actor_security_revision
@@ -1908,7 +1919,7 @@ def test_manager_revoke_and_schedule_operations_serialize(
         )[0]
         == 403
     )
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert connection.scalar(
             text("""
                 SELECT count(*) FROM public.idempotency_receipts

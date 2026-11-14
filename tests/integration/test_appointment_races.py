@@ -62,10 +62,21 @@ def test_parallel_same_patient_day_creates_exactly_one_counted_appointment(
             "appointment_history",
             "appointment_price_snapshots",
         ):
-            assert connection.scalar(text(f"SELECT count(*) FROM public.{table}")) == 1
+            assert (
+                connection.scalar(
+                    text(
+                        f"SELECT count(*) FROM public.{table} WHERE organization_id=:tenant"
+                    ),
+                    {"tenant": tenant},
+                )
+                == 1
+            )
         assert (
             connection.scalar(
-                text("SELECT last_number FROM public.appointment_day_counters")
+                text(
+                    "SELECT last_number FROM public.appointment_day_counters WHERE organization_id=:tenant"
+                ),
+                {"tenant": tenant},
             )
             == 1
         )
@@ -122,22 +133,29 @@ def test_concurrent_archive_and_new_id_creation_serialize_on_patient_row(
             "appointment_price_snapshots",
         ):
             assert (
-                connection.scalar(text(f"SELECT count(*) FROM public.{table}"))
+                connection.scalar(
+                    text(
+                        f"SELECT count(*) FROM public.{table} WHERE organization_id=:tenant"
+                    ),
+                    {"tenant": tenant},
+                )
                 == appointment_count
             )
         assert (
             connection.scalar(
                 text(
-                    "SELECT count(*) FROM public.idempotency_receipts WHERE operation='appointments.persist'"
-                )
+                    "SELECT count(*) FROM public.idempotency_receipts WHERE organization_id=:tenant AND operation='appointments.persist'"
+                ),
+                {"tenant": tenant},
             )
             == appointment_count
         )
         assert (
             connection.scalar(
                 text(
-                    "SELECT count(*) FROM public.outbox_events WHERE event_type='APPOINTMENT_PERSISTED'"
-                )
+                    "SELECT count(*) FROM public.outbox_events WHERE organization_id=:tenant AND event_type='APPOINTMENT_PERSISTED'"
+                ),
+                {"tenant": tenant},
             )
             == appointment_count
         )
@@ -178,8 +196,9 @@ def test_parallel_main_and_emergency_serialize_unique_clinic_day_numbering(
                 SELECT a.classification, a.lane, n.number
                 FROM public.appointments a JOIN public.appointment_number_assignments n
                   ON (a.organization_id, a.id) = (n.organization_id, n.appointment_id)
-                ORDER BY n.number
-            """)
+                WHERE a.organization_id=:tenant ORDER BY n.number
+            """),
+            {"tenant": tenant},
         ).all()
         assert len(assignments) == 2
         assert {row[0:2] for row in assignments} == {
@@ -188,7 +207,10 @@ def test_parallel_main_and_emergency_serialize_unique_clinic_day_numbering(
         }
         assert (
             connection.scalar(
-                text("SELECT last_number FROM public.appointment_day_counters")
+                text(
+                    "SELECT last_number FROM public.appointment_day_counters WHERE organization_id=:tenant"
+                ),
+                {"tenant": tenant},
             )
             == 2
         )
@@ -234,7 +256,15 @@ def test_failure_after_assignment_history_audit_outbox_and_receipt_rolls_back(
             "appointment_history",
             "appointment_price_snapshots",
         ):
-            assert connection.scalar(text(f"SELECT count(*) FROM public.{table}")) == 0
+            assert (
+                connection.scalar(
+                    text(
+                        f"SELECT count(*) FROM public.{table} WHERE organization_id=:tenant"
+                    ),
+                    {"tenant": tenant},
+                )
+                == 0
+            )
         assert (
             connection.scalar(
                 text("""
@@ -317,7 +347,10 @@ def test_archived_patient_blocks_new_id_but_retains_existing_confirmed_id(
         )
         assert (
             connection.scalar(
-                text("SELECT last_number FROM public.appointment_day_counters")
+                text(
+                    "SELECT last_number FROM public.appointment_day_counters WHERE organization_id=:tenant"
+                ),
+                {"tenant": tenant},
             )
             == 1
         )
