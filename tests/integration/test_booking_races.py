@@ -221,26 +221,27 @@ def test_signed_booked_receipt_survives_later_archive(booking_clinic):
 def test_direct_retry_waits_behind_archive_then_replays_committed_booking(
     booking_clinic,
 ):
-    """Exercise the patient-lock retry directly; verify signed replay after archive."""
+    """Direct retry waits at signed activation, then replays after archive commits."""
     clinic = booking_clinic
     app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
     patient, key = new_patient(clinic), str(uuid4())
     body = booking_body(patient)
     archive_started = Event()
-    archive_updated = Event()
-    release_archive = Event()
     archive_pid = []
+    retry_started = Event()
     receipt_read = Event()
     resume_retry = Event()
     retry_thread = []
     retry_pid = []
 
-    def hold_first_receipt_read(
-        _connection, _cursor, statement, _parameters, _context, _many
-    ):
-        if (
+    def observe_retry(connection, _cursor, statement, _parameters, _context, _many):
+        if get_ident() not in retry_thread:
+            return
+        if "public.f01_activate()" in statement:
+            retry_pid.append(connection.connection.driver_connection.info.backend_pid)
+            retry_started.set()
+        elif (
             "FROM public.idempotency_receipts AS r" in statement
-            and get_ident() in retry_thread
             and not receipt_read.is_set()
         ):
             receipt_read.set()
@@ -257,13 +258,10 @@ def test_direct_retry_waits_behind_archive_then_replays_committed_booking(
                 ),
                 {"patient": patient},
             )
-            archive_updated.set()
-            assert release_archive.wait(timeout=30)
 
-    def retry_after_first_receipt_miss():
+    def retry():
+        retry_thread.append(get_ident())
         with _booking_transaction(clinic, body, key) as connection:
-            retry_thread.append(get_ident())
-            retry_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             return book_appointment(
                 connection,
                 _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
@@ -271,10 +269,11 @@ def test_direct_retry_waits_behind_archive_then_replays_committed_booking(
                 key,
             )
 
-    event.listen(clinic.runtime, "after_cursor_execute", hold_first_receipt_read)
+    event.listen(clinic.runtime, "before_cursor_execute", observe_retry)
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            # Maintenance holds only the patient path; API activation must still run.
+            # The appointment insert also holds an organization FK lock. Signed
+            # activation must wait before it can read the winning receipt.
             with clinic.migration.begin() as holder:
                 saved = book_appointment(
                     holder,
@@ -287,19 +286,20 @@ def test_direct_retry_waits_behind_archive_then_replays_committed_booking(
                 assert archive_started.wait(timeout=15)
                 with clinic.migration.connect() as observer:
                     wait_for_postgres_lock(observer, archive_pid[0], holder_pid)
-                replay_future = pool.submit(retry_after_first_receipt_miss)
+                replay_future = pool.submit(retry)
+                assert retry_started.wait(timeout=15)
+                with clinic.migration.connect() as observer:
+                    wait_for_postgres_lock(observer, retry_pid[0], holder_pid)
+                assert not receipt_read.is_set()
+            try:
+                archive_future.result(timeout=30)
                 assert receipt_read.wait(timeout=15)
-            assert archive_updated.wait(timeout=15)
-            resume_retry.set()
-            with clinic.migration.connect() as observer:
-                wait_for_postgres_lock(observer, retry_pid[0], archive_pid[0])
-            release_archive.set()
-            archive_future.result(timeout=30)
+            finally:
+                resume_retry.set()
             assert replay_future.result(timeout=30) == saved
     finally:
         resume_retry.set()
-        release_archive.set()
-        event.remove(clinic.runtime, "after_cursor_execute", hold_first_receipt_read)
+        event.remove(clinic.runtime, "before_cursor_execute", observe_retry)
     status, replay = booking_request(clinic, clinic.owner, body=body, key=key)
     assert status == 201 and replay["data"] == saved
     assert replay["revision"] == saved["revision"]
