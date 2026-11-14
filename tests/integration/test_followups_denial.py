@@ -317,6 +317,21 @@ def test_signed_retained_active_claim_denies_read_and_acknowledged_fallback(
                 )
 
     before = booking_effects(clinic)
+    status, detail = booking_request(
+        clinic,
+        clinic.receptionist,
+        method="GET",
+        path=f"/v1/appointments/{source['appointment']}",
+    )
+    assert status == 200, detail
+    control = detail["data"]["decision_control"]
+    assert control["source_visit_id"] == str(source["visit"])
+    assert control["can_revise"] is False
+    assert "followup_qualification" not in detail["data"]
+    if retained_gap == "unverified_provenance":
+        assert control["kind"] == "ANCESTRY_UNKNOWN"
+        assert control["actor_role"] is None
+        assert control["deadline_date"] is None
     status, result = booking_request(
         clinic,
         clinic.receptionist,

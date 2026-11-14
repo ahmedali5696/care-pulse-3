@@ -154,14 +154,9 @@ def appointment_detail(
     return {**_projection(row), "history": recorded}
 
 
-def followup_qualification(
-    connection: Connection,
-    actor: AuthorizedStaff,
-    appointment_id: UUID,
-    intended_date: date,
-) -> dict:
-    """Operational qualification of a selected source appointment, without Visit narrative."""
-    source = appointment_detail(connection, actor, appointment_id)
+def _source_evidence(
+    connection: Connection, actor: AuthorizedStaff, appointment_id: UUID
+):
     evidence = (
         connection.execute(
             text("""
@@ -192,11 +187,114 @@ def followup_qualification(
         evidence = {
             **evidence,
             "source_revision": 0,
-            "provenance_state": proof["state"],
-            "decision": proof.get("decision"),
-            "decision_actor_staff_id": proof.get("actor_staff_id"),
-            "decision_actor_role": proof.get("actor_role"),
+            "provenance_state": proof["state"] if proof else "ANCESTRY_UNKNOWN",
+            "decision": proof.get("decision") if proof else None,
+            "decision_actor_staff_id": proof.get("actor_staff_id") if proof else None,
+            "decision_actor_role": proof.get("actor_role") if proof else None,
         }
+    return evidence
+
+
+def _valid_source(connection: Connection, actor: AuthorizedStaff, source, evidence):
+    return bool(
+        source["status"] == "Completed"
+        and source["service_type"] == "NEW_EXAMINATION"
+        and source["classification"] in ("ROUTINE", "URGENT", "EMERGENCY")
+        and evidence
+        and evidence["completed_at"] is not None
+        and evidence["provenance_state"] == "VERIFIED"
+        and evidence["patient_id"] == UUID(source["patient_id"])
+        and evidence["doctor_staff_id"] == UUID(source["doctor_staff_id"])
+        and connection.scalar(
+            text("""
+                SELECT EXISTS (SELECT 1 FROM public.completion_attestations
+                WHERE organization_id=:tenant AND visit_id=:visit
+                  AND examination_occurred)
+            """),
+            {"tenant": actor.organization_id, "visit": evidence["id"]},
+        )
+    )
+
+
+def _decision_control(actor, source, evidence, valid_source, followup_revision):
+    if (
+        evidence is None
+        or evidence["patient_id"] != UUID(source["patient_id"])
+        or evidence["doctor_staff_id"] != UUID(source["doctor_staff_id"])
+        or (
+            actor.role == "DOCTOR_OWNER"
+            and evidence["doctor_staff_id"] != actor.staff_id
+        )
+    ):
+        return None
+    verified = evidence["provenance_state"] == "VERIFIED"
+    decision = evidence["decision"] if verified else None
+    author_role = evidence["decision_actor_role"] if verified else None
+    kind = (
+        decision.get("kind", "NO_DECISION")
+        if isinstance(decision, dict)
+        else "NO_DECISION"
+    )
+    deadline = decision.get("deadline_date") if isinstance(decision, dict) else None
+    doctor_restriction = author_role == "DOCTOR_OWNER" and kind in (
+        "OPTED_OUT",
+        "DEADLINE",
+    )
+    return {
+        "source_visit_id": str(evidence["id"]),
+        "kind": kind if verified else "ANCESTRY_UNKNOWN",
+        "deadline_date": deadline,
+        "actor_role": author_role,
+        "can_revise": valid_source
+        and (actor.role == "DOCTOR_OWNER" or not doctor_restriction),
+        "completion_local_date": (
+            evidence["completed_at"]
+            .astimezone(ZoneInfo("Africa/Cairo"))
+            .date()
+            .isoformat()
+            if evidence["completed_at"] is not None
+            else None
+        ),
+        "source_decision_revision": evidence["source_revision"],
+        "visit_revision": evidence["clinical_revision"],
+        "followup_revision": followup_revision,
+    }
+
+
+def source_decision_control(
+    connection: Connection, actor: AuthorizedStaff, source: dict
+) -> dict | None:
+    """Decision context for an already-authorized Appointment, independent of claims."""
+    evidence = _source_evidence(connection, actor, UUID(source["id"]))
+    if evidence is None:
+        return None
+    revision = connection.scalar(
+        text("""
+            SELECT revision FROM public.clinic_policy_heads
+            WHERE organization_id=:tenant AND kind='FOLLOWUP'
+        """),
+        {"tenant": actor.organization_id},
+    )
+    if revision is None:
+        raise ContractError(409)
+    return _decision_control(
+        actor,
+        source,
+        evidence,
+        _valid_source(connection, actor, source, evidence),
+        revision,
+    )
+
+
+def followup_qualification(
+    connection: Connection,
+    actor: AuthorizedStaff,
+    appointment_id: UUID,
+    intended_date: date,
+) -> dict:
+    """Operational qualification of a selected source appointment, without Visit narrative."""
+    source = appointment_detail(connection, actor, appointment_id)
+    evidence = _source_evidence(connection, actor, appointment_id)
     claim_state = None
     if evidence is not None:
         claim_state = connection.scalar(
@@ -216,24 +314,7 @@ def followup_qualification(
     except (TypeError, ValueError) as invalid:
         raise ContractError(409) from invalid
     eligible = False
-    valid_source = bool(
-        source["status"] == "Completed"
-        and source["service_type"] == "NEW_EXAMINATION"
-        and source["classification"] in ("ROUTINE", "URGENT", "EMERGENCY")
-        and evidence
-        and evidence["completed_at"] is not None
-        and evidence["provenance_state"] == "VERIFIED"
-        and evidence["patient_id"] == UUID(source["patient_id"])
-        and evidence["doctor_staff_id"] == UUID(source["doctor_staff_id"])
-        and connection.scalar(
-            text("""
-                SELECT EXISTS (SELECT 1 FROM public.completion_attestations
-                WHERE organization_id=:tenant AND visit_id=:visit
-                  AND examination_occurred)
-            """),
-            {"tenant": actor.organization_id, "visit": evidence["id"]},
-        )
-    )
+    valid_source = _valid_source(connection, actor, source, evidence)
     if valid_source:
         decision = evidence["decision"]
         completed = evidence["completed_at"].astimezone(ZoneInfo("Africa/Cairo")).date()
@@ -289,46 +370,11 @@ def followup_qualification(
         ],
         "price_quote": price_quote,
     }
-    if evidence:
-        decision = evidence["decision"]
-        author_role = evidence["decision_actor_role"]
-        doctor_restriction = (
-            author_role == "DOCTOR_OWNER"
-            and isinstance(decision, dict)
-            and decision.get("kind") in ("OPTED_OUT", "DEADLINE")
-        )
-        qualification["decision_control"] = {
-            "kind": (
-                "ANCESTRY_UNKNOWN"
-                if evidence["provenance_state"] != "VERIFIED"
-                else decision.get("kind", "NO_DECISION")
-                if isinstance(decision, dict)
-                else "NO_DECISION"
-            ),
-            "deadline_date": (
-                decision.get("deadline_date") if isinstance(decision, dict) else None
-            ),
-            "actor_role": author_role,
-            "can_revise": (
-                valid_source
-                and (
-                    actor.role != "DOCTOR_OWNER"
-                    or evidence["doctor_staff_id"] == actor.staff_id
-                )
-                and (actor.role == "DOCTOR_OWNER" or not doctor_restriction)
-            ),
-            "completion_local_date": (
-                evidence["completed_at"]
-                .astimezone(ZoneInfo("Africa/Cairo"))
-                .date()
-                .isoformat()
-                if evidence["completed_at"] is not None
-                else None
-            ),
-            "source_decision_revision": evidence["source_revision"],
-            "visit_revision": evidence["clinical_revision"],
-            "followup_revision": pricing["FOLLOWUP"]["revision"],
-        }
+    control = _decision_control(
+        actor, source, evidence, valid_source, pricing["FOLLOWUP"]["revision"]
+    )
+    if control is not None:
+        qualification["decision_control"] = control
     return qualification
 
 

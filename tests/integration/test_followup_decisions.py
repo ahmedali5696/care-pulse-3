@@ -28,6 +28,7 @@ from carepulse.visits.eligibility_contracts import (
 from postgres_locks import wait_for_postgres_lock
 from pydantic import ValidationError
 from sqlalchemy import event, text
+from test_appointment_persistence import _activate_clinic
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_booking import booking_effects, booking_request
@@ -156,6 +157,131 @@ def test_followup_read_flags_reject_completed_followup_source(followup_clinic):
         is False
     )
     assert response["data"]["followup_control"]["can_extend"] is False
+    status, detail = booking_request(
+        clinic,
+        clinic.receptionist,
+        method="GET",
+        path=f"/v1/appointments/{confirmed['id']}",
+    )
+    assert status == 200, detail
+    assert (
+        detail["data"]["decision_control"]
+        == response["data"]["followup_qualification"]["decision_control"]
+    )
+    assert detail["data"]["decision_control"]["can_revise"] is False
+
+
+def test_signed_source_detail_controls_decision_with_active_claim(followup_clinic):
+    clinic = followup_clinic
+    source = _source(clinic)
+    confirmed = _confirmed(clinic, source)
+    detail_path = f"/v1/appointments/{source['appointment']}"
+    decision_path = f"/v1/visits/{source['visit']}"
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        frozen = _frozen_claim(connection, confirmed["claim"])
+    before = booking_effects(clinic)
+
+    def read(actor, kind, role, revision, can_revise, deadline=None):
+        status, detail = booking_request(clinic, actor, method="GET", path=detail_path)
+        assert status == 200, detail
+        data = detail["data"]
+        assert "followup_qualification" not in data
+        assert "followup_control" not in data
+        assert data["decision_control"] == {
+            "source_visit_id": str(source["visit"]),
+            "source_decision_revision": revision,
+            "visit_revision": 0,
+            "followup_revision": 1,
+            "kind": kind,
+            "deadline_date": deadline,
+            "completion_local_date": source["day"].isoformat(),
+            "actor_role": role,
+            "can_revise": can_revise,
+        }
+        serialized = json.dumps(data)
+        assert "PRIVATE_OPERATIONAL_REASON" not in serialized
+        assert "followup_decision" not in serialized
+        assert "clinical_revisions" not in serialized
+        return data["decision_control"]
+
+    def decide(actor, context, decision, expected):
+        body = {
+            "expected_source_decision_revision": context["source_decision_revision"],
+            "expected_visit_revision": context["visit_revision"],
+            "expected_followup_revision": context["followup_revision"],
+            "followup_decision": decision,
+        }
+        status, result = _signed_visit_request(
+            clinic,
+            actor,
+            path=decision_path,
+            method="PATCH",
+            body=body,
+            key=str(uuid4()),
+        )
+        assert status == expected, result
+        return result
+
+    reception = clinic.receptionist
+    doctor = clinic.owner
+    context = read(reception, "NO_DECISION", None, 0, True)
+    decide(reception, context, {"kind": "DEFAULT"}, 200)
+    context = read(reception, "DEFAULT", "RECEPTIONIST", 1, True)
+    decide(
+        reception, context, {"kind": "OPTED_OUT", "reason": "Receptionist reason"}, 200
+    )
+    context = read(doctor, "OPTED_OUT", "RECEPTIONIST", 2, True)
+    deadline = (source["day"] + timedelta(days=3)).isoformat()
+    decide(
+        doctor,
+        context,
+        {
+            "kind": "DEADLINE",
+            "deadline_date": deadline,
+            "reason": "PRIVATE_OPERATIONAL_REASON",
+        },
+        200,
+    )
+    context = read(reception, "DEADLINE", "DOCTOR_OWNER", 3, False, deadline)
+    denied_before = _effects(clinic, source["visit"], "visits.followup_decision")
+    decide(reception, context, {"kind": "DEFAULT"}, 403)
+    assert (
+        _effects(clinic, source["visit"], "visits.followup_decision") == denied_before
+    )
+    context = read(doctor, "DEADLINE", "DOCTOR_OWNER", 3, True, deadline)
+    decide(doctor, context, {"kind": "DEFAULT"}, 200)
+    read(reception, "DEFAULT", "DOCTOR_OWNER", 4, True)
+    status, result = booking_request(
+        clinic,
+        reception,
+        method="GET",
+        path=detail_path,
+        query={
+            "intended_service_date": (source["day"] + timedelta(days=2)).isoformat()
+        },
+    )
+    assert status == 409, result
+    assert "data" not in result
+    with clinic.migration.begin() as connection:
+        operator = connection.scalar(
+            text(
+                "SELECT created_by_operator_id FROM public.organizations WHERE id=:tenant"
+            ),
+            {"tenant": clinic.other},
+        )
+        foreign_doctor = _activate_clinic(connection, clinic.other, operator)
+    with transaction(clinic.runtime, clinic.other) as connection:
+        foreign = _v2_source(connection, clinic.other, foreign_doctor)
+    for actor in (reception, doctor):
+        for hidden in (foreign["appointment"], uuid4()):
+            status, result = booking_request(
+                clinic, actor, method="GET", path=f"/v1/appointments/{hidden}"
+            )
+            assert status == 404, result
+            assert "data" not in result
+    assert booking_effects(clinic) == before
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert _frozen_claim(connection, confirmed["claim"]) == frozen
 
 
 def test_receptionist_extension_flag_tracks_doctor_deadline_and_effective_claim(

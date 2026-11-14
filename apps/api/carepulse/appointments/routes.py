@@ -18,6 +18,7 @@ from carepulse.appointments.queries import (
     confirmed_followup_control,
     followup_qualification,
     list_appointments,
+    source_decision_control,
 )
 from carepulse.identity.authorization import protected_transaction
 from carepulse.identity.contracts import (
@@ -140,4 +141,9 @@ def get_appointment(appointment_id: UUID, request: Request):
             projection["followup_qualification"] = followup_qualification(
                 connection, actor, appointment_id, preview.intended_service_date
             )
+            control = projection["followup_qualification"].get("decision_control")
+        else:
+            control = source_decision_control(connection, actor, projection)
+        if control is not None:
+            projection["decision_control"] = control
         return success_response(projection, projection["revision"])

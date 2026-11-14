@@ -25,6 +25,7 @@ from test_appointment_persistence import (
 from test_appointment_persistence import (
     appointment_storage as appointment_storage,  # noqa: PLC0414 - fixture export
 )
+from test_b10_writer_migration import _t177_upgrade_proof
 from test_database import (
     ROOT,
     _create_empty_database,
@@ -421,7 +422,7 @@ def test_postgresql_final_check_accepts_python_confirmed_corpus(
 
 
 def test_t145_upgrade_preserves_historical_numeric_percentage_and_receipt(
-    admin, empty_database
+    admin, empty_database, tmp_path
 ):
     _create_empty_database(admin, empty_database)
     migration = _engine("carepulse_migration", empty_database)
@@ -542,8 +543,7 @@ def test_t145_upgrade_preserves_historical_numeric_percentage_and_receipt(
                     ),
                 },
             )
-        _at_revision(migration, T145_AFTER)
-        _at_revision(migration, T145_AFTER)
+        _t177_upgrade_proof(migration, T145_BEFORE, T145_AFTER, tmp_path)
         with migration.connect() as conn:
             assert conn.execute(
                 text("""

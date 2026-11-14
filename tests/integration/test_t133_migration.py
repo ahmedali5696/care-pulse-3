@@ -1,6 +1,5 @@
 """D-08/T133: forward-only 0033 upgrade and ungranted terminal ACL."""
 
-import shutil
 from pathlib import Path
 from uuid import uuid4
 
@@ -12,11 +11,13 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _activate_clinic
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
+from test_b10_writer_migration import _t177_receipt, _t177_upgrade_proof
 from test_database import _create_empty_database, _engine
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
 from test_followup_persistence import _v2_booking, _v2_command, _v2_record, _v2_source
+from test_visit_migration import _prepare
 
 ROOT = Path(__file__).resolve().parents[2]
 BEFORE = "0032_b10_cairo_offset_guard"
@@ -212,49 +213,19 @@ def test_t133_populated_0032_upgrade_preserves_claim_and_new_exam(
 def test_t133_failed_upgrade_0032_rolls_back_every_new_object(
     admin, empty_database, tmp_path
 ):
-    _create_empty_database(admin, empty_database)
-    migration = _engine("carepulse_migration", empty_database)
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
     try:
         _upgrade_to(migration, BEFORE)
-        scripts = tmp_path / "migrations"
-        shutil.copytree(ROOT / "db/migrations", scripts)
-        successor = scripts / "versions/0033_d08_terminal_writer.py"
-        successor.write_text(
-            'from alembic import op\nrevision="0033_d08_terminal_writer"\n'
-            'down_revision="0032_b10_cairo_offset_guard"\n'
-            "def upgrade():\n"
-            '    op.execute("CREATE TABLE public.t133_failed_upgrade (id integer)")\n'
-            '    op.execute("SELECT 1 / 0")\n',
-            encoding="utf-8",
-        )
-        with pytest.raises(DBAPIError) as failed:
-            _upgrade_to(migration, "head", scripts)
-        assert failed.value.orig.sqlstate == "22012"
+        with transaction(runtime, tenant) as connection:
+            source = _v2_source(connection, tenant, doctor)
+            claim = _v2_command(
+                connection, "create_followup_claim", source, **_v2_booking(source)
+            )
+            assert claim is not None
+        _t177_receipt(migration, tenant, doctor, claim)
+        _t177_upgrade_proof(migration, BEFORE, AFTER, tmp_path)
         with migration.connect() as connection:
-            assert (
-                connection.scalar(
-                    text("SELECT version_num FROM public.alembic_version")
-                )
-                == BEFORE
-            )
-            assert (
-                connection.scalar(
-                    text("SELECT to_regclass('public.t133_failed_upgrade')")
-                )
-                is None
-            )
-            assert (
-                connection.scalar(
-                    text("SELECT to_regprocedure(:signature)"), {"signature": TERMINAL}
-                )
-                is None
-            )
-            assert (
-                connection.scalar(
-                    text("SELECT to_regprocedure(:signature)"), {"signature": LEGACY}
-                )
-                is not None
-            )
-        _upgrade_to(migration, AFTER)
+            assert _acl(connection) == ("carepulse_migration", False, False, False)
     finally:
+        runtime.dispose()
         migration.dispose()

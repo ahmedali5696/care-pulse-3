@@ -63,6 +63,12 @@ def _local_slot(slot) -> LocalSlot:
 
 
 def _to_config(body: ScheduleConfigInput, confirmation=None) -> ScheduleConfig:
+    duration = (
+        Decimal(body.duration_minutes) if body.duration_minutes is not None else None
+    )
+    # Published SCHEDULE durations are PostgreSQL JSONB NUMERIC, not JSON strings.
+    if duration is not None and duration.adjusted() >= 131_072:
+        raise ContractError(422)
     approval = (
         OverlapCapacityConfirmation(
             confirmation.capacity, confirmation.capacity_revision
@@ -72,9 +78,7 @@ def _to_config(body: ScheduleConfigInput, confirmation=None) -> ScheduleConfig:
     )
     return ScheduleConfig(
         booking_mode=body.booking_mode,
-        duration_minutes=int(Decimal(body.duration_minutes))
-        if body.duration_minutes is not None
-        else None,
+        duration_minutes=int(duration) if duration is not None else None,
         holiday_booking_enabled=body.holiday_booking_enabled,
         allow_overlap=body.allow_overlap,
         no_show_cutoff=NoShowCutoff(

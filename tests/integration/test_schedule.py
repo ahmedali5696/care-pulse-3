@@ -22,9 +22,11 @@ from carepulse.main import app
 from carepulse.policies.schedule_contracts import ScheduleActivate, SchedulePatch
 from carepulse.policies.schedule_service import (
     activate,
+    load_current_schedule,
     read_schedule,
     stage_or_preview,
 )
+from carepulse.policies.slots import candidates_for_date
 from sqlalchemy import text
 from test_appointment_persistence import (
     _admit_saved,
@@ -540,8 +542,8 @@ def test_owner_patch_and_preview_stage_without_publication_then_activate(
 
 @pytest.mark.parametrize(
     "duration",
-    ["9007199254740993", "9" * 4301],
-    ids=["js_precision", "over_4300_digits"],
+    ["9007199254740993", "9" * 4301, "9" * 131_072],
+    ids=["js_precision", "over_4300_digits", "postgres_numeric_boundary"],
 )
 def test_duration_string_survives_signed_http_activation_and_preserves_history(
     patient_backend, duration
@@ -559,10 +561,14 @@ def test_duration_string_survives_signed_http_activation_and_preserves_history(
         "config": candidate,
         "overlap_capacity_confirmation": None,
     }
+    stage_key = str(uuid4())
     status, staged = _schedule_request(
-        clinic, clinic.owner, method="PATCH", body=body, key=str(uuid4())
+        clinic, clinic.owner, method="PATCH", body=body, key=stage_key
     )
     assert status == 200 and staged["data"]["revisions"]["schedule"] == 1
+    assert _schedule_request(
+        clinic, clinic.owner, method="PATCH", body=body, key=stage_key
+    ) == (status, staged)
     assert (
         _schedule_request(clinic, clinic.owner)[1]["data"]["config"]["duration_minutes"]
         is None
@@ -577,21 +583,38 @@ def test_duration_string_survives_signed_http_activation_and_preserves_history(
         key=str(uuid4()),
     )
     assert status == 200 and preview["data"]["affected"] == []
+    activation = {
+        "preview_id": preview["data"]["preview_id"],
+        "expected_schedule_revision": 1,
+        "expected_capacity_revision": 1,
+        "reason": "Synthetic duration activation",
+    }
+    activation_key = str(uuid4())
     status, published = _schedule_request(
         clinic,
         clinic.owner,
         method="POST",
         suffix="/activate",
-        body={
-            "preview_id": preview["data"]["preview_id"],
-            "expected_schedule_revision": 1,
-            "expected_capacity_revision": 1,
-            "reason": "Synthetic duration activation",
-        },
-        key=str(uuid4()),
+        body=activation,
+        key=activation_key,
     )
     assert status == 200 and published["data"]["schedule_revision"] == 2
     assert published["data"]["config"]["duration_minutes"] == duration
+    assert _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/activate",
+        body=activation,
+        key=activation_key,
+    ) == (status, published)
+    with transaction(clinic.runtime, clinic.tenant) as connection:
+        assert (
+            candidates_for_date(
+                load_current_schedule(connection, clinic.tenant), SERVICE_DAY
+            )
+            == ()
+        )
 
     status, raw = _schedule_request(clinic, clinic.owner, raw_response=True)
     assert status == 200
@@ -668,6 +691,86 @@ def test_duration_string_survives_signed_http_activation_and_preserves_history(
             (2, "number", duration),
             (3, "number", duration),
         ]
+
+
+def test_unrepresentable_duration_denies_stage_preview_and_retained_activation(
+    patient_backend,
+):
+    clinic = patient_backend
+    app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
+    invalid_duration = "1" + "0" * 131_072
+
+    def effects():
+        with clinic.migration.connect() as connection:
+            return connection.execute(
+                text("""
+                    SELECT (SELECT count(*) FROM public.clinic_policy_versions),
+                           (SELECT revision FROM public.clinic_policy_heads
+                            WHERE kind='SCHEDULE' AND organization_id=:tenant),
+                           (SELECT count(*) FROM public.clinic_policy_previews),
+                           (SELECT count(*) FROM public.idempotency_receipts),
+                           (SELECT count(*) FROM public.sensitive_audit),
+                           (SELECT count(*) FROM public.outbox_events)
+                """),
+                {"tenant": clinic.tenant},
+            ).one()
+
+    before = effects()
+    body = _patch(_config(duration_minutes=invalid_duration)).model_dump(mode="json")
+    for method, suffix in (("PATCH", ""), ("POST", "/preview")):
+        key = str(uuid4())
+        for _ in range(2):
+            status, denied = _schedule_request(
+                clinic, clinic.owner, method=method, suffix=suffix, body=body, key=key
+            )
+            assert status == 422 and denied["error"]["code"] == "INVALID_INPUT"
+            assert effects() == before
+
+    valid_body = _patch(_config()).model_dump(mode="json")
+    status, staged = _schedule_request(
+        clinic, clinic.owner, method="PATCH", body=valid_body, key=str(uuid4())
+    )
+    assert status == 200
+    retained_id = uuid4()
+    # Reproduce a pre-fix persisted candidate without altering immutable previews.
+    with clinic.migration.begin() as connection:
+        connection.execute(
+            text("""
+                INSERT INTO public.clinic_policy_previews
+                    (id,organization_id,policy_kind,policy_version,policy_revision,
+                     service_day_revision,actor_staff_id,actor_security_revision,
+                     selected_refs,affected_refs,record_revisions,candidate_payload)
+                SELECT :id,organization_id,policy_kind,policy_version,policy_revision,
+                       service_day_revision,actor_staff_id,actor_security_revision,
+                       selected_refs,affected_refs,record_revisions,
+                       jsonb_set(candidate_payload,'{config,duration_minutes}',
+                                 to_jsonb(CAST(:duration AS text)))
+                FROM public.clinic_policy_previews WHERE id=:original
+            """),
+            {
+                "id": retained_id,
+                "original": UUID(staged["data"]["preview_id"]),
+                "duration": invalid_duration,
+            },
+        )
+    before = effects()
+    key = str(uuid4())
+    for _ in range(2):
+        status, denied = _schedule_request(
+            clinic,
+            clinic.owner,
+            method="POST",
+            suffix="/activate",
+            body={
+                "preview_id": str(retained_id),
+                "expected_schedule_revision": 1,
+                "expected_capacity_revision": 1,
+                "reason": "Synthetic retained candidate",
+            },
+            key=key,
+        )
+        assert status == 422 and denied["error"]["code"] == "INVALID_INPUT"
+        assert effects() == before
 
 
 @pytest.mark.parametrize("numeric", [30, 9007199254740993, 30.0])

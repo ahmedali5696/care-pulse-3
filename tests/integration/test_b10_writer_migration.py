@@ -29,6 +29,255 @@ DURATION_AFTER = "0038_t159_duration_numeric"
 CAPACITY_AFTER = "0039_t160_capacity_numeric"
 
 
+def _t177_rows(connection, tables, *, legacy_price=False):
+    rows = {}
+    for table in tables:
+        projection = "to_jsonb(t)"
+        if legacy_price and table == "appointment_price_snapshots":
+            projection += " - 'discount_percent_text'"
+        rows[table] = (
+            connection.execute(
+                text(f"SELECT ({projection})::text FROM public.{table} t ORDER BY 1")
+            )
+            .scalars()
+            .all()
+        )
+    return rows
+
+
+def _t177_catalog(connection):
+    queries = {
+        "functions": """
+            SELECT p.oid, p.oid::regprocedure::text, pg_get_functiondef(p.oid),
+                   p.proowner, p.proacl::text,
+                   has_function_privilege('carepulse_runtime',p.oid,'EXECUTE'),
+                   has_function_privilege('carepulse_operator',p.oid,'EXECUTE'),
+                   EXISTS (SELECT 1 FROM aclexplode(coalesce(p.proacl,
+                       acldefault('f',p.proowner))) a WHERE a.grantee=0)
+            FROM pg_proc p WHERE p.pronamespace='public'::regnamespace
+              AND p.prokind IN ('f','p') ORDER BY p.oid
+        """,
+        "tables": """
+            SELECT c.relname, c.relowner, c.relacl::text,
+                   c.relrowsecurity, c.relforcerowsecurity,
+                   r.rolname, p.privilege, has_table_privilege(r.oid,c.oid,p.privilege)
+            FROM pg_class c CROSS JOIN pg_roles r
+            CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'),
+                               ('TRUNCATE'), ('REFERENCES'), ('TRIGGER')) p(privilege)
+            WHERE c.relnamespace='public'::regnamespace AND c.relkind='r'
+              AND r.rolname IN ('carepulse_runtime','carepulse_operator')
+            ORDER BY c.relname,r.rolname,p.privilege
+        """,
+        "columns": """
+            SELECT c.relname, a.attname, r.rolname, p.privilege, a.attacl::text,
+                   has_column_privilege(r.oid,c.oid,a.attnum,p.privilege)
+            FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid
+            CROSS JOIN pg_roles r
+            CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')) p(privilege)
+            WHERE c.relnamespace='public'::regnamespace AND c.relkind='r'
+              AND a.attnum>0 AND NOT a.attisdropped
+              AND r.rolname IN ('carepulse_runtime','carepulse_operator')
+            ORDER BY c.relname,a.attname,r.rolname,p.privilege
+        """,
+        "column_definitions": """
+            SELECT c.relname,a.attname,a.attnotnull,format_type(a.atttypid,a.atttypmod),
+                   pg_get_expr(d.adbin,d.adrelid)
+            FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid
+            LEFT JOIN pg_attrdef d ON (d.adrelid,d.adnum)=(a.attrelid,a.attnum)
+            WHERE c.relnamespace='public'::regnamespace AND c.relkind='r'
+              AND a.attnum>0 AND NOT a.attisdropped ORDER BY c.relname,a.attname
+        """,
+        "constraints": """
+            SELECT oid,conname,conrelid,convalidated,pg_get_constraintdef(oid)
+            FROM pg_constraint WHERE connamespace='public'::regnamespace ORDER BY oid
+        """,
+        "triggers": """
+            SELECT t.oid,t.tgenabled,pg_get_triggerdef(t.oid)
+            FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
+            WHERE c.relnamespace='public'::regnamespace ORDER BY t.oid
+        """,
+        "policies": """
+            SELECT tablename,policyname,permissive,roles,cmd,qual,with_check
+            FROM pg_policies WHERE schemaname='public' ORDER BY tablename,policyname
+        """,
+    }
+    return {name: connection.execute(text(sql)).all() for name, sql in queries.items()}
+
+
+def _t177_upgrade_proof(migration, predecessor, successor, tmp_path):
+    revision = text("SELECT version_num FROM public.alembic_version")
+    tables = (
+        "organizations",
+        "staff_accounts",
+        "patients",
+        "appointments",
+        "appointment_history",
+        "appointment_price_snapshots",
+        "appointment_number_assignments",
+        "appointment_day_counters",
+        "clinic_policy_versions",
+        "clinic_policy_heads",
+        "clinic_schedule_intervals",
+        "clinic_schedule_holidays",
+        "followup_claims",
+        "followup_extensions",
+        "followup_source_state",
+        "followup_source_decision_events",
+        "followup_authorization_events",
+        "completion_attestations",
+        "visits",
+        "clinical_revisions",
+        "queue_entries",
+        "queue_days",
+        "sensitive_audit",
+        "outbox_events",
+        "idempotency_receipts",
+    )
+    with migration.connect() as connection:
+        assert connection.scalar(revision) == predecessor
+        catalog = _t177_catalog(connection)
+        retained = _t177_rows(connection, tables)
+        assert retained["appointments"] and retained["appointment_history"]
+        assert (
+            retained["appointment_price_snapshots"] and retained["idempotency_receipts"]
+        )
+        assert retained["clinic_policy_versions"]
+        if successor != "0034_t145_exact_percentage":
+            assert retained["followup_claims"] and retained["completion_attestations"]
+
+    scripts = tmp_path / successor
+    shutil.copytree(ROOT / "db/migrations", scripts)
+    migration_file = scripts / "versions" / f"{successor}.py"
+    original = migration_file.read_text(encoding="utf-8")
+    migration_file.write_text(
+        original
+        + "\n\n_t177_original_upgrade = upgrade\n\ndef upgrade():\n"
+        + '    _t177_original_upgrade()\n    op.execute("SELECT 1 / 0")\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(DBAPIError) as failed:
+        _upgrade(migration, successor, scripts)
+    assert failed.value.orig.sqlstate == "22012"
+    with migration.connect() as connection:
+        assert connection.scalar(revision) == predecessor
+        assert _t177_catalog(connection) == catalog
+        assert _t177_rows(connection, tables) == retained
+
+    _upgrade(migration, successor)
+    with migration.connect() as connection:
+        assert connection.scalar(revision) == successor
+        upgraded = _t177_catalog(connection)
+        assert upgraded != catalog
+        assert upgraded["tables"] == catalog["tables"]
+        assert upgraded["policies"] == catalog["policies"]
+        previous_functions = {row[0]: row for row in catalog["functions"]}
+        functions = {row[0]: row for row in upgraded["functions"]}
+        assert previous_functions.keys() <= functions.keys()
+        for oid, previous in previous_functions.items():
+            current = functions[oid]
+            assert current[3] == previous[3]
+            if current[1] != previous[1]:
+                assert current[5:] == (False, False, False)
+            else:
+                assert current[4:] == previous[4:]
+        runtime_entrypoints = {
+            "create_followup_claim_ordered",
+            "complete_examined_visit",
+            "t145_percent_valid",
+            "t145_decimal_compare_rational",
+            "t145_percent_net_matches",
+        }
+        for oid in functions.keys() - previous_functions.keys():
+            current = functions[oid]
+            name = current[1].split("(")[0].removeprefix("public.")
+            assert current[5:] == (name in runtime_entrypoints, False, False)
+        legacy_price = successor == "0034_t145_exact_percentage"
+        columns = upgraded["columns"]
+        if legacy_price:
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM public.appointment_price_snapshots WHERE discount_percent_text IS NOT NULL"
+                    )
+                )
+                == 0
+            )
+            columns = [
+                row
+                for row in columns
+                if row[:2] != ("appointment_price_snapshots", "discount_percent_text")
+            ]
+        assert columns == catalog["columns"]
+        assert _t177_rows(connection, tables, legacy_price=legacy_price) == retained
+        after_rows = _t177_rows(connection, tables)
+    _upgrade(migration, successor)
+    with migration.connect() as connection:
+        assert connection.scalar(revision) == successor
+        assert _t177_catalog(connection) == upgraded
+        assert _t177_rows(connection, tables) == after_rows
+
+
+def _t177_receipt(migration, tenant, doctor, claim):
+    with migration.begin() as connection:
+        connection.execute(
+            text("""
+                INSERT INTO public.idempotency_receipts
+                    (id,scope_kind,scope_id,actor_kind,actor_id,organization_id,
+                     staff_id,operation,idempotency_key,request_digest,result_projection,
+                     result_revision)
+                VALUES (:id,'TENANT',:tenant,'STAFF',:doctor,:tenant,:doctor,
+                        'appointments.book',:key,:digest,CAST(:projection AS jsonb),0)
+            """),
+            {
+                "id": uuid4(),
+                "tenant": tenant,
+                "doctor": doctor,
+                "key": str(uuid4()),
+                "digest": "0" * 64,
+                "projection": json.dumps({"claim_id": str(claim)}),
+            },
+        )
+
+
+def test_t177_populated_writer_and_offset_successors_are_atomic(
+    admin, empty_database, tmp_path
+):
+    migration, runtime, tenant, doctor = _prepare(admin, empty_database)
+    try:
+        _upgrade(migration, PROOF_AFTER)
+        with transaction(runtime, tenant) as connection:
+            source = _v2_source(connection, tenant, doctor)
+            claim = _v2_command(
+                connection, "create_followup_claim", source, **_v2_booking(source)
+            )
+            assert claim is not None
+        _t177_receipt(migration, tenant, doctor, claim)
+        _t177_upgrade_proof(migration, PROOF_AFTER, GUARD_AFTER, tmp_path)
+        day = source["day"] + timedelta(days=1)
+        _publish_bookable_policies(migration, tenant, timed_day=day)
+        with transaction(runtime, tenant) as connection:
+            timed_source = _v2_source(connection, tenant, doctor)
+            start = datetime.combine(day, time(9), ZoneInfo("Africa/Cairo"))
+            timed_claim = _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                timed_source,
+                **_priced_booking(
+                    timed_source,
+                    service_date=day.isoformat(),
+                    booking_mode="EXACT_TIME",
+                    starts_at=start.isoformat(),
+                    ends_at=(start + timedelta(hours=1)).isoformat(),
+                ),
+            )
+            assert timed_claim is not None
+        _t177_receipt(migration, tenant, doctor, timed_claim)
+        _t177_upgrade_proof(migration, GUARD_AFTER, OFFSET_AFTER, tmp_path)
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
 def _publish_bookable_policies(
     migration,
     tenant,
@@ -172,13 +421,34 @@ def _writer_effect_counts(connection, tenant):
 
 
 def test_t159_duration_successor_preserves_saved_policy_and_private_guard(
-    admin, empty_database
+    admin, empty_database, tmp_path
 ):
     migration, runtime, tenant, doctor = _prepare(admin, empty_database)
     try:
         _upgrade(migration, UNICODE_AFTER)
         day = date(2030, 5, 6)
         _publish_bookable_policies(migration, tenant, timed_day=day)
+        with transaction(runtime, tenant) as connection:
+            historical = _v2_source(connection, tenant, doctor)
+            start = datetime.combine(day, time(10), ZoneInfo("Africa/Cairo"))
+            claim = _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                historical,
+                **_priced_booking(
+                    historical,
+                    service_date=day.isoformat(),
+                    booking_mode="EXACT_TIME",
+                    starts_at=start.isoformat(),
+                    ends_at=(start + timedelta(hours=1)).isoformat(),
+                    new_booking_date_exception={
+                        "selected_service_date": day.isoformat(),
+                        "reason": "Reviewed historical booking",
+                    },
+                ),
+            )
+            assert claim is not None
+        _t177_receipt(migration, tenant, doctor, claim)
         with migration.begin() as connection:
             connection.execute(
                 text("""
@@ -250,8 +520,7 @@ def test_t159_duration_successor_preserves_saved_policy_and_private_guard(
                 )
             assert denied.value.orig.sqlstate == "22P02"
 
-        _upgrade(migration, DURATION_AFTER)
-        _upgrade(migration, DURATION_AFTER)
+        _t177_upgrade_proof(migration, UNICODE_AFTER, DURATION_AFTER, tmp_path)
         with migration.connect() as connection:
             assert (
                 connection.execute(
@@ -451,7 +720,7 @@ def test_t160_populated_schedule_guard_and_failed_successor_are_atomic(
 
 
 def test_t155_unicode_blank_reasons_deny_new_evidence_and_preserve_history(
-    admin, empty_database
+    admin, empty_database, tmp_path
 ):
     migration, runtime, tenant, doctor = _prepare(admin, empty_database)
     expected = {"source_revision": 0, "clinical_revision": 0, "policy_version": 1}
@@ -480,6 +749,15 @@ def test_t155_unicode_blank_reasons_deny_new_evidence_and_preserve_history(
         with transaction(runtime, tenant) as connection:
             historical_source = _v2_source(connection, tenant, doctor)
             assert decision(connection, historical_source, "\u3000") == 1
+            booked_source = _v2_source(connection, tenant, doctor)
+            claim = _v2_command(
+                connection,
+                "create_followup_claim_ordered",
+                booked_source,
+                **_priced_booking(booked_source),
+            )
+            assert claim is not None
+        _t177_receipt(migration, tenant, doctor, claim)
         with migration.connect() as connection:
             old_evidence = connection.scalar(
                 text("""
@@ -488,8 +766,7 @@ def test_t155_unicode_blank_reasons_deny_new_evidence_and_preserve_history(
                 """),
                 {"tenant": tenant, "visit": historical_source["visit"]},
             )
-        _upgrade(migration, UNICODE_AFTER)
-        _upgrade(migration, UNICODE_AFTER)
+        _t177_upgrade_proof(migration, PARITY_AFTER, UNICODE_AFTER, tmp_path)
         with migration.connect() as connection:
             assert (
                 connection.scalar(
@@ -845,7 +1122,7 @@ def test_cairo_offset_guard_rejects_false_offset_and_accepts_cairo_and_utc(
 
 
 def test_exact_writer_rejects_submicrosecond_rounding_without_effects(
-    admin, empty_database
+    admin, empty_database, tmp_path
 ):
     migration, runtime, tenant, doctor = _prepare(admin, empty_database)
     try:
@@ -894,6 +1171,7 @@ def test_exact_writer_rejects_submicrosecond_rounding_without_effects(
                     is not None
                 )
                 savepoint.rollback()
+        _t177_receipt(migration, tenant, doctor, previous_claim)
         with migration.connect() as connection:
             saved = connection.execute(
                 text("""
@@ -905,8 +1183,10 @@ def test_exact_writer_rejects_submicrosecond_rounding_without_effects(
                 """),
                 {"tenant": tenant, "claim": previous_claim},
             ).one()
-        _upgrade(migration, EXACT_AFTER)
-        _upgrade(migration, PARITY_AFTER)
+        _t177_upgrade_proof(
+            migration, "0034_t145_exact_percentage", EXACT_AFTER, tmp_path
+        )
+        _t177_upgrade_proof(migration, EXACT_AFTER, PARITY_AFTER, tmp_path)
         with migration.connect() as connection:
             assert (
                 connection.execute(
