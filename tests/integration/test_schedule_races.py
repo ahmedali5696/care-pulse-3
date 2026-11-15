@@ -20,8 +20,8 @@ from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _draft, _patient, _query
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
+from test_booking_races import _activation_checkpoint
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
-from test_pricing import _blocked_by
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 from test_schedule import (
     SERVICE_DAY,
@@ -264,16 +264,17 @@ def test_direct_identical_activation_rechecks_receipt_after_authority_lock(
         with activation_transaction() as (connection, actor):
             return _activate(connection, actor, preview, key=key)
 
+    waiting_pid, ready = [], Event()
     with ThreadPoolExecutor(max_workers=1) as pool:
         with activation_transaction() as (holder, actor):
             original = _activate(holder, actor, preview, key=key)
             holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
-            future = pool.submit(retry)
             # F01 serializes requests before the schedule-head lock can be reached.
-            waiting_pid = _blocked_by(clinic, holder_pid)
-            with transaction(clinic.migration, clinic.tenant) as observer:
-                blocked_sql = _blocked_query(observer, waiting_pid, holder_pid)
-            assert "public.f01_activate()" in blocked_sql
+            with _activation_checkpoint(clinic, waiting_pid, ready):
+                future = pool.submit(retry)
+                assert ready.wait(timeout=15)
+                with transaction(clinic.migration, clinic.tenant) as observer:
+                    wait_for_postgres_lock(observer, waiting_pid[0], holder_pid)
         replay = future.result(timeout=30)
     assert replay == original
     assert original["schedule_revision"] == 2
