@@ -76,6 +76,9 @@ def test_running_service_state():
 
 def test_incompatible_revision_denies_then_recovers_without_schema_creation():
     with _admin() as admin:
+        (original_revision,) = admin.execute(
+            "SELECT version_num FROM public.alembic_version"
+        ).fetchone()
         original_tables = set(
             admin.execute(
                 "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
@@ -90,7 +93,7 @@ def test_incompatible_revision_denies_then_recovers_without_schema_creation():
         finally:
             admin.execute(
                 "UPDATE public.alembic_version SET version_num = %s",
-                ("0040_t173_numeric_money",),
+                (original_revision,),
             )
         _eventually()
         assert (
