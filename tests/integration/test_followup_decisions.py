@@ -51,7 +51,12 @@ from test_followups import (
 )
 from test_followups import followup_clinic as followup_clinic  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
-from test_pricing import _patch, pricing_request
+from test_pricing import (
+    _fresh_receptionist_session,
+    _owner_changes_manager,
+    _patch,
+    pricing_request,
+)
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 
 
@@ -835,6 +840,8 @@ def test_doctor_decision_appends_actual_operational_evidence_without_clinical_ch
         assert projection["followup_decision"] == command.followup_decision.model_dump(
             mode="json", exclude_none=True
         )
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+    with migration.connect() as connection:
         assert connection.execute(
             text(
                 "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
@@ -850,8 +857,6 @@ def test_doctor_decision_appends_actual_operational_evidence_without_clinical_ch
             )
             == 0
         )
-        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
-    with migration.connect() as connection:
         event = connection.execute(
             text("""
             SELECT e.source_revision, e.actor_staff_id, e.actor_role,
@@ -884,21 +889,8 @@ def test_receptionist_can_amend_own_decision_with_authorship_preserved(
     staff = UUID(clinic.receptionist.staff_id)
     identity = clinic.receptionist
     if manager:
-        with migration.begin() as connection:
-            connection.execute(
-                text(
-                    "UPDATE public.staff_accounts SET operational_manager=true, security_revision=security_revision+1 WHERE organization_id=:tenant AND id=:staff"
-                ),
-                {"tenant": tenant, "staff": staff},
-            )
-        identity = replace(identity, security_revision="1")
-        with migration.begin() as connection:
-            connection.execute(
-                text(
-                    'UPDATE public."session" SET "securityRevision"=1 WHERE id=:session'
-                ),
-                {"session": identity.session_id},
-            )
+        _owner_changes_manager(clinic, True, 0)
+        identity = _fresh_receptionist_session(clinic, 1)
     source = _source(clinic)
     command = _decision(
         "DEADLINE",
@@ -923,13 +915,13 @@ def test_receptionist_can_amend_own_decision_with_authorship_preserved(
             connection, actor, source["visit"], command, key
         )
         assert (first["revision"], second["revision"]) == (1, 2)
+    with migration.connect() as connection:
         assert connection.execute(
             text(
                 "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
             ),
             {"visit": source["visit"]},
         ).one() == (0, None)
-    with migration.connect() as connection:
         events = connection.execute(
             text("""
             SELECT source_revision, actor_staff_id, actor_role, before_decision, decision
@@ -1010,7 +1002,7 @@ def test_denied_decision_keeps_clinical_operational_and_receipt_evidence_empty(
     patient_backend, case, status, code
 ):
     clinic = patient_backend
-    tenant, doctor = clinic.tenant, UUID(clinic.owner.staff_id)
+    tenant = clinic.tenant
     source = _source(clinic)
     command = _decision(
         "DEADLINE",
@@ -1027,11 +1019,16 @@ def test_denied_decision_keeps_clinical_operational_and_receipt_evidence_empty(
                 text(
                     "UPDATE public.staff_accounts SET enabled=false, security_revision=security_revision+1 WHERE id=:staff"
                 ),
-                {"staff": doctor},
+                {"staff": UUID(clinic.receptionist.staff_id)},
             )
     with (
         pytest.raises(ContractError) as denied,
-        signed_command_transaction(clinic, command, visit=source["visit"]) as (
+        signed_command_transaction(
+            clinic,
+            command,
+            visit=source["visit"],
+            actor=clinic.receptionist if case == "disabled" else clinic.owner,
+        ) as (
             connection,
             actor,
             key,
@@ -1039,20 +1036,15 @@ def test_denied_decision_keeps_clinical_operational_and_receipt_evidence_empty(
     ):
         record_followup_decision(
             connection,
-            replace(actor, role="OPERATOR") if case == "operator" else actor,
+            replace(actor, role="OPERATOR", _legacy_bulk_reschedule=False)
+            if case == "operator"
+            else actor,
             source["visit"],
             command,
             key,
         )
     assert (denied.value.status_code, denied.value.code) == (status, code)
     with transaction(clinic.migration, tenant) as connection:
-        if case == "disabled":
-            connection.execute(
-                text(
-                    "UPDATE public.staff_accounts SET enabled=true, security_revision=security_revision+1 WHERE id=:staff"
-                ),
-                {"staff": doctor},
-            )
         assert connection.execute(
             text(
                 "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
@@ -1266,7 +1258,7 @@ def test_signed_followup_retry_waits_for_organization_lock_then_replays(
             assert release_original.wait(timeout=30)
 
     def observe_signed_retry(connection, _cursor, statement, _params, _context, _many):
-        if receipt_inserted.is_set() and "public.lock_active_organization" in statement:
+        if receipt_inserted.is_set() and "public.f01_activate()" in statement:
             retry_pid.append(connection.connection.driver_connection.info.backend_pid)
             retry_started.set()
 
@@ -1342,7 +1334,7 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
 
     def observe_sql(connection, cursor, statement, parameters, context, executemany):
         marker = (
-            "SELECT public.lock_active_organization"
+            "SELECT public.f01_activate()"
             if revoke_first
             else "FROM public.idempotency_receipts AS r"
         )
@@ -1972,13 +1964,14 @@ def test_confirmed_extension_appends_authorization_without_clinical_or_price_cha
         assert original[1] == original[0]["revision"] == 1
         assert (original[0]["claim_revision"], original[0]["visit_revision"]) == (1, 0)
         assert _frozen_claim(connection, confirmed["claim"], clinic.tenant) == frozen
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert connection.execute(
             text(
                 "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
             ),
             {"visit": source["visit"]},
         ).one() == (0, None)
-        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
     with signed_command_transaction(
         clinic, command, visit=source["visit"], key=key
     ) as (connection, actor, _):

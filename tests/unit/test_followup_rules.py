@@ -13,6 +13,7 @@ from carepulse.appointments.followup_rules import (
     validate_exception_deadline,
 )
 from carepulse.appointments.followups import _approved_deadline
+from carepulse.visits.eligibility_contracts import ExtendFollowup, FollowupDecision
 from pydantic import ValidationError
 
 COMPLETION = date(2026, 11, 1)
@@ -74,6 +75,23 @@ def test_extension_cannot_shorten_confirmed_deadline():
     )
     with pytest.raises(ValueError):
         extension_must_not_shorten(date(2026, 11, 8), date(2026, 11, 7))
+
+
+@pytest.mark.parametrize("codepoint", [0xD800, 0xDFFF, 0])
+def test_followup_reason_rejects_unrepresentable_text_before_activation(codepoint):
+    reason = f"bad{chr(codepoint)}reason"
+    with pytest.raises(ValidationError):
+        FollowupDecision.model_validate({"kind": "OPTED_OUT", "reason": reason})
+    with pytest.raises(ValidationError):
+        ExtendFollowup.model_validate(
+            {
+                "appointment_id": str(uuid4()),
+                "extended_deadline": "2026-11-10",
+                "reason": reason,
+                "expected_visit_revision": 0,
+                "expected_claim_revision": 1,
+            }
+        )
 
 
 def test_cairo_completion_day_uses_history_instant_after_midnight():

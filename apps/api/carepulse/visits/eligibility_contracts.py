@@ -18,7 +18,9 @@ Revision = Annotated[int, Field(strict=True, ge=0)]
 
 
 def _reason(value: str) -> str:
-    if not value.strip() or any(ord(character) < 32 for character in value):
+    if not value.strip() or any(
+        ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF for character in value
+    ):
         raise ValueError("A nonblank reason is required")
     return value.strip()
 
