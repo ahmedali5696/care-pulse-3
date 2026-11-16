@@ -115,6 +115,31 @@ def _booking_diag(clinic, actor, **kwargs):
         ):
             state["probing"] = True
             try:
+                ex_lines = (
+                    conn.execute(
+                        text(
+                            "EXPLAIN (ANALYZE, COSTS) "
+                            "SELECT count(*) FROM public.appointment_history"
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                diag["ex_h"] = [
+                    line.strip()
+                    for i, line in enumerate(ex_lines)
+                    if i == 0
+                    or any(
+                        k in line
+                        for k in (
+                            "Planning Time",
+                            "Execution Time",
+                            "JIT",
+                            "Functions:",
+                            "Timing:",
+                        )
+                    )
+                ]
                 diag["hist"] = conn.scalar(
                     text("SELECT count(*) FROM public.appointment_history")
                 )
