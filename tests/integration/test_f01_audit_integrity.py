@@ -81,15 +81,31 @@ def _history(
     )
 
 
+def _booking_diag(clinic, actor, **kwargs):
+    errors = []
+
+    def capture(context):
+        errors.append((repr(context.original_exception), context.statement))
+
+    event.listen(clinic.runtime, "handle_error", capture)
+    event.listen(clinic.gate, "handle_error", capture)
+    try:
+        status, payload = booking_request(clinic, actor, **kwargs)
+    finally:
+        event.remove(clinic.runtime, "handle_error", capture)
+        event.remove(clinic.gate, "handle_error", capture)
+    assert status == 201, (payload, errors)
+    return payload
+
+
 def test_booking_history_binds_new_appointment_actor_role_and_creation_event(
     booking_clinic,
 ):
     clinic = booking_clinic
     patient = new_patient(clinic)
-    status, old = booking_request(
+    old = _booking_diag(
         clinic, clinic.owner, body=booking_body(new_patient(clinic)), key=str(uuid4())
     )
-    assert status == 201, old
     previous = UUID(old["data"]["id"])
     body, key = booking_body(patient), str(uuid4())
     checked = []
@@ -474,15 +490,13 @@ def test_operation_resource_read_isolation_across_signed_purposes(followup_clini
         )
     source_a = completed_source(clinic)
     source_b = completed_source(clinic)
-    status_fa, created_fa = booking_request(
+    created_fa = _booking_diag(
         clinic, clinic.owner, body=followup_body(source_a), key=str(uuid4())
     )
-    assert status_fa == 201, created_fa
     followup_a = UUID(created_fa["data"]["id"])
-    status_fb, created_fb = booking_request(
+    created_fb = _booking_diag(
         clinic, clinic.owner, body=followup_body(source_b), key=str(uuid4())
     )
-    assert status_fb == 201, created_fb
     followup_b = UUID(created_fb["data"]["id"])
 
     # 1. SLOTS & SETTINGS_PRICING & SETTINGS_SCHEDULE cannot read clinical/patient tables directly.
