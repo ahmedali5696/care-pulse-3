@@ -29,7 +29,7 @@ from test_booking import booking_body, booking_request, new_patient
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_followups import completed_source, followup_body
 from test_followups import followup_clinic as followup_clinic  # noqa: PLC0414
-from test_patients import PATIENT, create_patient
+from test_patients import PATIENT
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_provisioning import operator_config as operator_config  # noqa: PLC0414
 from test_request_boundary import _signed
@@ -427,9 +427,9 @@ def _count_clinical_tables(connection):
 
 def test_operation_resource_read_isolation_across_signed_purposes(followup_clinic):
     clinic = followup_clinic
-    patient_a = UUID(create_patient(clinic, clinic.owner, PATIENT)["id"])
-    patient_b = UUID(create_patient(clinic, clinic.owner, PATIENT)["id"])
-    archived_patient = UUID(create_patient(clinic, clinic.owner, PATIENT)["id"])
+    patient_a = new_patient(clinic)
+    patient_b = new_patient(clinic)
+    archived_patient = new_patient(clinic)
     with clinic.migration.begin() as connection:
         connection.execute(
             text(

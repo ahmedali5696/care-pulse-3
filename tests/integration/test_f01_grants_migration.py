@@ -379,16 +379,18 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
                 ]
 
         with migration.connect() as connection:
-            assert (
-                connection.execute(
-                    text("""
+            assert connection.execute(
+                text("""
                     SELECT relname,relrowsecurity,relforcerowsecurity FROM pg_class
                     WHERE relnamespace='public'::regnamespace AND relkind='r'
                     ORDER BY relname
                 """)
-                ).all()
-                == original_rls
-            )
+            ).all() == [
+                (name, True, True)
+                if name in ("user", "verification")
+                else (name, rls, force)
+                for name, rls, force in original_rls
+            ]
             assert (
                 connection.scalar(
                     text("""
@@ -608,11 +610,13 @@ def test_f01_grants_cutover_is_atomic_repeatable_and_preserves_rows(
                             'public.f01_schedule_review_appointments(uuid,date)','EXECUTE')
                         AND has_function_privilege('carepulse_api',
                             'public.f01_audit_targets()','EXECUTE')
-                        AND NOT has_function_privilege('PUBLIC',
+                        AND has_function_privilege('carepulse_identity_owner',
+                            'public.native_account_unbound_for_receptionist(uuid,text)','EXECUTE')
+                        AND NOT has_function_privilege('public',
                             'public.f01_counted_appointment_intervals(uuid,date)','EXECUTE')
-                        AND NOT has_function_privilege('PUBLIC',
+                        AND NOT has_function_privilege('public',
                             'public.f01_schedule_review_appointments(uuid,date)','EXECUTE')
-                        AND NOT has_function_privilege('PUBLIC',
+                        AND NOT has_function_privilege('public',
                             'public.f01_audit_targets()','EXECUTE')
                         AND NOT has_schema_privilege('carepulse_identity_owner','public','CREATE')
                         AND NOT has_schema_privilege('carepulse_api','f01_private','USAGE')

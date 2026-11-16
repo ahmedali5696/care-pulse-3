@@ -254,11 +254,12 @@ def upgrade() -> None:
             f01_private.guard_audit_appointment_history(), f01_private.guard_staff_account_insert(),
             f01_private.capture_staff_audit(), f01_private.capture_invitation_audit(),
             f01_private.guard_staff_audit() FROM PUBLIC;
-        GRANT EXECUTE ON FUNCTION public.f01_audit_targets() TO carepulse_api;
+        GRANT EXECUTE ON FUNCTION public.f01_audit_targets()
+            TO carepulse_api, carepulse_migration;
 
-        CREATE TRIGGER f01_capture_audit_patient AFTER INSERT ON public.patients
+        CREATE TRIGGER z_f01_capture_audit_patient BEFORE INSERT ON public.patients
             FOR EACH ROW EXECUTE FUNCTION f01_private.capture_audit_patient();
-        CREATE TRIGGER f01_capture_audit_appointment AFTER INSERT ON public.appointments
+        CREATE TRIGGER z_f01_capture_audit_appointment BEFORE INSERT ON public.appointments
             FOR EACH ROW EXECUTE FUNCTION f01_private.capture_audit_appointment();
         CREATE TRIGGER a_f01_guard_audit_appointment_history BEFORE INSERT ON public.appointment_history
             FOR EACH ROW EXECUTE FUNCTION f01_private.guard_audit_appointment_history();
@@ -273,6 +274,8 @@ def upgrade() -> None:
     """)
     op.execute("""
         RESET ROLE;
+        GRANT EXECUTE ON FUNCTION public.native_account_unbound_for_receptionist(uuid, text)
+            TO carepulse_identity_owner;
         REVOKE TRIGGER ON public.patients, public.appointments, public.appointment_history,
             public.staff_accounts, public.invitations, public.sensitive_audit
             FROM carepulse_identity_owner;
@@ -591,15 +594,17 @@ def upgrade() -> None:
                           ))
                       OR (c.purpose = 'APPOINTMENT_BOOKING' AND c.method = 'POST'
                           AND c.path = '/v1/appointments'
-                          AND appointments.patient_id = c.patient_id
                           AND (
                               a.appointment_id = appointments.id
-                              OR (c.stage = 'PRIMARY' AND EXISTS (
-                                  SELECT 1 FROM public.visits v
-                                  WHERE v.organization_id = appointments.organization_id
-                                    AND v.id = c.source_visit_id
-                                    AND v.appointment_id = appointments.id
-                                    AND v.patient_id = c.patient_id
+                              OR (c.stage = 'PRIMARY' AND (
+                                  appointments.patient_id = c.patient_id
+                                  OR EXISTS (
+                                      SELECT 1 FROM public.visits v
+                                      WHERE v.organization_id = appointments.organization_id
+                                        AND v.id = c.source_visit_id
+                                        AND v.appointment_id = appointments.id
+                                        AND v.patient_id = c.patient_id
+                                  )
                               ))
                               OR EXISTS (
                                   SELECT 1 FROM public.idempotency_receipts r
@@ -687,15 +692,11 @@ def upgrade() -> None:
                               a.appointment_id = appointment_price_snapshots.appointment_id
                               OR EXISTS (
                                   SELECT 1 FROM public.idempotency_receipts r
-                                  JOIN public.appointments ap
-                                    ON ap.organization_id = r.organization_id
-                                   AND ap.id = appointment_price_snapshots.appointment_id
                                   WHERE r.organization_id = appointment_price_snapshots.organization_id
                                     AND r.scope_kind = 'TENANT' AND r.actor_kind = 'STAFF'
                                     AND r.staff_id::text = c.staff_id AND r.actor_id::text = c.staff_id
                                     AND r.operation = 'appointments.book'
                                     AND r.idempotency_key = c.idempotency_key
-                                    AND ap.patient_id = c.patient_id
                                     AND r.result_projection->>'id' = appointment_price_snapshots.appointment_id::text
                               )
                           ))
@@ -735,15 +736,11 @@ def upgrade() -> None:
                               ))
                               OR EXISTS (
                                   SELECT 1 FROM public.idempotency_receipts r
-                                  JOIN public.appointments ap
-                                    ON ap.organization_id = r.organization_id
-                                   AND ap.id = appointment_history.appointment_id
                                   WHERE r.organization_id = appointment_history.organization_id
                                     AND r.scope_kind = 'TENANT' AND r.actor_kind = 'STAFF'
                                     AND r.staff_id::text = c.staff_id AND r.actor_id::text = c.staff_id
                                     AND r.operation = 'appointments.book'
                                     AND r.idempotency_key = c.idempotency_key
-                                    AND ap.patient_id = c.patient_id
                                     AND r.result_projection->>'id' = appointment_history.appointment_id::text
                               )
                           ))
@@ -813,9 +810,10 @@ def upgrade() -> None:
                               )
                           ))
                       OR (c.purpose = 'APPOINTMENT_BOOKING' AND c.method = 'POST'
-                          AND c.path = '/v1/appointments' AND visits.patient_id = c.patient_id
+                          AND c.path = '/v1/appointments'
                           AND (
-                              (c.stage = 'PRIMARY' AND visits.id = c.source_visit_id)
+                              (c.stage = 'PRIMARY' AND visits.id = c.source_visit_id
+                                  AND visits.patient_id = c.patient_id)
                               OR EXISTS (
                                   SELECT 1 FROM public.idempotency_receipts r
                                   JOIN public.followup_claims cl
@@ -882,9 +880,9 @@ def upgrade() -> None:
                           ))
                       OR (c.purpose = 'APPOINTMENT_BOOKING' AND c.method = 'POST'
                           AND c.path = '/v1/appointments'
-                          AND followup_claims.patient_id = c.patient_id
                           AND (
-                              (c.stage = 'PRIMARY' AND followup_claims.source_visit_id = c.source_visit_id)
+                              (c.stage = 'PRIMARY' AND followup_claims.source_visit_id = c.source_visit_id
+                                  AND followup_claims.patient_id = c.patient_id)
                               OR EXISTS (
                                   SELECT 1 FROM public.idempotency_receipts r
                                   WHERE r.organization_id = followup_claims.organization_id
