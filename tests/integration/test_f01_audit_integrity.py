@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, timedelta
 from threading import Event
+from time import monotonic
 from uuid import UUID, uuid4
 
 import pytest
@@ -83,18 +84,71 @@ def _history(
 
 def _booking_diag(clinic, actor, **kwargs):
     errors = []
+    diag = []
+    started = monotonic()
+    state = {"receipt_inserted": False, "probing": False}
 
     def capture(context):
         errors.append((repr(context.original_exception), context.statement))
 
+    def inspect_after(conn, _cursor, statement, _parameters, _context, _many):
+        if state["probing"]:
+            return
+        if "INSERT INTO public.idempotency_receipts" in statement:
+            state["receipt_inserted"] = True
+            return
+        if (
+            state["receipt_inserted"]
+            and "FROM public.idempotency_receipts" in statement
+        ):
+            state["probing"] = True
+            try:
+                targets = conn.execute(
+                    text("SELECT * FROM public.f01_audit_targets()")
+                ).all()
+                ctx = conn.execute(
+                    text(
+                        "SELECT purpose, method, path, stage, patient_id, source_visit_id FROM public.f01_context()"
+                    )
+                ).all()
+                hist = conn.scalar(
+                    text("SELECT count(*) FROM public.appointment_history")
+                )
+                snaps = conn.scalar(
+                    text("SELECT count(*) FROM public.appointment_price_snapshots")
+                )
+                plan = (
+                    conn.execute(
+                        text(
+                            "EXPLAIN (COSTS OFF) SELECT 1 FROM public.appointment_history"
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                diag.append(
+                    {
+                        "elapsed": round(monotonic() - started, 3),
+                        "targets": targets,
+                        "ctx": ctx,
+                        "hist": hist,
+                        "snaps": snaps,
+                        "plan": plan,
+                    }
+                )
+            finally:
+                state["probing"] = False
+
     event.listen(clinic.runtime, "handle_error", capture)
     event.listen(clinic.gate, "handle_error", capture)
+    event.listen(clinic.runtime, "after_cursor_execute", inspect_after)
     try:
         status, payload = booking_request(clinic, actor, **kwargs)
     finally:
+        event.remove(clinic.runtime, "after_cursor_execute", inspect_after)
         event.remove(clinic.runtime, "handle_error", capture)
         event.remove(clinic.gate, "handle_error", capture)
-    assert status == 201, (payload, errors)
+    assert status == 201, (payload, errors, diag, round(monotonic() - started, 3))
     return payload
 
 
