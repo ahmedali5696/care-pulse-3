@@ -27,9 +27,11 @@ def upgrade() -> None:
             ADD COLUMN staff_audit_correlation uuid,
             ADD COLUMN staff_audit_consumed boolean NOT NULL DEFAULT false;
 
+        ALTER FUNCTION public.f01_context() ROWS 1;
+
         CREATE FUNCTION public.f01_audit_targets()
         RETURNS TABLE (patient_id uuid, appointment_id uuid)
-        LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+        LANGUAGE sql VOLATILE SECURITY DEFINER ROWS 1 SET search_path = pg_catalog, pg_temp AS $$
             SELECT a.audit_patient_id, a.audit_appointment_id
             FROM public.f01_context() c
             JOIN f01_private.activations a
