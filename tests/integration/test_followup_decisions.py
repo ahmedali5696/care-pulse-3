@@ -326,15 +326,24 @@ def test_receptionist_extension_flag_tracks_doctor_deadline_and_effective_claim(
     )
     endpoint = f"/v1/visits/{source['visit']}/extend-followup"
     body = command.model_dump(mode="json", exclude_unset=True)
-    status, written = _signed_visit_request(
-        clinic,
-        clinic.receptionist,
-        path=endpoint,
-        method="POST",
-        body=body,
-        key=str(uuid4()),
-    )
-    assert status == 201, written
+    trace = []
+
+    def _trace_after(_conn, cursor, statement, _params, _ctx, _many):
+        trace.append((cursor.rowcount, " ".join(statement.split())[:55]))
+
+    event.listen(clinic.runtime, "after_cursor_execute", _trace_after)
+    try:
+        status, written = _signed_visit_request(
+            clinic,
+            clinic.receptionist,
+            path=endpoint,
+            method="POST",
+            body=body,
+            key=str(uuid4()),
+        )
+    finally:
+        event.remove(clinic.runtime, "after_cursor_execute", _trace_after)
+    assert status == 201, (written, trace[-12:])
     assert (
         written["data"]["extended_deadline"]
         == (source["day"] + timedelta(days=9)).isoformat()
@@ -1963,9 +1972,9 @@ def test_confirmed_extension_appends_authorization_without_clinical_or_price_cha
         original = extend_followup(connection, actor, source["visit"], command, key)
         assert original[1] == original[0]["revision"] == 1
         assert (original[0]["claim_revision"], original[0]["visit_revision"]) == (1, 0)
-        assert _frozen_claim(connection, confirmed["claim"], clinic.tenant) == frozen
         connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
     with transaction(clinic.migration, clinic.tenant) as connection:
+        assert _frozen_claim(connection, confirmed["claim"], clinic.tenant) == frozen
         assert connection.execute(
             text(
                 "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"

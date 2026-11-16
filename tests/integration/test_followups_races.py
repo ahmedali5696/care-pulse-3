@@ -21,7 +21,7 @@ from carepulse.visits.eligibility_contracts import (
     FollowupDecisionPatchV2,
 )
 from postgres_locks import wait_for_postgres_lock
-from sqlalchemy import text
+from sqlalchemy import event, text
 from test_appointment_persistence import _admit_saved
 from test_booking import booking_body, booking_effects
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
@@ -580,19 +580,34 @@ def test_extension_locks_source_and_target_by_uuid_before_claim(
     )
     started = Event()
     extension_pid = []
+    race_trace = []
+
+    def _trace_race(_conn, cursor, statement, _params, _ctx, _many):
+        race_trace.append((cursor.rowcount, " ".join(statement.split())[:55]))
 
     def extend():
-        with signed_command_transaction(
-            clinic, extension, visit=source["visit"], pid=extension_pid, started=started
-        ) as (connection, actor, key):
-            _doctor_context(connection, UUID(clinic.owner.staff_id))
-            return extend_followup(
-                connection,
-                actor,
-                source["visit"],
+        event.listen(clinic.runtime, "after_cursor_execute", _trace_race)
+        try:
+            with signed_command_transaction(
+                clinic,
                 extension,
-                key,
-            )
+                visit=source["visit"],
+                pid=extension_pid,
+                started=started,
+            ) as (connection, actor, key):
+                _doctor_context(connection, UUID(clinic.owner.staff_id))
+                return extend_followup(
+                    connection,
+                    actor,
+                    source["visit"],
+                    extension,
+                    key,
+                )
+        except Exception as exc:
+            race_trace.append((-99, repr(exc)[:100]))
+            raise
+        finally:
+            event.remove(clinic.runtime, "after_cursor_execute", _trace_race)
 
     lock_row = text("""
         SELECT id FROM public.appointments
@@ -618,8 +633,13 @@ def test_extension_locks_source_and_target_by_uuid_before_claim(
                 first_pid = first_holder.scalar(text("SELECT pg_backend_pid()"))
                 competing = pool.submit(extend)
                 assert started.wait(timeout=15)
-                with transaction(clinic.migration, clinic.tenant) as observer:
-                    wait_for_postgres_lock(observer, extension_pid[0], first_pid)
+                try:
+                    with transaction(clinic.migration, clinic.tenant) as observer:
+                        wait_for_postgres_lock(observer, extension_pid[0], first_pid)
+                except Exception as exc:
+                    raise AssertionError(
+                        f"source_first={source_first} first={first_id} src={source_id} tgt={target_id} trace={race_trace}"
+                    ) from exc
             with transaction(clinic.migration, clinic.tenant) as observer:
                 wait_for_postgres_lock(observer, extension_pid[0], second_pid)
             with clinic.migration.connect() as observer:
