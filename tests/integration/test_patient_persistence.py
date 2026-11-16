@@ -116,7 +116,7 @@ def test_patient_rls_clinic_scope_and_privilege_denials(patient_storage, role_en
         b = _create(connection, tenant_b, phone="01012345678")
     assert a != b
 
-    with _tx(clinic, tenant_a) as connection:
+    with _tx(clinic, tenant_a, method="GET") as connection:
         assert connection.scalars(
             text("SELECT id FROM public.patients ORDER BY id")
         ).all() == [a]
@@ -127,6 +127,7 @@ def test_patient_rls_clinic_scope_and_privilege_denials(patient_storage, role_en
                 ORDER BY id LIMIT 10
             """)
         ).all() == [a]
+    with _tx(clinic, tenant_a) as connection:
         assert (
             connection.execute(
                 text(
@@ -277,8 +278,10 @@ def test_family_duplicates_and_independent_edits(patient_storage):
     clinic, _, tenant, _ = patient_storage
     with _tx(clinic, tenant) as connection:
         first = _create(connection, tenant, phone="01012345678")
+    with _tx(clinic, tenant) as connection:
         second = _create(connection, tenant, phone="01012345678")
-        assert first != second
+    assert first != second
+    with _tx(clinic, tenant, method="GET") as connection:
         assert (
             connection.scalar(
                 text(

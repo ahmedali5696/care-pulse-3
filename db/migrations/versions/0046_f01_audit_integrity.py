@@ -105,6 +105,20 @@ def upgrade() -> None:
         BEGIN
             IF session_user <> 'carepulse_api' THEN RETURN NEW; END IF;
             SELECT * INTO ctx FROM public.f01_context();
+            IF FOUND
+               AND ctx.purpose = 'OWNER_ACTIVATION' AND ctx.role = 'BOOTSTRAP'
+               AND ctx.stage = 'PRIMARY' AND ctx.method = 'POST'
+               AND ctx.path = '/v1/provisioning/owner-activate'
+               AND ctx.organization_id = NEW.organization_id::text
+               AND NEW.role = 'DOCTOR_OWNER' AND NEW.enabled AND NEW.verified
+               AND NEW.auth_user_id = ctx.native_user_id
+               AND EXISTS (
+                   SELECT 1 FROM public."user" u
+                   WHERE u.id = NEW.auth_user_id AND u."emailVerified"
+                     AND u.email = NEW.verified_email
+               ) THEN
+                RETURN NEW;
+            END IF;
             IF NOT FOUND OR NOT COALESCE(
                 ctx.purpose = 'STAFF_MANAGEMENT' AND ctx.role = 'DOCTOR_OWNER'
                 AND ctx.stage = 'PRIMARY' AND ctx.method = 'POST'
@@ -692,6 +706,13 @@ def upgrade() -> None:
                       OR (c.method = 'POST' AND c.path = '/v1/appointments'
                           AND (
                               a.appointment_id = appointment_price_snapshots.appointment_id
+                              OR (c.stage = 'PRIMARY' AND EXISTS (
+                                  SELECT 1 FROM public.visits v
+                                  WHERE v.organization_id = appointment_price_snapshots.organization_id
+                                    AND v.id = c.source_visit_id
+                                    AND v.appointment_id = appointment_price_snapshots.appointment_id
+                                    AND v.patient_id = c.patient_id
+                              ))
                               OR EXISTS (
                                   SELECT 1 FROM public.idempotency_receipts r
                                   WHERE r.organization_id = appointment_price_snapshots.organization_id
