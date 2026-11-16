@@ -61,26 +61,40 @@ def _receipt_query(
 
 def _source_reference(connection: Connection, actor: AuthorizedStaff, visit_id: UUID):
     tenant = actor.organization_id
-    source = (
+    visit = (
         connection.execute(
             text("""
-            SELECT v.patient_id, v.appointment_id, v.doctor_staff_id
-            FROM public.visits v JOIN public.appointments a
-              ON (a.organization_id, a.id) = (v.organization_id, v.appointment_id)
-            WHERE v.organization_id=:tenant AND v.id=:visit
-              AND (v.patient_id, v.doctor_staff_id) =
-                  (a.patient_id, a.doctor_staff_id)
-        """),
+                SELECT patient_id, appointment_id, doctor_staff_id
+                FROM public.visits
+                WHERE organization_id=:tenant AND id=:visit
+            """),
             {"tenant": tenant, "visit": visit_id},
         )
         .mappings()
         .one_or_none()
     )
-    if source is None or (
-        actor.role == "DOCTOR_OWNER" and source["doctor_staff_id"] != actor.staff_id
+    if visit is None or (
+        actor.role == "DOCTOR_OWNER" and visit["doctor_staff_id"] != actor.staff_id
     ):
         raise ContractError(404)
-    return source
+    appointment = (
+        connection.execute(
+            text("""
+                SELECT patient_id, doctor_staff_id
+                FROM public.appointments
+                WHERE organization_id=:tenant AND id=:appointment
+            """),
+            {"tenant": tenant, "appointment": visit["appointment_id"]},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if appointment is None or (
+        appointment["patient_id"],
+        appointment["doctor_staff_id"],
+    ) != (visit["patient_id"], visit["doctor_staff_id"]):
+        raise ContractError(404)
+    return visit
 
 
 def _locked_source(
