@@ -43,10 +43,24 @@ def _denied(connection, operation, *args, **kwargs):
     assert denied.value.orig.sqlstate == "42501"
 
 
-def _history(connection, appointment, actor, role, **changes):
+def _history(
+    connection,
+    tenant,
+    appointment,
+    status_value,
+    service_date,
+    number,
+    actor,
+    role,
+    **changes,
+):
     fields = {
         "id": uuid4(),
+        "tenant": tenant,
         "appointment": appointment,
+        "status": status_value,
+        "service_date": service_date,
+        "number": number,
         "actor": actor,
         "role": role,
         "action": "CREATED",
@@ -60,9 +74,8 @@ def _history(connection, appointment, actor, role, **changes):
                 (id, organization_id, appointment_id, appointment_revision, action,
                  new_status, new_service_date, new_number, actor_staff_id, actor_role,
                  reason, price_snapshot_appointment_id, replacement_appointment_id)
-            SELECT :id, a.organization_id, a.id, 0, :action, a.status, a.service_date,
-                a.current_number, :actor, :role, :reason, a.id, :replacement
-            FROM public.appointments a WHERE a.id = :appointment
+            VALUES (:id, :tenant, :appointment, 0, :action, :status, :service_date,
+                :number, :actor, :role, :reason, :appointment, :replacement)
         """),
         fields,
     )
@@ -97,21 +110,42 @@ def test_booking_history_binds_new_appointment_actor_role_and_creation_event(
                 != "appointment_history"
             ):
                 return
-            current = conn.scalar(
-                text("SELECT id FROM public.appointments WHERE patient_id=:patient"),
+            current, cur_status, cur_date, cur_number = conn.execute(
+                text(
+                    "SELECT id, status, service_date, current_number "
+                    "FROM public.appointments WHERE patient_id=:patient"
+                ),
                 {"patient": patient},
+            ).one()
+            old_row = (
+                previous,
+                old["data"]["status"],
+                date.fromisoformat(old["data"]["service_date"]),
+                old["data"]["number"],
             )
-            assert current is not None
-            for appointment, staff_id, role, changes in (
-                (previous, actor.staff_id, actor.role, {}),
-                (current, clinic.staff, "DOCTOR_OWNER", {}),
-                (current, actor.staff_id, "DOCTOR_OWNER", {}),
-                (current, actor.staff_id, actor.role, {"action": "STATUS"}),
-                (current, actor.staff_id, actor.role, {"reason": "fabricated"}),
-                (current, actor.staff_id, actor.role, {"replacement": previous}),
+            cur_row = (current, cur_status, cur_date, cur_number)
+            for (appt_id, st, sdate, num), staff_id, role, changes in (
+                (old_row, actor.staff_id, actor.role, {}),
+                (cur_row, clinic.staff, "DOCTOR_OWNER", {}),
+                (cur_row, actor.staff_id, "DOCTOR_OWNER", {}),
+                (cur_row, actor.staff_id, actor.role, {"action": "STATUS"}),
+                (cur_row, actor.staff_id, actor.role, {"reason": "fabricated"}),
+                (cur_row, actor.staff_id, actor.role, {"replacement": previous}),
             ):
-                _denied(conn, _history, conn, appointment, staff_id, role, **changes)
-                checked.append(appointment)
+                _denied(
+                    conn,
+                    _history,
+                    conn,
+                    clinic.tenant,
+                    appt_id,
+                    st,
+                    sdate,
+                    num,
+                    staff_id,
+                    role,
+                    **changes,
+                )
+                checked.append(appt_id)
 
         event.listen(connection, "before_execute", probe)
         try:
@@ -712,6 +746,7 @@ def test_operation_resource_read_isolation_across_signed_purposes(followup_clini
         body=new_exam_body,
         key=new_exam_key,
     ) as (connection, actor):
+        connection.execute(text("SET LOCAL statement_timeout = '20000'"))
         assert connection.scalars(text("SELECT id FROM public.patients")).all() == [
             patient_a
         ]
@@ -742,6 +777,27 @@ def test_operation_resource_read_isolation_across_signed_purposes(followup_clini
         assert connection.scalars(text("SELECT id FROM public.appointments")).all() == [
             UUID(booked["id"])
         ]
+        assert connection.scalar(
+            text("SELECT appointment_id FROM public.f01_audit_targets()")
+        ) == UUID(booked["id"])
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.appointment_price_snapshots WHERE appointment_id = :id"
+                ),
+                {"id": UUID(booked["id"])},
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.appointment_history WHERE appointment_id = :id AND action = 'CREATED' AND appointment_revision = 0"
+                ),
+                {"id": UUID(booked["id"])},
+            )
+            == 1
+        )
 
     # 4. VISIT_FOLLOWUP: PATCH and extend-followup isolate only the target visit/patient/claim.
     with signed_test_transaction(

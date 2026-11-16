@@ -1,6 +1,7 @@
 """F-01 grant migration, with isolated disposable databases only."""
 
 import shutil
+from pathlib import Path
 from uuid import uuid4
 
 import psycopg
@@ -10,7 +11,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
-from sqlalchemy import text
+from sqlalchemy import URL, create_engine, text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import (
     _activate_clinic,
@@ -404,7 +405,16 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
                 )
                 is True
             )
-        api = _engine("carepulse_api", empty_database)
+        api = create_engine(
+            URL.create(
+                "postgresql+psycopg",
+                username="carepulse_api",
+                password=Path("/run/secrets/api_db_password").read_text().strip(),
+                host="db",
+                database=empty_database,
+            ),
+            hide_parameters=True,
+        )
         try:
             with api.connect() as api_conn:
                 for sql in (
