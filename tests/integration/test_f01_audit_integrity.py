@@ -789,15 +789,36 @@ def test_operation_resource_read_isolation_across_signed_purposes(followup_clini
             )
             == 1
         )
-        assert (
-            connection.scalar(
-                text(
-                    "SELECT count(*) FROM public.appointment_history WHERE appointment_id = :id AND action = 'CREATED' AND appointment_revision = 0"
-                ),
-                {"id": UUID(booked["id"])},
-            )
-            == 1
+        hist_count = connection.scalar(
+            text(
+                "SELECT count(*) FROM public.appointment_history "
+                "WHERE appointment_id = :id AND action = 'CREATED' AND appointment_revision = 0"
+            ),
+            {"id": UUID(booked["id"])},
         )
+        if hist_count != 1:
+            all_hist = connection.execute(
+                text(
+                    "SELECT id, appointment_id, action, appointment_revision FROM public.appointment_history"
+                )
+            ).all()
+            plan = (
+                connection.execute(
+                    text(
+                        "EXPLAIN SELECT count(*) FROM public.appointment_history "
+                        "WHERE appointment_id = :id AND action = 'CREATED' AND appointment_revision = 0"
+                    ),
+                    {"id": UUID(booked["id"])},
+                )
+                .scalars()
+                .all()
+            )
+            raise AssertionError(
+                f"hist_count={hist_count} booked_history={booked.get('history')} "
+                f"all_hist={all_hist} targets={connection.execute(text('SELECT * FROM public.f01_audit_targets()')).all()} "
+                f"ctx={connection.execute(text('SELECT purpose, method, path, stage, patient_id, source_visit_id FROM public.f01_context()')).all()} "
+                f"plan={plan}"
+            )
 
     # 4. VISIT_FOLLOWUP: PATCH and extend-followup isolate only the target visit/patient/claim.
     with signed_test_transaction(

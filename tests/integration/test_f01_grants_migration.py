@@ -405,6 +405,11 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
                 )
                 is True
             )
+        admin.execute(
+            psycopg.sql.SQL("GRANT CONNECT ON DATABASE {} TO carepulse_api").format(
+                psycopg.sql.Identifier(empty_database)
+            )
+        )
         api = create_engine(
             URL.create(
                 "postgresql+psycopg",
