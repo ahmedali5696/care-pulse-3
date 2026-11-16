@@ -1,7 +1,7 @@
 """B-07 publication barrier races against real PostgreSQL booking transactions."""
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event
+from threading import Event
 from time import monotonic
 from uuid import UUID, uuid4
 
@@ -60,19 +60,40 @@ def test_signed_identical_concurrent_schedule_stage_reuses_one_preview(
     app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
     body = _patch(_config()).model_dump(mode="json")
     key = str(uuid4())
-    barrier = Barrier(2)
+    receipt_inserted, release_original, ready = Event(), Event(), Event()
+    holder_pid, waiter_pid = [], []
+
+    def hold_receipt(connection, _cursor, statement, _parameters, _context, _many):
+        if (
+            "INSERT INTO public.idempotency_receipts" in statement
+            and not receipt_inserted.is_set()
+        ):
+            holder_pid.append(connection.connection.driver_connection.info.backend_pid)
+            receipt_inserted.set()
+            assert release_original.wait(timeout=30)
 
     def send():
-        barrier.wait(timeout=15)
         return _schedule_request(
             clinic, clinic.owner, method=method, suffix=suffix, body=body, key=key
         )
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        first, second = [
-            future.result(timeout=35)
-            for future in (pool.submit(send), pool.submit(send))
-        ]
+    event.listen(clinic.runtime, "after_cursor_execute", hold_receipt)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            original = pool.submit(send)
+            try:
+                assert receipt_inserted.wait(timeout=15)
+                with _activation_checkpoint(clinic, waiter_pid, ready):
+                    replay = pool.submit(send)
+                    assert ready.wait(timeout=15)
+                    with clinic.migration.connect() as observer:
+                        wait_for_postgres_lock(observer, waiter_pid[0], holder_pid[0])
+            finally:
+                release_original.set()
+            first, second = original.result(timeout=30), replay.result(timeout=30)
+    finally:
+        release_original.set()
+        event.remove(clinic.runtime, "after_cursor_execute", hold_receipt)
     assert first == second
     assert first[0] == 200
     assert first[1]["data"]["revisions"]["active_schedule"] == 1
@@ -275,6 +296,59 @@ def test_direct_identical_activation_rechecks_receipt_after_authority_lock(
                 assert ready.wait(timeout=15)
                 with transaction(clinic.migration, clinic.tenant) as observer:
                     wait_for_postgres_lock(observer, waiting_pid[0], holder_pid)
+        replay = future.result(timeout=30)
+    assert replay == original
+    assert original["schedule_revision"] == 2
+    with transaction(clinic.migration, clinic.tenant) as connection:
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinic_policy_versions "
+                    "WHERE organization_id=:tenant AND kind='SCHEDULE'"
+                ),
+                {"tenant": clinic.tenant},
+            )
+            == 2
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.idempotency_receipts "
+                    "WHERE organization_id=:tenant AND operation='settings.schedule.activate' "
+                    "AND idempotency_key=:key"
+                ),
+                {"tenant": clinic.tenant, "key": key},
+            )
+            == 1
+        )
+
+
+def test_schema_identical_activation_rechecks_receipt_after_schedule_lock(
+    patient_backend,
+):
+    clinic = patient_backend
+    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
+    with transaction(clinic.migration, clinic.tenant) as connection:
+        preview = _stage(connection, actor, _config())
+    key = str(uuid4())
+    started, waiting_pid = Event(), []
+
+    def retry():
+        with transaction(clinic.migration, clinic.tenant) as connection:
+            waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            started.set()
+            return _activate(connection, actor, preview, key=key)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with transaction(clinic.migration, clinic.tenant) as holder:
+            original = _activate(holder, actor, preview, key=key)
+            holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
+            future = pool.submit(retry)
+            assert started.wait(timeout=15)
+            with transaction(clinic.migration, clinic.tenant) as observer:
+                blocked_sql = _blocked_query(observer, waiting_pid[0], holder_pid)
+            assert blocked_sql.startswith("SELECT 1 FROM public.clinic_policy_heads ")
+            assert " FOR UPDATE" in blocked_sql
         replay = future.result(timeout=30)
     assert replay == original
     assert original["schedule_revision"] == 2

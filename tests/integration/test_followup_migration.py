@@ -940,6 +940,7 @@ def test_fresh_and_failed_following_migration_keep_one_head(
         scripts = tmp_path / "migrations"
         shutil.copytree(ROOT / "db/migrations", scripts)
         # Isolate D-08 from later M1/B-06 heads for this rollback proof.
+        (scripts / "versions/0046_f01_audit_integrity.py").unlink()
         (scripts / "versions/0045_f01_revocation_evidence.py").unlink()
         (scripts / "versions/0044_f01_delivery_acl.py").unlink()
         (scripts / "versions/0043_f01_writer_boundary.py").unlink()

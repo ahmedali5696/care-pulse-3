@@ -56,7 +56,9 @@ def registered_test_request(clinic, identity, body):
 
 
 @contextmanager
-def signed_test_transaction(clinic, actor, *, method, path, purpose, body=None, key=""):
+def signed_test_transaction(
+    clinic, actor, *, method, path, purpose, body=None, key="", query=""
+):
     """A signed request with explicit scope for direct transaction/race probes."""
     payload = (
         json.dumps(body, separators=(",", ":")).encode() if body is not None else b""
@@ -66,7 +68,7 @@ def signed_test_transaction(clinic, actor, *, method, path, purpose, body=None, 
         method=method,
         path=path,
         purpose=purpose,
-        query="",
+        query=query,
         body_sha256=sha256(payload).hexdigest(),
         timestamp=str(int(datetime.now(UTC).timestamp() * 1000)),
         nonce=f"synthetic_{uuid4().hex}",

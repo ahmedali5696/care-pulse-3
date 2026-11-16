@@ -325,8 +325,18 @@ def test_session_cleanup_requires_committed_matching_revocation(
     )
     cleanup = text("SELECT public.delete_staff_sessions(:tenant, :user)")
     params = {"tenant": clinic.tenant, "user": user}
+    audit_payload = {
+        "organization_id": clinic.tenant,
+        "actor_staff_id": clinic.staff,
+        "actor_role": "DOCTOR_OWNER",
+        "action": "RECEPTIONIST_DISABLE",
+        "reason": command.reason,
+        "correlation_id": str(uuid4()),
+        "before_state": {"id": str(target), "enabled": True},
+        "after_state": {"id": str(target), "enabled": False},
+    }
     if outcome == "audit_only":
-        # A real prior withdrawal cannot authorize a different primary request.
+        # A real prior withdrawal and seeded audit row cannot authorize a different request.
         with clinic.migration.begin() as connection:
             connection.execute(
                 text(
@@ -334,6 +344,7 @@ def test_session_cleanup_requires_committed_matching_revocation(
                 ),
                 {"id": target},
             )
+            append_sensitive_audit(connection, audit_payload)
     with registered_test_request(clinic, identity, body):
         request = current_request.get().request_id
         _deny_stage(clinic, request, "SESSION_CLEANUP")
@@ -346,19 +357,15 @@ def test_session_cleanup_requires_committed_matching_revocation(
                     connection.scalar(cleanup, params)
                 assert denied.value.orig.sqlstate == "42501"
                 if outcome == "audit_only":
-                    append_sensitive_audit(
-                        connection,
-                        {
-                            "organization_id": clinic.tenant,
-                            "actor_staff_id": clinic.staff,
-                            "actor_role": "DOCTOR_OWNER",
-                            "action": "RECEPTIONIST_DISABLE",
-                            "reason": command.reason,
-                            "correlation_id": str(uuid4()),
-                            "before_state": {"id": str(target), "enabled": True},
-                            "after_state": {"id": str(target), "enabled": False},
-                        },
-                    )
+                    with (
+                        pytest.raises(DBAPIError) as audit_denied,
+                        connection.begin_nested(),
+                    ):
+                        append_sensitive_audit(
+                            connection,
+                            {**audit_payload, "correlation_id": str(uuid4())},
+                        )
+                    assert audit_denied.value.orig.sqlstate == "42501"
                 elif outcome == "write_only":
                     assert (
                         connection.execute(

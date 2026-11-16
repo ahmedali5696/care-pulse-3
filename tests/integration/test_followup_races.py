@@ -53,7 +53,7 @@ def _wait_for_pg_blocker(observer, pid):
 @pytest.mark.parametrize(
     "correction_first", [True, False], ids=["clinical-first", "extension-first"]
 )
-def test_current_head_doctor_clinical_correction_and_extension_preserve_independent_revisions(
+def test_f01_doctor_clinical_correction_and_signed_extension_preserve_independent_revisions(
     appointment_storage, appointment_api, correction_first
 ):
     runtime, migration, (tenant, _), (doctor, _) = appointment_storage
@@ -143,17 +143,27 @@ def test_current_head_doctor_clinical_correction_and_extension_preserve_independ
             else transaction(migration, tenant)
         )
         with context as connection:
-            waiter_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            started.set()
+            if not correction_first:
+                waiter_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+                started.set()
             return extend(connection) if correction_first else correct(connection)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         holder = pool.submit(hold_first)
-        waiter = pool.submit(wait_second)
         try:
-            assert started.wait(timeout=10)
-            with migration.connect() as observer:
-                assert holder_pid[0] in _wait_for_pg_blocker(observer, waiter_pid[0])
+            assert held.wait(timeout=10)
+            checkpoint = (
+                _activation_checkpoint(appointment_api, waiter_pid, started)
+                if correction_first
+                else nullcontext()
+            )
+            with checkpoint:
+                waiter = pool.submit(wait_second)
+                assert started.wait(timeout=10)
+                with migration.connect() as observer:
+                    assert holder_pid[0] in _wait_for_pg_blocker(
+                        observer, waiter_pid[0]
+                    )
         finally:
             release.set()
         assert holder.result(timeout=20) == 1

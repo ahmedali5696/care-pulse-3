@@ -499,10 +499,7 @@ def compute_affected(
             text("""
                 SELECT id, service_date, status, booking_mode,
                        starts_at, ends_at, revision
-                FROM public.appointments
-                WHERE organization_id = :tenant AND service_date >= :today
-                  AND status IN ('Booked','Waiting','In Examination','Completed')
-                ORDER BY service_date, id
+                FROM public.f01_schedule_review_appointments(:tenant, :today)
             """),
             {"tenant": tenant, "today": today},
         ).mappings()

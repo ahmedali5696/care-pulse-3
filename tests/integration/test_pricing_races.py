@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 import pytest
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.db import transaction
+from carepulse.identity.authorization import AuthorizedStaff
 from carepulse.main import app
 from carepulse.policies.pricing_contracts import PricingPatch
 from carepulse.policies.pricing_service import current_price_state, update_pricing
@@ -181,6 +182,60 @@ def test_direct_identical_pricing_rechecks_receipt_after_authority_lock(
                     wait_for_postgres_lock(
                         observer, waiting_pid[0], holder_pid, timeout=12
                     )
+        replay = future.result(timeout=30)
+    assert replay == original
+    with transaction(clinic.migration, clinic.tenant) as connection:
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinic_policy_versions "
+                    "WHERE organization_id = current_setting('app.organization_id')::uuid AND kind='PRICE'"
+                )
+            )
+            == 2
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.idempotency_receipts "
+                    "WHERE organization_id = current_setting('app.organization_id')::uuid "
+                    "AND operation='settings.pricing.update' AND idempotency_key=:key"
+                ),
+                {"key": key},
+            )
+            == 1
+        )
+
+
+def test_schema_identical_pricing_rechecks_receipt_after_policy_lock(patient_backend):
+    clinic = patient_backend
+    key = str(uuid4())
+    change = _change(1, standard_new_exam_egp="125.00")
+    actor = AuthorizedStaff(
+        clinic.tenant, UUID(clinic.owner.staff_id), "DOCTOR_OWNER", False, 0, 0, 0
+    )
+    waiting_pid, started = [], Event()
+
+    def competing_update():
+        with transaction(clinic.migration, clinic.tenant) as connection:
+            waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            started.set()
+            return update_pricing(connection, actor, change, key)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with transaction(clinic.migration, clinic.tenant) as connection:
+            original = update_pricing(connection, actor, change, key)
+            holder_pid = connection.scalar(text("SELECT pg_backend_pid()"))
+            future = pool.submit(competing_update)
+            assert started.wait(timeout=12)
+            with clinic.migration.connect() as observer:
+                wait_for_postgres_lock(observer, waiting_pid[0], holder_pid, timeout=12)
+                blocked_sql = observer.scalar(
+                    text("SELECT query FROM pg_stat_activity WHERE pid = :pid"),
+                    {"pid": waiting_pid[0]},
+                )
+                assert blocked_sql and "public.clinic_policy_heads" in blocked_sql
+                assert "FOR UPDATE" in blocked_sql
         replay = future.result(timeout=30)
     assert replay == original
     with transaction(clinic.migration, clinic.tenant) as connection:
@@ -390,7 +445,8 @@ def test_existing_snapshot_remains_byte_identical_after_price_and_followup_edits
         clinic, clinic.owner, change.model_dump(mode="json"), key
     ) as (conn, actor):
         update_pricing(conn, actor, change, key)
-        assert snapshot(conn) == before
+        # SETTINGS_PRICING cannot read appointment price snapshots directly (R03).
+        assert snapshot(conn) is None
     with transaction(clinic.migration, tenant) as conn:
         assert snapshot(conn) == before
         state = current_price_state(conn, tenant)

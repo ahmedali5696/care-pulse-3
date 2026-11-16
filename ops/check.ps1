@@ -605,7 +605,7 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_DB_PASSWORD_FILE:/run/secrets/postgres_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_f01_runtime_identity.py tests/integration/test_f01_grants_migration.py | tee "$private/f01-runtime-identity.log"
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_f01_runtime_identity.py tests/integration/test_f01_audit_integrity.py tests/integration/test_f01_grants_migration.py | tee "$private/f01-runtime-identity.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/f01-runtime-identity.log"; then
   echo 'FAIL mandatory F-01 runtime identity evidence skipped'; exit 1
 fi
