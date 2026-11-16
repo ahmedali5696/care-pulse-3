@@ -596,13 +596,35 @@ def test_extension_locks_source_and_target_by_uuid_before_claim(
                 started=started,
             ) as (connection, actor, key):
                 _doctor_context(connection, UUID(clinic.owner.staff_id))
-                return extend_followup(
-                    connection,
-                    actor,
-                    source["visit"],
-                    extension,
-                    key,
-                )
+                try:
+                    return extend_followup(
+                        connection,
+                        actor,
+                        source["visit"],
+                        extension,
+                        key,
+                    )
+                except ContractError:
+                    ctx_r = connection.execute(
+                        text(
+                            "SELECT purpose, method, stage, target_id::text, target_appointment_id::text FROM public.f01_context()"
+                        )
+                    ).all()
+                    v_r = connection.scalars(
+                        text("SELECT id::text FROM public.visits")
+                    ).all()
+                    a_r = connection.scalars(
+                        text("SELECT id::text FROM public.appointments")
+                    ).all()
+                    cl_r = connection.scalars(
+                        text("SELECT appointment_id::text FROM public.followup_claims")
+                    ).all()
+                    a_src = connection.scalar(
+                        text("SELECT count(*) FROM public.appointments WHERE id=:id"),
+                        {"id": source_id},
+                    )
+                    race_trace.append(("diag", ctx_r, v_r, a_r, cl_r, a_src))
+                    raise
         except Exception as exc:
             race_trace.append((-99, repr(exc)[:100]))
             raise
@@ -638,7 +660,7 @@ def test_extension_locks_source_and_target_by_uuid_before_claim(
                         wait_for_postgres_lock(observer, extension_pid[0], first_pid)
                 except Exception as exc:
                     raise AssertionError(
-                        f"source_first={source_first} first={first_id} src={source_id} tgt={target_id} trace={race_trace}"
+                        f"source_first={source_first} first={first_id} src={source_id} tgt={target_id} trace={race_trace[-5:]}"
                     ) from exc
             with transaction(clinic.migration, clinic.tenant) as observer:
                 wait_for_postgres_lock(observer, extension_pid[0], second_pid)
