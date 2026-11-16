@@ -84,16 +84,28 @@ def _history(
 
 def _booking_diag(clinic, actor, **kwargs):
     errors = []
-    diag = []
+    diag = {}
     started = monotonic()
+    slow = []
+    t_stmt = {}
     state = {"receipt_inserted": False, "probing": False}
 
+    def before_exec(conn, _cursor, statement, _parameters, _context, _many):
+        if state["probing"]:
+            return
+        t_stmt[id(conn)] = (monotonic(), " ".join(statement.split())[:45])
+
     def capture(context):
-        errors.append((repr(context.original_exception), context.statement))
+        errors.append(repr(context.original_exception)[:140])
 
     def inspect_after(conn, _cursor, statement, _parameters, _context, _many):
         if state["probing"]:
             return
+        entry = t_stmt.pop(id(conn), None)
+        if entry is not None:
+            dt = monotonic() - entry[0]
+            if dt >= 0.1:
+                slow.append((round(dt, 2), entry[1]))
         if "INSERT INTO public.idempotency_receipts" in statement:
             state["receipt_inserted"] = True
             return
@@ -103,52 +115,34 @@ def _booking_diag(clinic, actor, **kwargs):
         ):
             state["probing"] = True
             try:
-                targets = conn.execute(
-                    text("SELECT * FROM public.f01_audit_targets()")
-                ).all()
-                ctx = conn.execute(
-                    text(
-                        "SELECT purpose, method, path, stage, patient_id, source_visit_id FROM public.f01_context()"
-                    )
-                ).all()
-                hist = conn.scalar(
+                diag["hist"] = conn.scalar(
                     text("SELECT count(*) FROM public.appointment_history")
                 )
-                snaps = conn.scalar(
+                diag["snaps"] = conn.scalar(
                     text("SELECT count(*) FROM public.appointment_price_snapshots")
                 )
-                plan = (
-                    conn.execute(
-                        text(
-                            "EXPLAIN (COSTS OFF) SELECT 1 FROM public.appointment_history"
-                        )
-                    )
-                    .scalars()
-                    .all()
+                diag["ctx"] = len(
+                    conn.execute(text("SELECT 1 FROM public.f01_context()")).all()
                 )
-                diag.append(
-                    {
-                        "elapsed": round(monotonic() - started, 3),
-                        "targets": targets,
-                        "ctx": ctx,
-                        "hist": hist,
-                        "snaps": snaps,
-                        "plan": plan,
-                    }
-                )
+                diag["pre_dt"] = round(monotonic() - started, 2)
             finally:
                 state["probing"] = False
 
-    event.listen(clinic.runtime, "handle_error", capture)
-    event.listen(clinic.gate, "handle_error", capture)
-    event.listen(clinic.runtime, "after_cursor_execute", inspect_after)
+    for eng in (clinic.runtime, clinic.gate):
+        event.listen(eng, "before_cursor_execute", before_exec)
+        event.listen(eng, "after_cursor_execute", inspect_after)
+        event.listen(eng, "handle_error", capture)
     try:
         status, payload = booking_request(clinic, actor, **kwargs)
     finally:
-        event.remove(clinic.runtime, "after_cursor_execute", inspect_after)
-        event.remove(clinic.runtime, "handle_error", capture)
-        event.remove(clinic.gate, "handle_error", capture)
-    assert status == 201, (payload, errors, diag, round(monotonic() - started, 3))
+        for eng in (clinic.runtime, clinic.gate):
+            event.remove(eng, "after_cursor_execute", inspect_after)
+            event.remove(eng, "before_cursor_execute", before_exec)
+            event.remove(eng, "handle_error", capture)
+    assert status == 201, (
+        f"st={status} dt={round(monotonic() - started, 2)} "
+        f"err={errors} diag={diag} slow={slow}"
+    )
     return payload
 
 
@@ -163,67 +157,138 @@ def test_booking_history_binds_new_appointment_actor_role_and_creation_event(
     previous = UUID(old["data"]["id"])
     body, key = booking_body(patient), str(uuid4())
     checked = []
-    with signed_test_transaction(
-        clinic,
-        clinic.receptionist,
-        method="POST",
-        path="/v1/appointments",
-        purpose="APPOINTMENT_BOOKING",
-        body=body,
-        key=key,
-    ) as (connection, actor):
-        assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+    started = monotonic()
+    slow = []
+    t_stmt = {}
+    pre = {}
+    state = {"probing": False}
 
-        def probe(conn, clause, multiparams, params, execution_options):
-            if (
-                getattr(getattr(clause, "table", None), "name", None)
-                != "appointment_history"
-            ):
-                return
-            current, cur_status, cur_date, cur_number = conn.execute(
-                text(
-                    "SELECT id, status, service_date, current_number "
-                    "FROM public.appointments WHERE patient_id=:patient"
-                ),
-                {"patient": patient},
-            ).one()
-            old_row = (
-                previous,
-                old["data"]["status"],
-                date.fromisoformat(old["data"]["service_date"]),
-                old["data"]["number"],
-            )
-            cur_row = (current, cur_status, cur_date, cur_number)
-            for (appt_id, st, sdate, num), staff_id, role, changes in (
-                (old_row, actor.staff_id, actor.role, {}),
-                (cur_row, clinic.staff, "DOCTOR_OWNER", {}),
-                (cur_row, actor.staff_id, "DOCTOR_OWNER", {}),
-                (cur_row, actor.staff_id, actor.role, {"action": "STATUS"}),
-                (cur_row, actor.staff_id, actor.role, {"reason": "fabricated"}),
-                (cur_row, actor.staff_id, actor.role, {"replacement": previous}),
-            ):
-                _denied(
-                    conn,
-                    _history,
-                    conn,
-                    clinic.tenant,
-                    appt_id,
-                    st,
-                    sdate,
-                    num,
-                    staff_id,
-                    role,
-                    **changes,
-                )
-                checked.append(appt_id)
+    def before_sql(conn, _cursor, statement, _parameters, _context, _many):
+        if state["probing"]:
+            return
+        t_stmt[id(conn)] = (monotonic(), " ".join(statement.split())[:45])
 
-        event.listen(connection, "before_execute", probe)
+    def after_sql(conn, _cursor, statement, _parameters, _context, _many):
+        if state["probing"]:
+            return
+        entry = t_stmt.pop(id(conn), None)
+        if entry is not None:
+            dt = monotonic() - entry[0]
+            if dt >= 0.1:
+                slow.append((round(dt, 2), entry[1]))
+
+    for eng in (clinic.runtime, clinic.gate):
+        event.listen(eng, "before_cursor_execute", before_sql)
+        event.listen(eng, "after_cursor_execute", after_sql)
+    try:
         try:
-            saved = book_appointment(
-                connection, actor, BookAppointment.model_validate(body), key
-            )
-        finally:
-            event.remove(connection, "before_execute", probe)
+            with signed_test_transaction(
+                clinic,
+                clinic.receptionist,
+                method="POST",
+                path="/v1/appointments",
+                purpose="APPOINTMENT_BOOKING",
+                body=body,
+                key=key,
+            ) as (connection, actor):
+                assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+
+                def probe(conn, clause, multiparams, params, execution_options):
+                    if (
+                        getattr(getattr(clause, "table", None), "name", None)
+                        != "appointment_history"
+                    ):
+                        return
+                    current, cur_status, cur_date, cur_number = conn.execute(
+                        text(
+                            "SELECT id, status, service_date, current_number "
+                            "FROM public.appointments WHERE patient_id=:patient"
+                        ),
+                        {"patient": patient},
+                    ).one()
+                    old_row = (
+                        previous,
+                        old["data"]["status"],
+                        date.fromisoformat(old["data"]["service_date"]),
+                        old["data"]["number"],
+                    )
+                    cur_row = (current, cur_status, cur_date, cur_number)
+                    for (appt_id, st, sdate, num), staff_id, role, changes in (
+                        (old_row, actor.staff_id, actor.role, {}),
+                        (cur_row, clinic.staff, "DOCTOR_OWNER", {}),
+                        (cur_row, actor.staff_id, "DOCTOR_OWNER", {}),
+                        (cur_row, actor.staff_id, actor.role, {"action": "STATUS"}),
+                        (cur_row, actor.staff_id, actor.role, {"reason": "fabricated"}),
+                        (
+                            cur_row,
+                            actor.staff_id,
+                            actor.role,
+                            {"replacement": previous},
+                        ),
+                    ):
+                        _denied(
+                            conn,
+                            _history,
+                            conn,
+                            clinic.tenant,
+                            appt_id,
+                            st,
+                            sdate,
+                            num,
+                            staff_id,
+                            role,
+                            **changes,
+                        )
+                        checked.append(appt_id)
+
+                event.listen(connection, "before_execute", probe)
+                try:
+                    saved = book_appointment(
+                        connection, actor, BookAppointment.model_validate(body), key
+                    )
+                finally:
+                    event.remove(connection, "before_execute", probe)
+                state["probing"] = True
+                try:
+                    sid = UUID(saved["id"])
+                    pre["snap"] = connection.scalar(
+                        text(
+                            "SELECT count(*) FROM public.appointment_price_snapshots "
+                            "WHERE appointment_id=:id"
+                        ),
+                        {"id": sid},
+                    )
+                    pre["asg"] = connection.scalar(
+                        text(
+                            "SELECT count(*) FROM public.appointment_number_assignments "
+                            "WHERE appointment_id=:id"
+                        ),
+                        {"id": sid},
+                    )
+                    pre["hist"] = connection.scalar(
+                        text(
+                            "SELECT count(*) FROM public.appointment_history "
+                            "WHERE appointment_id=:id"
+                        ),
+                        {"id": sid},
+                    )
+                    pre["ctx"] = len(
+                        connection.execute(
+                            text("SELECT 1 FROM public.f01_context()")
+                        ).all()
+                    )
+                    pre["pre_dt"] = round(monotonic() - started, 2)
+                finally:
+                    state["probing"] = False
+        except Exception as exc:
+            raise AssertionError(
+                f"commit_err={repr(exc)[:140]} dt={round(monotonic() - started, 2)} "
+                f"pre={pre} slow={slow}"
+            ) from exc
+    finally:
+        for eng in (clinic.runtime, clinic.gate):
+            event.remove(eng, "after_cursor_execute", after_sql)
+            event.remove(eng, "before_cursor_execute", before_sql)
     assert len(checked) == 6
     with clinic.migration.connect() as connection:
         assert connection.execute(
