@@ -254,6 +254,11 @@ def _has_unknown_compat_attempt(
         text("SELECT to_regnamespace('compat_control') IS NOT NULL")
     ):
         return False
+    tenant = connection.scalar(
+        text("SELECT NULLIF(current_setting('app.organization_id', true), '')")
+    )
+    if not tenant or (org_id is not None and str(org_id) != tenant):
+        raise RuntimeError("Compatibility sender requires its current tenant context")
     return bool(
         connection.scalar(
             text("""
@@ -294,6 +299,11 @@ def claim_delivery_job(
         .one_or_none()
     )
     if job is None:
+        return None
+    # A tenant-wide poll has no job ID until this row is selected. Recheck
+    # the actual candidate before any claim/reclaim, including a prior
+    # ambiguous attempt correlated only by this job's ID.
+    if _has_unknown_compat_attempt(connection, job["id"], job["organization_id"]):
         return None
     now = _database_time(connection)
     if not _proof_usable(connection, job, now):

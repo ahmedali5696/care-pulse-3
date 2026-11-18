@@ -26,6 +26,8 @@ TENANT_TABLES = (
     "queue_entries",
     "doctor_controls",
     "visits",
+    "clinical_revisions",
+    "clinical_audit",
     "idempotency_receipts",
     "sensitive_audit",
     "outbox_events",
@@ -46,6 +48,8 @@ class Populated0040Inventory:
     delivery_job_a_id: str
     operator_id: str
     owner_user_ids: tuple[str, str]
+    receptionist_user_id: str
+    nonce_reference: tuple[str, str]
     expected_rows: dict[str, tuple[dict, ...]]
 
 
@@ -57,7 +61,14 @@ def _retained_rows(
     queries = {
         "organizations": ("id IN (%s, %s)", tenants),
         "operator_identities": ("id = %s", (inventory.operator_id,)),
-        '"user"': ("id IN (%s, %s)", inventory.owner_user_ids),
+        '"user"': (
+            "id IN (%s, %s, %s)",
+            (*inventory.owner_user_ids, inventory.receptionist_user_id),
+        ),
+        "request_nonces": (
+            "key_id = %s AND nonce = %s",
+            inventory.nonce_reference,
+        ),
         "protected_delivery_material": (
             "job_id IN (SELECT id FROM public.delivery_jobs WHERE organization_id IN (%s, %s))",
             tenants,
@@ -86,6 +97,8 @@ def seed_populated_0040_fixture(conn: psycopg.Connection) -> Populated0040Invent
     patients = (new_id(), new_id())
     appointments = (new_id(), new_id())
     owner_users = (f"compat-owner-{new_id()}", f"compat-owner-{new_id()}")
+    receptionist_user = f"compat-receptionist-{new_id()}"
+    nonce_reference = (f"synthetic-0040-{new_id()}", f"nonce-{new_id()}")
     visit = new_id()
     delivery_job = new_id()
 
@@ -94,6 +107,11 @@ def seed_populated_0040_fixture(conn: psycopg.Connection) -> Populated0040Invent
                (id, credential_digest, issued_by_reference)
                VALUES (%s, %s, 'synthetic-0040-cutover')""",
         (operator, f"synthetic:{operator}"),
+    )
+    conn.execute(
+        """INSERT INTO public.request_nonces (key_id, nonce, signed_at)
+           VALUES (%s, %s, clock_timestamp())""",
+        nonce_reference,
     )
 
     for index, (org, patient, appointment, owner_user) in enumerate(
@@ -124,6 +142,7 @@ def seed_populated_0040_fixture(conn: psycopg.Connection) -> Populated0040Invent
                VALUES (%s, %s, %s, %s, 'DOCTOR_OWNER', true, true)""",
             (doctor, org, owner_user, email),
         )
+        actor, actor_role = doctor, "DOCTOR_OWNER"
         conn.execute(
             """INSERT INTO public.invitations
                (id, organization_id, purpose, target_email, proof_digest,
@@ -159,6 +178,53 @@ def seed_populated_0040_fixture(conn: psycopg.Connection) -> Populated0040Invent
                     base64.urlsafe_b64encode(b"x" * 384).decode().rstrip("="),
                 ),
             )
+        else:
+            # Exercise a real CLAIMED lease transition, then settle it before
+            # drain. No SMTP was attempted and no SENT outcome is asserted.
+            past_claim_job, claim_owner = new_id(), new_id()
+            conn.execute(
+                """INSERT INTO public.delivery_jobs
+                   (id, organization_id, invitation_id, proof_reference, purpose,
+                    recipient, template, logical_key, proof_expires_at)
+                   SELECT %s, organization_id, id, id::text, 'FIRST_OWNER',
+                          target_email, 'first-owner', %s, expires_at
+                   FROM public.invitations WHERE id = %s""",
+                (past_claim_job, f"synthetic:{invitation}", invitation),
+            )
+            conn.execute(
+                """INSERT INTO public.protected_delivery_material
+                   (job_id, delivery_key_id, ciphertext_base64url)
+                   VALUES (%s, 'synthetic-0040-key', %s)""",
+                (
+                    past_claim_job,
+                    base64.urlsafe_b64encode(b"y" * 384).decode().rstrip("="),
+                ),
+            )
+            conn.execute(
+                """UPDATE public.delivery_jobs
+                   SET state = 'CLAIMED', attempts = 1, claim_owner = %s,
+                       claim_generation = 1, claimed_at = clock_timestamp(),
+                       lease_expires_at = clock_timestamp() + interval '5 minutes'
+                   WHERE id = %s""",
+                (claim_owner, past_claim_job),
+            )
+            conn.execute(
+                """SELECT set_config('app.delivery_claim_owner', %s, true),
+                          set_config('app.delivery_claim_generation', '1', true)""",
+                (claim_owner,),
+            )
+            conn.execute(
+                """UPDATE public.delivery_jobs
+                   SET state = 'FAILED', claim_owner = NULL, claimed_at = NULL,
+                       lease_expires_at = NULL,
+                       last_outcome = 'synthetic:no-transport-attempted'
+                   WHERE id = %s""",
+                (past_claim_job,),
+            )
+            conn.execute(
+                "DELETE FROM public.protected_delivery_material WHERE job_id = %s",
+                (past_claim_job,),
+            )
 
         conn.execute(
             """UPDATE public.invitations SET state = 'ACCEPTED',
@@ -175,6 +241,47 @@ def seed_populated_0040_fixture(conn: psycopg.Connection) -> Populated0040Invent
                VALUES (%s, %s, 'SYSTEM', 'FIRST_OWNER_ACTIVATED', %s)""",
             (new_id(), org, invitation),
         )
+        if index == 1:
+            # Only an activated clinic can issue a genuine Receptionist invitation.
+            actor, actor_role = new_id(), "RECEPTIONIST"
+            receptionist_email = f"compat-receptionist-{new_id()}@example.invalid"
+            conn.execute(
+                """INSERT INTO public."user"
+                   (id, name, email, "emailVerified", "createdAt", "updatedAt")
+                   VALUES (%s, 'Synthetic Receptionist', %s, true,
+                           clock_timestamp(), clock_timestamp())""",
+                (receptionist_user, receptionist_email),
+            )
+            conn.execute(
+                """INSERT INTO public.staff_accounts
+                   (id, organization_id, auth_user_id, verified_email, role,
+                    enabled, verified)
+                   VALUES (%s, %s, %s, %s, 'RECEPTIONIST', true, true)""",
+                (actor, org, receptionist_user, receptionist_email),
+            )
+            receptionist_invitation = new_id()
+            conn.execute(
+                """INSERT INTO public.invitations
+                   (id, organization_id, staff_id, purpose, target_email,
+                    proof_digest, issued_by_staff_id, expires_at)
+                   VALUES (%s, %s, %s, 'RECEPTIONIST', %s, %s, %s,
+                           clock_timestamp() + interval '20 minutes')""",
+                (
+                    receptionist_invitation,
+                    org,
+                    actor,
+                    receptionist_email,
+                    hashlib.sha256(receptionist_invitation.encode()).hexdigest(),
+                    doctor,
+                ),
+            )
+            conn.execute(
+                """UPDATE public.invitations SET state = 'ACCEPTED',
+                   accepted_by_user_id = %s,
+                   acceptance_reference = 'SYNTHETIC_RECEPTIONIST_ACCEPTANCE'
+                   WHERE id = %s""",
+                (receptionist_user, receptionist_invitation),
+            )
 
         # Default PRICE policy is immutable; publish a configured version normally.
         conn.execute(
@@ -240,8 +347,8 @@ def seed_populated_0040_fixture(conn: psycopg.Connection) -> Populated0040Invent
                 new_status, new_service_date, new_number, actor_staff_id, actor_role,
                 price_snapshot_appointment_id)
                VALUES (%s, %s, %s, 0, 'CREATED', 'Booked', %s, 1, %s,
-                       'DOCTOR_OWNER', %s)""",
-            (new_id(), org, appointment, date, doctor, appointment),
+                       %s, %s)""",
+            (new_id(), org, appointment, date, actor, actor_role, appointment),
         )
 
         if index == 0:
@@ -312,6 +419,29 @@ def seed_populated_0040_fixture(conn: psycopg.Connection) -> Populated0040Invent
                    VALUES (%s, %s, %s, %s, %s, %s, 2, clock_timestamp())""",
                 (visit, org, appointment, patient, doctor, date),
             )
+            # The 0040 guard requires an empty Visit at admission and the 0028
+            # fence prohibits retroactively assigning legacy followup_decision.
+            # A genuine guarded clinical correction records Doctor provenance.
+            conn.execute(
+                "SELECT set_config('app.clinical_change_kind', 'CORRECTION', true), "
+                "set_config('app.clinical_reason', 'Synthetic examination correction', true)"
+            )
+            conn.execute(
+                """UPDATE public.visits SET examination = 'Synthetic examination',
+                   findings = 'Synthetic clinical finding' WHERE id = %s""",
+                (visit,),
+            )
+            revision = conn.execute(
+                """SELECT id FROM public.clinical_revisions
+                   WHERE organization_id = %s AND visit_id = %s AND revision = 1""",
+                (org, visit),
+            ).fetchone()["id"]
+            conn.execute(
+                """INSERT INTO public.clinical_audit
+                   (id, organization_id, doctor_staff_id, clinical_revision, correlation_id)
+                   VALUES (%s, %s, %s, 1, %s)""",
+                (new_id(), org, doctor, str(revision)),
+            )
 
         conn.execute(
             """INSERT INTO public.idempotency_receipts
@@ -323,9 +453,9 @@ def seed_populated_0040_fixture(conn: psycopg.Connection) -> Populated0040Invent
             (
                 new_id(),
                 org,
-                doctor,
+                actor,
                 org,
-                doctor,
+                actor,
                 f"synthetic-{appointment}",
                 hashlib.sha256(appointment.encode()).hexdigest(),
                 Jsonb(
@@ -363,6 +493,8 @@ def seed_populated_0040_fixture(conn: psycopg.Connection) -> Populated0040Invent
         delivery_job_a_id=delivery_job,
         operator_id=operator,
         owner_user_ids=owner_users,
+        receptionist_user_id=receptionist_user,
+        nonce_reference=nonce_reference,
         expected_rows={},
     )
     rows = _retained_rows(conn, inventory)

@@ -8,8 +8,9 @@ from pathlib import Path
 import psycopg
 from alembic import command
 from alembic.config import Config
+from psycopg.rows import tuple_row
 from sqlalchemy import create_engine
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool
 
 from ops.compat.control import assert_current_owner
 from ops.compat.preflight import PUBLISHED_SUCCESSORS
@@ -23,6 +24,24 @@ from ops.compat.work import assert_all_work_settled
 
 class MigrationStepError(RuntimeError):
     """Raised when a migration step or independent observer readback fails."""
+
+
+class _BorrowedOwnerDbapi:
+    """Expose tuple-row DBAPI cursors without handing off the owner's session."""
+
+    def __init__(self, owner: psycopg.Connection) -> None:
+        self._owner = owner
+
+    def cursor(self, *args, **kwargs):
+        kwargs.setdefault("row_factory", tuple_row)
+        return self._owner.cursor(*args, **kwargs)
+
+    def close(self) -> None:
+        # SQLAlchemy must never terminate the controller's advisory-lock session.
+        pass
+
+    def __getattr__(self, name: str):
+        return getattr(self._owner, name)
 
 
 EXPECTED_TRANSITIONS: dict[str, str] = {
@@ -106,19 +125,23 @@ def advance_one_successor(
     cfg = Config(str(ini_path))
     sa_engine = create_engine(
         "postgresql+psycopg://",
-        creator=lambda: owner_conn,
-        poolclass=StaticPool,
+        creator=lambda: _BorrowedOwnerDbapi(owner_conn),
+        poolclass=NullPool,
         hide_parameters=True,
     )
     try:
-        with sa_engine.connect() as sa_conn:
+        # Alembic's env.py has its own begin_transaction(). Supply an already
+        # active outer unit so a failure after its DDL cannot commit before the
+        # owner acknowledges this successor.
+        with sa_engine.connect() as sa_conn, sa_conn.begin():
             cfg.attributes["connection"] = sa_conn
             command.upgrade(cfg, target_successor)
-            sa_conn.commit()
     except Exception:
         if not owner_conn.closed and not owner_conn.autocommit:
             owner_conn.rollback()
         raise
+    finally:
+        sa_engine.dispose()
 
     return target_successor
 

@@ -183,10 +183,18 @@ AS $$
         JOIN compat_control.target_control c ON c.target_id = w.target_id
         WHERE c.singleton_id = TRUE AND c.db_name = current_database()
           AND w.service = 'sender' AND w.disposition = 'UNKNOWN'
+          AND p_organization_id IS NOT NULL
+          AND p_organization_id = NULLIF(current_setting('app.organization_id', true), '')
           AND (
               (p_job_id IS NOT NULL AND w.correlation_id = p_job_id)
               OR (p_organization_id IS NOT NULL AND
                   w.correlation_id = 'org:' || p_organization_id)
+              OR (p_job_id IS NULL AND p_organization_id IS NOT NULL AND
+                  EXISTS (
+                      SELECT 1 FROM public.delivery_jobs j
+                      WHERE j.organization_id::text = p_organization_id
+                        AND j.id::text = w.correlation_id
+                  ))
           )
     );
 $$;
