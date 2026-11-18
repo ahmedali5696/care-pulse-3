@@ -2,6 +2,7 @@
 import { createConnection } from "node:net";
 import type { PoolClient } from "pg";
 import { loadWebConfig } from "./config";
+import { isCompatEnabled, verifyWebReadinessCompat } from "./compat/admission";
 import { runtimeDatabase } from "./db";
 
 const DEPENDENCY_TIMEOUT_MS = 1000;
@@ -63,6 +64,7 @@ export async function foundationReady(): Promise<boolean> {
     const dependencies = Promise.all([
       databaseReady(config), apiLive(config),
       config.smtp ? smtpReady(config.smtp) : Promise.resolve(true),
+      isCompatEnabled() ? verifyWebReadinessCompat() : Promise.resolve(true),
     ]).then((checks) => checks.every(Boolean));
     return await Promise.race([
       dependencies,

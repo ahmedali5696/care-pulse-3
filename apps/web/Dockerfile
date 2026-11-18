@@ -19,4 +19,4 @@ USER node
 EXPOSE 3000
 # Preflight server-only F-03 secrets/policy BEFORE binding the web listener.
 # Next instrumentation also validates but can be lazily initialized on request.
-CMD ["sh", "-c", "node --experimental-strip-types --input-type=module -e 'import(\"./config.ts\").then((m) => m.loadWebConfig())' && exec node ingress.mjs"]
+CMD ["sh", "-c", "node --experimental-strip-types --input-type=module -e 'import(\"./config.ts\").then((m) => m.loadWebConfig())' && exec node --experimental-strip-types ingress.mjs"]

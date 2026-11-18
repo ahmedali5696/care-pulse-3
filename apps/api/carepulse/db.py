@@ -6,6 +6,11 @@ from uuid import UUID
 
 from sqlalchemy import URL, Connection, Engine, create_engine, text
 
+from carepulse.compat.admission import (
+    CompatRuntimeConfig,
+    check_pool_checkout,
+    is_compat_enabled,
+)
 from carepulse.config import ConfigError, ServiceConfig
 
 
@@ -49,6 +54,10 @@ def transaction(
     if organization_id is not None and not isinstance(organization_id, UUID):
         raise ValueError("Organization context must be a validated UUID")
     with engine.begin() as connection:
+        if is_compat_enabled():
+            compat_cfg = CompatRuntimeConfig.from_env("api")
+            if compat_cfg is not None:
+                check_pool_checkout(connection, config=compat_cfg)
         connection.execute(
             text("SELECT set_config('app.organization_id', :organization_id, true)"),
             {"organization_id": str(organization_id) if organization_id else ""},

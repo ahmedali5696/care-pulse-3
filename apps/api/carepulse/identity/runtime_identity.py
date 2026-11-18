@@ -8,6 +8,11 @@ from dataclasses import dataclass
 from sqlalchemy import Connection, Engine, text
 from sqlalchemy.exc import DBAPIError
 
+from carepulse.compat.admission import (
+    CompatRuntimeConfig,
+    check_pool_checkout,
+    is_compat_enabled,
+)
 from carepulse.identity.contracts import ContractError
 from carepulse.identity.signing import CanonicalEnvelope
 
@@ -38,10 +43,22 @@ def bound_transaction(
         raise ContractError(403)
     with engine.begin() as connection:
         try:
+            if is_compat_enabled():
+                compat_cfg = CompatRuntimeConfig.from_env("api")
+                if compat_cfg is not None:
+                    check_pool_checkout(
+                        connection, config=compat_cfg, expected_login="carepulse_api"
+                    )
             pid, xid = connection.execute(
                 text("SELECT pg_backend_pid(), pg_current_xact_id()::text")
             ).one()
             with request.gate.begin() as gate:
+                if is_compat_enabled():
+                    compat_cfg = CompatRuntimeConfig.from_env("api")
+                    if compat_cfg is not None:
+                        check_pool_checkout(
+                            gate, config=compat_cfg, expected_login="carepulse_gate"
+                        )
                 gate.execute(
                     text(
                         "SELECT public.f01_bind(:request, :stage, :pid, CAST(:xid AS xid8))"

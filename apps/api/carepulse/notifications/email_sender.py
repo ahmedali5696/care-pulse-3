@@ -10,6 +10,14 @@ from uuid import UUID
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
+from carepulse.compat.admission import (
+    CompatAdmissionError,
+    CompatRuntimeConfig,
+    acquire_invocation_permit,
+    is_compat_enabled,
+    record_attempt_disposition,
+    release_invocation_permit,
+)
 from carepulse.config import ConfigError, load_config
 from carepulse.notifications.evidence import (
     ClaimedJob,
@@ -139,16 +147,36 @@ def send_one_job(
     if not _node_call(None, settings.timeout_seconds):
         raise ConfigError("Sender key or transport configuration unavailable")
     engine = create_engine(settings.connection_url, hide_parameters=True)
+    permit = None
+    permit_conn = None
+    final_disposition = "NOT_SENT"
+    claimed_job_id: str | None = str(job_id) if job_id else None
+    claimed_lease_gen: int | None = None
     try:
+        if is_compat_enabled():
+            compat_cfg = CompatRuntimeConfig.from_env("sender")
+            assert compat_cfg is not None
+            permit, permit_conn = acquire_invocation_permit(
+                engine,
+                config=compat_cfg,
+                expected_login="carepulse_sender",
+                invocation_class="sender_claim",
+                correlation_id=str(job_id) if job_id else f"org:{organization_id}",
+                record_attempt=True,
+            )
         with engine.begin() as connection:
             _tenant(connection, organization_id)
             claim = claim_delivery_job(connection, settings.policy, job_id)
         if claim is None:
+            final_disposition = "NOT_SENT"
             return "NOT_DUE"
+        claimed_job_id = str(claim.id)
+        claimed_lease_gen = claim.generation
         with engine.begin() as connection:
             _tenant(connection, organization_id)
             material = _material_payload(connection, claim)
         if material is None:
+            final_disposition = "NOT_SENT"
             return "STALE"
         payload, seconds_remaining = material
         deadline = min(float(settings.timeout_seconds), seconds_remaining - 0.5)
@@ -161,8 +189,10 @@ def send_one_job(
             )
             if sent:
                 outcome = JobOutcome("SENT", detail="SMTP_ACCEPTED")
+                final_disposition = "SENT"
             elif attempts is not None and attempts >= settings.policy.max_attempts:
                 outcome = JobOutcome("FAILED", detail="ATTEMPTS_EXHAUSTED")
+                final_disposition = "NOT_SENT"
             else:
                 retry_at = connection.scalar(
                     text("SELECT clock_timestamp() + (:seconds * interval '1 second')"),
@@ -171,12 +201,30 @@ def send_one_job(
                 outcome = JobOutcome(
                     "READY", not_before=retry_at, detail="RETRY_SCHEDULED"
                 )
+                final_disposition = "NOT_SENT"
             return (
                 outcome.state
                 if finish_delivery_job(connection, claim, outcome)
                 else "STALE"
             )
+    except Exception:
+        if claimed_lease_gen is not None:
+            final_disposition = "UNKNOWN"
+        raise
     finally:
+        if permit is not None and permit_conn is not None:
+            try:
+                record_attempt_disposition(
+                    permit_conn,
+                    permit,
+                    invocation_class="sender_claim",
+                    disposition=final_disposition,  # type: ignore[arg-type]
+                    correlation_id=claimed_job_id,
+                    lease_generation=claimed_lease_gen,
+                )
+            except CompatAdmissionError:
+                pass
+            release_invocation_permit(permit_conn, permit)
         engine.dispose()
 
 
@@ -190,7 +238,15 @@ def main() -> int:
     try:
         print(send_one_job(args.organization_id, args.job_id, _settings()))
         return 0
-    except (ConfigError, SQLAlchemyError, OSError, ValueError, TypeError, KeyError):
+    except (
+        CompatAdmissionError,
+        ConfigError,
+        SQLAlchemyError,
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+    ):
         print("Delivery unavailable")
         return 1
 

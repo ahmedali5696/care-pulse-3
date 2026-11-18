@@ -52,6 +52,14 @@ function deliveryLink(job: CommittedJob, token: string, origin: string): string 
 }
 
 async function sendCommittedJob(): Promise<void> {
+  if (process.env.CP_COMPAT_TARGET_ID?.trim()) {
+    if (
+      process.env.CP_COMPAT_GENERATION !== "candidate" ||
+      process.env.CP_COMPAT_SERVICE !== "sender"
+    ) {
+      throw new Error("Delivery unavailable");
+    }
+  }
   const settings = loadSenderMailConfig();
   if (process.argv.length === 3 && process.argv[2] === "--check") return;
   if (process.argv.length !== 2) throw new Error("Invalid sender entrypoint");

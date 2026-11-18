@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('inputs', 'python-quality', 'unit', 'web', 'imports', 'integration', 'integration-diagnostic')]
+    [ValidateSet('inputs', 'python-quality', 'unit', 'web', 'imports', 'integration', 'integration-diagnostic', 'compat-diagnostic')]
     [string]$Check
 )
 
@@ -68,10 +68,10 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': '81a4fc056d120ea775fa59592707f86f896c3f781993b2d990b190dbdb4f36d9',
+    '.github/workflows/foundation.yml': '6690eb65d83f688638311d58310535e67881cd6eb0e931db2e2334611fb34969',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'apps/api/Dockerfile': '8465e11d5b90d94704ec63072180f10c56dcf4becf471da84258ea21de5208c8',
-    'apps/web/Dockerfile': '933af52609f2a4eb638d048605ec555e2a3443cb25b3ba5d64d5a36ec585f02a',
+    'apps/web/Dockerfile': 'f4c68d5acdb939573661e8d79b1e08c901fa54cf87993464942eedab8f8df93b',
 }
 for filename, approved in approved_bootstrap_files.items():
     canonical = Path(filename).read_bytes().replace(b'\r\n', b'\n')
@@ -1149,6 +1149,116 @@ fi
 '@
             & bash -e -c $integration -- $Check
             if ($LASTEXITCODE -ne 0) { throw "Integration failed (exit $LASTEXITCODE)" }
+        }
+        'compat-diagnostic' {
+            if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Linux' -or $PSVersionTable.PSVersion.Major -lt 7) {
+                throw 'Compatibility diagnostic requires Docker-capable Linux CI and PowerShell 7; no local Docker probe performed'
+            }
+            if ($env:CP_CI_PROJECT -notmatch '^carepulse-ci-[0-9]+-[0-9]+$' -or $env:COMPOSE_PROJECT_NAME -ne $env:CP_CI_PROJECT) {
+                throw 'Explicit matching disposable CI project required'
+            }
+            $compatScript = @'
+set -euo pipefail
+umask 077
+if [[ "${GITHUB_EVENT_NAME:-}" != workflow_dispatch || "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false || -n "${CP_T133_SHA:-}" ]]; then
+  echo 'FAIL compat diagnostics require a manual dispatch without experimental modes'; exit 1
+fi
+mode="${CP_COMPAT_DIAGNOSTIC:-}"
+case "$mode" in
+  compat-us1|compat-us2|compat-us3) ;;
+  *) echo "FAIL unknown compat diagnostic mode: $mode"; exit 1 ;;
+esac
+private="$RUNNER_TEMP/foundation-ci-private"
+test ! -e "$private"
+mkdir -m 0700 "$private"
+source_dir="$RUNNER_TEMP/compat-source-0040"
+rm -rf -- "$source_dir"
+cleanup() {
+  local code=$? cleanup_failed=0
+  trap - EXIT
+  if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" && "$private" = "$RUNNER_TEMP/foundation-ci-private" && -d "$private" && -O "$private" && ! -L "$private" ]]; then
+    if ! docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer down --remove-orphans --volumes; then
+      echo 'FAIL scoped compat Compose cleanup'; cleanup_failed=1
+    fi
+    if ! rm -rf -- "$private" "$source_dir" || test -e "$private"; then
+      echo 'FAIL synthetic compat secret/source cleanup'; cleanup_failed=1
+    fi
+    if [ "$cleanup_failed" = 1 ]; then
+      code=1
+    else
+      echo 'PASS scoped compat Compose volume and synthetic secret cleanup'
+    fi
+  else
+    echo 'FAIL unsafe compat cleanup project'; code=1
+  fi
+  exit "$code"
+}
+trap cleanup EXIT
+
+source_sha='6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7'
+if ! git cat-file -e "${source_sha}^{commit}" 2>/dev/null; then
+  git fetch --no-tags --depth=1 origin "$source_sha"
+fi
+git cat-file -e "${source_sha}^{commit}"
+mkdir -m 0755 "$source_dir"
+git archive "$source_sha" | tar -x -C "$source_dir"
+echo "Verified immutable source commit $source_sha in $source_dir"
+export CP_SOURCE_CONTEXT="$source_dir"
+export CP_COMPAT_ADAPTERS_DIR="$PWD/ops/compat"
+export CP_COMPAT_MANIFEST_DIR="$private/manifests"
+mkdir -m 0755 "$CP_COMPAT_MANIFEST_DIR"
+
+export CP_SOURCE_RUNTIME_DB_PASSWORD_FILE="$private/source-runtime-db-password"
+export CP_SOURCE_AUTH_DB_PASSWORD_FILE="$private/source-auth-db-password"
+export CP_SOURCE_SENDER_DB_PASSWORD_FILE="$private/source-sender-db-password"
+export CP_SOURCE_SERVICE_KEY_FILE="$private/source-service-key"
+export CP_SOURCE_AUTH_SECRET_FILE="$private/source-auth-secret"
+export CP_SOURCE_FILE_ENCRYPTION_KEY_FILE="$private/source-file-key"
+
+for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_API_DB_PASSWORD_SOURCE_FILE" "$CP_WEB_DB_PASSWORD_SOURCE_FILE" "$CP_WORKER_DB_PASSWORD_SOURCE_FILE" "$CP_GATE_DB_PASSWORD_SOURCE_FILE" "$CP_DB_IDENTITY_KEY_SOURCE_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" "$CP_SOURCE_RUNTIME_DB_PASSWORD_FILE" "$CP_SOURCE_AUTH_DB_PASSWORD_FILE" "$CP_SOURCE_SENDER_DB_PASSWORD_FILE" "$CP_SOURCE_SERVICE_KEY_FILE" "$CP_SOURCE_AUTH_SECRET_FILE" "$CP_SOURCE_FILE_ENCRYPTION_KEY_FILE"; do
+  test "$(dirname "$file")" = "$private"
+  openssl rand -hex 32 > "$file"
+  chmod 0444 "$file"
+done
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" > /dev/null 2>&1
+openssl pkey -in "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" -pubout -out "$CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE" > /dev/null 2>&1
+chmod 0444 "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" "$CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE"
+
+docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer config --quiet
+docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer build --pull
+docker compose -f compose.compat.yaml --profile mail up -d --no-build db mail
+for attempt in $(seq 1 40); do
+  if docker compose -f compose.compat.yaml exec -T db pg_isready -h 127.0.0.1 -U carepulse_bootstrap -d carepulse > /dev/null 2>&1; then break; fi
+  if [ "$attempt" = 40 ]; then echo 'FAIL disposable compat database startup'; exit 1; fi
+  sleep 2
+done
+
+for svc in source-api source-web source-worker source-sender candidate-api candidate-web candidate-worker candidate-sender; do
+  img="$(docker compose -f compose.compat.yaml --profile source --profile source-sender --profile candidate --profile candidate-sender images -q "$svc" | head -n 1)"
+  echo "COMPAT_IMAGE $svc=$img"
+done
+
+case "$mode" in
+  compat-us1)
+    required_suites=(tests/unit/test_compat_admission.py tests/integration/test_compat_matrix.py tests/integration/test_compat_entry_denials.py)
+    for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
+    docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T observer python -m pytest -q -ra --tb=short -p no:cacheprovider "${required_suites[@]}"
+    docker compose -f compose.compat.yaml --profile candidate run --rm --no-deps -T --entrypoint node candidate-web --no-warnings --experimental-strip-types --test auth/compat.test.ts
+    ;;
+  compat-us2)
+    required_suites=(tests/integration/test_compat_drain.py tests/integration/test_compat_delivery.py tests/integration/test_compat_upgrade.py)
+    for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
+    docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T observer python -m pytest -q -ra --tb=short -p no:cacheprovider "${required_suites[@]}"
+    ;;
+  compat-us3)
+    required_suites=(tests/integration/test_compat_recovery_source.py tests/integration/test_compat_recovery_intermediate.py tests/integration/test_compat_recovery_target.py tests/integration/test_compat_preservation.py)
+    for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
+    docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T observer python -m pytest -q -ra --tb=short -p no:cacheprovider "${required_suites[@]}"
+    ;;
+esac
+'@
+            & bash -e -c $compatScript
+            if ($LASTEXITCODE -ne 0) { throw "Compatibility diagnostic failed (exit $LASTEXITCODE)" }
         }
     }
 } catch {

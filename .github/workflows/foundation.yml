@@ -34,6 +34,9 @@ on:
           - f01-followup-context
           - f01-pricing
           - f01-pricing-races
+          - compat-us1
+          - compat-us2
+          - compat-us3
 
 # Cancel superseded PR/push checks and duplicate manual runs of the same SHA/mode.
 # Keep manual runs for different commits and spike modes independent.
@@ -46,8 +49,8 @@ permissions:
 
 jobs:
   inputs-and-build:
-    name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'diagnostic-static-checks' || 'inputs-and-build' }}
-    if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' }}
+    name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && !startsWith(inputs.postgres_diagnostic, 'compat-') && 'diagnostic-static-checks' || 'inputs-and-build' }}
+    if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' || startsWith(inputs.postgres_diagnostic, 'compat-') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -239,11 +242,21 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Focused disposable PostgreSQL diagnostics and scoped cleanup
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && !startsWith(inputs.postgres_diagnostic, 'compat-') }}
         shell: pwsh
         env:
           CP_POSTGRES_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
         run: |
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
           & pwsh -NoProfile -File ops/check.ps1 integration-diagnostic
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Compatibility diagnostics (PRE-W3-COMPAT) and scoped cleanup
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && startsWith(inputs.postgres_diagnostic, 'compat-') }}
+        shell: pwsh
+        env:
+          CP_COMPAT_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
+        run: |
+          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
+          & pwsh -NoProfile -File ops/check.ps1 compat-diagnostic
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
