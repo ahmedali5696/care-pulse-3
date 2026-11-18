@@ -13,15 +13,15 @@ from dataclasses import dataclass
 import psycopg
 from psycopg import sql
 
-from ops.compat.control import assert_current_owner
+from ops.compat.control import assert_current_owner, read_control_record
 from ops.compat.drain import DrainVerification, observe_drain_complete
+from ops.compat.manifest import SOURCE_HEAD
 from ops.compat.preflight import PreflightReport
 from ops.compat.probes import (
     probe_alembic_head,
     probe_role_attributes,
     probe_target_identity,
 )
-from ops.compat.manifest import SOURCE_HEAD
 
 
 class PrerequisiteError(RuntimeError):
@@ -48,20 +48,16 @@ def _recheck_fenced_preconditions(
     owner_epoch: int,
 ) -> None:
     """Recheck owner lock/epoch, 0040 head, DRAINING, seal, and zero unresolved work before each write."""
-    ident = probe_target_identity(
-        owner_conn,
-        expected_cluster_id=preflight.cluster_id,
-        expected_db_name=preflight.db_name,
-    )
-    if ident.db_name != preflight.db_name:
-        raise PrerequisiteError("Target database mismatch")
+    owner_db = owner_conn.execute("SELECT current_database() AS db_name").fetchone()
+    if not owner_db or owner_db["db_name"] != preflight.db_name:
+        raise PrerequisiteError("Owner target database mismatch")
     probe_alembic_head(owner_conn, expected_head=SOURCE_HEAD)
 
     ctrl = assert_current_owner(
         owner_conn,
         target_id=preflight.target_id,
         expected_epoch=owner_epoch,
-        lock_mode="UPDATE",
+        lock_mode="NONE",
     )
     if ctrl.phase != "DRAINING" or ctrl.active_generation != "none":
         raise PrerequisiteError(
@@ -90,19 +86,40 @@ def apply_missing_prerequisites(
     admin_owner_conn: psycopg.Connection,
     observer_conn: psycopg.Connection,
     *,
+    owner_conn: psycopg.Connection,
     preflight: PreflightReport,
     drain_proof: DrainVerification,
     owner_epoch: int,
     role_passwords: Mapping[str, str],
 ) -> PrerequisiteDeltaReport:
     """Apply only the explicitly missing F-01 prerequisite delta under verified drain & owner lock."""
-    _recheck_fenced_preconditions(
+    if admin_owner_conn.autocommit:
+        raise PrerequisiteError(
+            "Prerequisite writes require a transactional admin backend"
+        )
+    probe_target_identity(
         admin_owner_conn,
-        observer_conn,
-        preflight=preflight,
-        drain_proof=drain_proof,
-        owner_epoch=owner_epoch,
+        expected_cluster_id=preflight.cluster_id,
+        expected_db_name=preflight.db_name,
     )
+
+    def recheck() -> None:
+        # Keep the control row fenced on the admin backend through each DDL commit.
+        fenced = read_control_record(admin_owner_conn, lock_mode="UPDATE")
+        if fenced.target_id != preflight.target_id or fenced.owner_epoch != owner_epoch:
+            raise PrerequisiteError("Prerequisite admin fence target/epoch mismatch")
+        if not admin_owner_conn.execute(
+            "SELECT 1 FROM pg_stat_activity WHERE pid = %s AND datname = current_database()",
+            (owner_conn.info.backend_pid,),
+        ).fetchone():
+            raise PrerequisiteError("Owner backend is not on the admin target")
+        _recheck_fenced_preconditions(
+            owner_conn,
+            observer_conn,
+            preflight=preflight,
+            drain_proof=drain_proof,
+            owner_epoch=owner_epoch,
+        )
 
     required_login_roles = (
         "carepulse_api",
@@ -123,88 +140,82 @@ def apply_missing_prerequisites(
             raise PrerequisiteError(
                 f"Incompatible existing role attributes on {role_name}"
             )
+    admin_owner_conn.commit()
 
     created_roles: list[str] = []
     for role_name in required_login_roles:
-        _recheck_fenced_preconditions(
-            admin_owner_conn,
-            observer_conn,
-            preflight=preflight,
-            drain_proof=drain_proof,
-            owner_epoch=owner_epoch,
-        )
-        if role_name not in existing:
-            admin_owner_conn.execute(
-                sql.SQL(
-                    "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD {}"
-                ).format(
-                    sql.Identifier(role_name),
-                    sql.Literal(role_passwords[role_name]),
+        with admin_owner_conn.transaction():
+            recheck()
+            if role_name not in existing:
+                admin_owner_conn.execute(
+                    sql.SQL(
+                        "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD {}"
+                    ).format(
+                        sql.Identifier(role_name),
+                        sql.Literal(role_passwords[role_name]),
+                    )
                 )
-            )
-            admin_owner_conn.execute(
-                sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
-                    sql.Identifier(preflight.db_name), sql.Identifier(role_name)
+                recheck()
+                admin_owner_conn.execute(
+                    sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                        sql.Identifier(preflight.db_name), sql.Identifier(role_name)
+                    )
                 )
-            )
-            created_roles.append(role_name)
-        admin_owner_conn.commit()
+                created_roles.append(role_name)
 
-    _recheck_fenced_preconditions(
-        admin_owner_conn,
-        observer_conn,
-        preflight=preflight,
-        drain_proof=drain_proof,
-        owner_epoch=owner_epoch,
-    )
-    if "carepulse_identity_owner" not in existing:
-        admin_owner_conn.execute(
-            "CREATE ROLE carepulse_identity_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS"
-        )
-        admin_owner_conn.execute(
-            "GRANT carepulse_identity_owner TO carepulse_migration WITH SET TRUE, INHERIT FALSE"
-        )
-        created_roles.append("carepulse_identity_owner")
-    admin_owner_conn.commit()
+    with admin_owner_conn.transaction():
+        recheck()
+        if "carepulse_identity_owner" not in existing:
+            admin_owner_conn.execute(
+                "CREATE ROLE carepulse_identity_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS"
+            )
+            recheck()
+            admin_owner_conn.execute(
+                "GRANT carepulse_identity_owner TO carepulse_migration WITH SET TRUE, INHERIT FALSE"
+            )
+            created_roles.append("carepulse_identity_owner")
 
     created_schemas: list[str] = []
-    _recheck_fenced_preconditions(
-        admin_owner_conn,
-        observer_conn,
-        preflight=preflight,
-        drain_proof=drain_proof,
-        owner_epoch=owner_epoch,
-    )
-    schema_rows = admin_owner_conn.execute(
-        "SELECT schema_name FROM information_schema.schemata WHERE schema_name IN ('f01_private', 'f01_crypto')"
-    ).fetchall()
-    existing_schemas = {
-        r["schema_name"] if isinstance(r, dict) else r[0] for r in schema_rows
-    }
-    if "f01_private" not in existing_schemas:
+    with admin_owner_conn.transaction():
+        recheck()
+        schema_rows = admin_owner_conn.execute(
+            "SELECT schema_name FROM information_schema.schemata WHERE schema_name IN ('f01_private', 'f01_crypto')"
+        ).fetchall()
+        existing_schemas = {
+            r["schema_name"] if isinstance(r, dict) else r[0] for r in schema_rows
+        }
+        if "f01_private" not in existing_schemas:
+            recheck()
+            admin_owner_conn.execute(
+                "CREATE SCHEMA f01_private AUTHORIZATION carepulse_identity_owner"
+            )
+            created_schemas.append("f01_private")
+        if "f01_crypto" not in existing_schemas:
+            recheck()
+            admin_owner_conn.execute(
+                "CREATE SCHEMA f01_crypto AUTHORIZATION carepulse_migration"
+            )
+            created_schemas.append("f01_crypto")
+        recheck()
         admin_owner_conn.execute(
-            "CREATE SCHEMA f01_private AUTHORIZATION carepulse_identity_owner"
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA f01_crypto"
         )
-        created_schemas.append("f01_private")
-    if "f01_crypto" not in existing_schemas:
+        recheck()
         admin_owner_conn.execute(
-            "CREATE SCHEMA f01_crypto AUTHORIZATION carepulse_migration"
+            "REVOKE ALL ON SCHEMA f01_private, f01_crypto FROM PUBLIC"
         )
-        created_schemas.append("f01_crypto")
-    admin_owner_conn.execute(
-        "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA f01_crypto"
-    )
-    admin_owner_conn.execute("REVOKE ALL ON SCHEMA f01_private, f01_crypto FROM PUBLIC")
-    admin_owner_conn.execute(
-        "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA f01_crypto FROM PUBLIC"
-    )
-    admin_owner_conn.execute(
-        "GRANT EXECUTE ON FUNCTION f01_crypto.hmac(bytea, bytea, text), f01_crypto.digest(bytea, text), f01_crypto.gen_random_bytes(integer) TO carepulse_identity_owner"
-    )
-    admin_owner_conn.execute(
-        "GRANT USAGE ON SCHEMA f01_crypto TO carepulse_identity_owner"
-    )
-    admin_owner_conn.commit()
+        recheck()
+        admin_owner_conn.execute(
+            "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA f01_crypto FROM PUBLIC"
+        )
+        recheck()
+        admin_owner_conn.execute(
+            "GRANT EXECUTE ON FUNCTION f01_crypto.hmac(bytea, bytea, text), f01_crypto.digest(bytea, text), f01_crypto.gen_random_bytes(integer) TO carepulse_identity_owner"
+        )
+        recheck()
+        admin_owner_conn.execute(
+            "GRANT USAGE ON SCHEMA f01_crypto TO carepulse_identity_owner"
+        )
 
     # Re-probe effective privileges after applying the missing delta.
     post_snaps = probe_role_attributes(

@@ -8,7 +8,6 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, Engine, text
-from sqlalchemy.exc import SQLAlchemyError
 
 
 def _insert(
@@ -250,41 +249,24 @@ def _end_unusable_job(connection: Connection, job_id: UUID, state: str) -> None:
 def _has_unknown_compat_attempt(
     connection: Connection, job_id: UUID | None, org_id: UUID | None = None
 ) -> bool:
-    """Return True if compat_control.work_evidence holds an unresolved UNKNOWN sender attempt."""
-    try:
-        exists = connection.scalar(
-            text(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema = 'compat_control' AND table_name = 'work_evidence'"
-            )
+    """Fail closed on unknown sender work through the sender-only control reader."""
+    if not connection.scalar(
+        text("SELECT to_regnamespace('compat_control') IS NOT NULL")
+    ):
+        return False
+    return bool(
+        connection.scalar(
+            text("""
+                SELECT compat_control.has_unknown_sender_attempt(
+                    :job, COALESCE(:org, NULLIF(current_setting('app.organization_id', true), ''))
+                )
+            """),
+            {
+                "job": str(job_id) if job_id is not None else None,
+                "org": str(org_id) if org_id is not None else None,
+            },
         )
-        if not exists:
-            return False
-        if job_id is not None:
-            hit = connection.scalar(
-                text(
-                    "SELECT 1 FROM compat_control.work_evidence "
-                    "WHERE service = 'sender' AND disposition = 'UNKNOWN' "
-                    "AND correlation_id = :cid LIMIT 1"
-                ),
-                {"cid": str(job_id)},
-            )
-            if hit:
-                return True
-        if org_id is not None:
-            hit = connection.scalar(
-                text(
-                    "SELECT 1 FROM compat_control.work_evidence "
-                    "WHERE service = 'sender' AND disposition = 'UNKNOWN' "
-                    "AND correlation_id = :oid LIMIT 1"
-                ),
-                {"oid": f"org:{org_id}"},
-            )
-            if hit:
-                return True
-        return False
-    except SQLAlchemyError:
-        return False
+    )
 
 
 def claim_delivery_job(

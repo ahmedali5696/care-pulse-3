@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
+import psycopg
 import pytest
+from alembic import command as alembic_command
+from carepulse.compat.admission import (
+    CompatAdmissionError,
+    CompatRuntimeConfig,
+    acquire_invocation_permit,
+)
+from sqlalchemy.exc import SQLAlchemyError
 
 from ops.compat.control import (
     ContentionError,
@@ -24,6 +34,7 @@ from ops.compat.preflight import (
     run_source_preflight,
 )
 from ops.compat.prerequisites import PrerequisiteError, apply_missing_prerequisites
+from ops.compat.probes import ProbeError, probe_alembic_head, probe_role_attributes
 from tests.integration.compat_ci_helpers import (
     build_manifest,
     connect_role,
@@ -31,6 +42,7 @@ from tests.integration.compat_ci_helpers import (
     ensure_roles_provisioned,
     get_cluster_id,
     grant_db_access,
+    make_sa_engine,
     read_secret,
     require_compat_ci,
     upgrade_to_revision,
@@ -48,6 +60,76 @@ from tests.integration.compat_matrix_fixture import (
 @pytest.fixture(scope="module", autouse=True)
 def _ci_guard() -> None:
     require_compat_ci()
+
+
+def _assert_product_roles_cannot_edit_fence(observer, dbname: str) -> None:
+    """Try protected-control mutations with each actual available product login."""
+    roles = (
+        "carepulse_runtime",
+        "carepulse_api",
+        "carepulse_web",
+        "carepulse_worker",
+        "carepulse_gate",
+        "carepulse_auth",
+        "carepulse_sender",
+        "carepulse_operator",
+    )
+    snapshots = probe_role_attributes(observer, roles)
+    before = observer.execute(
+        "SELECT phase, owner_epoch, source_manifest_id, target_manifest_id "
+        "FROM compat_control.target_control"
+    ).fetchone()
+    for role in roles:
+        snap = snapshots.get(role)
+        if snap is None or not snap.rolcanlogin:
+            continue
+        try:
+            conn = connect_role(role, dbname=dbname)
+        except psycopg.OperationalError:
+            # A login lacking CONNECT is already fenced at the physical boundary.
+            assert not observer.execute(
+                "SELECT has_database_privilege(%s, %s, 'CONNECT') AS allowed",
+                (role, dbname),
+            ).fetchone()["allowed"]
+            continue
+        try:
+            for statement in (
+                "UPDATE compat_control.target_control SET owner_epoch = 999",
+                "UPDATE compat_control.target_control SET phase = 'TARGET_OPEN'",
+                "UPDATE compat_control.work_evidence SET disposition = 'COMMITTED'",
+                "SET ROLE carepulse_migration",
+            ):
+                with pytest.raises(psycopg.Error):
+                    conn.execute(statement)
+                conn.rollback()
+        finally:
+            conn.close()
+    after = observer.execute(
+        "SELECT phase, owner_epoch, source_manifest_id, target_manifest_id "
+        "FROM compat_control.target_control"
+    ).fetchone()
+    assert after == before
+
+
+def _assert_both_generations_fenced(dbname, target_id, src_manifest, target_manifest):
+    for generation, login, manifest, expected_head in (
+        ("source", "carepulse_runtime", src_manifest, SOURCE_HEAD),
+        ("candidate", "carepulse_api", target_manifest, CANDIDATE_HEAD),
+    ):
+        cfg = CompatRuntimeConfig(
+            target_id=target_id,
+            manifest_id=manifest.manifest_id,
+            generation=generation,
+            expected_head=expected_head,
+            service="api",
+            db_name=dbname,
+        )
+        engine = make_sa_engine(login, dbname=dbname)
+        try:
+            with pytest.raises((CompatAdmissionError, SQLAlchemyError)):
+                acquire_invocation_permit(engine, config=cfg, expected_login=login)
+        finally:
+            engine.dispose()
 
 
 def test_populated_0040_to_0046_cutover_and_t030_fencing() -> None:
@@ -137,12 +219,15 @@ def test_populated_0040_to_0046_cutover_and_t030_fencing() -> None:
                 consumers_stopped=True,
                 require_source_sealed=True,
             )
+            _assert_both_generations_fenced(dbname, target_id, src_m, cand_m)
+            _assert_product_roles_cannot_edit_fence(observer, dbname)
 
             # 3. T030 refuses stale epoch without mutating roles/schemas.
             with pytest.raises((PrerequisiteError, ContentionError)):
                 apply_missing_prerequisites(
                     admin_owner,
                     observer,
+                    owner_conn=owner_conn,
                     preflight=preflight,
                     drain_proof=drain_proof,
                     owner_epoch=ctrl.owner_epoch - 1,
@@ -161,6 +246,7 @@ def test_populated_0040_to_0046_cutover_and_t030_fencing() -> None:
             delta = apply_missing_prerequisites(
                 admin_owner,
                 observer,
+                owner_conn=owner_conn,
                 preflight=preflight,
                 drain_proof=drain_proof,
                 owner_epoch=ctrl.owner_epoch,
@@ -180,6 +266,36 @@ def test_populated_0040_to_0046_cutover_and_t030_fencing() -> None:
             enter_migrating_phase(
                 owner_conn, target_id=target_id, owner_epoch=ctrl.owner_epoch
             )
+
+            # The first real successor must roll back if control is lost between
+            # applying its DDL and committing the owner-held migration unit.
+            original_upgrade = alembic_command.upgrade
+
+            def lose_ack_before_commit(config, revision):
+                original_upgrade(config, revision)
+                raise RuntimeError("injected loss before migration commit")
+
+            with (
+                patch(
+                    "ops.compat.migrate.command.upgrade",
+                    side_effect=lose_ack_before_commit,
+                ),
+                pytest.raises(
+                    RuntimeError, match="injected loss before migration commit"
+                ),
+            ):
+                advance_one_successor(
+                    owner_conn,
+                    target_id=target_id,
+                    owner_epoch=ctrl.owner_epoch,
+                    expected_predecessor=SOURCE_HEAD,
+                    target_successor=PUBLISHED_SUCCESSORS[0],
+                )
+            assert (
+                probe_alembic_head(observer, expected_head=SOURCE_HEAD) == SOURCE_HEAD
+            )
+            compare_retained_inventory(observer, inventory)
+
             current_rev = SOURCE_HEAD
             for successor in PUBLISHED_SUCCESSORS:
                 committed = advance_one_successor(
@@ -198,9 +314,26 @@ def test_populated_0040_to_0046_cutover_and_t030_fencing() -> None:
                 )
                 assert obs.committed_head == successor
                 compare_retained_inventory(observer, inventory)
+                _assert_both_generations_fenced(dbname, target_id, src_m, cand_m)
+                _assert_product_roles_cannot_edit_fence(observer, dbname)
                 current_rev = successor
 
             assert current_rev == CANDIDATE_HEAD
+            # A replay of an already committed unit must not apply it again.
+            with pytest.raises(ProbeError):
+                advance_one_successor(
+                    owner_conn,
+                    target_id=target_id,
+                    owner_epoch=ctrl.owner_epoch,
+                    expected_predecessor=PUBLISHED_SUCCESSORS[-2],
+                    target_successor=CANDIDATE_HEAD,
+                )
+            owner_conn.rollback()
+            assert (
+                probe_alembic_head(observer, expected_head=CANDIDATE_HEAD)
+                == CANDIDATE_HEAD
+            )
+            compare_retained_inventory(observer, inventory)
         finally:
             observer.close()
             admin_owner.close()

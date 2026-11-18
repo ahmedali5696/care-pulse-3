@@ -1,21 +1,41 @@
-"""Reusable real-0040 populated synthetic fixture and private comparison inventory (T029).
-
-Seeds two synthetic clinics with patients, appointments, frozen EGP pricing,
-visits, follow-up decisions, policies, receipts, audit/outbox, and delivery jobs,
-without seeding F-01 withdrawal or Doctor evidence before 0041+ semantics permit it.
-"""
+"""Populated, referentially valid 0040 cutover fixture and retained-row proof (T029)."""
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import psycopg
+from psycopg import sql
+from psycopg.types.json import Jsonb
+
+TENANT_TABLES = (
+    "staff_accounts",
+    "invitations",
+    "patients",
+    "clinic_policy_versions",
+    "clinic_policy_heads",
+    "appointment_day_counters",
+    "appointments",
+    "appointment_number_assignments",
+    "appointment_price_snapshots",
+    "appointment_history",
+    "queue_days",
+    "queue_entries",
+    "doctor_controls",
+    "visits",
+    "idempotency_receipts",
+    "sensitive_audit",
+    "outbox_events",
+    "delivery_jobs",
+)
 
 
 @dataclass(frozen=True)
 class Populated0040Inventory:
-    """Private comparison inventory captured at 0040 before cutover."""
+    """Source identities and original field values retained across each successor."""
 
     org_a_id: str
     org_b_id: str
@@ -24,73 +44,356 @@ class Populated0040Inventory:
     appointment_a_id: str
     visit_a_id: str
     delivery_job_a_id: str
-    expected_counts: dict[str, int]
+    operator_id: str
+    owner_user_ids: tuple[str, str]
+    expected_rows: dict[str, tuple[dict, ...]]
+
+
+def _retained_rows(
+    conn: psycopg.Connection, inventory: Populated0040Inventory
+) -> dict[str, tuple[dict, ...]]:
+    """Capture complete original row values; future additive columns are allowed."""
+    tenants = (inventory.org_a_id, inventory.org_b_id)
+    queries = {
+        "organizations": ("id IN (%s, %s)", tenants),
+        "operator_identities": ("id = %s", (inventory.operator_id,)),
+        '"user"': ("id IN (%s, %s)", inventory.owner_user_ids),
+        "protected_delivery_material": (
+            "job_id IN (SELECT id FROM public.delivery_jobs WHERE organization_id IN (%s, %s))",
+            tenants,
+        ),
+    }
+    for table in TENANT_TABLES:
+        queries[table] = ("organization_id IN (%s, %s)", tenants)
+
+    results = {}
+    for table, (predicate, params) in queries.items():
+        statement = sql.SQL("SELECT to_jsonb(t) AS row FROM public.{} t WHERE ").format(
+            sql.Identifier(table.strip('"'))
+        ) + sql.SQL(predicate)
+        results[table] = tuple(row["row"] for row in conn.execute(statement, params))
+    return results
 
 
 def seed_populated_0040_fixture(conn: psycopg.Connection) -> Populated0040Inventory:
-    """Seed two synthetic clinics at 0040 and return an immutable comparison inventory."""
-    org_a = str(uuid.uuid4())
-    org_b = str(uuid.uuid4())
-    patient_a = str(uuid.uuid4())
-    patient_b = str(uuid.uuid4())
-    appt_a = str(uuid.uuid4())
-    visit_a = str(uuid.uuid4())
-    job_a = str(uuid.uuid4())
+    """Create two real 0040 tenants with verified Owner and relational evidence."""
 
-    # Discover public tables present at 0040 to seed minimal valid synthetic rows.
-    tables = {
-        r["tablename"] if isinstance(r, dict) else r[0]
-        for r in conn.execute(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-        ).fetchall()
-    }
+    def new_id() -> str:
+        return str(uuid.uuid4())
 
-    if "organizations" in tables:
+    operator = new_id()
+    orgs = (new_id(), new_id())
+    patients = (new_id(), new_id())
+    appointments = (new_id(), new_id())
+    owner_users = (f"compat-owner-{new_id()}", f"compat-owner-{new_id()}")
+    visit = new_id()
+    delivery_job = new_id()
+
+    conn.execute(
+        """INSERT INTO public.operator_identities
+               (id, credential_digest, issued_by_reference)
+               VALUES (%s, %s, 'synthetic-0040-cutover')""",
+        (operator, f"synthetic:{operator}"),
+    )
+
+    for index, (org, patient, appointment, owner_user) in enumerate(
+        zip(orgs, patients, appointments, owner_users, strict=True)
+    ):
+        doctor, invitation, assignment = new_id(), new_id(), new_id()
+        email = f"compat-owner-{index}-{new_id()}@example.invalid"
+        date = "2026-10-27"
         conn.execute(
-            """
-            INSERT INTO public.organizations (id, branch, state)
-            VALUES (%s, 'Clinic Alpha', 'ACTIVE'), (%s, 'Clinic Beta', 'ACTIVE')
-            ON CONFLICT DO NOTHING
-            """,
-            (org_a, org_b),
+            """INSERT INTO public.organizations (id, branch, created_by_operator_id)
+               VALUES (%s, %s, %s)""",
+            (
+                org,
+                f"Synthetic 0040 Clinic {'Alpha' if index == 0 else 'Beta'}",
+                operator,
+            ),
+        )
+        conn.execute(
+            """INSERT INTO public."user"
+               (id, name, email, "emailVerified", "createdAt", "updatedAt")
+               VALUES (%s, 'Synthetic 0040 Doctor', %s, true,
+                       clock_timestamp(), clock_timestamp())""",
+            (owner_user, email),
+        )
+        conn.execute(
+            """INSERT INTO public.staff_accounts
+               (id, organization_id, auth_user_id, verified_email, role, enabled, verified)
+               VALUES (%s, %s, %s, %s, 'DOCTOR_OWNER', true, true)""",
+            (doctor, org, owner_user, email),
+        )
+        conn.execute(
+            """INSERT INTO public.invitations
+               (id, organization_id, purpose, target_email, proof_digest,
+                issued_by_operator_id, expires_at)
+               VALUES (%s, %s, 'FIRST_OWNER', %s, %s, %s,
+                       clock_timestamp() + interval '20 minutes')""",
+            (
+                invitation,
+                org,
+                email,
+                hashlib.sha256(invitation.encode()).hexdigest(),
+                operator,
+            ),
         )
 
-    counts: dict[str, int] = {}
-    for tbl in ("organizations", "patients", "appointments", "visits", "delivery_jobs"):
-        if tbl in tables:
-            row = conn.execute(f"SELECT count(*) AS c FROM public.{tbl}").fetchone()
-            counts[tbl] = int(row["c"] if isinstance(row, dict) else row[0])
-    conn.commit()
-    return Populated0040Inventory(
-        org_a_id=org_a,
-        org_b_id=org_b,
-        patient_a_id=patient_a,
-        patient_b_id=patient_b,
-        appointment_a_id=appt_a,
-        visit_a_id=visit_a,
-        delivery_job_a_id=job_a,
-        expected_counts=counts,
+        if index == 0:
+            # Genuine first-Owner delivery evidence; ciphertext contains no real proof.
+            conn.execute(
+                """INSERT INTO public.delivery_jobs
+                   (id, organization_id, invitation_id, proof_reference, purpose,
+                    recipient, template, logical_key, proof_expires_at)
+                   SELECT %s, organization_id, id, id::text, 'FIRST_OWNER',
+                          target_email, 'first-owner', %s, expires_at
+                   FROM public.invitations WHERE id = %s""",
+                (delivery_job, f"synthetic:{invitation}", invitation),
+            )
+            conn.execute(
+                """INSERT INTO public.protected_delivery_material
+                   (job_id, delivery_key_id, ciphertext_base64url)
+                   VALUES (%s, 'synthetic-0040-key', %s)""",
+                (
+                    delivery_job,
+                    base64.urlsafe_b64encode(b"x" * 384).decode().rstrip("="),
+                ),
+            )
+
+        conn.execute(
+            """UPDATE public.invitations SET state = 'ACCEPTED',
+               accepted_by_user_id = %s,
+               acceptance_reference = 'SIGNED_OWNER_ACTIVATION' WHERE id = %s""",
+            (owner_user, invitation),
+        )
+        conn.execute(
+            "UPDATE public.organizations SET state = 'ACTIVE' WHERE id = %s", (org,)
+        )
+        conn.execute(
+            """INSERT INTO public.sensitive_audit
+               (id, organization_id, actor_role, action, correlation_id)
+               VALUES (%s, %s, 'SYSTEM', 'FIRST_OWNER_ACTIVATED', %s)""",
+            (new_id(), org, invitation),
+        )
+
+        # Default PRICE policy is immutable; publish a configured version normally.
+        conn.execute(
+            """INSERT INTO public.clinic_policy_versions
+               (organization_id, kind, version, payload)
+               VALUES (%s, 'PRICE', 2, %s)""",
+            (
+                org,
+                Jsonb(
+                    {
+                        "standard_new_exam_egp": 100,
+                        "preferential_followup_egp": 30,
+                        "urgent_base_egp": None,
+                        "urgent_enabled": False,
+                    }
+                ),
+            ),
+        )
+        conn.execute(
+            """UPDATE public.clinic_policy_heads
+               SET current_version = 2, revision = 2
+               WHERE organization_id = %s AND kind = 'PRICE'""",
+            (org,),
+        )
+        conn.execute(
+            """INSERT INTO public.patients
+               (id, organization_id, name_parts, date_of_birth)
+               VALUES (%s, %s, %s, DATE '2001-01-01')""",
+            (patient, org, ["Synthetic", "Cutover", "Alpha" if index == 0 else "Beta"]),
+        )
+        conn.execute(
+            """INSERT INTO public.appointment_day_counters
+               (organization_id, service_date, last_number) VALUES (%s, %s, 1)""",
+            (org, date),
+        )
+        conn.execute(
+            """INSERT INTO public.appointments
+               (id, organization_id, patient_id, doctor_staff_id, service_date,
+                status, service_type, classification, lane, booking_mode,
+                current_assignment_id, current_number)
+               VALUES (%s, %s, %s, %s, %s, 'Booked', 'NEW_EXAMINATION',
+                       'ROUTINE', 'MAIN', 'OPEN', %s, 1)""",
+            (appointment, org, patient, doctor, date, assignment),
+        )
+        conn.execute(
+            """INSERT INTO public.appointment_number_assignments
+               (id, organization_id, appointment_id, service_date, number)
+               VALUES (%s, %s, %s, %s, 1)""",
+            (assignment, org, appointment, date),
+        )
+        conn.execute(
+            """INSERT INTO public.appointment_price_snapshots
+               (organization_id, appointment_id, service_type, classification,
+                base_egp, discount_type, discount_value, is_free, net_egp,
+                pricing_version, creation_standard_base_egp)
+               VALUES (%s, %s, 'NEW_EXAMINATION', 'ROUTINE',
+                       100.00, 'NONE', 0, false, 100.00, 2, 100.00)""",
+            (org, appointment),
+        )
+        conn.execute(
+            """INSERT INTO public.appointment_history
+               (id, organization_id, appointment_id, appointment_revision, action,
+                new_status, new_service_date, new_number, actor_staff_id, actor_role,
+                price_snapshot_appointment_id)
+               VALUES (%s, %s, %s, 0, 'CREATED', 'Booked', %s, 1, %s,
+                       'DOCTOR_OWNER', %s)""",
+            (new_id(), org, appointment, date, doctor, appointment),
+        )
+
+        if index == 0:
+            # Waiting attendance and its closure are required for genuine Visit admission.
+            day, entry = new_id(), new_id()
+            conn.execute(
+                "UPDATE public.appointments SET status = 'Waiting', revision = 1 WHERE id = %s",
+                (appointment,),
+            )
+            conn.execute(
+                """INSERT INTO public.appointment_history
+                   (id, organization_id, appointment_id, appointment_revision,
+                    action, old_status, new_status, old_service_date, new_service_date,
+                    old_number, new_number, actor_staff_id, actor_role,
+                    price_snapshot_appointment_id)
+                   VALUES (%s, %s, %s, 1, 'STATUS', 'Booked', 'Waiting',
+                           %s, %s, 1, 1, %s, 'DOCTOR_OWNER', %s)""",
+                (new_id(), org, appointment, date, date, doctor, appointment),
+            )
+            conn.execute(
+                """INSERT INTO public.queue_days
+                   (id, organization_id, doctor_staff_id, service_date, lane,
+                    queue_policy_version, arrival_counter)
+                   VALUES (%s, %s, %s, %s, 'MAIN', 1, 1)""",
+                (day, org, doctor, date),
+            )
+            conn.execute(
+                """INSERT INTO public.queue_entries
+                   (id, organization_id, queue_day_id, appointment_id, patient_id,
+                    doctor_staff_id, service_date, lane, routine_rank, disposition)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'MAIN', 1, 'ACTIVE')""",
+                (entry, org, day, appointment, patient, doctor, date),
+            )
+            conn.execute(
+                """SELECT * FROM public.lock_doctor_admission_capacity(
+                   %s, %s, %s, 'MAIN')""",
+                (org, doctor, date),
+            )
+            conn.execute(
+                """UPDATE public.appointments SET status = 'In Examination',
+                   revision = 2 WHERE id = %s""",
+                (appointment,),
+            )
+            conn.execute(
+                """INSERT INTO public.appointment_history
+                   (id, organization_id, appointment_id, appointment_revision,
+                    action, old_status, new_status, old_service_date, new_service_date,
+                    old_number, new_number, actor_staff_id, actor_role,
+                    price_snapshot_appointment_id)
+                   VALUES (%s, %s, %s, 2, 'STATUS', 'Waiting', 'In Examination',
+                           %s, %s, 1, 1, %s, 'DOCTOR_OWNER', %s)""",
+                (new_id(), org, appointment, date, date, doctor, appointment),
+            )
+            conn.execute(
+                """UPDATE public.queue_entries SET disposition = 'CLOSED',
+                   closure_history_revision = 2, revision = revision + 1 WHERE id = %s""",
+                (entry,),
+            )
+            conn.execute(
+                """UPDATE public.queue_days SET revision = revision + 1,
+                   routine_cursor = 1 WHERE id = %s""",
+                (day,),
+            )
+            conn.execute(
+                """INSERT INTO public.visits
+                   (id, organization_id, appointment_id, patient_id, doctor_staff_id,
+                    service_date, admission_history_revision, admitted_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, 2, clock_timestamp())""",
+                (visit, org, appointment, patient, doctor, date),
+            )
+
+        conn.execute(
+            """INSERT INTO public.idempotency_receipts
+               (id, scope_kind, scope_id, actor_kind, actor_id, organization_id,
+                staff_id, operation, idempotency_key, request_digest,
+                result_projection, result_revision)
+               VALUES (%s, 'TENANT', %s, 'STAFF', %s, %s, %s,
+                       'appointments.book', %s, %s, %s, 0)""",
+            (
+                new_id(),
+                org,
+                doctor,
+                org,
+                doctor,
+                f"synthetic-{appointment}",
+                hashlib.sha256(appointment.encode()).hexdigest(),
+                Jsonb(
+                    {"appointment_id": appointment, "number": 1, "net_egp": "100.00"}
+                ),
+            ),
+        )
+        conn.execute(
+            """INSERT INTO public.sensitive_audit
+               (id, organization_id, actor_staff_id, actor_role, action,
+                reason, correlation_id)
+               VALUES (%s, %s, %s, 'DOCTOR_OWNER', 'SYNTHETIC_SETTINGS_CHANGE',
+                       '0040 cutover fixture', %s)""",
+            (new_id(), org, doctor, new_id()),
+        )
+        conn.execute(
+            """INSERT INTO public.outbox_events
+               (id, organization_id, event_type, aggregate_type, aggregate_id, payload)
+               VALUES (%s, %s, 'APPOINTMENT_BOOKED', 'appointment', %s, %s)""",
+            (
+                new_id(),
+                org,
+                appointment,
+                Jsonb({"appointment_id": appointment, "patient_id": patient}),
+            ),
+        )
+
+    inventory = Populated0040Inventory(
+        org_a_id=orgs[0],
+        org_b_id=orgs[1],
+        patient_a_id=patients[0],
+        patient_b_id=patients[1],
+        appointment_a_id=appointments[0],
+        visit_a_id=visit,
+        delivery_job_a_id=delivery_job,
+        operator_id=operator,
+        owner_user_ids=owner_users,
+        expected_rows={},
     )
+    rows = _retained_rows(conn, inventory)
+    for table, values in rows.items():
+        if not values:
+            raise AssertionError(f"Unpopulated 0040 fixture table: {table}")
+    conn.commit()
+    return replace(inventory, expected_rows=rows)
 
 
 def compare_retained_inventory(
     conn: psycopg.Connection, inventory: Populated0040Inventory
 ) -> None:
-    """Verify retained counts and organization rows across migration steps."""
-    for tbl, expected in inventory.expected_counts.items():
-        row = conn.execute(f"SELECT count(*) AS c FROM public.{tbl}").fetchone()
-        actual = int(row["c"] if isinstance(row, dict) else row[0])
-        if actual < expected:
-            raise AssertionError(
-                f"Retained count regression on {tbl}: expected >= {expected}, got {actual}"
+    """Require every captured source row and original field value to survive."""
+    actual_rows = _retained_rows(conn, inventory)
+    for table, originals in inventory.expected_rows.items():
+        remaining = list(actual_rows[table])
+        for original in originals:
+            matched = next(
+                (
+                    index
+                    for index, row in enumerate(remaining)
+                    if all(
+                        key in row and row[key] == value
+                        for key, value in original.items()
+                    )
+                ),
+                None,
             )
-    if "organizations" in inventory.expected_counts:
-        rows = conn.execute(
-            "SELECT id::text AS id FROM public.organizations WHERE id IN (%s, %s)",
-            (inventory.org_a_id, inventory.org_b_id),
-        ).fetchall()
-        found = {r["id"] if isinstance(r, dict) else r[0] for r in rows}
-        if found != {inventory.org_a_id, inventory.org_b_id}:
-            raise AssertionError(
-                "Synthetic clinic organizations missing after migration"
-            )
+            if matched is None:
+                raise AssertionError(
+                    f"Retained 0040 row/field regression: {table}: {original}"
+                )
+            remaining.pop(matched)

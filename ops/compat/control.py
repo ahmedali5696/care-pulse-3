@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from typing import Literal
+from weakref import WeakKeyDictionary
 
 import psycopg
 from psycopg.rows import dict_row
@@ -19,6 +20,10 @@ ControlPhase = Literal[
 ]
 VALID_PHASES: frozenset[str] = frozenset(
     {"CLOSED", "SOURCE_OPEN", "DRAINING", "MIGRATING", "VERIFYING", "TARGET_OPEN"}
+)
+# pg_locks does not distinguish session locks from transaction advisory locks.
+_claimed_owner_epochs: WeakKeyDictionary[psycopg.Connection, tuple[str, int, int]] = (
+    WeakKeyDictionary()
 )
 
 
@@ -48,7 +53,7 @@ class ControlRecord:
 
 def advisory_key(namespace: str, target_id: str) -> int:
     """Derive a deterministic signed 64-bit PostgreSQL advisory lock key."""
-    digest = hashlib.sha256(f"compat:{namespace}:{target_id}".encode("utf-8")).digest()
+    digest = hashlib.sha256(f"compat:{namespace}:{target_id}".encode()).digest()
     return int.from_bytes(digest[:8], "big", signed=True)
 
 
@@ -85,6 +90,7 @@ def acquire_owner_lock(conn: psycopg.Connection, target_id: str) -> bool:
 
 def release_owner_lock(conn: psycopg.Connection, target_id: str) -> bool:
     """Release the session-scoped advisory owner lock."""
+    _claimed_owner_epochs.pop(conn, None)
     key = advisory_key("owner", target_id)
     row = conn.execute("SELECT pg_advisory_unlock(%s) AS released", (key,)).fetchone()
     if not conn.autocommit:
@@ -215,6 +221,11 @@ def claim_owner_epoch(
         ).fetchone()
         conn.commit()
         assert row is not None
+        _claimed_owner_epochs[conn] = (
+            target_id,
+            int(row["owner_epoch"]),
+            conn.info.backend_pid,
+        )
         return ControlRecord(
             target_id=row["target_id"],
             cluster_id=row["cluster_id"],
@@ -246,6 +257,34 @@ def assert_current_owner(
     lock_mode: Literal["NONE", "UPDATE"] = "UPDATE",
 ) -> ControlRecord:
     """Verify this nonpooled controller still owns the target lock and current epoch."""
+    key = advisory_key("owner", target_id)
+    held = conn.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM pg_locks
+            WHERE locktype = 'advisory'
+              AND pid = pg_backend_pid()
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+              AND classid::bigint = %s
+              AND objid::bigint = %s
+              AND objsubid = 1
+              AND mode = 'ExclusiveLock'
+              AND granted
+        ) AS held
+        """,
+        ((key >> 32) & 0xFFFFFFFF, key & 0xFFFFFFFF),
+    ).fetchone()
+    if (
+        _claimed_owner_epochs.get(conn)
+        != (target_id, expected_epoch, conn.info.backend_pid)
+        or not held
+        or not held["held"]
+    ):
+        if not conn.autocommit:
+            conn.rollback()
+        raise ContentionError(
+            f"Backend does not hold the claimed owner advisory session lock for {target_id} at epoch {expected_epoch}"
+        )
     current = read_control_record(conn, lock_mode=lock_mode)
     if current.target_id != target_id:
         if not conn.autocommit:

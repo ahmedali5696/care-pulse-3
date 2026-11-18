@@ -1236,9 +1236,12 @@ for attempt in $(seq 1 40); do
 done
 
 for svc in source-api source-web source-worker source-sender candidate-api candidate-web candidate-worker candidate-sender; do
-  img="$(docker compose -f compose.compat.yaml --profile source --profile source-sender --profile candidate --profile candidate-sender images -q "$svc" | head -n 1)"
+  img_tag="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["services"][sys.argv[2]]["image"])' "$private/compose.compat.json" "$svc")"
+  img="$(docker image inspect --format '{{.Id}}' "$img_tag")"
+  [[ "$img" == sha256:* ]] || { echo "FAIL missing built compat image for $svc"; exit 1; }
   echo "COMPAT_IMAGE $svc=$img"
 done
+sha256sum ops/compat/source-web.cjs ops/compat/source-api.py ops/compat/source-jobs.py apps/api/carepulse/compat/admission.py apps/web/compat/admission.ts
 
 case "$mode" in
   compat-us1)

@@ -169,10 +169,33 @@ AS $$
     WHERE tc.singleton_id = TRUE;
 $$;
 
+-- Sender-only, target-bound uncertainty check. No product role can read the
+-- protected work ledger; an unresolved SMTP outcome must still block reclaim.
+CREATE OR REPLACE FUNCTION compat_control.has_unknown_sender_attempt(
+    p_job_id TEXT, p_organization_id TEXT
+) RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM compat_control.work_evidence w
+        JOIN compat_control.target_control c ON c.target_id = w.target_id
+        WHERE c.singleton_id = TRUE AND c.db_name = current_database()
+          AND w.service = 'sender' AND w.disposition = 'UNKNOWN'
+          AND (
+              (p_job_id IS NOT NULL AND w.correlation_id = p_job_id)
+              OR (p_organization_id IS NOT NULL AND
+                  w.correlation_id = 'org:' || p_organization_id)
+          )
+    );
+$$;
+
 REVOKE ALL ON TABLE compat_control.target_control FROM PUBLIC;
 REVOKE ALL ON TABLE compat_control.work_evidence FROM PUBLIC;
 REVOKE ALL ON FUNCTION compat_control.read_target_control() FROM PUBLIC;
 REVOKE ALL ON FUNCTION compat_control.read_target_status() FROM PUBLIC;
+REVOKE ALL ON FUNCTION compat_control.has_unknown_sender_attempt(TEXT, TEXT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION compat_control.record_own_attempt(
     TEXT, TEXT, BIGINT, TEXT, TEXT, TEXT, TEXT, BIGINT, TEXT
 ) FROM PUBLIC;
@@ -193,6 +216,9 @@ BEGIN
             EXECUTE format('GRANT EXECUTE ON FUNCTION compat_control.read_target_status() TO %I', r);
             EXECUTE format('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON compat_control.target_control FROM %I', r);
             EXECUTE format('REVOKE ALL ON compat_control.work_evidence FROM %I', r);
+            IF r = 'carepulse_sender' THEN
+                EXECUTE format('GRANT EXECUTE ON FUNCTION compat_control.has_unknown_sender_attempt(TEXT, TEXT) TO %I', r);
+            END IF;
         END IF;
     END LOOP;
 

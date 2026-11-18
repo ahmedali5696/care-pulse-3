@@ -16,6 +16,7 @@ from carepulse.compat.admission import (
 
 from ops.compat.control import (
     ContentionError,
+    advisory_key,
     claim_owner_epoch,
     inspect_as_competitor,
     release_exclusive_drain_permit,
@@ -23,6 +24,7 @@ from ops.compat.control import (
 )
 from ops.compat.drain import (
     DrainError,
+    commit_draining_fence,
     drain_and_settle,
     observe_drain_complete,
 )
@@ -47,6 +49,81 @@ from tests.integration.compat_matrix_fixture import (
 @pytest.fixture(scope="module", autouse=True)
 def _ci_guard() -> None:
     require_compat_ci()
+
+
+def test_matching_epoch_cannot_mutate_without_claimed_session_owner_lock() -> None:
+    with disposable_database("compat_owner") as dbname:
+        admin = connect_role("carepulse_bootstrap", dbname=dbname, autocommit=True)
+        try:
+            ensure_roles_provisioned(admin, source_only=True)
+            grant_db_access(admin, dbname, source_only=True)
+            cluster_id = get_cluster_id(admin)
+        finally:
+            admin.close()
+
+        upgrade_to_revision(dbname, SOURCE_HEAD)
+        target_id = f"t-{dbname}"
+        src = build_manifest(
+            generation="source",
+            target_id=target_id,
+            cluster_id=cluster_id,
+            db_name=dbname,
+        )
+        cand = build_manifest(
+            generation="candidate",
+            target_id=target_id,
+            cluster_id=cluster_id,
+            db_name=dbname,
+        )
+        setup = connect_role("carepulse_migration", dbname=dbname)
+        try:
+            provision_target_control(
+                setup,
+                target_id=target_id,
+                cluster_id=cluster_id,
+                db_name=dbname,
+                source_manifest_id=src.manifest_id,
+                target_manifest_id=cand.manifest_id,
+            )
+        finally:
+            setup.close()
+
+        owner = connect_role("carepulse_migration", dbname=dbname)
+        competitor = connect_role("carepulse_migration", dbname=dbname)
+        try:
+            claimed = claim_owner_epoch(
+                owner,
+                target_id=target_id,
+                expected_cluster_id=cluster_id,
+                expected_db_name=dbname,
+            )
+
+            # Same role, target and current epoch do not grant another backend control.
+            with pytest.raises(ContentionError, match="claimed owner"):
+                commit_draining_fence(
+                    competitor, target_id=target_id, owner_epoch=claimed.owner_epoch
+                )
+            assert (
+                inspect_as_competitor(competitor, target_id=target_id).phase == "CLOSED"
+            )
+
+            # An expired claimant cannot substitute a transaction advisory lock.
+            assert release_owner_lock(owner, target_id)
+            owner.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (advisory_key("owner", target_id),),
+            )
+            with pytest.raises(ContentionError, match="claimed owner"):
+                commit_draining_fence(
+                    owner, target_id=target_id, owner_epoch=claimed.owner_epoch
+                )
+            assert (
+                inspect_as_competitor(competitor, target_id=target_id).phase == "CLOSED"
+            )
+        finally:
+            competitor.close()
+            owner.rollback()
+            owner.close()
 
 
 def test_ordered_invocation_versus_drain_with_lock_observation() -> None:
