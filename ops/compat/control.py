@@ -248,10 +248,14 @@ def assert_current_owner(
     """Verify this nonpooled controller still owns the target lock and current epoch."""
     current = read_control_record(conn, lock_mode=lock_mode)
     if current.target_id != target_id:
+        if not conn.autocommit:
+            conn.rollback()
         raise ContentionError(
             f"Target mismatch: expected {target_id}, got {current.target_id}"
         )
     if current.owner_epoch != expected_epoch:
+        if not conn.autocommit:
+            conn.rollback()
         raise ContentionError(
             f"Superseded controller epoch: held {expected_epoch}, current {current.owner_epoch}"
         )

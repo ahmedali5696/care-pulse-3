@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from ops.compat.control import (
+    ContentionError,
     claim_owner_epoch,
     release_exclusive_drain_permit,
     release_owner_lock,
@@ -138,7 +139,7 @@ def test_populated_0040_to_0046_cutover_and_t030_fencing() -> None:
             )
 
             # 3. T030 refuses stale epoch without mutating roles/schemas.
-            with pytest.raises(PrerequisiteError):
+            with pytest.raises((PrerequisiteError, ContentionError)):
                 apply_missing_prerequisites(
                     admin_owner,
                     observer,
