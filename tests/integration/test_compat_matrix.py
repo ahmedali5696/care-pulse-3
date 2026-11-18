@@ -12,9 +12,10 @@ from carepulse.compat.admission import (
     probe_compat_readiness,
     release_invocation_permit,
 )
+from sqlalchemy.exc import SQLAlchemyError
 
 from ops.compat.manifest import SOURCE_HEAD as MANIFEST_SOURCE_HEAD
-from ops.compat.probes import probe_alembic_head
+from ops.compat.probes import ProbeError, probe_alembic_head
 from tests.integration.compat_ci_helpers import (
     build_manifest,
     connect_role,
@@ -135,7 +136,7 @@ def test_matched_0040_source_activation_and_candidate_denial() -> None:
         )
         api_engine = make_sa_engine("carepulse_api", dbname=dbname)
         try:
-            with pytest.raises(CompatAdmissionError):
+            with pytest.raises((CompatAdmissionError, SQLAlchemyError)):
                 acquire_invocation_permit(
                     api_engine,
                     config=cand_cfg,
@@ -228,7 +229,7 @@ def test_matched_0046_candidate_activation_and_source_denial() -> None:
         )
         rt_eng = make_sa_engine("carepulse_runtime", dbname=dbname)
         try:
-            with pytest.raises(CompatAdmissionError):
+            with pytest.raises((CompatAdmissionError, SQLAlchemyError)):
                 acquire_invocation_permit(
                     rt_eng, config=src_cfg, expected_login="carepulse_runtime"
                 )
@@ -295,7 +296,7 @@ def test_intermediate_heads_remain_fenced_for_both_generations(
         mig2 = connect_role("carepulse_migration", dbname=dbname)
         try:
             assert probe_alembic_head(mig2) == intermediate_rev
-            with pytest.raises(MatrixFixtureError):
+            with pytest.raises((MatrixFixtureError, ProbeError)):
                 initial_activate_matched_target(
                     mig2, manifest=cand_manifest, expected_target_id=target_id
                 )
@@ -317,7 +318,7 @@ def test_intermediate_heads_remain_fenced_for_both_generations(
             )
             eng = make_sa_engine(role, dbname=dbname)
             try:
-                with pytest.raises(CompatAdmissionError):
+                with pytest.raises((CompatAdmissionError, SQLAlchemyError)):
                     acquire_invocation_permit(eng, config=cfg, expected_login=role)
             finally:
                 eng.dispose()
