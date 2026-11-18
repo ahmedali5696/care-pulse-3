@@ -152,29 +152,17 @@ def verify_control_and_head(
     config: CompatRuntimeConfig,
     lock_for_share: bool = True,
 ) -> int:
-    """Validate singleton alembic head and compat_control.target_control under short FOR SHARE."""
-    revs = (
-        session_or_conn.execute(text("SELECT version_num FROM public.alembic_version"))
-        .scalars()
-        .all()
-    )
-    if len(revs) != 1 or revs[0] != config.expected_head:
-        raise CompatAdmissionError("Incompatible schema revision")
-
+    """Validate singleton alembic head and compat_control.target_control."""
     sql_query = (
         "SELECT * FROM compat_control.read_target_control()"
         if lock_for_share
-        else """
-            SELECT target_id, db_name, phase, owner_epoch,
-                   source_manifest_id, target_manifest_id, active_generation,
-                   source_sealed
-            FROM compat_control.target_control
-            WHERE singleton_id = TRUE
-            """
+        else "SELECT * FROM compat_control.read_target_status()"
     )
     ctrl = session_or_conn.execute(text(sql_query)).mappings().first()
     if ctrl is None:
         raise CompatAdmissionError("Missing target control")
+    if ctrl["alembic_head"] != config.expected_head:
+        raise CompatAdmissionError("Incompatible schema revision")
     if ctrl["target_id"] != config.target_id or ctrl["db_name"] != config.db_name:
         raise CompatAdmissionError("Target binding mismatch")
     if ctrl["phase"] != _expected_phase(config.generation):

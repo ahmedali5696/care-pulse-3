@@ -121,13 +121,6 @@ export async function verifyControlAndHead(
   config: CompatWebConfig,
   lockForShare = true,
 ): Promise<number> {
-  const rev = await client.query<{ version_num: string }>(
-    "SELECT version_num FROM public.alembic_version",
-  );
-  if (rev.rows.length !== 1 || rev.rows[0].version_num !== config.expectedHead) {
-    throw new CompatAdmissionError("Incompatible schema revision");
-  }
-
   const expectedPhase =
     config.generation === "source" ? "SOURCE_OPEN" : "TARGET_OPEN";
   const manifestCol =
@@ -140,20 +133,23 @@ export async function verifyControlAndHead(
     manifest_id: string;
     active_generation: string;
     source_sealed: boolean;
+    alembic_head: string | null;
   }>(
     lockForShare
       ? `SELECT target_id, db_name, phase, owner_epoch,
-                ${manifestCol} AS manifest_id, active_generation, source_sealed
+                ${manifestCol} AS manifest_id, active_generation, source_sealed, alembic_head
          FROM compat_control.read_target_control()`
       : `SELECT target_id, db_name, phase, owner_epoch,
-                ${manifestCol} AS manifest_id, active_generation, source_sealed
-         FROM compat_control.target_control
-         WHERE singleton_id = TRUE`,
+                ${manifestCol} AS manifest_id, active_generation, source_sealed, alembic_head
+         FROM compat_control.read_target_status()`,
   );
   if (ctrl.rows.length !== 1) {
     throw new CompatAdmissionError("Missing target control");
   }
   const row = ctrl.rows[0];
+  if (row.alembic_head !== config.expectedHead) {
+    throw new CompatAdmissionError("Incompatible schema revision");
+  }
   if (row.target_id !== config.targetId || row.db_name !== config.dbName) {
     throw new CompatAdmissionError("Target binding mismatch");
   }

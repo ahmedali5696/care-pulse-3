@@ -138,16 +138,21 @@ def test_verify_control_and_head_denies_missing_or_wrong_phase() -> None:
     )
     session = MagicMock()
     # Missing/wrong head
-    session.execute.return_value.scalars.return_value.all.return_value = [
-        "0045_f01_revocation_evidence"
-    ]
+    session.execute.return_value.mappings.return_value.first.return_value = {
+        "target_id": "target-1",
+        "db_name": "carepulse",
+        "phase": "TARGET_OPEN",
+        "owner_epoch": 1,
+        "source_manifest_id": "source-v1",
+        "target_manifest_id": "candidate-v1",
+        "active_generation": "candidate",
+        "source_sealed": False,
+        "alembic_head": "0045_f01_revocation_evidence",
+    }
     with pytest.raises(CompatAdmissionError, match="Incompatible schema revision"):
         verify_control_and_head(session, config=cfg)
 
     # Matching head but CLOSED phase
-    session.execute.return_value.scalars.return_value.all.return_value = [
-        CANDIDATE_HEAD
-    ]
     session.execute.return_value.mappings.return_value.first.return_value = {
         "target_id": "target-1",
         "db_name": "carepulse",
@@ -157,6 +162,7 @@ def test_verify_control_and_head_denies_missing_or_wrong_phase() -> None:
         "target_manifest_id": "candidate-v1",
         "active_generation": "none",
         "source_sealed": False,
+        "alembic_head": CANDIDATE_HEAD,
     }
     with pytest.raises(CompatAdmissionError, match="fenced"):
         verify_control_and_head(session, config=cfg)

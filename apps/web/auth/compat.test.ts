@@ -75,11 +75,21 @@ test("verifyPoolClientIdentity rejects superuser or wrong role", async () => {
 
 test("verifyControlAndHead rejects closed or intermediate head", async () => {
   const fakeClient = {
-    async query(sql: string) {
-      if (sql.includes("alembic_version")) {
-        return { rows: [{ version_num: "0043_f01_writer_boundary" }] };
-      }
-      return { rows: [] };
+    async query() {
+      return {
+        rows: [
+          {
+            target_id: "t1",
+            db_name: "carepulse",
+            phase: "TARGET_OPEN",
+            owner_epoch: 1,
+            manifest_id: "m1",
+            active_generation: "candidate",
+            source_sealed: false,
+            alembic_head: "0043_f01_writer_boundary",
+          },
+        ],
+      };
     },
   };
   await assert.rejects(
