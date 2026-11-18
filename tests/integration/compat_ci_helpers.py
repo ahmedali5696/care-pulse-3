@@ -170,6 +170,7 @@ def grant_db_access(
         ]
     )
     conn.execute(f"GRANT CONNECT ON DATABASE {dbname} TO {', '.join(roles)}")
+    conn.execute(f"GRANT CREATE ON DATABASE {dbname} TO carepulse_migration")
     conn.execute("REVOKE ALL ON SCHEMA public FROM PUBLIC")
     conn.execute("ALTER SCHEMA public OWNER TO carepulse_migration")
     conn.execute(
