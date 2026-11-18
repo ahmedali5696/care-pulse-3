@@ -1244,18 +1244,18 @@ case "$mode" in
   compat-us1)
     required_suites=(tests/unit/test_compat_admission.py tests/integration/test_compat_matrix.py tests/integration/test_compat_entry_denials.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -u -m pytest -v -s -ra --tb=short -p no:cacheprovider "${required_suites[@]}"
+    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "${required_suites[@]}"
     docker compose -f compose.compat.yaml --profile candidate run --rm --no-deps -T --entrypoint node candidate-web --no-warnings --experimental-strip-types --test auth/compat.test.ts
     ;;
   compat-us2)
     required_suites=(tests/integration/test_compat_drain.py tests/integration/test_compat_delivery.py tests/integration/test_compat_upgrade.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -u -m pytest -v -s -ra --tb=short -p no:cacheprovider "${required_suites[@]}"
+    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "${required_suites[@]}"
     ;;
   compat-us3)
     required_suites=(tests/integration/test_compat_recovery_source.py tests/integration/test_compat_recovery_intermediate.py tests/integration/test_compat_recovery_target.py tests/integration/test_compat_preservation.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -u -m pytest -v -s -ra --tb=short -p no:cacheprovider "${required_suites[@]}"
+    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "${required_suites[@]}"
     ;;
 esac
 '@
