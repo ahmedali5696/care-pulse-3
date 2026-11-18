@@ -153,40 +153,46 @@ def test_ordered_invocation_versus_drain_with_lock_observation() -> None:
         # Wait until DRAINING is committed and owner_conn is waiting on the advisory permit.
         obs = connect_role("carepulse_bootstrap", dbname=dbname, autocommit=True)
         try:
-            deadline = time.monotonic() + 10
-            saw_waiter = False
-            while time.monotonic() < deadline:
-                row = obs.execute(
-                    """
-                    SELECT count(*) AS waiters
-                    FROM pg_stat_activity a
-                    WHERE a.datname = %s
-                      AND a.wait_event_type = 'Lock'
-                      AND a.wait_event = 'advisory'
-                      AND cardinality(pg_blocking_pids(a.pid)) > 0
-                    """,
-                    (dbname,),
-                ).fetchone()
-                if row and int(row["waiters"]) > 0:
-                    saw_waiter = True
-                    break
-                time.sleep(0.1)
-            assert saw_waiter, "Expected controller drain to wait on held shared permit"
-
-            # Fresh admission while DRAINING must be denied promptly without deadlock.
-            with pytest.raises(CompatAdmissionError):
-                acquire_invocation_permit(
-                    rt_eng, config=src_cfg, expected_login="carepulse_runtime"
+            try:
+                deadline = time.monotonic() + 10
+                saw_waiter = False
+                while time.monotonic() < deadline:
+                    row = obs.execute(
+                        """
+                        SELECT count(*) AS waiters
+                        FROM pg_stat_activity a
+                        WHERE a.datname = %s
+                          AND a.wait_event_type = 'Lock'
+                          AND a.wait_event = 'advisory'
+                          AND cardinality(pg_blocking_pids(a.pid)) > 0
+                        """,
+                        (dbname,),
+                    ).fetchone()
+                    if row and int(row["waiters"]) > 0:
+                        saw_waiter = True
+                        break
+                    time.sleep(0.1)
+                assert saw_waiter, (
+                    "Expected controller drain to wait on held shared permit"
                 )
 
-            # Complete the earlier invocation -> drain finishes!
-            from carepulse.compat.admission import record_attempt_disposition
+                # Fresh admission while DRAINING must be denied promptly without deadlock.
+                with pytest.raises(CompatAdmissionError):
+                    acquire_invocation_permit(
+                        rt_eng, config=src_cfg, expected_login="carepulse_runtime"
+                    )
 
-            record_attempt_disposition(
-                pconn, permit, invocation_class="http", disposition="COMMITTED"
-            )
-            release_invocation_permit(pconn, permit)
+                # Complete the earlier invocation -> drain finishes!
+                from carepulse.compat.admission import record_attempt_disposition
+
+                record_attempt_disposition(
+                    pconn, permit, invocation_class="http", disposition="COMMITTED"
+                )
+            finally:
+                release_invocation_permit(pconn, permit)
+
             assert drain_done.wait(timeout=10)
+            t.join(timeout=2)
             assert not drain_errors
 
             # Before sealing, observe_drain_complete(require_source_sealed=True) fails.
@@ -213,7 +219,8 @@ def test_ordered_invocation_versus_drain_with_lock_observation() -> None:
             assert proof.source_sealed is True
         finally:
             obs.close()
-            release_exclusive_drain_permit(owner_conn, target_id)
-            release_owner_lock(owner_conn, target_id)
+            if not t.is_alive():
+                release_exclusive_drain_permit(owner_conn, target_id)
+                release_owner_lock(owner_conn, target_id)
             owner_conn.close()
             rt_eng.dispose()
