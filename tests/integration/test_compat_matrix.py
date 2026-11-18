@@ -55,7 +55,7 @@ def test_matched_0040_source_activation_and_candidate_denial() -> None:
     with disposable_database("compat_m0040") as dbname:
         admin = connect_role("carepulse_bootstrap", dbname=dbname, autocommit=True)
         try:
-            ensure_roles_provisioned(admin, source_only=False)
+            ensure_roles_provisioned(admin, source_only=True)
             grant_db_access(admin, dbname, source_only=True)
             cluster_id = get_cluster_id(admin)
         finally:
@@ -244,16 +244,9 @@ def test_intermediate_heads_remain_fenced_for_both_generations(
     with disposable_database("compat_mid") as dbname:
         admin = connect_role("carepulse_bootstrap", dbname=dbname, autocommit=True)
         try:
-            ensure_roles_provisioned(admin, source_only=False)
+            ensure_roles_provisioned(admin, source_only=True)
             grant_db_access(admin, dbname, source_only=True)
             cluster_id = get_cluster_id(admin)
-            apply_fixture_only_0041_delta(
-                admin,
-                api_password=read_secret("carepulse_api"),
-                web_password=read_secret("carepulse_web"),
-                worker_password=read_secret("carepulse_worker"),
-                gate_password=read_secret("carepulse_gate"),
-            )
         finally:
             admin.close()
 
@@ -282,8 +275,28 @@ def test_intermediate_heads_remain_fenced_for_both_generations(
                 source_manifest_id=src_manifest.manifest_id,
                 target_manifest_id=cand_manifest.manifest_id,
             )
+            snap = snapshot_0040_baseline(mig, target_id=target_id)
+            assert snap.head == MANIFEST_SOURCE_HEAD
+            conn_priv = mig.execute(
+                "SELECT has_database_privilege('carepulse_api', %s, 'CONNECT') AS ok "
+                "WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'carepulse_api')",
+                (dbname,),
+            ).fetchone()
+            assert conn_priv is None or not conn_priv["ok"]
         finally:
             mig.close()
+
+        admin = connect_role("carepulse_bootstrap", dbname=dbname, autocommit=True)
+        try:
+            apply_fixture_only_0041_delta(
+                admin,
+                api_password=read_secret("carepulse_api"),
+                web_password=read_secret("carepulse_web"),
+                worker_password=read_secret("carepulse_worker"),
+                gate_password=read_secret("carepulse_gate"),
+            )
+        finally:
+            admin.close()
 
         step_matrix_head(
             host="db",
