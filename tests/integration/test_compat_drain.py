@@ -23,7 +23,6 @@ from ops.compat.control import (
 )
 from ops.compat.drain import (
     DrainError,
-    commit_draining_fence,
     drain_and_settle,
     observe_drain_complete,
 )
@@ -143,7 +142,7 @@ def test_ordered_invocation_versus_drain_with_lock_observation() -> None:
                     owner_epoch=ctrl.owner_epoch,
                     blocking=True,
                 )
-            except BaseException as exc:
+            except (DrainError, RuntimeError) as exc:
                 drain_errors.append(exc)
             finally:
                 drain_done.set()

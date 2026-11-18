@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, Engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 
 def _insert(
@@ -282,7 +283,7 @@ def _has_unknown_compat_attempt(
             if hit:
                 return True
         return False
-    except Exception:
+    except SQLAlchemyError:
         return False
 
 
