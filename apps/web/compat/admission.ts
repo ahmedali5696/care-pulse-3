@@ -132,8 +132,6 @@ export async function verifyControlAndHead(
     config.generation === "source" ? "SOURCE_OPEN" : "TARGET_OPEN";
   const manifestCol =
     config.generation === "source" ? "source_manifest_id" : "target_manifest_id";
-  const suffix = lockForShare ? " FOR SHARE" : "";
-
   const ctrl = await client.query<{
     target_id: string;
     db_name: string;
@@ -143,10 +141,14 @@ export async function verifyControlAndHead(
     active_generation: string;
     source_sealed: boolean;
   }>(
-    `SELECT target_id, db_name, phase, owner_epoch,
-            ${manifestCol} AS manifest_id, active_generation, source_sealed
-     FROM compat_control.target_control
-     WHERE singleton_id = TRUE${suffix}`,
+    lockForShare
+      ? `SELECT target_id, db_name, phase, owner_epoch,
+                ${manifestCol} AS manifest_id, active_generation, source_sealed
+         FROM compat_control.read_target_control()`
+      : `SELECT target_id, db_name, phase, owner_epoch,
+                ${manifestCol} AS manifest_id, active_generation, source_sealed
+         FROM compat_control.target_control
+         WHERE singleton_id = TRUE`,
   );
   if (ctrl.rows.length !== 1) {
     throw new CompatAdmissionError("Missing target control");

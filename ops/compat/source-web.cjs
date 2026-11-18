@@ -102,8 +102,7 @@ async function verifyClient(client, cfg, expectedRole) {
   const ctrl = await client.query(
     `SELECT target_id, db_name, phase, owner_epoch,
             source_manifest_id, active_generation, source_sealed
-     FROM compat_control.target_control
-     WHERE singleton_id = TRUE FOR SHARE`,
+     FROM compat_control.read_target_control()`,
   );
   if (ctrl.rows.length !== 1) throw new Error("Missing target control");
   const c = ctrl.rows[0];

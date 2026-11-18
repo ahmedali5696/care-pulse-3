@@ -77,8 +77,7 @@ def _verify_job_connection(
                 """
             SELECT target_id, db_name, phase, owner_epoch,
                    source_manifest_id, active_generation, source_sealed
-            FROM compat_control.target_control
-            WHERE singleton_id = TRUE FOR SHARE
+            FROM compat_control.read_target_control()
             """
             )
         )

@@ -107,8 +107,34 @@ BEGIN
 END;
 $$;
 
+-- Narrow read-only control reader that takes FOR SHARE without granting UPDATE on target_control.
+CREATE OR REPLACE FUNCTION compat_control.read_target_control()
+RETURNS TABLE (
+    target_id TEXT,
+    cluster_id TEXT,
+    db_name TEXT,
+    phase TEXT,
+    owner_epoch BIGINT,
+    source_manifest_id TEXT,
+    target_manifest_id TEXT,
+    active_generation TEXT,
+    source_sealed BOOLEAN
+)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = compat_control, pg_catalog
+AS $$
+    SELECT tc.target_id, tc.cluster_id, tc.db_name, tc.phase, tc.owner_epoch,
+           tc.source_manifest_id, tc.target_manifest_id, tc.active_generation,
+           tc.source_sealed
+    FROM compat_control.target_control tc
+    WHERE tc.singleton_id = TRUE
+    FOR SHARE;
+$$;
+
 REVOKE ALL ON TABLE compat_control.target_control FROM PUBLIC;
 REVOKE ALL ON TABLE compat_control.work_evidence FROM PUBLIC;
+REVOKE ALL ON FUNCTION compat_control.read_target_control() FROM PUBLIC;
 REVOKE ALL ON FUNCTION compat_control.record_own_attempt(
     TEXT, TEXT, BIGINT, TEXT, TEXT, TEXT, TEXT, BIGINT, TEXT
 ) FROM PUBLIC;
@@ -125,6 +151,7 @@ BEGIN
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
             EXECUTE format('GRANT USAGE ON SCHEMA compat_control TO %I', r);
             EXECUTE format('GRANT SELECT ON compat_control.target_control TO %I', r);
+            EXECUTE format('GRANT EXECUTE ON FUNCTION compat_control.read_target_control() TO %I', r);
             EXECUTE format('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON compat_control.target_control FROM %I', r);
             EXECUTE format('REVOKE ALL ON compat_control.work_evidence FROM %I', r);
         END IF;

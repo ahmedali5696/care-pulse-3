@@ -161,22 +161,18 @@ def verify_control_and_head(
     if len(revs) != 1 or revs[0] != config.expected_head:
         raise CompatAdmissionError("Incompatible schema revision")
 
-    lock_clause = " FOR SHARE" if lock_for_share else ""
-    ctrl = (
-        session_or_conn.execute(
-            text(
-                f"""
+    sql_query = (
+        "SELECT * FROM compat_control.read_target_control()"
+        if lock_for_share
+        else """
             SELECT target_id, db_name, phase, owner_epoch,
                    source_manifest_id, target_manifest_id, active_generation,
                    source_sealed
             FROM compat_control.target_control
-            WHERE singleton_id = TRUE{lock_clause}
+            WHERE singleton_id = TRUE
             """
-            )
-        )
-        .mappings()
-        .first()
     )
+    ctrl = session_or_conn.execute(text(sql_query)).mappings().first()
     if ctrl is None:
         raise CompatAdmissionError("Missing target control")
     if ctrl["target_id"] != config.target_id or ctrl["db_name"] != config.db_name:

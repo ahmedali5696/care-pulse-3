@@ -246,6 +246,13 @@ def test_intermediate_heads_remain_fenced_for_both_generations(
             ensure_roles_provisioned(admin, source_only=False)
             grant_db_access(admin, dbname, source_only=True)
             cluster_id = get_cluster_id(admin)
+            apply_fixture_only_0041_delta(
+                admin,
+                api_password=read_secret("carepulse_api"),
+                web_password=read_secret("carepulse_web"),
+                worker_password=read_secret("carepulse_worker"),
+                gate_password=read_secret("carepulse_gate"),
+            )
         finally:
             admin.close()
 
@@ -273,13 +280,6 @@ def test_intermediate_heads_remain_fenced_for_both_generations(
                 db_name=dbname,
                 source_manifest_id=src_manifest.manifest_id,
                 target_manifest_id=cand_manifest.manifest_id,
-            )
-            apply_fixture_only_0041_delta(
-                mig,
-                api_password=read_secret("carepulse_api"),
-                web_password=read_secret("carepulse_web"),
-                worker_password=read_secret("carepulse_worker"),
-                gate_password=read_secret("carepulse_gate"),
             )
         finally:
             mig.close()
