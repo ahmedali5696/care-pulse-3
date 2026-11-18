@@ -68,12 +68,12 @@ BEGIN
     IF v_ctrl.target_id <> p_target_id OR v_ctrl.db_name <> current_database() THEN
         RAISE EXCEPTION 'compat_target_mismatch' USING ERRCODE = 'P0001';
     END IF;
-    IF p_owner_epoch <> v_ctrl.owner_epoch THEN
-        RAISE EXCEPTION 'compat_epoch_mismatch' USING ERRCODE = 'P0001';
-    END IF;
 
     SELECT * INTO v_existing FROM compat_control.work_evidence WHERE attempt_id = p_attempt_id FOR UPDATE;
     IF NOT FOUND THEN
+        IF p_owner_epoch <> v_ctrl.owner_epoch THEN
+            RAISE EXCEPTION 'compat_epoch_mismatch' USING ERRCODE = 'P0001';
+        END IF;
         IF v_ctrl.phase NOT IN ('SOURCE_OPEN', 'TARGET_OPEN') THEN
             RAISE EXCEPTION 'compat_admission_closed' USING ERRCODE = 'P0001';
         END IF;
@@ -93,6 +93,9 @@ BEGIN
     ELSE
         IF v_existing.created_by_role <> session_user THEN
             RAISE EXCEPTION 'compat_attempt_owner_mismatch' USING ERRCODE = '42501';
+        END IF;
+        IF v_existing.owner_epoch <> p_owner_epoch THEN
+            RAISE EXCEPTION 'compat_epoch_mismatch' USING ERRCODE = 'P0001';
         END IF;
         IF v_existing.disposition = 'UNKNOWN' THEN
             RAISE EXCEPTION 'compat_unknown_disposition_immutable' USING ERRCODE = 'P0001';

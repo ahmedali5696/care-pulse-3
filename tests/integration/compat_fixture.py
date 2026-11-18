@@ -48,7 +48,7 @@ def seed_populated_0040_fixture(conn: psycopg.Connection) -> Populated0040Invent
     if "organizations" in tables:
         conn.execute(
             """
-            INSERT INTO public.organizations (id, name, state)
+            INSERT INTO public.organizations (id, branch, state)
             VALUES (%s, 'Clinic Alpha', 'ACTIVE'), (%s, 'Clinic Beta', 'ACTIVE')
             ON CONFLICT DO NOTHING
             """,

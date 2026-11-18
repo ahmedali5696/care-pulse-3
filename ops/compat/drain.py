@@ -42,7 +42,7 @@ def commit_draining_fence(
     current = assert_current_owner(
         conn, target_id=target_id, expected_epoch=owner_epoch, lock_mode="UPDATE"
     )
-    if current.phase not in ("CLOSED", "SOURCE_OPEN", "DRAINING"):
+    if current.phase not in ("CLOSED", "SOURCE_OPEN", "TARGET_OPEN", "DRAINING"):
         raise DrainError(f"Cannot enter DRAINING from phase {current.phase}")
 
     row = conn.execute(
