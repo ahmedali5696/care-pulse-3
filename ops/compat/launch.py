@@ -172,6 +172,28 @@ def seal_generation_launch(
     )
 
 
+def mark_source_sealed_in_control(conn, *, target_id: str, owner_epoch: int) -> None:
+    """Record source_sealed = TRUE in compat_control.target_control under current owner epoch (T037)."""
+    cur = conn.execute(
+        """
+        UPDATE compat_control.target_control
+        SET source_sealed = TRUE,
+            updated_at = now()
+        WHERE singleton_id = TRUE
+          AND target_id = %s
+          AND owner_epoch = %s
+          AND phase = 'DRAINING'
+        """,
+        (target_id, owner_epoch),
+    )
+    if cur.rowcount != 1:
+        conn.rollback()
+        raise LaunchBindingError(
+            "Cannot seal source launch outside DRAINING under current owner epoch"
+        )
+    conn.commit()
+
+
 def is_generation_sealed(
     seal_state_path: Path, *, target_id: str, generation: str
 ) -> bool:

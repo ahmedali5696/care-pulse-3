@@ -69,13 +69,21 @@ async function sendCommittedJob(): Promise<void> {
   );
   const link = deliveryLink(job, proof, settings.origin);
   const kind = job.context.purpose === "PASSWORD_RESET" ? "reset" : "invitation";
-  await sendSyntheticMail(kind, job.context.committed_recipient, link);
+  try {
+    await sendSyntheticMail(kind, job.context.committed_recipient, link);
+  } catch {
+    process.stderr.write("AMBIGUOUS_TRANSPORT\n");
+    throw new Error("AMBIGUOUS_TRANSPORT");
+  }
 }
 
 try {
   await sendCommittedJob();
   process.stdout.write("SENT\n");
-} catch {
+} catch (err) {
+  if (!(err instanceof Error && err.message === "AMBIGUOUS_TRANSPORT")) {
+    process.stderr.write("NOT_SENT\n");
+  }
   process.stderr.write("Delivery unavailable\n");
   process.exitCode = 1;
 }

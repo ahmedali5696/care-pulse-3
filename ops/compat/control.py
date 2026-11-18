@@ -236,3 +236,33 @@ def claim_owner_epoch(
             conn.rollback()
         release_owner_lock(conn, target_id)
         raise
+
+
+def assert_current_owner(
+    conn: psycopg.Connection,
+    *,
+    target_id: str,
+    expected_epoch: int,
+    lock_mode: Literal["NONE", "UPDATE"] = "UPDATE",
+) -> ControlRecord:
+    """Verify this nonpooled controller still owns the target lock and current epoch."""
+    current = read_control_record(conn, lock_mode=lock_mode)
+    if current.target_id != target_id:
+        raise ContentionError(
+            f"Target mismatch: expected {target_id}, got {current.target_id}"
+        )
+    if current.owner_epoch != expected_epoch:
+        raise ContentionError(
+            f"Superseded controller epoch: held {expected_epoch}, current {current.owner_epoch}"
+        )
+    return current
+
+
+def inspect_as_competitor(conn: psycopg.Connection, *, target_id: str) -> ControlRecord:
+    """Read-only inspection for a contending controller that does not hold the owner lock."""
+    current = read_control_record(conn, lock_mode="NONE")
+    if current.target_id != target_id:
+        raise ControlError(
+            f"Target mismatch: expected {target_id}, got {current.target_id}"
+        )
+    return current

@@ -288,6 +288,23 @@ def record_attempt_disposition(
         raise CompatAdmissionError("Failed to record attempt disposition") from exc
 
 
+def correlate_receipt_attempt(
+    permit_conn,
+    permit: AdmissionPermit,
+    *,
+    receipt_id: str,
+    disposition: Literal["COMMITTED", "ROLLED_BACK"] = "COMMITTED",
+) -> None:
+    """Correlate an admitted HTTP/stream invocation to its durable receipt (T033)."""
+    record_attempt_disposition(
+        permit_conn,
+        permit,
+        invocation_class="http",
+        disposition=disposition,
+        correlation_id=receipt_id,
+    )
+
+
 def release_invocation_permit(permit_conn, permit: AdmissionPermit) -> None:
     """Release the shared session permit and close the permit connection."""
     try:

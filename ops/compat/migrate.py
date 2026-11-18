@@ -1,0 +1,172 @@
+"""Single-unit owner-held Alembic migration and independent observer readback (T038, T039)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import psycopg
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
+
+from ops.compat.control import assert_current_owner
+from ops.compat.preflight import PUBLISHED_SUCCESSORS
+from ops.compat.probes import (
+    probe_alembic_head,
+    probe_effective_table_privileges,
+    probe_rls_and_triggers,
+)
+from ops.compat.work import assert_all_work_settled
+
+
+class MigrationStepError(RuntimeError):
+    """Raised when a migration step or independent observer readback fails."""
+
+
+EXPECTED_TRANSITIONS: dict[str, str] = {
+    "0040_t173_numeric_money": "0041_f01_runtime_identity",
+    "0041_f01_runtime_identity": "0042_f01_effective_grants",
+    "0042_f01_effective_grants": "0043_f01_writer_boundary",
+    "0043_f01_writer_boundary": "0044_f01_delivery_acl",
+    "0044_f01_delivery_acl": "0045_f01_revocation_evidence",
+    "0045_f01_revocation_evidence": "0046_f01_audit_integrity",
+}
+
+
+@dataclass(frozen=True)
+class StepObservation:
+    """Independently observed state after one committed successor."""
+
+    target_id: str
+    owner_epoch: int
+    committed_head: str
+    phase: str
+
+
+def enter_migrating_phase(
+    conn: psycopg.Connection,
+    *,
+    target_id: str,
+    owner_epoch: int,
+) -> None:
+    """Transition DRAINING -> MIGRATING under current owner lock and verified drain."""
+    ctrl = assert_current_owner(
+        conn, target_id=target_id, expected_epoch=owner_epoch, lock_mode="UPDATE"
+    )
+    if ctrl.phase not in ("DRAINING", "MIGRATING"):
+        raise MigrationStepError(f"Cannot enter MIGRATING from {ctrl.phase}")
+    if ctrl.drain_verified_epoch != owner_epoch:
+        raise MigrationStepError("Drain not verified for current owner epoch")
+    assert_all_work_settled(conn, target_id=target_id)
+    conn.execute(
+        """
+        UPDATE compat_control.target_control
+        SET phase = 'MIGRATING',
+            active_generation = 'none',
+            updated_at = now()
+        WHERE singleton_id = TRUE AND target_id = %s AND owner_epoch = %s
+        """,
+        (target_id, owner_epoch),
+    )
+    conn.commit()
+
+
+def advance_one_successor(
+    owner_conn: psycopg.Connection,
+    *,
+    target_id: str,
+    owner_epoch: int,
+    expected_predecessor: str,
+    target_successor: str,
+    alembic_ini: Path | None = None,
+) -> str:
+    """Advance exactly one published successor on the same owner-lock backend connection (T038)."""
+    if target_successor not in PUBLISHED_SUCCESSORS:
+        raise MigrationStepError(f"Unapproved successor revision: {target_successor!r}")
+    if EXPECTED_TRANSITIONS.get(expected_predecessor) != target_successor:
+        raise MigrationStepError(
+            f"Invalid transition {expected_predecessor} -> {target_successor}"
+        )
+
+    ctrl = assert_current_owner(
+        owner_conn, target_id=target_id, expected_epoch=owner_epoch, lock_mode="UPDATE"
+    )
+    if ctrl.phase != "MIGRATING" or ctrl.active_generation != "none":
+        raise MigrationStepError(
+            f"Migration requires MIGRATING/none, observed {ctrl.phase}/{ctrl.active_generation}"
+        )
+    actual_head = probe_alembic_head(owner_conn, expected_head=expected_predecessor)
+    assert actual_head == expected_predecessor
+    owner_conn.commit()
+
+    # Supply the exact same owner-lock backend connection to Alembic (no child migrator).
+    ini_path = alembic_ini or (Path(__file__).resolve().parents[2] / "alembic.ini")
+    cfg = Config(str(ini_path))
+    sa_engine = create_engine(
+        "postgresql+psycopg://",
+        creator=lambda: owner_conn,
+        poolclass=StaticPool,
+        hide_parameters=True,
+    )
+    try:
+        with sa_engine.connect() as sa_conn:
+            cfg.attributes["connection"] = sa_conn
+            command.upgrade(cfg, target_successor)
+            sa_conn.commit()
+    except Exception:
+        if not owner_conn.closed and not owner_conn.autocommit:
+            owner_conn.rollback()
+        raise
+
+    return target_successor
+
+
+def observe_committed_successor(
+    observer_conn: psycopg.Connection,
+    *,
+    target_id: str,
+    expected_epoch: int,
+    expected_head: str,
+) -> StepObservation:
+    """Independently read back committed revision and per-revision effective security (T039)."""
+    actual_head = probe_alembic_head(observer_conn, expected_head=expected_head)
+    ctrl = observer_conn.execute(
+        """
+        SELECT target_id, phase, owner_epoch
+        FROM compat_control.target_control
+        WHERE singleton_id = TRUE
+        """
+    ).fetchone()
+    if ctrl is None:
+        raise MigrationStepError("Missing control record on observer readback")
+    t_id = ctrl["target_id"] if isinstance(ctrl, dict) else ctrl[0]
+    phase = ctrl["phase"] if isinstance(ctrl, dict) else ctrl[1]
+    epoch = int(ctrl["owner_epoch"] if isinstance(ctrl, dict) else ctrl[2])
+    if t_id != target_id or epoch != expected_epoch:
+        raise MigrationStepError("Observer readback target/epoch mismatch")
+
+    if actual_head >= "0042_f01_effective_grants":
+        privs = probe_effective_table_privileges(
+            observer_conn,
+            "carepulse_runtime",
+            "public.alembic_version",
+            ("SELECT", "INSERT", "UPDATE", "DELETE"),
+        )
+        if any(privs.values()):
+            raise MigrationStepError(
+                "carepulse_runtime retained unexpected privileges on public.alembic_version at >=0042"
+            )
+    if actual_head >= "0041_f01_runtime_identity":
+        probe_rls_and_triggers(
+            observer_conn,
+            required_force_rls_tables=("public.organizations", "public.patients"),
+        )
+
+    return StepObservation(
+        target_id=t_id,
+        owner_epoch=epoch,
+        committed_head=actual_head,
+        phase=phase,
+    )

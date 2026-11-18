@@ -246,10 +246,52 @@ def _end_unusable_job(connection: Connection, job_id: UUID, state: str) -> None:
     )
 
 
+def _has_unknown_compat_attempt(
+    connection: Connection, job_id: UUID | None, org_id: UUID | None = None
+) -> bool:
+    """Return True if compat_control.work_evidence holds an unresolved UNKNOWN sender attempt."""
+    try:
+        exists = connection.scalar(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = 'compat_control' AND table_name = 'work_evidence'"
+            )
+        )
+        if not exists:
+            return False
+        if job_id is not None:
+            hit = connection.scalar(
+                text(
+                    "SELECT 1 FROM compat_control.work_evidence "
+                    "WHERE service = 'sender' AND disposition = 'UNKNOWN' "
+                    "AND correlation_id = :cid LIMIT 1"
+                ),
+                {"cid": str(job_id)},
+            )
+            if hit:
+                return True
+        if org_id is not None:
+            hit = connection.scalar(
+                text(
+                    "SELECT 1 FROM compat_control.work_evidence "
+                    "WHERE service = 'sender' AND disposition = 'UNKNOWN' "
+                    "AND correlation_id = :oid LIMIT 1"
+                ),
+                {"oid": f"org:{org_id}"},
+            )
+            if hit:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def claim_delivery_job(
     connection: Connection, policy: ClaimPolicy, job_id: UUID | None = None
 ) -> ClaimedJob | None:
     """Lock one due job; DB time and the persisted generation decide ownership."""
+    if _has_unknown_compat_attempt(connection, job_id):
+        return None
     job = (
         connection.execute(
             text("""

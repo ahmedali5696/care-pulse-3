@@ -123,7 +123,8 @@ def _material_payload(connection, claim: ClaimedJob) -> tuple[bytes, float] | No
     return encoded, float(committed["remaining"])
 
 
-def _node_call(input_bytes: bytes | None, timeout: float) -> bool:
+def _node_call(input_bytes: bytes | None, timeout: float) -> str:
+    """Invoke Node transport and distinguish SENT, NOT_SENT, and AMBIGUOUS (T035)."""
     command = [_NODE, _ADAPTER]
     if input_bytes is None:
         command.append("--check")
@@ -135,16 +136,24 @@ def _node_call(input_bytes: bytes | None, timeout: float) -> bool:
             timeout=timeout,
             check=False,
         )
-        return completed.returncode == 0 and completed.stdout == b"SENT\n"
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+        if completed.returncode == 0 and completed.stdout == b"SENT\n":
+            return "SENT"
+        if b"NOT_SENT" in completed.stderr or (
+            input_bytes is None and completed.returncode != 0
+        ):
+            return "NOT_SENT"
+        return "AMBIGUOUS"
+    except subprocess.TimeoutExpired:
+        return "AMBIGUOUS"
+    except OSError:
+        return "NOT_SENT"
 
 
 def send_one_job(
     organization_id: UUID, job_id: UUID | None, settings: SenderSettings
 ) -> str:
     """Commit claim before Node; finish only if D-09 still owns the generation."""
-    if not _node_call(None, settings.timeout_seconds):
+    if _node_call(None, settings.timeout_seconds) != "SENT":
         raise ConfigError("Sender key or transport configuration unavailable")
     engine = create_engine(settings.connection_url, hide_parameters=True)
     permit = None
@@ -180,7 +189,14 @@ def send_one_job(
             return "STALE"
         payload, seconds_remaining = material
         deadline = min(float(settings.timeout_seconds), seconds_remaining - 0.5)
-        sent = deadline > 0 and _node_call(payload, deadline)
+        transport_status = (
+            _node_call(payload, deadline) if deadline > 0 else "AMBIGUOUS"
+        )
+        if transport_status == "AMBIGUOUS":
+            # Never auto-retry, discard material, or count ambiguous ack as settled (T035).
+            final_disposition = "UNKNOWN"
+            return "AMBIGUOUS"
+        sent = transport_status == "SENT"
         with engine.begin() as connection:
             _tenant(connection, organization_id)
             attempts = connection.scalar(

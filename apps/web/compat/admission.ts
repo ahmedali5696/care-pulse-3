@@ -219,6 +219,24 @@ export async function acquireWebAdmissionPermit(
   }
 }
 
+export async function correlateWebAttempt(
+  permit: WebAdmissionPermit,
+  correlationId: string,
+  disposition: "COMMITTED" | "ROLLED_BACK" = "COMMITTED",
+): Promise<void> {
+  await permit.client.query(
+    `SELECT compat_control.record_own_attempt($1, $2, $3, $4, 'web', 'http', $5, NULL, $6)`,
+    [
+      permit.attemptId,
+      permit.targetId,
+      permit.ownerEpoch,
+      permit.generation,
+      correlationId,
+      disposition,
+    ],
+  );
+}
+
 export async function releaseWebAdmissionPermit(
   permit: WebAdmissionPermit,
   disposition: "COMMITTED" | "ROLLED_BACK" = "COMMITTED",
