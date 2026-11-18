@@ -129,18 +129,23 @@ def ensure_roles_provisioned(
                 )
             )
 
-    if not source_only:
-        for nologin in ("carepulse_policy_seed", "carepulse_identity_owner"):
-            exists = conn.execute(
-                "SELECT 1 FROM pg_roles WHERE rolname = %s", (nologin,)
-            ).fetchone()
-            if not exists:
-                conn.execute(
-                    f"CREATE ROLE {nologin} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS"
-                )
+    # carepulse_policy_seed is a D-04 (0040) role; carepulse_identity_owner is F-01 (0041+).
+    nologin_roles = (
+        ("carepulse_policy_seed",)
+        if source_only
+        else ("carepulse_policy_seed", "carepulse_identity_owner")
+    )
+    for nologin in nologin_roles:
+        exists = conn.execute(
+            "SELECT 1 FROM pg_roles WHERE rolname = %s", (nologin,)
+        ).fetchone()
+        if not exists:
             conn.execute(
-                f"GRANT {nologin} TO carepulse_migration WITH SET TRUE, INHERIT FALSE"
+                f"CREATE ROLE {nologin} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS"
             )
+        conn.execute(
+            f"GRANT {nologin} TO carepulse_migration WITH SET TRUE, INHERIT FALSE"
+        )
     conn.commit()
 
 
