@@ -11,6 +11,7 @@ from pathlib import Path
 import psycopg
 from alembic import command
 from alembic.config import Config
+from psycopg import sql
 from psycopg.rows import dict_row
 from sqlalchemy import URL, create_engine
 
@@ -117,11 +118,16 @@ def ensure_roles_provisioned(
         ).fetchone()
         if not exists:
             conn.execute(
-                f"CREATE ROLE {role_name} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD %s",
-                (pw,),
+                sql.SQL(
+                    "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD {}"
+                ).format(sql.Identifier(role_name), sql.Literal(pw))
             )
         else:
-            conn.execute(f"ALTER ROLE {role_name} LOGIN PASSWORD %s", (pw,))
+            conn.execute(
+                sql.SQL("ALTER ROLE {} LOGIN PASSWORD {}").format(
+                    sql.Identifier(role_name), sql.Literal(pw)
+                )
+            )
 
     if not source_only:
         for nologin in ("carepulse_policy_seed", "carepulse_identity_owner"):

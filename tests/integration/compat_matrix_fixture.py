@@ -11,6 +11,7 @@ from pathlib import Path
 import psycopg
 from alembic import command
 from alembic.config import Config
+from psycopg import sql
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
 
@@ -131,10 +132,15 @@ def apply_fixture_only_0041_delta(
         ).fetchone()
         if not exists:
             conn.execute(
-                f"CREATE ROLE {role_name} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD %s",
-                (password,),
+                sql.SQL(
+                    "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD {}"
+                ).format(sql.Identifier(role_name), sql.Literal(password))
             )
-            conn.execute(f"GRANT CONNECT ON DATABASE {conn.info.dbname} TO {role_name}")
+            conn.execute(
+                sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                    sql.Identifier(conn.info.dbname), sql.Identifier(role_name)
+                )
+            )
     for nologin_role in ("carepulse_policy_seed", "carepulse_identity_owner"):
         exists = conn.execute(
             "SELECT 1 FROM pg_roles WHERE rolname = %s", (nologin_role,)
