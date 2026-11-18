@@ -127,6 +127,7 @@ def advance_one_successor(
         "postgresql+psycopg://",
         creator=lambda: _BorrowedOwnerDbapi(owner_conn),
         poolclass=NullPool,
+        use_native_hstore=False,
         hide_parameters=True,
     )
     try:
