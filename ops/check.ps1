@@ -1225,6 +1225,8 @@ openssl pkey -in "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" -pubout -out "$CP_DELIVE
 chmod 0444 "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" "$CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE"
 
 docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer config --quiet
+docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer config --format json > "$private/compose.compat.json"
+chmod 0444 "$private/compose.compat.json"
 docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer build --pull
 docker compose -f compose.compat.yaml --profile mail up -d --no-build db mail
 for attempt in $(seq 1 40); do
@@ -1242,18 +1244,18 @@ case "$mode" in
   compat-us1)
     required_suites=(tests/unit/test_compat_admission.py tests/integration/test_compat_matrix.py tests/integration/test_compat_entry_denials.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T observer python -m pytest -q -ra --tb=short -p no:cacheprovider "${required_suites[@]}"
+    docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -m pytest -q -ra --tb=short -p no:cacheprovider "${required_suites[@]}"
     docker compose -f compose.compat.yaml --profile candidate run --rm --no-deps -T --entrypoint node candidate-web --no-warnings --experimental-strip-types --test auth/compat.test.ts
     ;;
   compat-us2)
     required_suites=(tests/integration/test_compat_drain.py tests/integration/test_compat_delivery.py tests/integration/test_compat_upgrade.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T observer python -m pytest -q -ra --tb=short -p no:cacheprovider "${required_suites[@]}"
+    docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -m pytest -q -ra --tb=short -p no:cacheprovider "${required_suites[@]}"
     ;;
   compat-us3)
     required_suites=(tests/integration/test_compat_recovery_source.py tests/integration/test_compat_recovery_intermediate.py tests/integration/test_compat_recovery_target.py tests/integration/test_compat_preservation.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T observer python -m pytest -q -ra --tb=short -p no:cacheprovider "${required_suites[@]}"
+    docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -m pytest -q -ra --tb=short -p no:cacheprovider "${required_suites[@]}"
     ;;
 esac
 '@

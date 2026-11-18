@@ -206,7 +206,16 @@ def verify_compose_isolation(compose_doc: Mapping[str, object]) -> None:
             raise LaunchBindingError(f"Untrusted NODE_OPTIONS in {svc_name}")
         if svc_name in ("source-api", "source-web", "source-worker", "source-sender"):
             vols = svc_cfg.get("volumes") or []
-            if not any("/run/compat-adapters:ro" in str(v) for v in vols):
+            has_ro_adapters = any(
+                (isinstance(v, str) and "/run/compat-adapters:ro" in v)
+                or (
+                    isinstance(v, Mapping)
+                    and v.get("target") == "/run/compat-adapters"
+                    and v.get("read_only") is True
+                )
+                for v in vols
+            )
+            if not has_ro_adapters:
                 raise LaunchBindingError(
                     f"Source service {svc_name} missing read-only compat-adapters mount"
                 )

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
+import os
 
 import psycopg
 import pytest
-import yaml
 from carepulse.compat.admission import (
     CANDIDATE_HEAD,
     SOURCE_HEAD,
@@ -41,8 +41,9 @@ def _ci_guard() -> None:
 
 
 def test_compose_compat_topology_has_no_bypass_paths() -> None:
-    compose_path = Path("/srv/compose.compat.yaml")
-    doc = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    compose_path = os.environ["CP_COMPAT_COMPOSE_CONFIG_PATH"]
+    with open(compose_path, encoding="utf-8") as fh:
+        doc = json.load(fh)
     verify_compose_isolation(doc)
 
 

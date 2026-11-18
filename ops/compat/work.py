@@ -57,6 +57,7 @@ def list_work_attempts(
     ).fetchall()
     result: list[WorkAttemptRecord] = []
     for r in rows:
+
         def _get(k: str, i: int, row=r):
             return row[k] if isinstance(row, dict) else row[i]
 
