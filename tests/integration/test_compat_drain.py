@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from contextlib import ExitStack
 
 import psycopg
 import pytest
@@ -181,77 +182,88 @@ def test_ordered_invocation_versus_drain_with_lock_observation() -> None:
             service="api",
             db_name=dbname,
         )
-        rt_eng = make_sa_engine("carepulse_runtime", dbname=dbname)
-        permit, pconn = acquire_invocation_permit(
-            rt_eng,
-            config=src_cfg,
-            expected_login="carepulse_runtime",
-            record_attempt=True,
-        )
-        http_pid = pconn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one()
-        sender_cfg = CompatRuntimeConfig(
-            target_id=target_id,
-            manifest_id=src_m.manifest_id,
-            generation="source",
-            expected_head=SOURCE_HEAD,
-            service="sender",
-            db_name=dbname,
-        )
-        sender_eng = make_sa_engine("carepulse_sender", dbname=dbname)
-        sender_permit, sender_conn = acquire_invocation_permit(
-            sender_eng,
-            config=sender_cfg,
-            expected_login="carepulse_sender",
-            invocation_class="sender_claim",
-            record_attempt=True,
-        )
-        sender_pid = sender_conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one()
+        with ExitStack() as setup:
+            rt_eng = make_sa_engine("carepulse_runtime", dbname=dbname)
+            setup.callback(rt_eng.dispose)
+            permit, pconn = acquire_invocation_permit(
+                rt_eng,
+                config=src_cfg,
+                expected_login="carepulse_runtime",
+                record_attempt=True,
+            )
+            setup.callback(release_invocation_permit, pconn, permit)
+            http_pid = pconn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one()
+            sender_cfg = CompatRuntimeConfig(
+                target_id=target_id,
+                manifest_id=src_m.manifest_id,
+                generation="source",
+                expected_head=SOURCE_HEAD,
+                service="sender",
+                db_name=dbname,
+            )
+            sender_eng = make_sa_engine("carepulse_sender", dbname=dbname)
+            setup.callback(sender_eng.dispose)
+            sender_permit, sender_conn = acquire_invocation_permit(
+                sender_eng,
+                config=sender_cfg,
+                expected_login="carepulse_sender",
+                invocation_class="sender_claim",
+                record_attempt=True,
+            )
+            setup.callback(release_invocation_permit, sender_conn, sender_permit)
+            sender_pid = sender_conn.exec_driver_sql(
+                "SELECT pg_backend_pid()"
+            ).scalar_one()
 
-        # 2. Controller claims owner epoch and starts drain in a background thread.
-        owner_conn = connect_role("carepulse_migration", dbname=dbname)
-        ctrl = claim_owner_epoch(
-            owner_conn,
-            target_id=target_id,
-            expected_cluster_id=cluster_id,
-            expected_db_name=dbname,
-        )
+            # 2. Controller claims owner epoch and starts drain in a background thread.
+            owner_conn = connect_role("carepulse_migration", dbname=dbname)
+            setup.callback(owner_conn.close)
+            ctrl = claim_owner_epoch(
+                owner_conn,
+                target_id=target_id,
+                expected_cluster_id=cluster_id,
+                expected_db_name=dbname,
+            )
 
-        # Competing controller cannot acquire owner lock; gets inspect-only access.
-        comp_conn = connect_role("carepulse_migration", dbname=dbname)
-        try:
-            with pytest.raises(ContentionError):
-                claim_owner_epoch(
-                    comp_conn,
-                    target_id=target_id,
-                    expected_cluster_id=cluster_id,
-                    expected_db_name=dbname,
-                )
-            inspected = inspect_as_competitor(comp_conn, target_id=target_id)
-            assert inspected.owner_epoch == ctrl.owner_epoch
-        finally:
-            comp_conn.close()
-
-        drain_done = threading.Event()
-        drain_errors: list[BaseException] = []
-
-        def _run_drain() -> None:
+            # Competing controller cannot acquire owner lock; gets inspect-only access.
+            comp_conn = connect_role("carepulse_migration", dbname=dbname)
             try:
-                drain_and_settle(
-                    owner_conn,
-                    target_id=target_id,
-                    owner_epoch=ctrl.owner_epoch,
-                    blocking=True,
-                )
-            except (DrainError, RuntimeError) as exc:
-                drain_errors.append(exc)
+                with pytest.raises(ContentionError):
+                    claim_owner_epoch(
+                        comp_conn,
+                        target_id=target_id,
+                        expected_cluster_id=cluster_id,
+                        expected_db_name=dbname,
+                    )
+                inspected = inspect_as_competitor(comp_conn, target_id=target_id)
+                assert inspected.owner_epoch == ctrl.owner_epoch
             finally:
-                drain_done.set()
+                comp_conn.close()
 
-        t = threading.Thread(target=_run_drain, daemon=True)
-        t.start()
+            drain_done = threading.Event()
+            drain_errors: list[BaseException] = []
+
+            def _run_drain() -> None:
+                try:
+                    drain_and_settle(
+                        owner_conn,
+                        target_id=target_id,
+                        owner_epoch=ctrl.owner_epoch,
+                        blocking=True,
+                    )
+                except (DrainError, RuntimeError) as exc:
+                    drain_errors.append(exc)
+                finally:
+                    drain_done.set()
+
+            t = threading.Thread(target=_run_drain, daemon=True)
+            t.start()
+
+            # After observer acquisition the existing outer finally owns cleanup.
+            obs = connect_role("carepulse_bootstrap", dbname=dbname, autocommit=True)
+            setup.pop_all()
 
         # Wait until DRAINING is committed and the owner is blocked by BOTH admitted holders.
-        obs = connect_role("carepulse_bootstrap", dbname=dbname, autocommit=True)
         try:
             try:
                 deadline = time.monotonic() + 10

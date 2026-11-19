@@ -7,6 +7,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from ops.compat.control import assert_current_owner
 from ops.compat.manifest import (
     GenerationManifest,
     ServiceKind,
@@ -174,6 +175,11 @@ def seal_generation_launch(
 
 def mark_source_sealed_in_control(conn, *, target_id: str, owner_epoch: int) -> None:
     """Record source_sealed = TRUE in compat_control.target_control under current owner epoch (T037)."""
+    ctrl = assert_current_owner(
+        conn, target_id=target_id, expected_epoch=owner_epoch, lock_mode="UPDATE"
+    )
+    if ctrl.phase != "DRAINING" or ctrl.active_generation != "none":
+        raise LaunchBindingError("Source sealing requires closed DRAINING admission")
     cur = conn.execute(
         """
         UPDATE compat_control.target_control
@@ -241,8 +247,11 @@ def verify_compose_isolation(compose_doc: Mapping[str, object]) -> None:
                 raise LaunchBindingError(
                     f"Source service {svc_name} missing read-only compat-adapters mount"
                 )
-        if svc_name not in ("source-sender", "candidate-sender", "mail"):
-            if isinstance(env, Mapping) and env.get("CP_SMTP_HOST"):
-                raise LaunchBindingError(
-                    f"Non-sender service {svc_name} must not configure SMTP egress"
-                )
+        if (
+            svc_name not in ("source-sender", "candidate-sender", "mail")
+            and isinstance(env, Mapping)
+            and env.get("CP_SMTP_HOST")
+        ):
+            raise LaunchBindingError(
+                f"Non-sender service {svc_name} must not configure SMTP egress"
+            )
