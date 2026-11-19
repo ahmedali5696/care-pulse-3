@@ -301,6 +301,41 @@ def assert_current_owner(
     return current
 
 
+def bind_refenced_owner_epoch(
+    conn: psycopg.Connection, *, target_id: str, expected_epoch: int
+) -> ControlRecord:
+    """Bind an owner epoch committed by the atomic lost-reopen refence CAS."""
+    key = advisory_key("owner", target_id)
+    held = conn.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM pg_locks
+            WHERE locktype='advisory' AND pid=pg_backend_pid()
+              AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
+              AND classid::bigint=%s AND objid::bigint=%s
+              AND objsubid=1 AND mode='ExclusiveLock' AND granted
+        ) AS held
+        """,
+        ((key >> 32) & 0xFFFFFFFF, key & 0xFFFFFFFF),
+    ).fetchone()
+    current = read_control_record(conn, lock_mode="UPDATE")
+    role = conn.execute("SELECT session_user::text AS login").fetchone()["login"]
+    if (
+        role != "carepulse_migration"
+        or not held
+        or not held["held"]
+        or current.target_id != target_id
+        or current.owner_epoch != expected_epoch
+        or current.phase != "DRAINING"
+        or current.active_generation != "none"
+    ):
+        conn.rollback()
+        raise ContentionError("Lost-reopen fencing owner epoch is not held")
+    conn.commit()
+    _claimed_owner_epochs[conn] = (target_id, expected_epoch, conn.info.backend_pid)
+    return current
+
+
 def inspect_as_competitor(conn: psycopg.Connection, *, target_id: str) -> ControlRecord:
     """Read-only inspection for a contending controller that does not hold the owner lock."""
     current = read_control_record(conn, lock_mode="NONE")

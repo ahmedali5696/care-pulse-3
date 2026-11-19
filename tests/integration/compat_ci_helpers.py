@@ -54,6 +54,17 @@ def read_secret(role: str) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
+def read_source_secret(role: str) -> str:
+    if role not in ("carepulse_auth", "carepulse_sender"):
+        raise ValueError("Unsupported predecessor shared role")
+    short = "auth" if role == "carepulse_auth" else "sender"
+    return (
+        Path(f"/run/secrets/source_{short}_db_password")
+        .read_text(encoding="utf-8")
+        .strip()
+    )
+
+
 def connect_role(
     role: str, *, dbname: str = "carepulse", autocommit: bool = False
 ) -> psycopg.Connection:
@@ -85,7 +96,10 @@ def make_sa_engine(role: str, *, dbname: str = "carepulse"):
 
 
 def ensure_roles_provisioned(
-    conn: psycopg.Connection, *, source_only: bool = False
+    conn: psycopg.Connection,
+    *,
+    source_only: bool = False,
+    separate_source_secrets: bool = False,
 ) -> None:
     """Provision PostgreSQL roles using real secrets (0040 historical or full 0046)."""
     if source_only:
@@ -96,6 +110,9 @@ def ensure_roles_provisioned(
             "carepulse_sender": read_secret("carepulse_sender"),
             "carepulse_auth": read_secret("carepulse_auth"),
         }
+        if separate_source_secrets:
+            for shared_role in ("carepulse_auth", "carepulse_sender"):
+                role_defs[shared_role] = read_source_secret(shared_role)
     else:
         role_defs = {
             role: read_secret(role)

@@ -17,7 +17,9 @@ import psycopg
 from ops.compat.control import (
     ControlRecord,
     acquire_exclusive_drain_permit,
+    acquire_owner_lock,
     assert_current_owner,
+    bind_refenced_owner_epoch,
     claim_owner_epoch,
     open_nonpooled_connection,
     read_control_record,
@@ -55,6 +57,19 @@ class RecoveryTakeover:
     committed_head: str
     branch: RecoveryBranch
     next_successor: str | None
+
+
+@dataclass(frozen=True)
+class FencedReopen:
+    """Durable closure after an ambiguous reopen, with owner backend retained."""
+
+    owner_conn: psycopg.Connection
+    control: ControlRecord
+    previous_epoch: int
+    previous_generation: str
+    committed_head: str
+    unresolved_work: int
+    surviving_sessions: int
 
 
 def _require_checkpoint(checkpoint: ExecutedUS2Checkpoint) -> None:
@@ -244,9 +259,216 @@ def recover_owner(
             ):
                 raise RecoveryError("Durable head/control changed during takeover")
             _assert_no_unresolved_work(observer, binding.target_id)
-            yield RecoveryTakeover(owner, claimed, head, branch, successor)
+            # The predecessor epoch's drain stamp cannot authorize work in a
+            # new controller epoch. Re-establish it only after a fresh observer
+            # proves the exclusive permit, no unsettled work and no surviving
+            # physical source/candidate pool (including idle connections).
+            survivors = observer.execute(
+                """
+                SELECT count(*) AS n FROM pg_stat_activity
+                WHERE datname=current_database()
+                  AND usename IN ('carepulse_runtime', 'carepulse_api',
+                                  'carepulse_web', 'carepulse_gate',
+                                  'carepulse_auth', 'carepulse_worker',
+                                  'carepulse_sender')
+                """
+            ).fetchone()["n"]
+            if survivors or (head != SOURCE_HEAD and not after.source_sealed):
+                raise RecoveryError(
+                    "Unsealed predecessor pool or source is still reachable"
+                )
+            current = assert_current_owner(
+                owner,
+                target_id=binding.target_id,
+                expected_epoch=claimed.owner_epoch,
+                lock_mode="UPDATE",
+            )
+            if current != after or probe_alembic_head(owner) != head:
+                owner.rollback()
+                raise RecoveryError(
+                    "Owner or durable head changed before drain revalidation"
+                )
+            _assert_no_unresolved_work(owner, binding.target_id)
+            changed = owner.execute(
+                """
+                UPDATE compat_control.target_control
+                SET drain_verified_epoch = %s, updated_at=now()
+                WHERE singleton_id=TRUE AND target_id=%s AND owner_epoch=%s
+                  AND phase=%s AND active_generation='none'
+                RETURNING owner_epoch
+                """,
+                (
+                    claimed.owner_epoch,
+                    binding.target_id,
+                    claimed.owner_epoch,
+                    claimed.phase,
+                ),
+            ).fetchone()
+            if not changed or changed["owner_epoch"] != claimed.owner_epoch:
+                owner.rollback()
+                raise RecoveryError("Drain proof rebind CAS failed")
+            owner.commit()
+            witnessed = read_control_record(observer)
+            if (
+                witnessed.drain_verified_epoch != claimed.owner_epoch
+                or witnessed.owner_epoch != claimed.owner_epoch
+                or probe_alembic_head(observer) != head
+            ):
+                raise RecoveryError("New owner epoch lacks durable drain proof")
+            yield RecoveryTakeover(owner, witnessed, head, branch, successor)
         finally:
             observer.close()
     finally:
         # Closing the physical session drops both the owner and exclusive permits.
+        owner.close()
+
+
+@contextmanager
+def recover_ambiguous_open(
+    *,
+    owner_connection: Mapping[str, str | int],
+    observer_connection: Mapping[str, str | int],
+    source_manifest: GenerationManifest,
+    target_manifest: GenerationManifest,
+    executed_us2: ExecutedUS2Checkpoint,
+    expected_open_epoch: int,
+    expected_open_generation: Literal["source", "candidate"],
+) -> Iterator[FencedReopen]:
+    """Re-fence an OPEN target and advance epoch in the SAME row-locked transaction.
+
+    A lost reopen acknowledgement may hide accepted business work. Close new
+    ingress first; report unsettled prior work for independent reconciliation.
+    This call never resends mail, replays business work, or reopens traffic.
+    """
+    _require_checkpoint(executed_us2)
+    verify_manifest_pair(source_manifest, target_manifest)
+    if expected_open_generation not in ("source", "candidate"):
+        raise RecoveryError("Unknown generation on ambiguous reopen")
+    binding = source_manifest.target_binding
+    if (
+        owner_connection.get("dbname") != binding.db_name
+        or observer_connection.get("dbname") != binding.db_name
+        or owner_connection.get("user") != "carepulse_migration"
+        or expected_open_epoch < 1
+    ):
+        raise RecoveryError("Ambiguous reopen target or owner binding is invalid")
+    previous_phase = (
+        "SOURCE_OPEN" if expected_open_generation == "source" else "TARGET_OPEN"
+    )
+    expected_head = (
+        SOURCE_HEAD
+        if expected_open_generation == "source"
+        else "0046_f01_audit_integrity"
+    )
+    owner = open_nonpooled_connection(**owner_connection)
+    try:
+        observer = open_nonpooled_connection(**observer_connection, autocommit=True)
+        try:
+            probe_target_identity(
+                observer,
+                expected_cluster_id=binding.cluster_id,
+                expected_db_name=binding.db_name,
+            )
+            owner.execute(
+                "SELECT set_config('application_name', %s, false)",
+                (f"compat-lost-open-{uuid.uuid4().hex}",),
+            )
+            owner.commit()
+            marker = owner.execute(
+                "SELECT current_setting('application_name') AS name"
+            ).fetchone()["name"]
+            owner.commit()
+            if not observer.execute(
+                "SELECT 1 FROM pg_stat_activity WHERE pid=%s AND datname=%s AND usename='carepulse_migration' AND application_name=%s",
+                (owner.info.backend_pid, binding.db_name, marker),
+            ).fetchone():
+                raise RecoveryError("Owner backend is not on the observed cluster")
+            if not acquire_owner_lock(owner, binding.target_id):
+                raise RecoveryError("Previous controller is still owner; inspect only")
+            current = read_control_record(owner, lock_mode="UPDATE")
+            if (
+                current.target_id != binding.target_id
+                or current.cluster_id != binding.cluster_id
+                or current.db_name != binding.db_name
+                or current.source_manifest_id != source_manifest.manifest_id
+                or current.target_manifest_id != target_manifest.manifest_id
+                or current.owner_epoch != expected_open_epoch
+                or current.phase != previous_phase
+                or current.active_generation != expected_open_generation
+                or probe_alembic_head(owner) != expected_head
+            ):
+                owner.rollback()
+                raise RecoveryError("The observed OPEN event or revision has changed")
+            row = owner.execute(
+                """
+                UPDATE compat_control.target_control
+                SET owner_epoch=owner_epoch+1, phase='DRAINING',
+                    active_generation='none', drain_verified_epoch=NULL,
+                    updated_at=now()
+                WHERE singleton_id=TRUE AND target_id=%s AND owner_epoch=%s
+                  AND phase=%s AND active_generation=%s
+                  AND source_manifest_id=%s AND target_manifest_id=%s
+                  AND EXISTS (SELECT 1 FROM public.alembic_version WHERE version_num=%s)
+                RETURNING owner_epoch
+                """,
+                (
+                    binding.target_id,
+                    expected_open_epoch,
+                    previous_phase,
+                    expected_open_generation,
+                    source_manifest.manifest_id,
+                    target_manifest.manifest_id,
+                    expected_head,
+                ),
+            ).fetchone()
+            if not row or row["owner_epoch"] != expected_open_epoch + 1:
+                owner.rollback()
+                raise RecoveryError("Re-fence compare-and-set lost ownership")
+            owner.commit()
+
+            # The fence is now durable. Outstanding earlier work must settle
+            # under its original attempt/lease before ANY later release.
+            fenced = read_control_record(observer)
+            if (
+                fenced.target_id != binding.target_id
+                or fenced.owner_epoch != expected_open_epoch + 1
+                or fenced.phase != "DRAINING"
+                or fenced.active_generation != "none"
+                or fenced.drain_verified_epoch is not None
+                or probe_alembic_head(observer) != expected_head
+            ):
+                raise RecoveryError("Lost closure acknowledgement; leave fenced")
+            bind_refenced_owner_epoch(
+                owner,
+                target_id=binding.target_id,
+                expected_epoch=fenced.owner_epoch,
+            )
+            unknown = observer.execute(
+                "SELECT count(*) AS n FROM compat_control.work_evidence WHERE target_id=%s AND disposition IN ('PENDING','UNKNOWN')",
+                (binding.target_id,),
+            ).fetchone()["n"]
+            claimed = observer.execute(
+                "SELECT count(*) AS n FROM public.delivery_jobs WHERE state='CLAIMED'"
+            ).fetchone()["n"]
+            live = observer.execute(
+                """
+                SELECT count(*) AS n FROM pg_stat_activity
+                WHERE datname=current_database()
+                  AND usename IN ('carepulse_runtime','carepulse_api','carepulse_web',
+                                  'carepulse_worker','carepulse_gate','carepulse_auth',
+                                  'carepulse_sender')
+                """
+            ).fetchone()["n"]
+            yield FencedReopen(
+                owner,
+                fenced,
+                expected_open_epoch,
+                expected_open_generation,
+                expected_head,
+                int(unknown) + int(claimed),
+                int(live),
+            )
+        finally:
+            observer.close()
+    finally:
         owner.close()

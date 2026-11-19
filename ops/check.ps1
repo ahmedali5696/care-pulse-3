@@ -1258,7 +1258,46 @@ case "$mode" in
   compat-us3)
     required_suites=(tests/integration/test_compat_recovery_source.py tests/integration/test_compat_recovery_intermediate.py tests/integration/test_compat_recovery_target.py tests/integration/test_compat_preservation.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "${required_suites[@]}"
+    python3 - "$private/compose.compat.json" "$private/observed.json" "$GITHUB_SHA" <<'PY'
+import json, re, subprocess, sys
+
+config_path, output_path, sha = sys.argv[1:]
+assert re.fullmatch(r'[0-9a-f]{40}', sha)
+services = json.load(open(config_path, encoding='utf-8'))['services']
+observed = {'candidate_sha': sha, 'services': {}}
+for generation in ('source', 'candidate'):
+    for service in ('api', 'web', 'worker', 'sender'):
+        name = f'{generation}-{service}'
+        spec = services[name]
+        image = json.loads(subprocess.check_output(
+            ['docker', 'image', 'inspect', spec['image']], text=True))[0]
+        image_id = image['Id']
+        assert re.fullmatch(r'sha256:[0-9a-f]{64}', image_id)
+        entry = spec.get('entrypoint')
+        command = spec.get('command')
+        if entry is None:
+            entry = image['Config'].get('Entrypoint') or []
+        if command is None:
+            command = image['Config'].get('Cmd') or []
+        assert isinstance(entry, list) and isinstance(command, list)
+        volumes = spec.get('volumes', [])
+        observed['services'][name] = {
+            'image_id': image_id,
+            'entry': entry + command,
+            'adapter_readonly': any(v.get('target') == '/run/compat-adapters'
+                                    and v.get('read_only') is True for v in volumes),
+            'api_peer': spec.get('environment', {}).get('CP_COMPAT_EXPECTED_API_PEER', ''),
+            'smtp_peer': spec.get('environment', {}).get('CP_SMTP_HOST', ''),
+            'db_name': spec.get('environment', {}).get('CP_DB_NAME', ''),
+            'target_id': spec.get('environment', {}).get('CP_COMPAT_TARGET_ID', ''),
+            'secrets': sorted(s.get('source', '') if isinstance(s, dict) else s
+                              for s in spec.get('secrets', [])),
+        }
+with open(output_path, 'w', encoding='utf-8') as stream:
+    json.dump(observed, stream, sort_keys=True)
+PY
+    chmod 0444 "$private/observed.json"
+    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "${required_suites[@]}"
     ;;
 esac
 '@
