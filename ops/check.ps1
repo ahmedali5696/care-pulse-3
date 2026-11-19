@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('inputs', 'python-quality', 'unit', 'web', 'imports', 'integration', 'integration-diagnostic', 'compat-diagnostic')]
+    [ValidateSet('inputs', 'python-quality', 'unit', 'web', 'imports', 'integration', 'integration-diagnostic', 'compat-diagnostic', 'compat-full')]
     [string]$Check
 )
 
@@ -68,7 +68,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': '6690eb65d83f688638311d58310535e67881cd6eb0e931db2e2334611fb34969',
+    '.github/workflows/foundation.yml': '528ccd4f64bebbde8b9f439a18e43a10185cfeeee3e806f8c8348d67017a603b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'apps/api/Dockerfile': '8465e11d5b90d94704ec63072180f10c56dcf4becf471da84258ea21de5208c8',
     'apps/web/Dockerfile': 'f4c68d5acdb939573661e8d79b1e08c901fa54cf87993464942eedab8f8df93b',
@@ -1155,9 +1155,9 @@ fi
             & bash -e -c $integration -- $Check
             if ($LASTEXITCODE -ne 0) { throw "Integration failed (exit $LASTEXITCODE)" }
         }
-        'compat-diagnostic' {
+        { $_ -in @('compat-diagnostic', 'compat-full') } {
             if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Linux' -or $PSVersionTable.PSVersion.Major -lt 7) {
-                throw 'Compatibility diagnostic requires Docker-capable Linux CI and PowerShell 7; no local Docker probe performed'
+                throw 'Compatibility verification requires Docker-capable Linux CI and PowerShell 7; no local Docker probe performed'
             }
             if ($env:CP_CI_PROJECT -notmatch '^carepulse-ci-[0-9]+-[0-9]+$' -or $env:COMPOSE_PROJECT_NAME -ne $env:CP_CI_PROJECT) {
                 throw 'Explicit matching disposable CI project required'
@@ -1165,17 +1165,29 @@ fi
             $compatScript = @'
 set -euo pipefail
 umask 077
-if [[ "${GITHUB_EVENT_NAME:-}" != workflow_dispatch || "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false || -n "${CP_T133_SHA:-}" ]]; then
-  echo 'FAIL compat diagnostics require a manual dispatch without experimental modes'; exit 1
+if [[ "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false || -n "${CP_T133_SHA:-}" ]]; then
+  echo 'FAIL compat runner cannot combine with experimental or protected modes'; exit 1
 fi
-mode="${CP_COMPAT_DIAGNOSTIC:-}"
-case "$mode" in
-  compat-us1|compat-us2|compat-us3) ;;
-  *) echo "FAIL unknown compat diagnostic mode: $mode"; exit 1 ;;
-esac
+if [[ "$1" = compat-diagnostic ]]; then
+  if [[ "${GITHUB_EVENT_NAME:-}" != workflow_dispatch ]]; then
+    echo 'FAIL compat diagnostics require a manual dispatch'; exit 1
+  fi
+  mode="${CP_COMPAT_DIAGNOSTIC:-}"
+  case "$mode" in
+    compat-us1|compat-us2|compat-us3) ;;
+    *) echo "FAIL unknown compat diagnostic mode: $mode"; exit 1 ;;
+  esac
+elif [[ "$1" = compat-full && "${CP_COMPAT_DIAGNOSTIC:-}" = compat-full ]]; then
+  mode=compat-full
+else
+  echo 'FAIL invalid ordinary compatibility selection'; exit 1
+fi
 private="$RUNNER_TEMP/foundation-ci-private"
 test ! -e "$private"
 mkdir -m 0700 "$private"
+if [[ "$mode" = compat-full ]]; then
+  mkdir -m 1777 "$private/compat-results"
+fi
 source_dir="$RUNNER_TEMP/compat-source-0040"
 rm -rf -- "$source_dir"
 cleanup() {
@@ -1254,19 +1266,51 @@ for svc in source-api source-web source-worker source-sender candidate-api candi
 done
 sha256sum ops/compat/source-web.cjs ops/compat/source-api.py ops/compat/source-jobs.py apps/api/carepulse/compat/admission.py apps/web/compat/admission.ts
 
-case "$mode" in
-  compat-us1)
+assert_full_compat_count() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+group, expected, filename = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+root = ET.parse(filename).getroot()
+suites = [root] if root.tag == 'testsuite' else list(root)
+if len(suites) != 1 or suites[0].tag != 'testsuite':
+    raise SystemExit(f'FAIL {group}: missing or ambiguous JUnit test suite')
+suite = suites[0]
+stats = {key: int(suite.attrib[key]) for key in ('tests', 'failures', 'errors', 'skipped')}
+if stats != {'tests': expected, 'failures': 0, 'errors': 0, 'skipped': 0}:
+    raise SystemExit(f'FAIL {group}: expected {expected} tests, zero failures/skips; got {stats}')
+print(f'PASS {group}: {expected} mandatory Python tests, zero skips')
+PY
+}
+run_compat_observer() {
+  local group="$1" expected="$2"
+  shift 2
+  if [[ "$mode" = compat-full ]]; then
+    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/compat-results:/tmp/compat-results:rw" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "--junitxml=/tmp/compat-results/$group.xml" "$@"
+    assert_full_compat_count "$group" "$expected" "$private/compat-results/$group.xml"
+  else
+    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "$@"
+  fi
+}
+if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
     required_suites=(tests/unit/test_compat_admission.py tests/integration/test_compat_matrix.py tests/integration/test_compat_entry_denials.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "${required_suites[@]}"
-    docker compose -f compose.compat.yaml --profile candidate run --rm --no-deps -T --entrypoint node candidate-web --no-warnings --experimental-strip-types --test auth/compat.test.ts
-    ;;
-  compat-us2)
+    run_compat_observer compat-us1 15 "${required_suites[@]}"
+    docker compose -f compose.compat.yaml --profile candidate run --rm --no-deps -T --entrypoint node candidate-web --no-warnings --experimental-strip-types --test --test-reporter=tap auth/compat.test.ts | tee "$private/compat-us1-web.log"
+    if [[ "$mode" = compat-full ]]; then
+      for result in '# tests 4' '# pass 4' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
+        grep -Fxq "$result" "$private/compat-us1-web.log" || { echo "FAIL mandatory compat Web test count: $result"; exit 1; }
+      done
+      echo 'PASS compat-us1-web: 4 mandatory Web tests, zero skips'
+    fi
+fi
+if [[ "$mode" = compat-us2 || "$mode" = compat-full ]]; then
     required_suites=(tests/integration/test_compat_drain.py tests/integration/test_compat_delivery.py tests/integration/test_compat_upgrade.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "${required_suites[@]}"
-    ;;
-  compat-us3)
+    run_compat_observer compat-us2 5 "${required_suites[@]}"
+fi
+if [[ "$mode" = compat-us3 || "$mode" = compat-full ]]; then
     required_suites=(tests/integration/test_compat_recovery_source.py tests/integration/test_compat_recovery_intermediate.py tests/integration/test_compat_recovery_target.py tests/integration/test_compat_preservation.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
     python3 - "$private/compose.compat.json" "$private/observed.json" "$GITHUB_SHA" <<'PY'
@@ -1312,8 +1356,13 @@ PY
     python3 -u ops/compat/ci_host.py "$private/handshake" "$private/observed.json" > "$private/ci-host.log" 2>&1 &
     host_pid=$!
     set +e
-    timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" -v "$private/handshake:/tmp/compat-host:rw" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=35 --tb=short -p no:cacheprovider "${required_suites[@]}"
-    test_code=$?
+    if [[ "$mode" = compat-full ]]; then
+      timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" -v "$private/handshake:/tmp/compat-host:rw" -v "$private/compat-results:/tmp/compat-results:rw" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=35 --tb=short -p no:cacheprovider --junitxml=/tmp/compat-results/compat-us3.xml "${required_suites[@]}"
+      test_code=$?
+    else
+      timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" -v "$private/handshake:/tmp/compat-host:rw" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=35 --tb=short -p no:cacheprovider "${required_suites[@]}"
+      test_code=$?
+    fi
     kill -TERM "$host_pid" 2>/dev/null || true
     wait "$host_pid"
     host_code=$?
@@ -1324,11 +1373,16 @@ PY
       test "$host_code" -eq 0 || cat "$private/ci-host.log"
       exit 1
     fi
-    ;;
-esac
+    if [[ "$mode" = compat-full ]]; then
+      assert_full_compat_count compat-us3 10 "$private/compat-results/compat-us3.xml"
+    fi
+fi
+if [[ "$mode" = compat-full ]]; then
+  echo 'PASS mandatory compatibility: 30 Python cases (US1 15, US2 5, US3 10), 4 Web cases, zero skips'
+fi
 '@
-            & bash -e -c $compatScript
-            if ($LASTEXITCODE -ne 0) { throw "Compatibility diagnostic failed (exit $LASTEXITCODE)" }
+            & bash -e -c $compatScript -- $Check
+            if ($LASTEXITCODE -ne 0) { throw "Compatibility verification failed (exit $LASTEXITCODE)" }
         }
     }
 } catch {

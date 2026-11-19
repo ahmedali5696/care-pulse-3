@@ -241,6 +241,16 @@ jobs:
           & pwsh -NoProfile -File ops/check.ps1 integration
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Mandatory source 0040 to candidate 0046 compatibility, recovery and preserved-data acceptance
+        if: ${{ (!inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full') && !inputs.t133_terminal && !inputs.b04_spike }}
+        shell: pwsh
+        env:
+          CP_COMPAT_DIAGNOSTIC: compat-full
+        run: |
+          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
+          & pwsh -NoProfile -File ops/check.ps1 compat-full
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Focused disposable PostgreSQL diagnostics and scoped cleanup
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && !startsWith(inputs.postgres_diagnostic, 'compat-') }}
         shell: pwsh

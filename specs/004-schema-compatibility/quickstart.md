@@ -1,0 +1,141 @@
+# Quickstart — verify a synthetic 0040 → 0046 cutover
+
+Use this guide for authorized synthetic engineering verification. The focused compatibility checkpoints are separate from the ordinary full Foundation gate. Only an **executed** successful full run at its exact executable SHA can satisfy T056; implementation-agent review does not constitute independent T057 acceptance.
+
+## Establish the inputs
+
+From the repository root, use PowerShell 7, the pinned Python environment and the repository's locked dependencies. For the build and integration phases use Foundation's pinned Linux/Compose runner, full Git history or verified source archives, generated run-scoped secrets, disposable PostgreSQL 17.11 and the synthetic mail sink. Provision distinct secrets/networks per generation, a private maintenance connection and an independent observer. Bring up each test database only in the runner-owned project. Docker is not required on the workstation.
+
+```powershell
+$sourceSha = '6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7'
+$referenceSha = 'f7609a616519179b8feb2fad6721350c5a2c9d31'
+$reviewedSha = git rev-parse HEAD
+git show -s --format='%H %s' $sourceSha $referenceSha $reviewedSha
+git diff --name-status $sourceSha $referenceSha -- db/migrations/versions
+python -B -m alembic -c alembic.ini heads
+pwsh -NoProfile -File ops/check.ps1 imports
+pwsh -NoProfile -File ops/check.ps1 unit
+```
+
+Expected reference delta is exactly the six added migration files in the [published sequence](research.md). The compatible executable uses the single head `0046_f01_audit_integrity`. Record the full reviewed SHA. Build Web/API/worker/sender from the actual source trees, verify image and admission adapter digests, and record which payload the runner launches. Include the original role setup at 0040. Using the candidate role bootstrap to create the populated source hides the prerequisite transition.
+
+## Exercise normal entries on real PostgreSQL
+
+The ordinary Foundation `full` mode first runs the existing `ops/check.ps1 integration` checks and then the mandatory `ops/check.ps1 compat-full` source/candidate suite in the same `compose-integration` job. The three focused `compat-us1`, `compat-us2`, `compat-us3` selectors remain independently executable. Each compat suite uses disposable real PostgreSQL; its recovery scenarios retain the same 0040-origin database across actual successive revisions. A disposable copy is appropriate for conflicting input, fault injection or product verification while the target is closed. Record state before/after with the [data model](data-model.md) and [admission contract](contracts/cutover.md) as oracles.
+
+| Scenario | Action and expected observation |
+| --- | --- |
+| Source and target controls (SC-001, SC-005) | Use each eligible matched generation at its supported endpoint. Through Web sign in as permitted synthetic staff, read a permitted record, book one appointment and retry the same key. Verify the actual actor/role/tenant, one receipt/result and consistent number/price/history/audit/outbox. A changed-input reuse follows the existing conflict contract. Direct private API with valid scoped proof behaves consistently. Exercise scoped same-tenant, foreign-tenant, revoked and field-scope denials. Start the actual sender and observe its permitted claim/delivery separately from worker health. |
+| Full compatibility matrix (SC-001) | Exercise each row of the contract at open 0040, each of the five real committed intermediates, closed 0046 and verified/open 0046. Keep the other generation physically present. Attempt mixed Web/API in both directions, direct signed API, native login/session change and cookie issuance, an existing tab/stream, worker poll, sender claim/reclaim and delivery. Include cold start and a reused pool after prior success. At each fenced entry expect no protected payload, mutations, new nonce/receipt, session change, forwarded call, claim, material cleanup or delivery. Observe liveness and bounded sanitized unavailability. |
+| Failed trust or metadata (SC-001, SC-005) | On disposable copies try wrong target, missing/empty/multiple, unknown/newer or unreadable version, DB outage, incorrect effective grant at the correct head, wrong service/gate login, unknown image and retired credentials on both fresh and previously established sessions. Exercise unwrapped listeners/launches through private networks and a mismatched peer before Web session refresh. Check denial and side effects at the normal entry point. Complete outstanding prior work separately. |
+| Populated fixture (SC-003, SC-005) | Seed two synthetic clinics with different roles, patients, appointments/number history and frozen prices, visits with evidenced actors, Follow-up claims/decisions, policy versions, receipts, audit/outbox, historical nonces and jobs including pending and known claimed work. Capture exact values, keys and relationships privately at 0040. Settle claims before advancing. Compare the expected retained evidence, constraints, FORCE RLS and effective privileges at each revision, including the expected grant changes. In eligible 0046 run authorized product work with real F-01 login/backend/transaction/operation/resource bindings. Check consumed nonces, independent proofs, frozen historical provenance and no side effects on denials. |
+| Ordered closure and takeover (SC-002, SC-004) | Use separate PostgreSQL sessions and explicit transaction checkpoints. Hold a signed booking and a sender admission, start closure, observe the actual waiting backend and blocker, and release the earlier work to commit or roll back. Reverse each order. Submit another booking, poll and competing controller after closure. At most one controller advances or reopens. A superseded owner and stale restarts cannot release the fence. Inspect committed rows/receipts, leases, work references and Mailpit observations. The runner already has a [PostgreSQL lock observer](../../tests/integration/postgres_locks.py). |
+| Uncertain delivery (SC-002, SC-004) | Pause after the claim commit and at transport acceptance before DB settlement. Test confirmed delivery, confirmed no delivery, and a lost/ambiguous acknowledgement. Include lease expiry and normal retry eligibility. The last case preserves evidence and blocks migration or re-opening as applicable across restart. Observe zero automatic reclaims/redeliveries while blocked. The synthetic sink can independently count deliveries without exporting message bodies. |
+| Populated rejection and recovery (SC-003, SC-004) | Fail read-only preflight with an absent prerequisite or incompatible fixture. Compare original data/head; check zero repairs. Exercise fresh install separately. On isolated copies of the populated path, inject failure after a successor's actual statements before commit, then after commit before acknowledgement. Do this at each boundary, including the first 0041 and final 0046, without editing published migration files. Restart controller and services, independently observe the last commit and effective authority, then retry the intact predecessor or move forward one successor. Inject failure between target key/policy initialization and retirement, during target verification, and on lost reopen acknowledgement. Repeat at head and verify unchanged evidence and no duplicates. |
+| Identity evidence on recovery (SC-004, SC-005) | In an isolated 0040-origin case at a revision that supports it, seed controlled private identity evidence with the fixture authority while product admission remains closed. Include an unconsumed signed request, a historical/consumed nonce, and a binding with indeterminate transaction outcome. Compare their dispositions after restart. Unconsumed work stays subject to original expiry/authorization, a consumed nonce stays spent, unknown bindings survive cleanup, and a pre-0045 activation cannot acquire withdrawal authority from unrelated audit. Keep an affected unknown outcome fenced. |
+
+Run the fresh-install, repeat-at-head and rejected-populated controls alongside the existing F-01 migration/identity suites. A maintenance seed, raw migrator SQL success or a mocked readiness flag cannot count as an authorized application result. Keep protected T133 and historical-only writers in their original evidence lanes.
+
+### Mandatory ordinary-full compatibility selection (T054–T055)
+
+The following are **mandatory executed test counts**, not merely discovered files. The Python numbers include parametrized cases. A missing suite, collection change, skip/xfail, time-out or failed assertion must fail the full acceptance run. An independently executed Node/Web test group is also required; passing Python tests alone is insufficient.
+
+| Coverage | Executed suite | Required result |
+| --- | --- | --- |
+| `compat-us1` matrix, real-login/entry denial, admitted-control unit checks | `tests/unit/test_compat_admission.py`, `tests/integration/test_compat_matrix.py`, `tests/integration/test_compat_entry_denials.py` | **15/15 Python** (4 + 7 + 4) |
+| `compat-us1` guarded Web/native admission | `apps/web/auth/compat.test.ts` in actual candidate Web image | **4/4 Node** |
+| `compat-us2` ordered drain, uncertain sender and populated upgrade | `tests/integration/test_compat_drain.py`, `tests/integration/test_compat_delivery.py`, `tests/integration/test_compat_upgrade.py` | **5/5 Python** (3 + 1 + 1) |
+| `compat-us3` source/intermediate/target recovery and authentic preservation | `tests/integration/test_compat_recovery_source.py`, `tests/integration/test_compat_recovery_intermediate.py`, `tests/integration/test_compat_recovery_target.py`, `tests/integration/test_compat_preservation.py` | **10/10 Python** (2 + 1 + 3 + 4) |
+| **Total ordinary-full compatibility** | One pinned-image compatibility topology and its independently supervised real source/candidate actors | **30/30 Python + 4/4 Node; zero skips** |
+
+The ordinary full path is **not** a replacement for the existing Foundation unit, Web, imports, authorized clinical integration, historic-only writer checks, private-network tests or synthetic Mailpit checks. T133 terminal acceptance is separately protected and must not be called by this ordinary route. `compat-us1/2/3` are diagnostics, not substitutes for `postgres_diagnostic=full`.
+
+On a Docker-capable, authorized GitHub Actions runner, reproduce the final gate with the exact feature-branch tip (do not dispatch against an unrelated SHA):
+
+```powershell
+$reviewedBranch = 'feature/pre-wave-3-runtime-identity'
+$reviewedSha = git rev-parse HEAD
+git ls-remote --heads origin "refs/heads/$reviewedBranch"
+gh workflow run foundation.yml --repo ahmedali5696/care-pulse-3 --ref $reviewedBranch -f postgres_diagnostic=full -f t133_terminal=false -f b04_spike=false
+gh run list --repo ahmedali5696/care-pulse-3 --workflow foundation.yml --branch $reviewedBranch --commit $reviewedSha --event workflow_dispatch --json databaseId,headSha,status,conclusion,url
+gh run view $runId --repo ahmedali5696/care-pulse-3 --json headSha,status,conclusion,url,jobs
+gh run view $runId --repo ahmedali5696/care-pulse-3 --log
+```
+
+Both `inputs-and-build` (including canonical-LF whole-file SHA-256 checks) and `compose-integration` must succeed on **the same exact `$reviewedSha`**. Verify actual immutable source 0040 and candidate 0046 image IDs, separate read-only source adapter digests, live service/peer/role bindings, single database head and owner epoch, PostgreSQL waiter/blocker evidence, 0040 signed booking receipt/replay with no additional effects, Mailpit before/after counts, and positive cleanup evidence for disposable data/volumes/networks and runner-generated secrets. Do not include raw PHI, passwords, nonce values, SQL dumps or credentials in evidence.
+
+The client workstation has no Docker/PostgreSQL integration runner: local collection, parse, unit and static checks **cannot** prove compatibility. A failed/missing job, absent mandatory test, any skip, unknown original transaction/SMTP outcome or incomplete cleanup leaves final acceptance **unverified**. Treat real network packet capture and production backup/restore, credential custody and release approval as distinct additional evidence, not as outcomes of this synthetic gate.
+
+## Collect the acceptance record (SC-006)
+
+### Executed focused US1 checkpoint — T027
+
+The early `compat-us1` diagnostic passed on 2026-11-18 in [Foundation run 44394714913](https://github.com/ahmedali5696/care-pulse-3/actions/runs/44394714913), executable SHA `70e4226d1c88d04fc0de8f5d50ee425c6e2e5685`. Both `inputs-and-build` and `postgres-diagnostic` succeeded. Real PostgreSQL executed **15/15 Python** compatibility admission/matrix/negative entry tests in 8.46 seconds, and the actual candidate Web image executed its Node suite with **zero skipped**; scoped compatibility Compose and synthetic-secret cleanup passed. This is an independent early checkpoint, not final Foundation acceptance.
+
+### Executed focused US2 checkpoint — T042
+
+The **early `compat-us2` diagnostic passed** on 2026-11-18 in [Foundation run 44424355381](https://github.com/ahmedali5696/care-pulse-3/actions/runs/44424355381), executable SHA `835a257aa8374c50d615bf7b75676cccb49137e7`. Both `inputs-and-build` and `postgres-diagnostic` succeeded; the five real PostgreSQL cases (owner lock, both sender/HTTP drain race orders, ambiguous delivery, and populated six-successor upgrade) passed in 5.55 seconds, with **zero mandatory skips**. The run verified scoped compatibility Compose volume and synthetic secret cleanup. This is the early T042 checkpoint, **not** T053 recovery or the final ordinary Foundation gate.
+
+The run recorded the following built image IDs (SHA-256) for the actual source and candidate participants:
+
+| Participant | Source 0040 image ID | Candidate 0046 image ID |
+| --- | --- | --- |
+| API | `d0d4e9dcb3c914068d7dd6cefb3ec44f5678c0196968a3a3fec32a5f6f2014cd` | `baeb309bb4fd992e3e776a4ae39b2f9aea65d20b3414232767e99c200edbd9bf` |
+| Web | `2b06184790f7b578623563c871c656bc88b5064dc400242b19e3f4b8e38eba79` | `daf0dc8fd9a7170f7fb184bdeb87f8c4fc5b30b7c75a32f7d6c741be68c15aa4` |
+| Worker | `ac97da0822b34cf0ae31007be5a3c90e485d2bd78226b6ac5f853795a4dbcc02` | `6075c85b75352893d254238b4353c7410b2116010386f8606e6175107a7e5888` |
+| Sender | `6359a4535339af7c5801bdffe3cc9b731645920f575cdcd03714265274105b2e` | `467a3cef21294fe26949c61ab2871b3b1c80d1a860ed2eb39a19b9df6530d2bc` |
+
+The adapter/guard SHA-256 values were: source Web `293631a1df1ae5ed846864dd2fccf0b12b46cc322ba0b4fc6d061fd60f65b52a`, source API `bb63f1cdfa504a833846cb0cdea52480ca69613a482605e51f182e159ebe2376`, source jobs `b77d222bed8a14cbffbd4ce4da6d7dea0a6a13c4febdfe641dcefec7938b9b4b`, candidate API admission `1382b83710435c9a5791ffbc7526eb135b63a2d282740d89c81c11f1c9429974`, and candidate Web admission `4dd3c690b2f677bb0dac096614de5d4533c3ec73a3eca919574feaff36da1864`.
+
+### Executed focused US3 checkpoint — T053
+
+The early `compat-us3` diagnostic passed on 2026-11-19 in [Foundation run 44537908117](https://github.com/ahmedali5696/care-pulse-3/actions/runs/44537908117), executable SHA `c87870f6581c881b901778bec1e3d939d4b3c909`. Both `inputs-and-build` and `postgres-diagnostic` succeeded; **10/10 Python** recovery/preservation cases passed in 76.16 seconds with **zero mandatory skips** and scoped cleanup. The intermediate-recovery case separately launched and attested actual source/candidate worker and sender images at **each 0041–0046 committed head**, checked live heartbeat and denied readiness, and independently observed zero Mailpit messages before/after each denied sender attempt. The preserved original 0040 booking was generated through authentic immutable-source signed HTTP (`201`), not by a synthetic SQL receipt: candidate F-01 signed same-body/same-key replay returned `201` with original revision `0`; changed-body conflict returned `409`, cross-tenant and revoked-session denials each returned `401`. Original receipt/digest/scope/result and retained domain/audit/outbox/delivery counts were unchanged, and synthetic Mailpit stayed `0→0`. These are US3 focused facts, **not** full ordinary Foundation acceptance or packet-level SMTP interception proof.
+
+
+After the user explicitly starts the assigned PRE-W3-COMPAT implementation, its coding agent may dispatch and retry in-scope diagnostic and ordinary full Foundation CI without requesting separate approval for each run. This does not authorize implementation now, or merge, deployment, production cutover or release. For the final ordinary full gate after T055, set `$reviewedBranch` to the branch carrying the exact reviewed executable. Confirm its tip before dispatch. Capture the run ID from GitHub and check the actual SHA again afterward.
+
+```powershell
+$reviewedBranch = git branch --show-current
+git ls-remote --heads origin "refs/heads/$reviewedBranch"
+gh workflow run foundation.yml --ref $reviewedBranch -f postgres_diagnostic=full -f t133_terminal=false -f b04_spike=false
+gh run list --workflow foundation.yml --branch $reviewedBranch --commit $reviewedSha --event workflow_dispatch --json databaseId,headSha,status,conclusion,url
+```
+
+For the dispatched run ID, inspect its evidence.
+
+```powershell
+gh run view $runId --json headSha,status,conclusion,url,jobs
+gh run view $runId --log
+```
+
+Require an exact SHA match, completed successful `inputs-and-build` and `compose-integration`, the mandatory scenario selections and counts with zero mandatory skips, and cleanup of both generations, private networks, secrets, copied fixtures and volumes. Include sanitized head/phase/role outcomes, ordered lock observations, retained-data comparison results and send counts. Keep raw clinical, auth, SQL and secret material out of reports. If a required case is missing or uncertain, record compatibility as unverified.
+
+For a failure, record the exact SHA, run, failing case/step and classification. Use the smallest applicable **listed** PostgreSQL diagnostic with observed root cause before a correction. The workflow supports `compat-us1`, `compat-us2`, and `compat-us3` as early diagnostic selections. A focused result supports the relevant story checkpoint only. Re-run ordinary full Foundation at the final executable for acceptance. [Foundation workflow](../../.github/workflows/foundation.yml) · [PostgreSQL CI procedure](../../docs/postgresql-ci.md)
+
+## Independent-review handoff index (T057)
+
+This is an evidence **index prepared by the implementer**, not an independent review result. For each row, the reviewer must inspect the referenced assertions and the mandatory compatibility logs of the exact-sha ordinary-full run, in addition to the unchanged approved PRD, domain model, system design, implementation plan and Constitution. The final disposition belongs to independent reviewers; absence of evidence is **BLOCKED**, not PASS.
+
+| Requirement | Implementation evidence | Required executable proof |
+| --- | --- | --- |
+| FR-001 — measured generation/head/phase | `ops/compat/manifest.py`, `launch.py`, `probes.py`, `compose.compat.yaml`; separate `source-*.py`/`.cjs` adapters | `test_compat_matrix.py`, `test_compat_entry_denials.py`; image/adapter SHA-256 logs |
+| FR-002 — all effect-entry gates | `apps/api/carepulse/compat/admission.py`, `apps/api/carepulse/main.py`, `apps/web/ingress.mjs`, `apps/web/compat/admission.ts`, `ops/compat/source-jobs.py` | US1 matrix/entry denials, `apps/web/auth/compat.test.ts`, US3 image-backed sender/worker checks |
+| FR-003 — live versus ready | `apps/api/carepulse/health.py`, `apps/web/health.ts`, `apps/worker/status.py` | US1 matrix and US3 intermediate worker restarts/heartbeat and readiness denial |
+| FR-004 — exclusive closure and admitted-work reconciliation | `ops/compat/control.py`, `drain.py`, `work.py` | `test_compat_drain.py`, `test_compat_delivery.py`; PostgreSQL waiter/blocker and uncertain-outcome assertions |
+| FR-005 — target/prerequisite/security validation | `ops/compat/preflight.py`, `prerequisites.py`, `probes.py`, `verify.py` | `test_compat_upgrade.py`, `test_compat_preservation.py`; per-head validation/rejected prerequisites |
+| FR-006 — immutable ordered revision path | `ops/compat/migrate.py`, `recover.py` and published Alembic 0040–0046 (unchanged) | `test_compat_upgrade.py`, `test_compat_recovery_intermediate.py`; real per-commit observations |
+| FR-007 — owner-authorized recovery/reopening | `ops/compat/control.py`, `recover.py`, `reopen.py` | `test_compat_recovery_source.py`, `test_compat_recovery_target.py`; lost acknowledgement/fencing |
+| FR-008 — effective logins/RLS/actor binding | `db/compat-control.sql`, `apps/api/carepulse/identity/boundary.py`, `apps/api/carepulse/compat/admission.py` | US1 real-login negative probes, US3 signed F-01 tenant/revocation denial, target security verification |
+| FR-009 — receipts, nonces, evidence and sender provenance | `ops/compat/work.py`, `verify.py`, `tests/integration/compat_recovery_lab.py` | `test_compat_preservation.py`; authentic signed 0040 booking, exact original receipt and 0046 replay, unchanged effects |
+| FR-010 — whole-gate acceptance | `ops/check.ps1`, `.github/workflows/foundation.yml`, `compose.compat.yaml` | Exact-SHA `inputs-and-build` **and** `compose-integration`, 30 Python + 4 Node, zero mandatory skips and cleanup |
+
+| Success criterion | Reviewer correlation |
+| --- | --- |
+| SC-001 | US1 matrix and real-service denials; US3 real worker/sender identities, head and phase |
+| SC-002 | US2 PostgreSQL observed lock ordering, competing owner, admitted sender and unknown-outcome fence |
+| SC-003 | US2 six-successor populated upgrade plus US3 retained-data/role/provenance checks |
+| SC-004 | US3 source, each intermediate and target recovery; lost response/commit/reopen, no stale admission |
+| SC-005 | US1 RLS/real-login denials plus US3 historical receipt, candidate signed replay/conflict/cross-tenant/revocation |
+| SC-006 | Final ordinary-full jobs, pinned fingerprints/builds, exact-SHA results, complete teardown and distinct independent disposition |
+
+**Outstanding reviewer decisions and issues (none closed by this handoff):** Security must review trusted ingress source behind NAT/proxy ([#2](https://github.com/ahmedali5696/care-pulse-3/issues/2)), pinned dependency advisories ([#4](https://github.com/ahmedali5696/care-pulse-3/issues/4)), credential/sender policy ([#5](https://github.com/ahmedali5696/care-pulse-3/issues/5)), production numeric policy ([#18](https://github.com/ahmedali5696/care-pulse-3/issues/18)), shared-runtime spoof boundary and clinical provenance ([#26](https://github.com/ahmedali5696/care-pulse-3/issues/26)), and compatibility evidence reconciliation ([#28](https://github.com/ahmedali5696/care-pulse-3/issues/28)). Clinical and the Product Owner retain independently reviewed actor/Follow-up provenance and manager/Receptionist contract implementation/acceptance ([#24](https://github.com/ahmedali5696/care-pulse-3/issues/24), [#25](https://github.com/ahmedali5696/care-pulse-3/issues/25), [#26](https://github.com/ahmedali5696/care-pulse-3/issues/26)). Operations and the Product Owner retain populated historical-upgrade/restore evidence ([#13](https://github.com/ahmedali5696/care-pulse-3/issues/13)), production operator-key/SMTP custody ([#5](https://github.com/ahmedali5696/care-pulse-3/issues/5)), and the independent **OPEN-OPS-01/02/03**, **OPEN-FILES-01** and **SECURITY-POLICY-NUMERICS** production gates ([#18](https://github.com/ahmedali5696/care-pulse-3/issues/18)). No production backup/restore, live transport packet proof, deployment, Wave 3 or release approval is inferred from synthetic compatibility runs.
