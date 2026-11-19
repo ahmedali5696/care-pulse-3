@@ -1,5 +1,7 @@
 """Host-owned compatibility handshake must reject unsafe observer requests."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from ops.compat.ci_host import Supervisor
@@ -76,3 +78,43 @@ def test_host_uses_explicit_boolean_encoding_and_denies_unsealed_source(monkeypa
     monkeypatch.setattr("ops.compat.ci_host.compose", sealed_query)
     with pytest.raises(RuntimeError, match="source-seal"):
         Supervisor.__new__(Supervisor).validate(request)
+
+
+@pytest.mark.parametrize("image_matches", [True, False])
+def test_sender_attests_actual_container_image_and_removes_it(
+    monkeypatch, image_matches
+):
+    image = "sha256:" + "a" * 64
+    container = "b" * 64
+    removed = []
+    monkeypatch.setenv("CP_CI_PROJECT", "carepulse-ci-123-1")
+    monkeypatch.setattr(
+        "ops.compat.ci_host.command",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout="Delivery unavailable\n", stderr=""
+        ),
+    )
+    monkeypatch.setattr(
+        "ops.compat.ci_host.required",
+        lambda *_args, **_kwargs: (
+            container + "|" + (image if image_matches else "sha256:" + "c" * 64)
+        ),
+    )
+    host = Supervisor.__new__(Supervisor)
+    host.observed = {"services": {"source-sender": {"image_id": image}}}
+    host.remove = removed.append
+    request = {
+        "source_manifest_id": "source-0040",
+        "db_name": "compat_mid_abcdefghijkl",
+        "target_id": "t-compat_mid_abcdefghijkl",
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "job_id": "22222222-2222-2222-2222-222222222222",
+    }
+    if image_matches:
+        result = host.sender("source-sender", request, "d" * 24)
+        assert result["container_id"] == container
+        assert result["image_id"] == image
+    else:
+        with pytest.raises(RuntimeError, match="image mismatches"):
+            host.sender("source-sender", request, "d" * 24)
+    assert removed == ["carepulse-ci-123-1-" + "d" * 12 + "-source-sender"]

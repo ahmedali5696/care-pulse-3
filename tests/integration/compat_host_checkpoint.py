@@ -158,6 +158,7 @@ def checkpoint_restarted_jobs(
             raise AssertionError("T051 image-backed worker did not restart fenced")
         if (
             sender.get("image_id") != image_ids[generation]["sender"]
+            or not re.fullmatch(r"[0-9a-f]{64}", str(sender.get("container_id", "")))
             or sender.get("invoked") is not True
             or type(sender.get("exit_code")) is not int
             or sender["exit_code"] != 1

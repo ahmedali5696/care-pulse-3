@@ -639,14 +639,15 @@ def test_authentic_0040_signed_receipt_replays_with_f01_without_any_new_effect()
         )
         try:
             receipt = observer.execute(
-                "SELECT scope_kind, scope_id, actor_kind, actor_id, staff_id, "
-                "request_digest, result_projection, result_revision "
-                "FROM public.idempotency_receipts "
+                "SELECT to_jsonb(r) AS row FROM public.idempotency_receipts r "
                 "WHERE organization_id=%s AND operation='appointments.book' "
                 "AND idempotency_key=%s",
                 (tenant, key),
-            ).fetchone()
+            ).fetchone()["row"]
             assert receipt is not None
+            assert receipt["operation"] == "appointments.book"
+            assert receipt["idempotency_key"] == key
+            assert receipt["organization_id"] == tenant
             assert receipt["scope_kind"] == "TENANT"
             assert str(receipt["scope_id"]) == tenant
             assert receipt["actor_kind"] == "STAFF"
@@ -732,33 +733,38 @@ def test_authentic_0040_signed_receipt_replays_with_f01_without_any_new_effect()
                 )
                 assert changed_status == 409
                 assert changed["error"]["code"] == "IDEMPOTENCY_CONFLICT"
-                assert booking_request(
+                cross_tenant_status = booking_request(
                     clinic,
                     replace(actor, organization_id=lab.inventory.org_b_id),
                     body=body,
                     key=key,
-                )[0] in (401, 403)
+                )[0]
+                assert cross_tenant_status in (401, 403)
                 with cutover.admin.transaction():
                     cutover.admin.execute(
                         'UPDATE public."session" SET "expiresAt"=clock_timestamp() '
                         "WHERE id=%s",
                         (session,),
                     )
-                assert booking_request(clinic, actor, body=body, key=key)[0] in (
-                    401,
-                    403,
-                )
+                revoked_status = booking_request(clinic, actor, body=body, key=key)[0]
+                assert revoked_status in (401, 403)
                 assert _booking_effects(cutover.observer, tenant) == before
                 persisted = cutover.observer.execute(
-                    "SELECT request_digest,result_projection,result_revision "
-                    "FROM public.idempotency_receipts "
-                    "WHERE organization_id=%s AND idempotency_key=%s",
+                    "SELECT to_jsonb(r) AS row FROM public.idempotency_receipts r "
+                    "WHERE organization_id=%s AND operation='appointments.book' "
+                    "AND idempotency_key=%s",
                     (tenant, key),
-                ).fetchone()
-                assert persisted["request_digest"] == receipt["request_digest"]
-                assert persisted["result_projection"] == receipt["result_projection"]
-                assert persisted["result_revision"] == receipt["result_revision"]
+                ).fetchone()["row"]
+                assert persisted == receipt
                 assert _mail_count() == original_mail
+                print(
+                    "T053_EVIDENCE original_status=201 replay_status=201"
+                    " original_revision=0 replay_revision=0 conflict_status=409"
+                    f" cross_tenant_status={cross_tenant_status}"
+                    f" revoked_status={revoked_status}"
+                    f" mailpit_before={original_mail} mailpit_after={_mail_count()}"
+                    f" retained_effect_counts={dict(before)}"
+                )
             finally:
                 for name, previous in previous_state.items():
                     setattr(app.state, name, previous)

@@ -327,7 +327,6 @@ class Supervisor:
         args = (
             *COMPOSE,
             "run",
-            "--rm",
             "--no-deps",
             "-T",
             "--name",
@@ -344,19 +343,32 @@ class Supervisor:
             "--job-id",
             request["job_id"],
         )
-        response = command(args, timeout=20)
-        if (
-            response.returncode != 1
-            or response.stdout.strip() != "Delivery unavailable"
-        ):
-            # Report only bounded metadata, never the sender's potentially sensitive output.
-            raise RuntimeError(
-                f"{service} sender denial mismatch: exit={response.returncode}, "
-                f"expected_output={response.stdout.strip() == 'Delivery unavailable'}, "
-                f"stdout_bytes={len(response.stdout)}, stderr_bytes={len(response.stderr)}"
-            )
+        try:
+            response = command(args, timeout=20)
+            actual = required(
+                ("docker", "inspect", "--format", "{{.Id}}|{{.Image}}", name)
+            ).split("|")
+            if (
+                len(actual) != 2
+                or not re.fullmatch(r"[0-9a-f]{64}", actual[0])
+                or actual[1] != spec["image_id"]
+            ):
+                raise RuntimeError("Sender container image mismatches inspected build")
+            if (
+                response.returncode != 1
+                or response.stdout.strip() != "Delivery unavailable"
+            ):
+                # Do not expose sender output, which could contain sensitive material.
+                raise RuntimeError(
+                    f"{service} sender denial mismatch: exit={response.returncode}, "
+                    f"expected_output={response.stdout.strip() == 'Delivery unavailable'}, "
+                    f"stdout_bytes={len(response.stdout)}, stderr_bytes={len(response.stderr)}"
+                )
+        finally:
+            self.remove(name)
         return {
             "image_id": spec["image_id"],
+            "container_id": actual[0],
             "invoked": True,
             "exit_code": 1,
             "denial": "Delivery unavailable",

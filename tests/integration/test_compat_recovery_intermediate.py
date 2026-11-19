@@ -308,6 +308,17 @@ def test_resume_each_0041_to_0046_after_rollback_and_lost_commit_ack() -> None:
                     )
                 assert read_control_record(observer) == control
                 assert probe_alembic_head(observer) == successor
+                print(
+                    "T051_EVIDENCE"
+                    f" head={successor}"
+                    f" source_worker={result['workers']['source']['restart_container_id'][:16]}"
+                    f" candidate_worker={result['workers']['candidate']['restart_container_id'][:16]}"
+                    f" source_sender={result['senders']['source']['container_id'][:16]}"
+                    f" candidate_sender={result['senders']['candidate']['container_id'][:16]}"
+                    f" mailpit_before={result['mail_before']}"
+                    f" mailpit_after={result['mail_after']}"
+                    " persisted_effects_unchanged=true"
+                )
                 current = successor
                 current_owner = takeover.owner_conn
                 owner_epoch = takeover.control.owner_epoch
