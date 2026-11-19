@@ -68,6 +68,8 @@ def reopen_fenced_generation(
     phase = "SOURCE_OPEN" if generation == "source" else "TARGET_OPEN"
     binding = source_manifest.target_binding
 
+    verify_generation_launch(manifest, observed_units)
+
     # Actual credentials must work against the same physical target, and the
     # probes must terminate before the final stale-pool check.
     required_logins = (
@@ -148,7 +150,6 @@ def reopen_fenced_generation(
                     "A retired predecessor credential still authenticates"
                 )
 
-    verify_generation_launch(manifest, observed_units)
     security = verify_fenced_security(
         observer_conn,
         source_manifest=source_manifest,

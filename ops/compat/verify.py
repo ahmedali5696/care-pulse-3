@@ -320,7 +320,7 @@ def verify_fenced_security(
           WHERE n.nspname IN ('public','compat_control','f01_private','f01_crypto') AND acl.grantee=0
           UNION ALL
           SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace,
-            LATERAL aclexplode(COALESCE(c.relacl,acldefault(CASE WHEN c.relkind='S' THEN 'S' ELSE 'r' END,c.relowner))) acl
+            LATERAL aclexplode(COALESCE(c.relacl,acldefault((CASE WHEN c.relkind='S' THEN 'S' ELSE 'r' END)::"char",c.relowner))) acl
           WHERE n.nspname IN ('public','compat_control','f01_private') AND c.relkind IN ('r','p','v','m','S') AND acl.grantee=0
           UNION ALL
           SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace,
