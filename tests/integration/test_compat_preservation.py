@@ -1,5 +1,6 @@
 """T053: preserve original tenant/actor/receipt evidence across real 0040→0046."""
 
+from dataclasses import replace
 from uuid import uuid4
 
 import pytest
@@ -42,6 +43,19 @@ def test_historical_receipts_actor_and_consumed_nonce_survive_each_real_successo
             == (source_data["visits"][0]["doctor_staff_id"])
         )
         compare_retained_inventory(cutover.observer, lab.inventory)
+        # A real integrity failure must never echo an original clinical row.
+        altered = {
+            **source_data,
+            "visits": (
+                {**source_data["visits"][0], "_private_marker": "sensitive-sentinel"},
+            ),
+        }
+        with pytest.raises(AssertionError) as mismatch:
+            compare_retained_inventory(
+                cutover.observer,
+                replace(lab.inventory, expected_rows=altered),
+            )
+        assert "sensitive-sentinel" not in str(mismatch.value)
         security = verify_fenced_security(
             cutover.observer,
             source_manifest=lab.source_manifest,

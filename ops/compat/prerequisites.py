@@ -155,13 +155,17 @@ def apply_missing_prerequisites(
                         sql.Literal(role_passwords[role_name]),
                     )
                 )
+                created_roles.append(role_name)
+            if not admin_owner_conn.execute(
+                "SELECT has_database_privilege(%s,%s,'CONNECT') AS allowed",
+                (role_name, preflight.db_name),
+            ).fetchone()["allowed"]:
                 recheck()
                 admin_owner_conn.execute(
                     sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
                         sql.Identifier(preflight.db_name), sql.Identifier(role_name)
                     )
                 )
-                created_roles.append(role_name)
 
     with admin_owner_conn.transaction():
         recheck()

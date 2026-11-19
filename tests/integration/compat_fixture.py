@@ -512,7 +512,7 @@ def compare_retained_inventory(
     actual_rows = _retained_rows(conn, inventory)
     for table, originals in inventory.expected_rows.items():
         remaining = list(actual_rows[table])
-        for original in originals:
+        for row_index, original in enumerate(originals):
             matched = next(
                 (
                     index
@@ -526,6 +526,6 @@ def compare_retained_inventory(
             )
             if matched is None:
                 raise AssertionError(
-                    f"Retained 0040 row/field regression: {table}: {original}"
+                    f"Retained 0040 row/field regression: {table}, row index {row_index}"
                 )
             remaining.pop(matched)
