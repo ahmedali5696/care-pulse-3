@@ -116,7 +116,8 @@ class Supervisor:
         sql = (
             "SELECT concat_ws('|',t.target_id,t.cluster_id,t.db_name,t.phase,"
             "t.owner_epoch,t.source_manifest_id,t.target_manifest_id,t.active_generation,"
-            "t.source_sealed,(SELECT version_num FROM public.alembic_version)) "
+            "CASE WHEN t.source_sealed THEN 'true' ELSE 'false' END,"
+            "(SELECT version_num FROM public.alembic_version)) "
             "FROM compat_control.target_control t WHERE singleton_id=true"
         )
         record = compose(
@@ -146,13 +147,14 @@ class Supervisor:
         ):
             raise RuntimeError("CI-host target/head/phase mismatch")
         if request["kind"] == "intermediate":
-            if (
-                record[1] != request["cluster_id"]
-                or int(record[4]) != request["owner_epoch"]
-                or record[6] != request["candidate_manifest_id"]
-                or record[8] != "true"
-            ):
-                raise RuntimeError("CI-host owner/manifest/source-seal mismatch")
+            if record[1] != request["cluster_id"]:
+                raise RuntimeError("CI-host cluster identity mismatch")
+            if int(record[4]) != request["owner_epoch"]:
+                raise RuntimeError("CI-host owner epoch mismatch")
+            if record[6] != request["candidate_manifest_id"]:
+                raise RuntimeError("CI-host candidate manifest mismatch")
+            if record[8] != "true":
+                raise RuntimeError("CI-host source-seal mismatch")
         elif record[8] != "false":
             raise RuntimeError("CI-host source already sealed")
 
