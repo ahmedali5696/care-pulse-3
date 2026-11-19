@@ -90,6 +90,8 @@ def inspected_prelaunch_pair(
         "candidate-sender": "apps/api/carepulse/compat/admission.py",
     }
     required_secrets = {
+        "source-api": {"source_delivery_public_key"},
+        "source-sender": {"source_delivery_private_key"},
         "candidate-api": {"api_db_password", "gate_db_password"},
         "candidate-web": {"web_db_password", "auth_db_password"},
         "candidate-worker": {"worker_db_password"},

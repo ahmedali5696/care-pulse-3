@@ -1219,6 +1219,8 @@ export CP_SOURCE_SENDER_DB_PASSWORD_FILE="$private/source-sender-db-password"
 export CP_SOURCE_SERVICE_KEY_FILE="$private/source-service-key"
 export CP_SOURCE_AUTH_SECRET_FILE="$private/source-auth-secret"
 export CP_SOURCE_FILE_ENCRYPTION_KEY_FILE="$private/source-file-key"
+export CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE="$private/source-delivery-private-key"
+export CP_SOURCE_DELIVERY_PUBLIC_KEY_FILE="$private/source-delivery-public-key"
 
 for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_API_DB_PASSWORD_SOURCE_FILE" "$CP_WEB_DB_PASSWORD_SOURCE_FILE" "$CP_WORKER_DB_PASSWORD_SOURCE_FILE" "$CP_GATE_DB_PASSWORD_SOURCE_FILE" "$CP_DB_IDENTITY_KEY_SOURCE_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" "$CP_SOURCE_RUNTIME_DB_PASSWORD_FILE" "$CP_SOURCE_AUTH_DB_PASSWORD_FILE" "$CP_SOURCE_SENDER_DB_PASSWORD_FILE" "$CP_SOURCE_SERVICE_KEY_FILE" "$CP_SOURCE_AUTH_SECRET_FILE" "$CP_SOURCE_FILE_ENCRYPTION_KEY_FILE"; do
   test "$(dirname "$file")" = "$private"
@@ -1228,6 +1230,10 @@ done
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" > /dev/null 2>&1
 openssl pkey -in "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" -pubout -out "$CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE" > /dev/null 2>&1
 chmod 0444 "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" "$CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE" > /dev/null 2>&1
+openssl pkey -in "$CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE" -pubout -out "$CP_SOURCE_DELIVERY_PUBLIC_KEY_FILE" > /dev/null 2>&1
+chmod 0444 "$CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE" "$CP_SOURCE_DELIVERY_PUBLIC_KEY_FILE"
+! cmp -s "$CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE" "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE"
 
 docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer config --quiet
 docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer config --format json > "$private/compose.compat.json"

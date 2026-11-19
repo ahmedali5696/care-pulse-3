@@ -57,6 +57,8 @@ services:
       CP_DB_PASSWORD_FILE: /run/secrets/source_runtime_db_password
       CP_SERVICE_KEY_FILE: /run/secrets/source_service_key
       CP_SIGNING_KEY_ID: ${CP_SOURCE_SIGNING_KEY_ID:-synthetic-source-v1}
+      CP_DELIVERY_KEY_ID: ${CP_SOURCE_DELIVERY_KEY_ID:-synthetic-source-delivery-v1}
+      CP_DELIVERY_PUBLIC_KEY_FILE: /run/secrets/source_delivery_public_key
       CP_FILE_ENCRYPTION_KEY_FILE: /run/secrets/source_file_encryption_key
       CP_MAIL_ENABLED: "false"
       CP_SCAN_ENABLED: "false"
@@ -64,6 +66,7 @@ services:
       - active_policy
       - source_runtime_db_password
       - source_service_key
+      - source_delivery_public_key
       - source_file_encryption_key
     entrypoint: ["python", "/run/compat-adapters/source-api.py"]
 
@@ -193,9 +196,12 @@ services:
       CP_DELIVERY_ATTEMPT_TIMEOUT_SECONDS: ${CP_DELIVERY_ATTEMPT_TIMEOUT_SECONDS:-5}
       CP_DELIVERY_MAX_ATTEMPTS: ${CP_DELIVERY_MAX_ATTEMPTS:-3}
       CP_DELIVERY_RETRY_SECONDS: ${CP_DELIVERY_RETRY_SECONDS:-2}
+      CP_DELIVERY_PRIVATE_KEY_FILE: /run/secrets/source_delivery_private_key
+      CP_DELIVERY_PRIVATE_KEY_FILES: ${CP_SOURCE_DELIVERY_KEY_ID:-synthetic-source-delivery-v1}=/run/secrets/source_delivery_private_key
     secrets:
       - active_policy
       - source_sender_db_password
+      - source_delivery_private_key
     entrypoint: ["python", "/run/compat-adapters/source-jobs.py", "sender"]
     command: []
 
@@ -513,3 +519,7 @@ secrets:
     file: ${CP_SOURCE_AUTH_SECRET_FILE:-${CP_AUTH_SECRET_SOURCE_FILE:?Set source auth secret file}}
   source_file_encryption_key:
     file: ${CP_SOURCE_FILE_ENCRYPTION_KEY_FILE:-${CP_FILE_ENCRYPTION_KEY_SOURCE_FILE:?Set source file encryption key file}}
+  source_delivery_private_key:
+    file: ${CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE:?Set separate source delivery private key file}
+  source_delivery_public_key:
+    file: ${CP_SOURCE_DELIVERY_PUBLIC_KEY_FILE:?Set separate source delivery public key file}
