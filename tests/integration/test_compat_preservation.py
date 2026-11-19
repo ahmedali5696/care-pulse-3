@@ -504,6 +504,12 @@ def _booking_effects(observer, tenant):
         """
         SELECT (SELECT count(*) FROM public.appointments WHERE organization_id=%s)
                     AS appointments,
+               (SELECT count(*) FROM public.appointment_day_counters
+                  WHERE organization_id=%s) AS day_counters,
+               (SELECT count(*) FROM public.appointment_number_assignments
+                  WHERE organization_id=%s) AS number_assignments,
+               (SELECT count(*) FROM public.appointment_history
+                  WHERE organization_id=%s) AS history,
                (SELECT count(*) FROM public.idempotency_receipts WHERE organization_id=%s)
                     AS receipts,
                (SELECT count(*) FROM public.sensitive_audit WHERE organization_id=%s)
@@ -513,7 +519,7 @@ def _booking_effects(observer, tenant):
                (SELECT count(*) FROM public.delivery_jobs WHERE organization_id=%s)
                     AS delivery
         """,
-        (tenant,) * 5,
+        (tenant,) * 8,
     ).fetchone()
 
 
@@ -570,6 +576,7 @@ def test_authentic_0040_signed_receipt_replays_with_f01_without_any_new_effect()
                     "booking_mode": "OPEN",
                     "duration_minutes": None,
                     "holiday_booking_enabled": False,
+                    "routine_walk_in_enabled": False,
                     "allow_overlap": False,
                     "no_show_cutoff": {"enabled": False, "local_time": None},
                     "working_weekdays": [1, 2, 3, 4, 5, 6, 7],

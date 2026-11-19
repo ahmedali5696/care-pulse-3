@@ -490,9 +490,14 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda _s, _f: setattr(supervisor, "stopped", True))
     try:
         supervisor.run()
+    except RuntimeError as invalid:
+        # Every RuntimeError in this supervisor uses a fixed, sanitized reason.
+        print(
+            f"FAIL bounded CI-host compatibility handshake: {invalid}", file=sys.stderr
+        )
+        return 1
     except (
         OSError,
-        RuntimeError,
         ValueError,
         KeyError,
         TypeError,
