@@ -3,7 +3,7 @@ import nodemailer from "nodemailer";
 import { loadMailSettings } from "./config.ts";
 import { renderMail, type TemplateKind } from "./templates.ts";
 
-export class ConnectionRefusedBeforeSmtp extends Error {}
+export class PreSmtpConnectionFailure extends Error {}
 
 export async function sendSyntheticMail(kind: TemplateKind, recipient: string, link?: string) {
   const config = loadMailSettings();
@@ -24,12 +24,12 @@ export async function sendSyntheticMail(kind: TemplateKind, recipient: string, l
     });
     if (result.accepted.length !== 1 || result.rejected.length) throw new Error("Mail rejected");
   } catch (error) {
-    // A refused TCP connect never established an SMTP session. Other failures,
-    // including disconnects after connection, have an uncertain delivery outcome.
-    if (error instanceof Error && error.message.startsWith("connect ECONNREFUSED ") &&
-        "code" in error && error.code === "ESOCKET" &&
-        "command" in error && error.command === "CONN") {
-      throw new ConnectionRefusedBeforeSmtp("Synthetic mail unavailable");
+    // DNS failure or refused TCP connect before SMTP cannot have delivered mail.
+    // Never infer this from disconnects after SMTP established a connection.
+    if (error instanceof Error && "command" in error && error.command === "CONN" &&
+        "code" in error && (error.code === "EDNS" ||
+        (error.code === "ESOCKET" && error.message.startsWith("connect ECONNREFUSED ")))) {
+      throw new PreSmtpConnectionFailure("Synthetic mail unavailable");
     }
     throw new Error("Synthetic mail unavailable");
   } finally {

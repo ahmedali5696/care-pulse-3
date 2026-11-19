@@ -8,7 +8,7 @@ import {
   decryptDeliveryToken, deliveryLabel, encryptDeliveryToken,
   type DeliveryContext, type DeliveryMaterial,
 } from "./delivery-material.ts";
-import { ConnectionRefusedBeforeSmtp, sendSyntheticMail } from "./transport.ts";
+import { PreSmtpConnectionFailure, sendSyntheticMail } from "./transport.ts";
 
 const vector = JSON.parse(readFileSync(
   new URL("../../../tests/fixtures/delivery-material-vectors.json", import.meta.url), "utf8",
@@ -104,7 +104,7 @@ test("bad keys and invalid token or label encoding fail closed", () => {
     { [vector.key_id]: keys.privatePem }, `${proofDigest(vector.token)}\n`));
 });
 
-test("SMTP refusal before connection is retryable, but unknown transport failure is not", async (t) => {
+test("SMTP DNS/refusal before connection is retryable, but unknown transport failure is not", async (t) => {
   const saved = {
     enabled: process.env.CP_MAIL_ENABLED,
     host: process.env.CP_SMTP_HOST,
@@ -124,16 +124,23 @@ test("SMTP refusal before connection is retryable, but unknown transport failure
   try {
     await assert.rejects(
       sendSyntheticMail("invitation", "mail@example.invalid"),
-      ConnectionRefusedBeforeSmtp,
+      PreSmtpConnectionFailure,
+    );
+    error = Object.assign(new Error("getaddrinfo ENOTFOUND mail"), {
+      code: "EDNS", command: "CONN",
+    });
+    await assert.rejects(
+      sendSyntheticMail("invitation", "mail@example.invalid"),
+      PreSmtpConnectionFailure,
     );
     error = Object.assign(new Error("Connection closed during SMTP DATA"), {
       code: "ESOCKET", command: "DATA",
     });
     await assert.rejects(
       sendSyntheticMail("invitation", "mail@example.invalid"),
-      (failure) => failure instanceof Error && !(failure instanceof ConnectionRefusedBeforeSmtp),
+      (failure) => failure instanceof Error && !(failure instanceof PreSmtpConnectionFailure),
     );
-    assert.equal(closed, 2);
+    assert.equal(closed, 3);
   } finally {
     for (const [name, value] of Object.entries({
       CP_MAIL_ENABLED: saved.enabled, CP_SMTP_HOST: saved.host, CP_SMTP_PORT: saved.port,

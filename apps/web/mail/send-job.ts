@@ -2,7 +2,7 @@ import { loadSenderMailConfig } from "./config.ts";
 import {
   decryptDeliveryToken, type DeliveryContext, type DeliveryMaterial,
 } from "./delivery-material.ts";
-import { ConnectionRefusedBeforeSmtp, sendSyntheticMail } from "./transport.ts";
+import { PreSmtpConnectionFailure, sendSyntheticMail } from "./transport.ts";
 
 type CommittedJob = {
   context: DeliveryContext;
@@ -72,7 +72,7 @@ async function sendCommittedJob(): Promise<void> {
   try {
     await sendSyntheticMail(kind, job.context.committed_recipient, link);
   } catch (error) {
-    if (error instanceof ConnectionRefusedBeforeSmtp) throw error;
+    if (error instanceof PreSmtpConnectionFailure) throw error;
     process.stderr.write("AMBIGUOUS_TRANSPORT\n");
     throw new Error("AMBIGUOUS_TRANSPORT");
   }
