@@ -2,7 +2,7 @@ import { loadSenderMailConfig } from "./config.ts";
 import {
   decryptDeliveryToken, type DeliveryContext, type DeliveryMaterial,
 } from "./delivery-material.ts";
-import { sendSyntheticMail } from "./transport.ts";
+import { ConnectionRefusedBeforeSmtp, sendSyntheticMail } from "./transport.ts";
 
 type CommittedJob = {
   context: DeliveryContext;
@@ -71,7 +71,8 @@ async function sendCommittedJob(): Promise<void> {
   const kind = job.context.purpose === "PASSWORD_RESET" ? "reset" : "invitation";
   try {
     await sendSyntheticMail(kind, job.context.committed_recipient, link);
-  } catch {
+  } catch (error) {
+    if (error instanceof ConnectionRefusedBeforeSmtp) throw error;
     process.stderr.write("AMBIGUOUS_TRANSPORT\n");
     throw new Error("AMBIGUOUS_TRANSPORT");
   }

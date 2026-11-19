@@ -3,6 +3,8 @@ import nodemailer from "nodemailer";
 import { loadMailSettings } from "./config.ts";
 import { renderMail, type TemplateKind } from "./templates.ts";
 
+export class ConnectionRefusedBeforeSmtp extends Error {}
+
 export async function sendSyntheticMail(kind: TemplateKind, recipient: string, link?: string) {
   const config = loadMailSettings();
   if (!config.smtp ||
@@ -21,7 +23,14 @@ export async function sendSyntheticMail(kind: TemplateKind, recipient: string, l
       ...renderMail(kind, link),
     });
     if (result.accepted.length !== 1 || result.rejected.length) throw new Error("Mail rejected");
-  } catch {
+  } catch (error) {
+    // A refused TCP connect never established an SMTP session. Other failures,
+    // including disconnects after connection, have an uncertain delivery outcome.
+    if (error instanceof Error && error.message.startsWith("connect ECONNREFUSED ") &&
+        "code" in error && error.code === "ESOCKET" &&
+        "command" in error && error.command === "CONN") {
+      throw new ConnectionRefusedBeforeSmtp("Synthetic mail unavailable");
+    }
     throw new Error("Synthetic mail unavailable");
   } finally {
     transport.close();

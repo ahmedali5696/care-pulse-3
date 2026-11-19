@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import nodemailer from "nodemailer";
 
 import {
   decryptDeliveryToken, deliveryLabel, encryptDeliveryToken,
   type DeliveryContext, type DeliveryMaterial,
 } from "./delivery-material.ts";
+import { ConnectionRefusedBeforeSmtp, sendSyntheticMail } from "./transport.ts";
 
 const vector = JSON.parse(readFileSync(
   new URL("../../../tests/fixtures/delivery-material-vectors.json", import.meta.url), "utf8",
@@ -100,4 +102,44 @@ test("bad keys and invalid token or label encoding fail closed", () => {
     { [vector.key_id]: `${keys.privatePem}UNEXPECTED TRAILING BYTES` }, proofDigest(vector.token)));
   assert.throws(() => decryptDeliveryToken(material, vector.context,
     { [vector.key_id]: keys.privatePem }, `${proofDigest(vector.token)}\n`));
+});
+
+test("SMTP refusal before connection is retryable, but unknown transport failure is not", async (t) => {
+  const saved = {
+    enabled: process.env.CP_MAIL_ENABLED,
+    host: process.env.CP_SMTP_HOST,
+    port: process.env.CP_SMTP_PORT,
+  };
+  process.env.CP_MAIL_ENABLED = "true";
+  process.env.CP_SMTP_HOST = "mail";
+  process.env.CP_SMTP_PORT = "1025";
+  let error: Error = Object.assign(new Error("connect ECONNREFUSED 172.18.0.3:1025"), {
+    code: "ESOCKET", command: "CONN",
+  });
+  let closed = 0;
+  t.mock.method(nodemailer, "createTransport", () => ({
+    sendMail: async () => { throw error; },
+    close: () => { closed++; },
+  }) as never);
+  try {
+    await assert.rejects(
+      sendSyntheticMail("invitation", "mail@example.invalid"),
+      ConnectionRefusedBeforeSmtp,
+    );
+    error = Object.assign(new Error("Connection closed during SMTP DATA"), {
+      code: "ESOCKET", command: "DATA",
+    });
+    await assert.rejects(
+      sendSyntheticMail("invitation", "mail@example.invalid"),
+      (failure) => failure instanceof Error && !(failure instanceof ConnectionRefusedBeforeSmtp),
+    );
+    assert.equal(closed, 2);
+  } finally {
+    for (const [name, value] of Object.entries({
+      CP_MAIL_ENABLED: saved.enabled, CP_SMTP_HOST: saved.host, CP_SMTP_PORT: saved.port,
+    })) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });
