@@ -1,6 +1,8 @@
 """T051: independently recover real intermediate heads after lost acknowledgements."""
 
+import json
 from unittest.mock import patch
+from urllib.request import urlopen
 
 import pytest
 from carepulse.compat.admission import (
@@ -13,6 +15,7 @@ from ops.compat.control import (
     ContentionError,
     assert_current_owner,
     claim_owner_epoch,
+    read_control_record,
 )
 from ops.compat.drain import drain_and_settle, observe_drain_complete
 from ops.compat.launch import mark_source_sealed_in_control
@@ -28,6 +31,7 @@ from ops.compat.probes import probe_alembic_head
 from ops.compat.recover import ExecutedUS2Checkpoint, recover_owner
 from ops.compat.verify import verify_fenced_security, verify_retained_evidence
 from tests.integration.compat_ci_helpers import connect_role, read_secret
+from tests.integration.compat_host_checkpoint import checkpoint_restarted_jobs
 from tests.integration.compat_recovery_lab import (
     original_sender_engine,
     populated_0040_lab,
@@ -37,6 +41,44 @@ from tests.integration.compat_recovery_lab import (
 CHECKPOINT = ExecutedUS2Checkpoint(
     44424355381, "835a257aa8374c50d615bf7b75676cccb49137e7", 5, 5, True
 )
+
+
+def _mailpit_count() -> int:
+    with urlopen("http://mail:8025/api/v1/messages", timeout=6) as response:
+        count = json.load(response)["total"]
+    assert type(count) is int and count >= 0
+    return count
+
+
+def _retained_fingerprints(observer, lab) -> tuple[str, ...]:
+    """Compare opaque fingerprints; never log original tenant rows or credentials."""
+    tenants = (lab.inventory.org_a_id, lab.inventory.org_b_id)
+    queries = (
+        (
+            "compat_control.work_evidence",
+            "attempt_id",
+            "target_id=%s",
+            (lab.target_id,),
+        ),
+        ("public.delivery_jobs", "id", "organization_id IN (%s,%s)", tenants),
+        ("public.outbox_events", "id", "organization_id IN (%s,%s)", tenants),
+        ("public.sensitive_audit", "id", "organization_id IN (%s,%s)", tenants),
+        ("public.idempotency_receipts", "id", "organization_id IN (%s,%s)", tenants),
+        (
+            "public.protected_delivery_material",
+            "job_id",
+            "job_id IN (SELECT id FROM public.delivery_jobs WHERE organization_id IN (%s,%s))",
+            tenants,
+        ),
+    )
+    return tuple(
+        observer.execute(
+            "SELECT md5(COALESCE(string_agg(to_jsonb(t)::text, '|' "
+            f"ORDER BY t.{key}), '')) AS digest FROM {table} t WHERE {where}",
+            params,
+        ).fetchone()["digest"]
+        for table, key, where, params in queries
+    )
 
 
 def _login(role: str, dbname: str) -> dict[str, str | int]:
@@ -215,6 +257,57 @@ def test_resume_each_0041_to_0046_after_rollback_and_lost_commit_ack() -> None:
                         )
                 finally:
                     sender.dispose()
+
+                # A separate CI host must invoke the *built* source/candidate
+                # workers and senders. No Docker socket enters the observer.
+                # Keep the recovered exclusive drain permit held during probes.
+                control = read_control_record(observer)
+                assert (
+                    control.target_id,
+                    control.cluster_id,
+                    control.db_name,
+                    control.phase,
+                    control.active_generation,
+                    control.owner_epoch,
+                    control.drain_verified_epoch,
+                    control.source_manifest_id,
+                    control.target_manifest_id,
+                ) == (
+                    lab.target_id,
+                    lab.cluster_id,
+                    lab.dbname,
+                    "MIGRATING",
+                    "none",
+                    takeover.control.owner_epoch,
+                    takeover.control.owner_epoch,
+                    lab.source_manifest.manifest_id,
+                    lab.target_manifest.manifest_id,
+                )
+                before = _retained_fingerprints(observer, lab)
+                mail_before = _mailpit_count()
+                result = checkpoint_restarted_jobs(
+                    step=i,
+                    head=successor,
+                    db_name=lab.dbname,
+                    target_id=lab.target_id,
+                    cluster_id=lab.cluster_id,
+                    source_manifest_id=lab.source_manifest.manifest_id,
+                    candidate_manifest_id=lab.target_manifest.manifest_id,
+                    owner_epoch=takeover.control.owner_epoch,
+                    tenant_id=lab.inventory.org_a_id,
+                    job_id=lab.inventory.delivery_job_a_id,
+                )
+                if (
+                    result["mail_before"] != mail_before
+                    or result["mail_after"] != _mailpit_count()
+                ):
+                    raise AssertionError("Image-backed sender changed Mailpit state")
+                if before != _retained_fingerprints(observer, lab):
+                    raise AssertionError(
+                        "Image-backed restart changed retained work/evidence"
+                    )
+                assert read_control_record(observer) == control
+                assert probe_alembic_head(observer) == successor
                 current = successor
                 current_owner = takeover.owner_conn
                 owner_epoch = takeover.control.owner_epoch

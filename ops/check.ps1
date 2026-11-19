@@ -266,6 +266,11 @@ mkdir -m 0700 "$private"
 cleanup() {
   local code=$? cleanup_failed=0
   trap - EXIT
+  if [[ -n "${host_pid:-}" ]]; then
+    kill -TERM "$host_pid" 2>/dev/null || true
+    wait "$host_pid" 2>/dev/null || true
+    host_pid=''
+  fi
   if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" && "$private" = "$RUNNER_TEMP/foundation-ci-private" && -d "$private" && -O "$private" && ! -L "$private" ]]; then
     if ! docker compose --profile mail --profile test --profile sender --profile operator down --remove-orphans --volumes; then
       echo 'FAIL scoped Compose cleanup'; cleanup_failed=1
@@ -1297,7 +1302,22 @@ with open(output_path, 'w', encoding='utf-8') as stream:
     json.dump(observed, stream, sort_keys=True)
 PY
     chmod 0444 "$private/observed.json"
-    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "${required_suites[@]}"
+    mkdir -m 1777 "$private/handshake"
+    python3 -u ops/compat/ci_host.py "$private/handshake" "$private/observed.json" > "$private/ci-host.log" 2>&1 &
+    host_pid=$!
+    set +e
+    timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" -v "$private/handshake:/tmp/compat-host:rw" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=35 --tb=short -p no:cacheprovider "${required_suites[@]}"
+    test_code=$?
+    kill -TERM "$host_pid" 2>/dev/null || true
+    wait "$host_pid"
+    host_code=$?
+    host_pid=''
+    set -e
+    if [[ "$test_code" -ne 0 || "$host_code" -ne 0 ]]; then
+      echo 'FAIL real compatibility scenario or bounded host supervisor'
+      test "$host_code" -eq 0 || cat "$private/ci-host.log"
+      exit 1
+    fi
     ;;
 esac
 '@
