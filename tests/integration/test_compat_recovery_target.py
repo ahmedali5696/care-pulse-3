@@ -381,15 +381,23 @@ def test_lost_open_refence_orders_held_work_before_new_admission() -> None:
                 try:
                     try:
                         recovery_future = pool.submit(_refence)
-                        with observer_engine.connect() as lock_observer:
+                        # Fresh PG activity snapshots are required while the
+                        # owner session is starting and waiting on the row lock.
+                        with observer_engine.connect().execution_options(
+                            isolation_level="AUTOCOMMIT"
+                        ) as lock_observer:
                             deadline = time.monotonic() + 15
                             recovery_pid = None
                             while recovery_pid is None and time.monotonic() < deadline:
+                                if recovery_future.done():
+                                    # Surface a controller startup/ownership error,
+                                    # rather than misreporting it as a lock timeout.
+                                    recovery_future.result()
                                 recovery_pid = lock_observer.exec_driver_sql(
                                     "SELECT pid FROM pg_stat_activity WHERE datname = %s "
                                     "AND usename = 'carepulse_migration' "
-                                    "AND application_name LIKE 'compat-lost-open-%%'",
-                                    (lab.dbname,),
+                                    "AND %s = ANY(pg_blocking_pids(pid))",
+                                    (lab.dbname, http_pid),
                                 ).scalar_one_or_none()
                                 if recovery_pid is None:
                                     time.sleep(0.02)
