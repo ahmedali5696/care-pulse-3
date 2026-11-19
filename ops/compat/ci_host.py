@@ -349,7 +349,12 @@ class Supervisor:
             response.returncode != 1
             or response.stdout.strip() != "Delivery unavailable"
         ):
-            raise RuntimeError("Sender did not fail closed before claim/transport")
+            # Report only bounded metadata, never the sender's potentially sensitive output.
+            raise RuntimeError(
+                f"{service} sender denial mismatch: exit={response.returncode}, "
+                f"expected_output={response.stdout.strip() == 'Delivery unavailable'}, "
+                f"stdout_bytes={len(response.stdout)}, stderr_bytes={len(response.stderr)}"
+            )
         return {
             "image_id": spec["image_id"],
             "invoked": True,
