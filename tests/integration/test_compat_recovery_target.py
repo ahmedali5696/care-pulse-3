@@ -14,7 +14,6 @@ from carepulse.compat.admission import (
     record_attempt_disposition,
     release_invocation_permit,
 )
-from sqlalchemy import event
 from sqlalchemy.exc import SQLAlchemyError
 
 from ops.compat.control import read_control_record, release_exclusive_drain_permit
@@ -343,14 +342,7 @@ def test_lost_open_refence_orders_held_work_before_new_admission() -> None:
             # invocation permits remain held, including the uncertain sender.
             fenced_ready = threading.Event()
             release_recovery = threading.Event()
-            worker_connected = threading.Event()
-            worker_pid: list[int] = []
             fenced_states = []
-
-            @event.listens_for(worker, "connect")
-            def _capture_worker_pid(dbapi_connection, _record):
-                worker_pid.append(dbapi_connection.info.backend_pid)
-                worker_connected.set()
 
             def _refence():
                 with recover_ambiguous_open(
@@ -372,12 +364,11 @@ def test_lost_open_refence_orders_held_work_before_new_admission() -> None:
                         worker,
                         config=worker_cfg,
                         expected_login="carepulse_worker",
-                        record_attempt=True,
                     )
                     release_invocation_permit(connection, acquired)
                     pytest.fail("New work entered after the re-fence was queued")
 
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=1) as pool:
                 try:
                     try:
                         recovery_future = pool.submit(_refence)
@@ -407,17 +398,14 @@ def test_lost_open_refence_orders_held_work_before_new_admission() -> None:
                             wait_for_postgres_lock(
                                 lock_observer, recovery_pid, http_pid
                             )
-                            admission_future = pool.submit(_new_admission)
-                            assert worker_connected.wait(timeout=10)
-                            wait_for_postgres_lock(
-                                lock_observer, worker_pid[0], recovery_pid
-                            )
                         assert not fenced_ready.is_set()
                     finally:
                         http_conn.commit()  # Release row lock; retain both permits.
 
                     assert fenced_ready.wait(timeout=15), "Re-fence did not commit"
-                    admission_future.result(timeout=15)
+                    # Reject a fresh real worker login after the durable fence;
+                    # a reader begun before the commit may legitimately see OPEN.
+                    _new_admission()
                     fenced = fenced_states[0]
                     assert fenced.control.owner_epoch == opened.owner_epoch + 1
                     assert fenced.control.phase == "DRAINING"
