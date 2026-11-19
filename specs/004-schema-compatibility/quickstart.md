@@ -43,10 +43,10 @@ The following are **mandatory executed test counts**, not merely discovered file
 | Coverage | Executed suite | Required result |
 | --- | --- | --- |
 | `compat-us1` matrix, real-login/entry denial, admitted-control unit checks | `tests/unit/test_compat_admission.py`, `tests/integration/test_compat_matrix.py`, `tests/integration/test_compat_entry_denials.py` | **15/15 Python** (4 + 7 + 4) |
-| `compat-us1` guarded Web/native admission | `apps/web/auth/compat.test.ts` in actual candidate Web image | **4/4 Node** |
+| `compat-us1` guarded Web/native admission and pooled-query regression | `apps/web/auth/compat.test.ts` in actual candidate Web image | **5/5 Node** |
 | `compat-us2` ordered drain, uncertain sender and populated upgrade | `tests/integration/test_compat_drain.py`, `tests/integration/test_compat_delivery.py`, `tests/integration/test_compat_upgrade.py` | **5/5 Python** (3 + 1 + 1) |
 | `compat-us3` source/intermediate/target recovery and authentic preservation | `tests/integration/test_compat_recovery_source.py`, `tests/integration/test_compat_recovery_intermediate.py`, `tests/integration/test_compat_recovery_target.py`, `tests/integration/test_compat_preservation.py` | **10/10 Python** (2 + 1 + 3 + 4) |
-| **Total ordinary-full compatibility** | One pinned-image compatibility topology and its independently supervised real source/candidate actors | **30/30 Python + 4/4 Node; zero skips** |
+| **Total ordinary-full compatibility** | One pinned-image compatibility topology and its independently supervised real source/candidate actors | **30/30 Python + 5/5 Node; zero skips** |
 
 The ordinary full path is **not** a replacement for the existing Foundation unit, Web, imports, authorized clinical integration, historic-only writer checks, private-network tests or synthetic Mailpit checks. T133 terminal acceptance is separately protected and must not be called by this ordinary route. `compat-us1/2/3` are diagnostics, not substitutes for `postgres_diagnostic=full`.
 
@@ -91,6 +91,10 @@ The adapter/guard SHA-256 values were: source Web `293631a1df1ae5ed846864dd2fccf
 
 The early `compat-us3` diagnostic passed on 2026-11-19 in [Foundation run 44537908117](https://github.com/ahmedali5696/care-pulse-3/actions/runs/44537908117), executable SHA `c87870f6581c881b901778bec1e3d939d4b3c909`. Both `inputs-and-build` and `postgres-diagnostic` succeeded; **10/10 Python** recovery/preservation cases passed in 76.16 seconds with **zero mandatory skips** and scoped cleanup. The intermediate-recovery case separately launched and attested actual source/candidate worker and sender images at **each 0041–0046 committed head**, checked live heartbeat and denied readiness, and independently observed zero Mailpit messages before/after each denied sender attempt. The preserved original 0040 booking was generated through authentic immutable-source signed HTTP (`201`), not by a synthetic SQL receipt: candidate F-01 signed same-body/same-key replay returned `201` with original revision `0`; changed-body conflict returned `409`, cross-tenant and revoked-session denials each returned `401`. Original receipt/digest/scope/result and retained domain/audit/outbox/delivery counts were unchanged, and synthetic Mailpit stayed `0→0`. These are US3 focused facts, **not** full ordinary Foundation acceptance or packet-level SMTP interception proof.
 
+### Ordinary-full failure triage — not acceptance
+
+[Foundation run 44545224232](https://github.com/ahmedali5696/care-pulse-3/actions/runs/44545224232) at executable SHA `c505c44cd0d99578ca30f473e2cdf9fd196aecdb` had successful `inputs-and-build` (job `135633942851`) but cancelled `compose-integration` (job `135636566251`) at the existing **40-minute** job limit. Its ordinary PostgreSQL suites progressed through historical and current-head checks, then stopped after `PASS runner-host web` at `ops/check.ps1:734` while starting the Better Auth database-context probe. The mandatory compatibility step never started (**zero executed mandatory full-compat cases**) and scoped cleanup did not report successful completion. Root cause in `apps/web/db.ts`: the new promise-only `pool.connect` wrapper was incompatible with the callback-based `Pool.query` implementation it delegated to, leaving the ordinary probe unresolved. The follow-up in-scope correction makes all wrapped `pool.query` calls explicitly borrow and release the verified promise connection; a bounded regression test and a 60-second probe guard prevent another silent job-long wait. This failed run must not be used as SC-006 evidence.
+
 
 After the user explicitly starts the assigned PRE-W3-COMPAT implementation, its coding agent may dispatch and retry in-scope diagnostic and ordinary full Foundation CI without requesting separate approval for each run. This does not authorize implementation now, or merge, deployment, production cutover or release. For the final ordinary full gate after T055, set `$reviewedBranch` to the branch carrying the exact reviewed executable. Confirm its tip before dispatch. Capture the run ID from GitHub and check the actual SHA again afterward.
 
@@ -127,7 +131,7 @@ This is an evidence **index prepared by the implementer**, not an independent re
 | FR-007 — owner-authorized recovery/reopening | `ops/compat/control.py`, `recover.py`, `reopen.py` | `test_compat_recovery_source.py`, `test_compat_recovery_target.py`; lost acknowledgement/fencing |
 | FR-008 — effective logins/RLS/actor binding | `db/compat-control.sql`, `apps/api/carepulse/identity/boundary.py`, `apps/api/carepulse/compat/admission.py` | US1 real-login negative probes, US3 signed F-01 tenant/revocation denial, target security verification |
 | FR-009 — receipts, nonces, evidence and sender provenance | `ops/compat/work.py`, `verify.py`, `tests/integration/compat_recovery_lab.py` | `test_compat_preservation.py`; authentic signed 0040 booking, exact original receipt and 0046 replay, unchanged effects |
-| FR-010 — whole-gate acceptance | `ops/check.ps1`, `.github/workflows/foundation.yml`, `compose.compat.yaml` | Exact-SHA `inputs-and-build` **and** `compose-integration`, 30 Python + 4 Node, zero mandatory skips and cleanup |
+| FR-010 — whole-gate acceptance | `ops/check.ps1`, `.github/workflows/foundation.yml`, `compose.compat.yaml` | Exact-SHA `inputs-and-build` **and** `compose-integration`, 30 Python + 5 Node, zero mandatory skips and cleanup |
 
 | Success criterion | Reviewer correlation |
 | --- | --- |

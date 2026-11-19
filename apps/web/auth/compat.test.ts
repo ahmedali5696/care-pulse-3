@@ -3,6 +3,8 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Pool } from "pg";
+import { authDatabase } from "../db.ts";
 import {
   CompatAdmissionError,
   loadCompatWebConfig,
@@ -18,6 +20,41 @@ test("permitLockKey produces deterministic signed 64-bit integer string", () => 
   assert.equal(k1, k2);
   assert.notEqual(k1, k3);
   assert.match(k1, /^-?\d+$/);
+});
+
+test("native auth pool.query uses the verified promise connection", { timeout: 5000 }, async () => {
+  const originalConnect = Pool.prototype.connect;
+  const savedTarget = process.env.CP_COMPAT_TARGET_ID;
+  let releases = 0;
+  Object.defineProperty(Pool.prototype, "connect", {
+    configurable: true,
+    writable: true,
+    value: async (...args: unknown[]) => {
+      assert.equal(args.length, 0, "callback-style Pool.connect would hang");
+      return {
+        query: async () => ({ rows: [{ ok: 1 }] }),
+        release: () => { releases++; },
+      };
+    },
+  });
+  delete process.env.CP_COMPAT_TARGET_ID;
+  try {
+    const pool = authDatabase({
+      authDatabase: { host: "127.0.0.1", port: 5432, name: "carepulse", user: "carepulse_auth", password: "synthetic" },
+    } as Parameters<typeof authDatabase>[0]);
+    const result = await pool.query("SELECT 1");
+    assert.equal(result.rows[0].ok, 1);
+    assert.equal(releases, 1);
+    await pool.end();
+  } finally {
+    Object.defineProperty(Pool.prototype, "connect", {
+      configurable: true,
+      writable: true,
+      value: originalConnect,
+    });
+    if (savedTarget === undefined) delete process.env.CP_COMPAT_TARGET_ID;
+    else process.env.CP_COMPAT_TARGET_ID = savedTarget;
+  }
 });
 
 test("loadCompatWebConfig rejects mismatched API peer", () => {

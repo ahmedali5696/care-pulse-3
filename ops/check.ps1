@@ -731,7 +731,7 @@ for attempt in $(seq 1 40); do
   sleep 2
 done
 echo 'PASS runner-host web http://127.0.0.1:3000/'
-docker compose exec -T web node --experimental-strip-types --input-type=module <<'NODE'
+timeout 60s docker compose exec -T web node --experimental-strip-types --input-type=module <<'NODE'
 import { getSchema } from 'better-auth/db';
 import { getMigrations } from 'better-auth/db/migration';
 import { betterAuth } from 'better-auth';
@@ -1299,10 +1299,10 @@ if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
     run_compat_observer compat-us1 15 "${required_suites[@]}"
     docker compose -f compose.compat.yaml --profile candidate run --rm --no-deps -T --entrypoint node candidate-web --no-warnings --experimental-strip-types --test --test-reporter=tap auth/compat.test.ts | tee "$private/compat-us1-web.log"
     if [[ "$mode" = compat-full ]]; then
-      for result in '# tests 4' '# pass 4' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
+      for result in '# tests 5' '# pass 5' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
         grep -Fxq "$result" "$private/compat-us1-web.log" || { echo "FAIL mandatory compat Web test count: $result"; exit 1; }
       done
-      echo 'PASS compat-us1-web: 4 mandatory Web tests, zero skips'
+      echo 'PASS compat-us1-web: 5 mandatory Web tests, zero skips'
     fi
 fi
 if [[ "$mode" = compat-us2 || "$mode" = compat-full ]]; then
@@ -1378,7 +1378,7 @@ PY
     fi
 fi
 if [[ "$mode" = compat-full ]]; then
-  echo 'PASS mandatory compatibility: 30 Python cases (US1 15, US2 5, US3 10), 4 Web cases, zero skips'
+  echo 'PASS mandatory compatibility: 30 Python cases (US1 15, US2 5, US3 10), 5 Web cases, zero skips'
 fi
 '@
             & bash -e -c $compatScript -- $Check

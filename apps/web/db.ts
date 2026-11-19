@@ -36,14 +36,11 @@ function createPool(
     return client;
   }) as Pool["connect"];
 
-  const rawQuery = pool.query.bind(pool);
   pool.query = (async <R extends QueryResultRow = QueryResultRow>(
     textOrConfig: string | QueryConfig,
     values?: unknown[],
   ): Promise<QueryResult<R>> => {
-    if (!isCompatEnabled() || compatCheckActive.getStore()) {
-      return rawQuery(textOrConfig as string, values) as Promise<QueryResult<R>>;
-    }
+    // pg's Pool.query uses connect(callback); our verified connect is promise-only.
     const client: PoolClient = await pool.connect();
     try {
       return await client.query<R>(textOrConfig as string, values);
