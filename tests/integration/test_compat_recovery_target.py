@@ -1,15 +1,23 @@
 """T052: fenced 0046 retirement, candidate eligibility and lost-reopen recovery."""
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+
 import pytest
 from carepulse.compat.admission import (
+    CompatAdmissionError,
     CompatRuntimeConfig,
     acquire_invocation_permit,
+    check_pool_checkout,
     record_attempt_disposition,
     release_invocation_permit,
 )
+from sqlalchemy import event
 from sqlalchemy.exc import SQLAlchemyError
 
-from ops.compat.control import read_control_record
+from ops.compat.control import read_control_record, release_exclusive_drain_permit
 from ops.compat.credentials import retire_legacy_runtime
 from ops.compat.launch import LaunchBindingError
 from ops.compat.manifest import CANDIDATE_HEAD
@@ -26,11 +34,13 @@ from tests.integration.compat_ci_helpers import (
     read_secret,
     read_source_secret,
 )
+from tests.integration.compat_fixture import compare_retained_inventory
 from tests.integration.compat_recovery_lab import (
     committed_0046_cutover,
     inspected_prelaunch_pair,
     populated_0040_lab,
 )
+from tests.integration.postgres_locks import wait_for_postgres_lock
 
 CHECKPOINT = ExecutedUS2Checkpoint(
     44424355381, "835a257aa8374c50d615bf7b75676cccb49137e7", 5, 5, True
@@ -142,6 +152,7 @@ def test_candidate_reopens_once_then_lost_ack_atomically_refences() -> None:
             },
         )
         assert opened.phase == "TARGET_OPEN"
+        assert release_exclusive_drain_permit(cutover.owner, lab.target_id)
         cfg = CompatRuntimeConfig(
             target_id=lab.target_id,
             manifest_id=candidate.manifest_id,
@@ -206,3 +217,238 @@ def test_candidate_reopens_once_then_lost_ack_atomically_refences() -> None:
                 pytest.fail("Competing owner cannot re-fence this event")
         assert read_control_record(cutover.observer).phase == "DRAINING"
         assert probe_alembic_head(cutover.observer) == CANDIDATE_HEAD
+
+
+def test_lost_open_refence_orders_held_work_before_new_admission() -> None:
+    with (
+        populated_0040_lab("compat_target_race") as lab,
+        committed_0046_cutover(lab) as cutover,
+    ):
+        source, candidate, units = inspected_prelaunch_pair(lab)
+        retire_legacy_runtime(
+            cutover.admin,
+            cutover.owner,
+            cutover.observer,
+            source_manifest=source,
+            target_manifest=candidate,
+            baseline=lab.retained_baseline(),
+            owner_epoch=cutover.owner_epoch,
+            original_shared_passwords={
+                role: read_source_secret(role)
+                for role in ("carepulse_auth", "carepulse_sender")
+            },
+            candidate_shared_passwords={
+                role: read_secret(role)
+                for role in ("carepulse_auth", "carepulse_sender")
+            },
+        )
+        active_roles = (
+            "carepulse_api",
+            "carepulse_web",
+            "carepulse_worker",
+            "carepulse_gate",
+            "carepulse_auth",
+            "carepulse_sender",
+            "carepulse_operator",
+        )
+        opened = reopen_fenced_generation(
+            cutover.owner,
+            cutover.observer,
+            source_manifest=source,
+            target_manifest=candidate,
+            baseline=lab.retained_baseline(),
+            owner_epoch=cutover.owner_epoch,
+            generation="candidate",
+            observed_units=units,
+            login_probes={r: _connection(r, lab.dbname) for r in active_roles},
+            predecessor_login_probes={
+                "carepulse_runtime": _connection("carepulse_runtime", lab.dbname),
+                **{
+                    r: _connection(r, lab.dbname, read_source_secret(r))
+                    for r in ("carepulse_auth", "carepulse_sender")
+                },
+            },
+        )
+        assert opened.phase == "TARGET_OPEN"
+        assert release_exclusive_drain_permit(cutover.owner, lab.target_id)
+        cutover.owner.close()  # Lost OPEN acknowledgement also loses owner lock.
+
+        http_cfg = CompatRuntimeConfig(
+            target_id=lab.target_id,
+            manifest_id=candidate.manifest_id,
+            generation="candidate",
+            expected_head=CANDIDATE_HEAD,
+            service="api",
+            db_name=lab.dbname,
+        )
+        sender_cfg = CompatRuntimeConfig(
+            target_id=lab.target_id,
+            manifest_id=candidate.manifest_id,
+            generation="candidate",
+            expected_head=CANDIDATE_HEAD,
+            service="sender",
+            db_name=lab.dbname,
+        )
+        worker_cfg = CompatRuntimeConfig(
+            target_id=lab.target_id,
+            manifest_id=candidate.manifest_id,
+            generation="candidate",
+            expected_head=CANDIDATE_HEAD,
+            service="worker",
+            db_name=lab.dbname,
+        )
+        with ExitStack() as cleanup:
+            api = make_sa_engine("carepulse_api", dbname=lab.dbname)
+            sender = make_sa_engine("carepulse_sender", dbname=lab.dbname)
+            worker = make_sa_engine("carepulse_worker", dbname=lab.dbname)
+            observer_engine = make_sa_engine("carepulse_bootstrap", dbname=lab.dbname)
+            for engine in (api, sender, worker, observer_engine):
+                cleanup.callback(engine.dispose)
+            http_permit, http_conn = acquire_invocation_permit(
+                api,
+                config=http_cfg,
+                expected_login="carepulse_api",
+                record_attempt=True,
+            )
+            cleanup.callback(release_invocation_permit, http_conn, http_permit)
+            sender_permit, sender_conn = acquire_invocation_permit(
+                sender,
+                config=sender_cfg,
+                expected_login="carepulse_sender",
+                invocation_class="sender_claim",
+                record_attempt=True,
+            )
+            cleanup.callback(release_invocation_permit, sender_conn, sender_permit)
+            record_attempt_disposition(
+                http_conn,
+                http_permit,
+                invocation_class="http",
+                disposition="ROLLED_BACK",
+            )
+            record_attempt_disposition(
+                sender_conn,
+                sender_permit,
+                invocation_class="sender_claim",
+                disposition="UNKNOWN",
+            )
+
+            http_pid = http_conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one()
+            assert (
+                http_conn.exec_driver_sql(
+                    "SELECT phase FROM compat_control.read_target_control()"
+                ).scalar_one()
+                == "TARGET_OPEN"
+            )
+            # The original HTTP backend holds the row while both original
+            # invocation permits remain held, including the uncertain sender.
+            fenced_ready = threading.Event()
+            release_recovery = threading.Event()
+            worker_connected = threading.Event()
+            worker_pid: list[int] = []
+            fenced_states = []
+
+            @event.listens_for(worker, "connect")
+            def _capture_worker_pid(dbapi_connection, _record):
+                worker_pid.append(dbapi_connection.info.backend_pid)
+                worker_connected.set()
+
+            def _refence():
+                with recover_ambiguous_open(
+                    owner_connection=_connection("carepulse_migration", lab.dbname),
+                    observer_connection=_connection("carepulse_bootstrap", lab.dbname),
+                    source_manifest=source,
+                    target_manifest=candidate,
+                    executed_us2=CHECKPOINT,
+                    expected_open_epoch=opened.owner_epoch,
+                    expected_open_generation="candidate",
+                ) as fenced:
+                    fenced_states.append(fenced)
+                    fenced_ready.set()
+                    release_recovery.wait()
+
+            def _new_admission():
+                with pytest.raises(CompatAdmissionError):
+                    acquired, connection = acquire_invocation_permit(
+                        worker,
+                        config=worker_cfg,
+                        expected_login="carepulse_worker",
+                        record_attempt=True,
+                    )
+                    release_invocation_permit(connection, acquired)
+                    pytest.fail("New work entered after the re-fence was queued")
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                try:
+                    try:
+                        recovery_future = pool.submit(_refence)
+                        with observer_engine.connect() as lock_observer:
+                            deadline = time.monotonic() + 15
+                            recovery_pid = None
+                            while recovery_pid is None and time.monotonic() < deadline:
+                                recovery_pid = lock_observer.exec_driver_sql(
+                                    "SELECT pid FROM pg_stat_activity WHERE datname = %s "
+                                    "AND usename = 'carepulse_migration' "
+                                    "AND application_name LIKE 'compat-lost-open-%%'",
+                                    (lab.dbname,),
+                                ).scalar_one_or_none()
+                                if recovery_pid is None:
+                                    time.sleep(0.02)
+                            assert recovery_pid is not None, (
+                                "Recovery owner backend not observed"
+                            )
+                            wait_for_postgres_lock(
+                                lock_observer, recovery_pid, http_pid
+                            )
+                            admission_future = pool.submit(_new_admission)
+                            assert worker_connected.wait(timeout=10)
+                            wait_for_postgres_lock(
+                                lock_observer, worker_pid[0], recovery_pid
+                            )
+                        assert not fenced_ready.is_set()
+                    finally:
+                        http_conn.commit()  # Release row lock; retain both permits.
+
+                    assert fenced_ready.wait(timeout=15), "Re-fence did not commit"
+                    admission_future.result(timeout=15)
+                    fenced = fenced_states[0]
+                    assert fenced.control.owner_epoch == opened.owner_epoch + 1
+                    assert fenced.control.phase == "DRAINING"
+                    assert fenced.control.active_generation == "none"
+                    assert fenced.unresolved_work == 1
+                    assert fenced.surviving_sessions >= 2
+                    with pytest.raises(CompatAdmissionError):
+                        check_pool_checkout(
+                            http_conn,
+                            config=http_cfg,
+                            expected_login="carepulse_api",
+                            expected_epoch=opened.owner_epoch,
+                        )
+                    actual = cutover.observer.execute(
+                        "SELECT attempt_id, disposition FROM compat_control.work_evidence "
+                        "WHERE target_id=%s",
+                        (lab.target_id,),
+                    ).fetchall()
+                    assert {r["attempt_id"]: r["disposition"] for r in actual} == {
+                        http_permit.attempt_id: "ROLLED_BACK",
+                        sender_permit.attempt_id: "UNKNOWN",
+                    }
+                    assert probe_alembic_head(cutover.observer) == CANDIDATE_HEAD
+                    compare_retained_inventory(cutover.observer, lab.inventory)
+                finally:
+                    release_recovery.set()
+                recovery_future.result(timeout=15)
+
+            assert read_control_record(cutover.observer).phase == "DRAINING"
+            with (
+                pytest.raises(RecoveryError, match="changed"),
+                recover_ambiguous_open(
+                    owner_connection=_connection("carepulse_migration", lab.dbname),
+                    observer_connection=_connection("carepulse_bootstrap", lab.dbname),
+                    source_manifest=source,
+                    target_manifest=candidate,
+                    executed_us2=CHECKPOINT,
+                    expected_open_epoch=opened.owner_epoch,
+                    expected_open_generation="candidate",
+                ),
+            ):
+                pytest.fail("Stale epoch unexpectedly reacquired OPEN authority")

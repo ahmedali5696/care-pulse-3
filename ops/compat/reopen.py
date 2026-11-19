@@ -140,7 +140,30 @@ def reopen_fenced_generation(
             try:
                 old = open_nonpooled_connection(**options)
             except psycopg.OperationalError as exc:
-                if exc.sqlstate not in ("28P01", "28000"):
+                # Some libpq startup failures expose the server's FATAL
+                # NOLOGIN diagnosis but no structured SQLSTATE. Never count
+                # unrelated network/database failures as retired credentials.
+                explicitly_disabled = (
+                    role == "carepulse_runtime"
+                    and exc.sqlstate is None
+                    and "FATAL:" in str(exc)
+                    and 'role "carepulse_runtime" is not permitted to log in'
+                    in str(exc)
+                    and not probe_role_attributes(observer_conn, (role,))[
+                        role
+                    ].rolcanlogin
+                )
+                wrong_original_password = (
+                    role in ("carepulse_auth", "carepulse_sender")
+                    and exc.sqlstate is None
+                    and "FATAL:" in str(exc)
+                    and f'password authentication failed for user "{role}"' in str(exc)
+                )
+                if (
+                    exc.sqlstate not in ("28P01", "28000")
+                    and not explicitly_disabled
+                    and not wrong_original_password
+                ):
                     raise ReopenError(
                         "Predecessor denial was not an auth rejection"
                     ) from exc

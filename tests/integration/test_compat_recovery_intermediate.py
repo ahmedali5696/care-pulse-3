@@ -26,10 +26,12 @@ from ops.compat.preflight import PUBLISHED_SUCCESSORS, run_source_preflight
 from ops.compat.prerequisites import apply_missing_prerequisites
 from ops.compat.probes import probe_alembic_head
 from ops.compat.recover import ExecutedUS2Checkpoint, recover_owner
+from ops.compat.verify import verify_fenced_security, verify_retained_evidence
 from tests.integration.compat_ci_helpers import connect_role, read_secret
 from tests.integration.compat_recovery_lab import (
     original_sender_engine,
     populated_0040_lab,
+    seed_synthetic_0041_identity,
 )
 
 CHECKPOINT = ExecutedUS2Checkpoint(
@@ -136,12 +138,8 @@ def test_resume_each_0041_to_0046_after_rollback_and_lost_commit_ack() -> None:
                     expected_predecessor=current,
                     target_successor=successor,
                 )
-                observe_committed_successor(
-                    observer,
-                    target_id=lab.target_id,
-                    expected_epoch=owner_epoch,
-                    expected_head=successor,
-                )
+                if successor == PUBLISHED_SUCCESSORS[0]:
+                    seed_synthetic_0041_identity(admin)
                 if recovery_context is None:
                     current_owner.close()
                 else:
@@ -159,6 +157,24 @@ def test_resume_each_0041_to_0046_after_rollback_and_lost_commit_ack() -> None:
                 )
                 takeover = following_context.__enter__()
                 recovery_context = following_context
+                # The owner vanished after the commit, before any successor
+                # readback. Verify the durable head under the recovered epoch.
+                observe_committed_successor(
+                    observer,
+                    target_id=lab.target_id,
+                    expected_epoch=takeover.control.owner_epoch,
+                    expected_head=successor,
+                )
+                security = verify_fenced_security(
+                    observer,
+                    source_manifest=lab.source_manifest,
+                    target_manifest=lab.target_manifest,
+                    expected_epoch=takeover.control.owner_epoch,
+                    expected_head=successor,
+                )
+                verify_retained_evidence(
+                    observer, baseline=lab.retained_baseline(), security=security
+                )
                 assert takeover.committed_head == successor
                 assert takeover.control.owner_epoch == owner_epoch + 1
                 assert takeover.control.drain_verified_epoch == owner_epoch + 1
