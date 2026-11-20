@@ -4,6 +4,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from dataclasses import replace
 
 import pytest
 from carepulse.compat.admission import (
@@ -17,7 +18,7 @@ from carepulse.compat.admission import (
 from sqlalchemy.exc import SQLAlchemyError
 
 from ops.compat.control import read_control_record, release_exclusive_drain_permit
-from ops.compat.credentials import retire_legacy_runtime
+from ops.compat.credentials import CredentialError, retire_legacy_runtime
 from ops.compat.launch import LaunchBindingError
 from ops.compat.manifest import CANDIDATE_HEAD
 from ops.compat.probes import probe_alembic_head
@@ -26,7 +27,7 @@ from ops.compat.recover import (
     RecoveryError,
     recover_ambiguous_open,
 )
-from ops.compat.reopen import reopen_fenced_generation
+from ops.compat.reopen import ReopenError, reopen_fenced_generation
 from ops.compat.verify import VerificationError, verify_fenced_security
 from tests.integration.compat_ci_helpers import (
     make_sa_engine,
@@ -75,14 +76,51 @@ def test_incomplete_0046_key_policy_and_unguarded_build_never_open() -> None:
                 observed_units=units[:3],
                 login_probes={},
             )
+        for rejected_units in (
+            (replace(units[0], generation="source"), *units[1:]),
+            tuple(
+                replace(unit, configured_peers=("untrusted-peer",))
+                if unit.service == "sender"
+                else unit
+                for unit in units
+            ),
+        ):
+            with pytest.raises(LaunchBindingError):
+                reopen_fenced_generation(
+                    cutover.owner,
+                    cutover.observer,
+                    source_manifest=source,
+                    target_manifest=candidate,
+                    baseline=lab.retained_baseline(),
+                    owner_epoch=cutover.owner_epoch,
+                    generation="candidate",
+                    observed_units=rejected_units,
+                    login_probes={},
+                )
         assert read_control_record(cutover.observer).phase == "MIGRATING"
 
-        # This is a disposable copy. Remove a required key policy to prove
-        # that a plausible 0046 head alone cannot release clinical traffic.
+        # The disposable target must reject a missing active key independently
+        # of the policy check, despite already having the expected 0046 head.
         with cutover.admin.transaction():
             cutover.admin.execute("SET LOCAL ROLE carepulse_identity_owner")
+            cutover.admin.execute(
+                "UPDATE f01_private.keys SET status='REVOKED' WHERE status='ACTIVE'"
+            )
+        with pytest.raises(VerificationError, match="F-01 key or policy"):
+            verify_fenced_security(
+                cutover.observer,
+                source_manifest=source,
+                target_manifest=candidate,
+                expected_epoch=cutover.owner_epoch,
+                expected_head=CANDIDATE_HEAD,
+            )
+        with cutover.admin.transaction():
+            cutover.admin.execute("SET LOCAL ROLE carepulse_identity_owner")
+            cutover.admin.execute(
+                "UPDATE f01_private.keys SET status='ACTIVE' WHERE status='REVOKED'"
+            )
             cutover.admin.execute("DELETE FROM f01_private.policy")
-        with pytest.raises(VerificationError):
+        with pytest.raises(VerificationError, match="F-01 key or policy"):
             verify_fenced_security(
                 cutover.observer,
                 source_manifest=source,
@@ -100,22 +138,42 @@ def test_candidate_reopens_once_then_lost_ack_atomically_refences() -> None:
         committed_0046_cutover(lab) as cutover,
     ):
         source, candidate, units = inspected_prelaunch_pair(lab)
-        retired = retire_legacy_runtime(
-            cutover.admin,
-            cutover.owner,
-            cutover.observer,
-            source_manifest=source,
-            target_manifest=candidate,
-            baseline=lab.retained_baseline(),
-            owner_epoch=cutover.owner_epoch,
-            original_shared_passwords={
+        retirement_args = {
+            "source_manifest": source,
+            "target_manifest": candidate,
+            "baseline": lab.retained_baseline(),
+            "owner_epoch": cutover.owner_epoch,
+            "original_shared_passwords": {
                 role: read_source_secret(role)
                 for role in ("carepulse_auth", "carepulse_sender")
             },
-            candidate_shared_passwords={
+            "candidate_shared_passwords": {
                 role: read_secret(role)
                 for role in ("carepulse_auth", "carepulse_sender")
             },
+        }
+        predecessor = make_sa_engine("carepulse_runtime", dbname=lab.dbname)
+        try:
+            with predecessor.connect() as held:
+                cutover.admin.execute("ALTER ROLE carepulse_runtime NOLOGIN")
+                cutover.admin.commit()
+                assert (
+                    held.exec_driver_sql("SELECT current_user").scalar_one()
+                    == "carepulse_runtime"
+                )
+                with pytest.raises(CredentialError, match="backend remains"):
+                    retire_legacy_runtime(
+                        cutover.admin,
+                        cutover.owner,
+                        cutover.observer,
+                        **retirement_args,
+                    )
+                assert read_control_record(cutover.observer).active_generation == "none"
+        finally:
+            predecessor.dispose()
+
+        retired = retire_legacy_runtime(
+            cutover.admin, cutover.owner, cutover.observer, **retirement_args
         )
         assert retired.legacy_login_disabled
         assert set(retired.rotated_shared_roles) == {
@@ -132,6 +190,28 @@ def test_candidate_reopens_once_then_lost_ack_atomically_refences() -> None:
             "carepulse_sender",
             "carepulse_operator",
         )
+        logins = {role: _connection(role, lab.dbname) for role in active_roles}
+        predecessor_logins = {
+            "carepulse_runtime": _connection("carepulse_runtime", lab.dbname),
+            **{
+                role: _connection(role, lab.dbname, read_source_secret(role))
+                for role in ("carepulse_auth", "carepulse_sender")
+            },
+        }
+        with pytest.raises(ReopenError, match="Untrusted service login probe"):
+            reopen_fenced_generation(
+                cutover.owner,
+                cutover.observer,
+                source_manifest=source,
+                target_manifest=candidate,
+                baseline=lab.retained_baseline(),
+                owner_epoch=cutover.owner_epoch,
+                generation="candidate",
+                observed_units=units,
+                login_probes={**logins, "carepulse_api": logins["carepulse_worker"]},
+                predecessor_login_probes=predecessor_logins,
+            )
+        assert read_control_record(cutover.observer).phase == "MIGRATING"
         opened = reopen_fenced_generation(
             cutover.owner,
             cutover.observer,
@@ -141,16 +221,25 @@ def test_candidate_reopens_once_then_lost_ack_atomically_refences() -> None:
             owner_epoch=cutover.owner_epoch,
             generation="candidate",
             observed_units=units,
-            login_probes={r: _connection(r, lab.dbname) for r in active_roles},
-            predecessor_login_probes={
-                "carepulse_runtime": _connection("carepulse_runtime", lab.dbname),
-                **{
-                    r: _connection(r, lab.dbname, read_source_secret(r))
-                    for r in ("carepulse_auth", "carepulse_sender")
-                },
-            },
+            login_probes=logins,
+            predecessor_login_probes=predecessor_logins,
         )
         assert opened.phase == "TARGET_OPEN"
+        with pytest.raises(VerificationError, match="Fenced target"):
+            reopen_fenced_generation(
+                cutover.owner,
+                cutover.observer,
+                source_manifest=source,
+                target_manifest=candidate,
+                baseline=lab.retained_baseline(),
+                owner_epoch=cutover.owner_epoch,
+                generation="candidate",
+                observed_units=units,
+                login_probes=logins,
+                predecessor_login_probes=predecessor_logins,
+            )
+        assert read_control_record(cutover.observer).phase == "TARGET_OPEN"
+        compare_retained_inventory(cutover.observer, lab.inventory)
         assert release_exclusive_drain_permit(cutover.owner, lab.target_id)
         cfg = CompatRuntimeConfig(
             target_id=lab.target_id,
@@ -356,7 +445,35 @@ def test_lost_open_refence_orders_held_work_before_new_admission() -> None:
                 ) as fenced:
                     fenced_states.append(fenced)
                     fenced_ready.set()
-                    release_recovery.wait()
+                    assert release_recovery.wait(timeout=15)
+                    with pytest.raises(
+                        VerificationError, match="Unresolved sender or admitted work"
+                    ):
+                        reopen_fenced_generation(
+                            fenced.owner_conn,
+                            cutover.observer,
+                            source_manifest=source,
+                            target_manifest=candidate,
+                            baseline=lab.retained_baseline(),
+                            owner_epoch=fenced.control.owner_epoch,
+                            generation="candidate",
+                            observed_units=units,
+                            login_probes={
+                                role: _connection(role, lab.dbname)
+                                for role in active_roles
+                            },
+                            predecessor_login_probes={
+                                "carepulse_runtime": _connection(
+                                    "carepulse_runtime", lab.dbname
+                                ),
+                                **{
+                                    role: _connection(
+                                        role, lab.dbname, read_source_secret(role)
+                                    )
+                                    for role in ("carepulse_auth", "carepulse_sender")
+                                },
+                            },
+                        )
 
             def _new_admission():
                 with pytest.raises(CompatAdmissionError):

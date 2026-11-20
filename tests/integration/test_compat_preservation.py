@@ -16,10 +16,12 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
+from carepulse.appointments.book import book_appointment
 from carepulse.appointments.booking_contracts import BookAppointment
 from carepulse.config import ServiceConfig, _load_policy
 from carepulse.identity.authorization import protected_transaction
 from carepulse.identity.contracts import ContractError, normalized_request_digest
+from carepulse.identity.runtime_identity import current_request
 from carepulse.identity.signing import (
     PROTOCOL_VERSION,
     CanonicalEnvelope,
@@ -295,6 +297,69 @@ def test_disposable_0046_signed_proof_nonce_and_live_tenant_denials() -> None:
                 pytest.fail("Consumed signed nonce was re-registered")
             assert replay.value.orig.sqlstate == "23505"
 
+            unconsumed = replace(
+                identity,
+                timestamp=str(int(datetime.now(UTC).timestamp() * 1000)),
+                nonce=f"synthetic_{uuid4().hex}",
+            )
+            with registered_test_request(clinic, unconsumed, b""):
+                assert current_request.get() is not None
+
+            pending = replace(
+                identity,
+                timestamp=str(int(datetime.now(UTC).timestamp() * 1000)),
+                nonce=f"synthetic_{uuid4().hex}",
+            )
+            with registered_test_request(clinic, pending, b""):
+                request = current_request.get()
+                assert request is not None
+                with api.connect() as transaction:
+                    pid, xid = transaction.execute(
+                        text("SELECT pg_backend_pid(), pg_current_xact_id()::text")
+                    ).one()
+                    with gate.begin() as binder:
+                        binder.execute(
+                            text(
+                                "SELECT public.f01_bind(:request, 'PRIMARY', :pid, CAST(:xid AS xid8))"
+                            ),
+                            {"request": request.request_id, "pid": pid, "xid": xid},
+                        )
+                    # Cleanup must retain an expired request while its real
+                    # bound transaction still has no durable disposition.
+                    with cutover.admin.transaction():
+                        cutover.admin.execute("SET LOCAL ROLE carepulse_identity_owner")
+                        cutover.admin.execute(
+                            "UPDATE f01_private.requests SET expires_at="
+                            "clock_timestamp()-interval '1 second' WHERE id=%s",
+                            (request.request_id,),
+                        )
+                    with gate.begin() as cleanup:
+                        cleanup.execute(text("SELECT public.f01_cleanup()"))
+                    assert (
+                        cutover.observer.execute(
+                            "SELECT pg_xact_status(xid) AS status FROM f01_private.bindings "
+                            "WHERE request_id=%s AND stage='PRIMARY'",
+                            (request.request_id,),
+                        ).fetchone()["status"]
+                        == "in progress"
+                    )
+                    security = verify_fenced_security(
+                        cutover.observer,
+                        source_manifest=lab.source_manifest,
+                        target_manifest=lab.target_manifest,
+                        expected_epoch=cutover.owner_epoch,
+                        expected_head=CANDIDATE_HEAD,
+                    )
+                    with pytest.raises(
+                        VerificationError, match="Unresolved F-01 transaction binding"
+                    ):
+                        verify_retained_evidence(
+                            cutover.observer,
+                            baseline=lab.retained_baseline(),
+                            security=security,
+                        )
+                    transaction.rollback()
+
             foreign = replace(
                 identity,
                 organization_id=lab.inventory.org_b_id,
@@ -363,6 +428,8 @@ def test_disposable_0046_signed_proof_nonce_and_live_tenant_denials() -> None:
         ).fetchall()
         assert {row["nonce"]: (row["bound"], row["activated"]) for row in evidence} == {
             identity.nonce: (True, True),
+            unconsumed.nonce: (None, False),
+            pending.nonce: (True, False),
             foreign.nonce: (True, False),
             revoked.nonce: (True, False),
         }
@@ -376,13 +443,15 @@ def test_disposable_0046_signed_proof_nonce_and_live_tenant_denials() -> None:
                     identity.key_id,
                     [
                         identity.nonce,
+                        unconsumed.nonce,
+                        pending.nonce,
                         foreign.nonce,
                         revoked.nonce,
                         after_revocation.nonce,
                     ],
                 ),
             ).fetchone()["n"]
-            == 3
+            == 5
         )
         compare_retained_inventory(cutover.observer, lab.inventory)
         assert read_control_record(cutover.observer).phase == "MIGRATING"
@@ -663,11 +732,41 @@ def test_authentic_0040_signed_receipt_replays_with_f01_without_any_new_effect()
                 "SELECT to_jsonb(a) AS row FROM public.appointments a WHERE id=%s",
                 (original["data"]["id"],),
             ).fetchone()["row"]
+            provenance_sql = """
+                SELECT (SELECT to_jsonb(h) FROM public.appointment_history h
+                        WHERE h.organization_id=%s AND h.appointment_id=%s
+                          AND h.action='CREATED') AS history,
+                       (SELECT to_jsonb(a) FROM public.sensitive_audit a
+                        WHERE a.organization_id=%s AND a.correlation_id=%s
+                          AND a.action='appointments.book') AS audit
+            """
+            provenance_args = (tenant, original["data"]["id"]) * 2
+            original_provenance = observer.execute(
+                provenance_sql, provenance_args
+            ).fetchone()
+            assert original_provenance["history"]["actor_staff_id"] == str(staff["id"])
+            assert original_provenance["history"]["actor_role"] == "DOCTOR_OWNER"
+            assert original_provenance["audit"]["actor_staff_id"] == str(staff["id"])
+            assert original_provenance["audit"]["actor_role"] == "DOCTOR_OWNER"
+            assert (
+                original_provenance["audit"]["after_state"]["appointment_id"]
+                == original["data"]["id"]
+            )
         finally:
             observer.close()
 
         with committed_0046_cutover(lab) as cutover:
             assert _booking_effects(cutover.observer, tenant) == before
+            assert (
+                cutover.observer.execute(
+                    "SELECT count(*) AS n FROM f01_private.activations"
+                ).fetchone()["n"]
+                == 0
+            )
+            assert (
+                cutover.observer.execute(provenance_sql, provenance_args).fetchone()
+                == original_provenance
+            )
             retained_appointment = cutover.observer.execute(
                 "SELECT to_jsonb(a) AS row FROM public.appointments a WHERE id=%s",
                 (original["data"]["id"],),
@@ -701,7 +800,7 @@ def test_authentic_0040_signed_receipt_replays_with_f01_without_any_new_effect()
             app.state.db_engine = api
             app.state.gate_engine = gate
             app.state.service_config = config
-            clinic = SimpleNamespace(config=config)
+            clinic = SimpleNamespace(config=config, gate=gate, runtime=api)
             actor = CanonicalEnvelope(
                 protocol_version=PROTOCOL_VERSION,
                 key_id=config.signing_key_id,
@@ -733,6 +832,51 @@ def test_authentic_0040_signed_receipt_replays_with_f01_without_any_new_effect()
                 )
                 assert changed_status == 409
                 assert changed["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+                rollback_key = f"rollback-{uuid4().hex}"
+                rollback_body = {
+                    **body,
+                    "service_date": (service_date + timedelta(days=1)).isoformat(),
+                }
+                rollback_raw = json.dumps(rollback_body, separators=(",", ":")).encode()
+                rollback_actor = replace(
+                    actor,
+                    body_sha256=sha256(rollback_raw).hexdigest(),
+                    idempotency_key=rollback_key,
+                    timestamp=str(int(datetime.now(UTC).timestamp() * 1000)),
+                    nonce=f"synthetic_{uuid4().hex}",
+                )
+                with (
+                    registered_test_request(clinic, rollback_actor, rollback_raw),
+                    pytest.raises(RuntimeError, match="intentional test rollback"),
+                    protected_transaction(
+                        api, rollback_actor, config.policy.session_idle_minutes
+                    ) as (connection, authorized),
+                ):
+                    created = book_appointment(
+                        connection,
+                        authorized,
+                        BookAppointment.model_validate(rollback_body),
+                        rollback_key,
+                    )
+                    assert (
+                        connection.scalar(
+                            text(
+                                "SELECT count(*) FROM public.appointments WHERE id=:id"
+                            ),
+                            {"id": created["id"]},
+                        )
+                        == 1
+                    )
+                    raise RuntimeError("intentional test rollback")
+                assert _booking_effects(cutover.observer, tenant) == before
+                assert (
+                    cutover.observer.execute(
+                        "SELECT count(*) AS n FROM f01_private.nonces "
+                        "WHERE http_key_id=%s AND nonce=%s",
+                        (rollback_actor.key_id, rollback_actor.nonce),
+                    ).fetchone()["n"]
+                    == 1
+                )
                 cross_tenant_status = booking_request(
                     clinic,
                     replace(actor, organization_id=lab.inventory.org_b_id),
