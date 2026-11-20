@@ -51,7 +51,7 @@ def _ci_guard() -> None:
     require_compat_ci()
 
 
-def test_matched_0040_source_activation_and_candidate_denial() -> None:
+def test_matched_0040_source_activation_and_candidate_denial(monkeypatch) -> None:
     with disposable_database("compat_m0040") as dbname:
         admin = connect_role("carepulse_bootstrap", dbname=dbname, autocommit=True)
         try:
@@ -122,6 +122,16 @@ def test_matched_0040_source_activation_and_candidate_denial() -> None:
             )
             assert permit.owner_epoch == 1
             release_invocation_permit(pconn, permit)
+            with monkeypatch.context() as env:
+                for name, value in {
+                    "CP_COMPAT_TARGET_ID": target_id,
+                    "CP_COMPAT_MANIFEST_ID": src_manifest.manifest_id,
+                    "CP_COMPAT_GENERATION": "source",
+                    "CP_COMPAT_EXPECTED_HEAD": SOURCE_HEAD,
+                    "CP_DB_NAME": dbname,
+                }.items():
+                    env.setenv(name, value)
+                assert probe_compat_readiness(rt_engine, "api") is True
         finally:
             rt_engine.dispose()
 

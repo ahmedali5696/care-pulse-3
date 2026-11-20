@@ -25,7 +25,11 @@ from ops.compat.migrate import (
     enter_migrating_phase,
     observe_committed_successor,
 )
-from ops.compat.preflight import PUBLISHED_SUCCESSORS, run_source_preflight
+from ops.compat.preflight import (
+    PUBLISHED_SUCCESSORS,
+    US1_EXECUTED_CHECKPOINT,
+    run_source_preflight,
+)
 from ops.compat.prerequisites import apply_missing_prerequisites
 from ops.compat.probes import probe_alembic_head
 from ops.compat.recover import ExecutedUS2Checkpoint, recover_owner
@@ -104,7 +108,8 @@ def test_resume_each_0041_to_0046_after_rollback_and_lost_commit_ack() -> None:
                 observer,
                 source_manifest=lab.source_manifest,
                 target_manifest=lab.target_manifest,
-                us1_checkpoint_executed=True,
+                source_baseline=lab.retained_baseline(),
+                us1_checkpoint=US1_EXECUTED_CHECKPOINT,
             )
             owner_epoch = claim_owner_epoch(
                 initial_owner,
@@ -143,7 +148,12 @@ def test_resume_each_0041_to_0046_after_rollback_and_lost_commit_ack() -> None:
                 },
             )
             enter_migrating_phase(
-                initial_owner, target_id=lab.target_id, owner_epoch=owner_epoch
+                initial_owner,
+                observer,
+                target_id=lab.target_id,
+                owner_epoch=owner_epoch,
+                preflight=preflight,
+                drain_proof=proof,
             )
 
             current = SOURCE_HEAD
@@ -166,19 +176,23 @@ def test_resume_each_0041_to_0046_after_rollback_and_lost_commit_ack() -> None:
                 ):
                     advance_one_successor(
                         current_owner,
+                        observer,
                         target_id=lab.target_id,
                         owner_epoch=owner_epoch,
                         expected_predecessor=current,
                         target_successor=successor,
+                        preflight=preflight,
                     )
                 assert probe_alembic_head(observer) == current
 
                 advance_one_successor(
                     current_owner,
+                    observer,
                     target_id=lab.target_id,
                     owner_epoch=owner_epoch,
                     expected_predecessor=current,
                     target_successor=successor,
+                    preflight=preflight,
                 )
                 if successor == PUBLISHED_SUCCESSORS[0]:
                     seed_synthetic_0041_identity(admin)

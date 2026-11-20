@@ -26,12 +26,14 @@ async function databaseReady(config: WebConfig): Promise<boolean> {
   }
 }
 
-async function apiLive(config: WebConfig): Promise<boolean> {
+async function apiAvailable(config: WebConfig, compatEnabled: boolean): Promise<boolean> {
   try {
-    const response = await fetch(`${config.apiUrl}/health/live`, {
-      cache: "no-store", signal: AbortSignal.timeout(DEPENDENCY_TIMEOUT_MS),
+    const response = await fetch(`${config.apiUrl}/health/${compatEnabled ? "ready" : "live"}`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(compatEnabled ? PROBE_DEADLINE_MS : DEPENDENCY_TIMEOUT_MS),
     });
-    return response.status === 200 && (await response.json()).status === "alive";
+    return response.status === 200 &&
+      (await response.json()).status === (compatEnabled ? "ready" : "alive");
   } catch {
     return false;
   }
@@ -61,10 +63,11 @@ export async function foundationReady(): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const config = loadWebConfig();
+    const compatEnabled = isCompatEnabled();
     const dependencies = Promise.all([
-      databaseReady(config), apiLive(config),
+      compatEnabled ? verifyWebReadinessCompat() : databaseReady(config),
+      apiAvailable(config, compatEnabled),
       config.smtp ? smtpReady(config.smtp) : Promise.resolve(true),
-      isCompatEnabled() ? verifyWebReadinessCompat() : Promise.resolve(true),
     ]).then((checks) => checks.every(Boolean));
     return await Promise.race([
       dependencies,

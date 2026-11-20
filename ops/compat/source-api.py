@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import uuid
-from pathlib import Path
 
 import uvicorn
 from carepulse.config import load_config
@@ -24,7 +23,7 @@ SOURCE_HEAD = "0040_t173_numeric_money"
 
 
 def _permit_key(target_id: str) -> int:
-    digest = hashlib.sha256(f"compat:permit:{target_id}".encode("utf-8")).digest()
+    digest = hashlib.sha256(f"compat:permit:{target_id}".encode()).digest()
     return int.from_bytes(digest[:8], "big", signed=True)
 
 
@@ -72,20 +71,12 @@ def _verify_source_connection(
     ):
         raise RuntimeError("Source API role/database mismatch")
 
-    revs = (
-        conn.execute(text("SELECT version_num FROM public.alembic_version"))
-        .scalars()
-        .all()
-    )
-    if revs != [SOURCE_HEAD]:
-        raise RuntimeError("Source API schema revision mismatch")
-
     ctrl = (
         conn.execute(
             text(
                 """
             SELECT target_id, db_name, phase, owner_epoch,
-                   source_manifest_id, active_generation, source_sealed
+                   source_manifest_id, active_generation, source_sealed, alembic_head
             FROM compat_control.read_target_control()
             """
             )
@@ -97,6 +88,7 @@ def _verify_source_connection(
         ctrl is None
         or ctrl["target_id"] != target_id
         or ctrl["db_name"] != db_name
+        or ctrl["alembic_head"] != SOURCE_HEAD
         or ctrl["phase"] != "SOURCE_OPEN"
         or ctrl["active_generation"] != "source"
         or ctrl["source_sealed"]
@@ -124,24 +116,23 @@ def _guard_source_pool_checkout(
             or ident[2] != "carepulse_runtime"
         ):
             raise RuntimeError("Source pool role/database mismatch")
-        cur.execute("SELECT version_num FROM public.alembic_version")
-        revs = cur.fetchall()
-        if len(revs) != 1 or revs[0][0] != SOURCE_HEAD:
-            raise RuntimeError("Source pool head mismatch")
         cur.execute(
             """
-            SELECT target_id, phase, active_generation, source_sealed, source_manifest_id
-            FROM compat_control.target_control WHERE singleton_id = TRUE
+            SELECT target_id, db_name, phase, active_generation, source_sealed,
+                   source_manifest_id, alembic_head
+            FROM compat_control.read_target_status()
             """
         )
         ctrl = cur.fetchone()
         if (
             not ctrl
             or ctrl[0] != target_id
-            or ctrl[1] != "SOURCE_OPEN"
-            or ctrl[2] != "source"
-            or ctrl[3]
-            or ctrl[4] != manifest_id
+            or ctrl[1] != db_name
+            or ctrl[2] != "SOURCE_OPEN"
+            or ctrl[3] != "source"
+            or ctrl[4]
+            or ctrl[5] != manifest_id
+            or ctrl[6] != SOURCE_HEAD
         ):
             raise RuntimeError("Source pool fenced")
     finally:
@@ -162,7 +153,33 @@ class SourceCompatASGIGuard:
 
     async def __call__(self, scope, receive, send) -> None:
         path = scope.get("path", "")
-        if scope.get("type") != "http" or path in ("/health/live", "/health/ready"):
+        if scope.get("type") != "http" or path == "/health/live":
+            await self.asgi_app(scope, receive, send)
+            return
+
+        if path == "/health/ready":
+            try:
+                target_id, manifest_id, _, _ = _compat_settings()
+                with self._get_engine().connect() as connection:
+                    _verify_source_connection(
+                        connection,
+                        target_id,
+                        manifest_id,
+                        os.environ.get("CP_DB_NAME", "carepulse").strip(),
+                    )
+            except Exception:  # noqa: BLE001 - readiness must deny every unknown guard failure
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 503,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"cache-control", b"no-store"),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": b'{"ready":false}'})
+                return
             await self.asgi_app(scope, receive, send)
             return
 
@@ -170,11 +187,12 @@ class SourceCompatASGIGuard:
         db_name = os.environ.get("CP_DB_NAME", "carepulse").strip()
         key = _permit_key(target_id)
         engine = self._get_engine()
-        conn = engine.connect()
+        conn = None
         attempt_id = str(uuid.uuid4())
         epoch = 0
         locked = False
         try:
+            conn = engine.connect()
             if not conn.execute(
                 text("SELECT pg_try_advisory_lock_shared(:k)"), {"k": key}
             ).scalar():
@@ -192,20 +210,21 @@ class SourceCompatASGIGuard:
                 {"aid": attempt_id, "tid": target_id, "epoch": epoch},
             )
             conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except SQLAlchemyError:
-                pass
-            if locked:
+        except Exception:  # noqa: BLE001 - no failed admission may reach the source app
+            if conn is not None:
                 try:
-                    conn.execute(
-                        text("SELECT pg_advisory_unlock_shared(:k)"), {"k": key}
-                    )
-                    conn.commit()
+                    conn.rollback()
                 except SQLAlchemyError:
                     pass
-            conn.close()
+                if locked:
+                    try:
+                        conn.execute(
+                            text("SELECT pg_advisory_unlock_shared(:k)"), {"k": key}
+                        )
+                        conn.commit()
+                    except SQLAlchemyError:
+                        pass
+                conn.close()
             body = json.dumps({"detail": "Service unavailable"}).encode("utf-8")
             await send(
                 {
@@ -220,39 +239,10 @@ class SourceCompatASGIGuard:
             await send({"type": "http.response.body", "body": body})
             return
 
-        status_code = 500
-
-        async def tracked_send(message) -> None:
-            nonlocal status_code
-            if message.get("type") == "http.response.start":
-                status_code = int(message.get("status", 500))
-            await send(message)
-
         try:
-            await self.asgi_app(scope, receive, tracked_send)
+            await self.asgi_app(scope, receive, send)
         finally:
-            try:
-                conn.execute(
-                    text(
-                        """
-                        SELECT compat_control.record_own_attempt(
-                            :aid, :tid, :epoch, 'source', 'api', 'http', NULL, NULL, :disp
-                        )
-                        """
-                    ),
-                    {
-                        "aid": attempt_id,
-                        "tid": target_id,
-                        "epoch": epoch,
-                        "disp": "COMMITTED" if status_code < 500 else "ROLLED_BACK",
-                    },
-                )
-                conn.commit()
-            except SQLAlchemyError:
-                try:
-                    conn.rollback()
-                except SQLAlchemyError:
-                    pass
+            # Preserve PENDING: an ASGI response cannot prove commit or rollback.
             try:
                 conn.execute(text("SELECT pg_advisory_unlock_shared(:k)"), {"k": key})
                 conn.commit()

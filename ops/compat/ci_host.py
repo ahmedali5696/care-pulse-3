@@ -31,6 +31,36 @@ UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 RUN_TIMEOUT = 20
 
 
+def trusted_foundation_event() -> bool:
+    """Only first-party ordinary Foundation events may use the Docker supervisor."""
+    if (
+        os.environ.get("CI") != "true"
+        or os.environ.get("GITHUB_ACTIONS") != "true"
+        or os.environ.get("RUNNER_OS") != "Linux"
+        or os.environ.get("GITHUB_REPOSITORY") != "ahmedali5696/care-pulse-3"
+        or os.environ.get("GITHUB_SERVER_URL") != "https://github.com"
+    ):
+        return False
+    event = os.environ.get("GITHUB_EVENT_NAME")
+    if event == "workflow_dispatch":
+        return os.environ.get("GITHUB_REF", "").startswith("refs/heads/")
+    if event == "push":
+        return os.environ.get("GITHUB_REF") == "refs/heads/development"
+    if event == "pull_request":
+        try:
+            payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+            return (
+                payload["repository"]["full_name"] == "ahmedali5696/care-pulse-3"
+                and payload["pull_request"]["head"]["repo"]["full_name"]
+                == "ahmedali5696/care-pulse-3"
+                and payload["pull_request"]["base"]["repo"]["full_name"]
+                == "ahmedali5696/care-pulse-3"
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            return False
+    return False
+
+
 def command(args: list[str] | tuple[str, ...], *, timeout: int = RUN_TIMEOUT):
     return subprocess.run(
         args, capture_output=True, text=True, timeout=timeout, check=False
@@ -59,8 +89,7 @@ def emit(path: Path, payload: dict) -> None:
 class Supervisor:
     def __init__(self, directory: Path, observed_path: Path) -> None:
         if (
-            os.environ.get("CI") != "true"
-            or os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
+            not trusted_foundation_event()
             or not re.fullmatch(
                 r"carepulse-ci-[0-9]+-[0-9]+", os.environ.get("CP_CI_PROJECT", "")
             )

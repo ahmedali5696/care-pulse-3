@@ -14,9 +14,13 @@ import psycopg
 from psycopg import sql
 
 from ops.compat.control import assert_current_owner, read_control_record
-from ops.compat.drain import DrainVerification, observe_drain_complete
+from ops.compat.drain import (
+    DrainVerification,
+    assert_exclusive_drain_permit,
+    observe_drain_complete,
+)
 from ops.compat.manifest import SOURCE_HEAD
-from ops.compat.preflight import PreflightReport
+from ops.compat.preflight import PreflightReport, verify_populated_source_basis
 from ops.compat.probes import (
     probe_alembic_head,
     probe_role_attributes,
@@ -59,6 +63,7 @@ def _recheck_fenced_preconditions(
         expected_epoch=owner_epoch,
         lock_mode="NONE",
     )
+    assert_exclusive_drain_permit(owner_conn, preflight.target_id)
     if ctrl.phase != "DRAINING" or ctrl.active_generation != "none":
         raise PrerequisiteError(
             f"Prerequisites require DRAINING/none, observed {ctrl.phase}/{ctrl.active_generation}"
@@ -75,11 +80,22 @@ def _recheck_fenced_preconditions(
         observer_conn,
         target_id=preflight.target_id,
         expected_epoch=owner_epoch,
-        consumers_stopped=True,
+        consumers_stopped=drain_proof.consumers_stopped,
         require_source_sealed=True,
     )
     if fresh.unresolved_work_count != 0 or fresh.active_product_sessions != 0:
         raise PrerequisiteError("Unresolved work or active product sessions detected")
+    if fresh.claimed_delivery_jobs != 0:
+        raise PrerequisiteError(
+            "Claimed delivery job remains before prerequisite mutation"
+        )
+    verify_populated_source_basis(
+        observer_conn,
+        preflight.source_baseline,
+        preflight.target_id,
+        preflight.cluster_id,
+        preflight.db_name,
+    )
 
 
 def apply_missing_prerequisites(

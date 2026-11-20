@@ -97,8 +97,23 @@ BEGIN
         IF v_existing.owner_epoch <> p_owner_epoch THEN
             RAISE EXCEPTION 'compat_epoch_mismatch' USING ERRCODE = 'P0001';
         END IF;
+        IF v_existing.target_id <> p_target_id
+           OR v_existing.generation <> p_generation
+           OR v_existing.service <> p_service
+           OR v_existing.invocation_class <> p_invocation_class THEN
+            RAISE EXCEPTION 'compat_attempt_binding_mismatch' USING ERRCODE = 'P0001';
+        END IF;
         IF v_existing.disposition = 'UNKNOWN' THEN
             RAISE EXCEPTION 'compat_unknown_disposition_immutable' USING ERRCODE = 'P0001';
+        END IF;
+        IF v_existing.disposition <> 'PENDING'
+           AND p_disposition <> v_existing.disposition THEN
+            RAISE EXCEPTION 'compat_settled_disposition_immutable' USING ERRCODE = 'P0001';
+        END IF;
+        IF v_existing.lease_generation IS NOT NULL
+           AND p_lease_generation IS NOT NULL
+           AND v_existing.lease_generation <> p_lease_generation THEN
+            RAISE EXCEPTION 'compat_lease_generation_mismatch' USING ERRCODE = 'P0001';
         END IF;
         UPDATE compat_control.work_evidence
         SET correlation_id = COALESCE(p_correlation_id, correlation_id),
@@ -169,8 +184,9 @@ AS $$
     WHERE tc.singleton_id = TRUE;
 $$;
 
--- Sender-only, target-bound uncertainty check. No product role can read the
--- protected work ledger; an unresolved SMTP outcome must still block reclaim.
+-- Sender-only, target-bound uncertainty check. A crashed sender leaves PENDING,
+-- which must block reclaim just as UNKNOWN does. The current invocation may
+-- exclude only its own still-pending reservation for the same tenant/epoch.
 CREATE OR REPLACE FUNCTION compat_control.has_unknown_sender_attempt(
     p_job_id TEXT, p_organization_id TEXT
 ) RETURNS BOOLEAN
@@ -182,9 +198,19 @@ AS $$
         FROM compat_control.work_evidence w
         JOIN compat_control.target_control c ON c.target_id = w.target_id
         WHERE c.singleton_id = TRUE AND c.db_name = current_database()
-          AND w.service = 'sender' AND w.disposition = 'UNKNOWN'
+          AND w.service = 'sender' AND w.disposition IN ('PENDING', 'UNKNOWN')
           AND p_organization_id IS NOT NULL
           AND p_organization_id = NULLIF(current_setting('app.organization_id', true), '')
+          AND NOT (
+              w.disposition = 'PENDING'
+              AND w.attempt_id = NULLIF(current_setting('app.compat_attempt_id', true), '')
+              AND w.created_by_role = session_user
+              AND w.owner_epoch = c.owner_epoch
+              AND w.generation = c.active_generation
+              AND w.invocation_class = 'sender_claim'
+              AND (w.correlation_id = p_job_id
+                   OR w.correlation_id = 'org:' || p_organization_id)
+          )
           AND (
               (p_job_id IS NOT NULL AND w.correlation_id = p_job_id)
               OR (p_organization_id IS NOT NULL AND

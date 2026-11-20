@@ -8,13 +8,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from carepulse.compat.admission import (
-    CompatAdmissionError,
-    CompatRuntimeConfig,
-    is_compat_enabled,
-    verify_connection_identity,
-    verify_control_and_head,
-)
+from carepulse.compat.admission import is_compat_enabled, probe_compat_readiness
 from carepulse.config import ConfigError, Consumer, load_config
 from carepulse.db import create_db_engine, transaction
 
@@ -41,24 +35,14 @@ def probe_readiness(consumer: Consumer) -> bool:
 def _database_ready(consumer: Consumer) -> bool:
     engine = create_db_engine(load_config(consumer))
     try:
+        if is_compat_enabled():
+            return probe_compat_readiness(engine, consumer)
         with transaction(engine) as connection:
             connection.execute(text("SET LOCAL statement_timeout = 2000"))
             revisions = connection.scalars(
                 text("SELECT version_num FROM public.alembic_version")
             ).all()
-            if revisions != [COMPATIBLE_REVISION]:
-                return False
-            if is_compat_enabled():
-                compat_cfg = CompatRuntimeConfig.from_env(consumer)
-                if compat_cfg is None:
-                    return False
-                verify_connection_identity(connection, config=compat_cfg)
-                verify_control_and_head(
-                    connection, config=compat_cfg, lock_for_share=False
-                )
-            return True
-    except CompatAdmissionError:
-        return False
+            return revisions == [COMPATIBLE_REVISION]
     finally:
         engine.dispose()
 

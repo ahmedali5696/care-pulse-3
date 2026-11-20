@@ -63,11 +63,16 @@ def _settings() -> SenderSettings:
     )
 
 
-def _tenant(connection, organization_id: UUID) -> None:
+def _tenant(connection, organization_id: UUID, attempt_id: str | None = None) -> None:
     connection.execute(
         text("SELECT set_config('app.organization_id', :tenant, true)"),
         {"tenant": str(organization_id)},
     )
+    if attempt_id is not None:
+        connection.execute(
+            text("SELECT set_config('app.compat_attempt_id', :attempt, true)"),
+            {"attempt": attempt_id},
+        )
 
 
 def _material_payload(connection, claim: ClaimedJob) -> tuple[bytes, float] | None:
@@ -158,7 +163,7 @@ def send_one_job(
     engine = create_engine(settings.connection_url, hide_parameters=True)
     permit = None
     permit_conn = None
-    final_disposition = "NOT_SENT"
+    final_disposition = "UNKNOWN"
     claimed_job_id: str | None = str(job_id) if job_id else None
     claimed_lease_gen: int | None = None
     try:
@@ -174,8 +179,25 @@ def send_one_job(
                 record_attempt=True,
             )
         with engine.begin() as connection:
-            _tenant(connection, organization_id)
+            _tenant(connection, organization_id, permit.attempt_id if permit else None)
             claim = claim_delivery_job(connection, settings.policy, job_id)
+            if claim is not None and permit is not None:
+                connection.execute(
+                    text("""
+                        SELECT compat_control.record_own_attempt(
+                            :aid, :tid, :epoch, :generation, 'sender',
+                            'sender_claim', :job, :lease, 'PENDING'
+                        )
+                    """),
+                    {
+                        "aid": permit.attempt_id,
+                        "tid": permit.target_id,
+                        "epoch": permit.owner_epoch,
+                        "generation": permit.generation,
+                        "job": str(claim.id),
+                        "lease": claim.generation,
+                    },
+                )
         if claim is None:
             final_disposition = "NOT_SENT"
             return "NOT_DUE"
@@ -197,6 +219,7 @@ def send_one_job(
             final_disposition = "UNKNOWN"
             return "AMBIGUOUS"
         sent = transport_status == "SENT"
+        outcome = None
         with engine.begin() as connection:
             _tenant(connection, organization_id)
             attempts = connection.scalar(
@@ -205,10 +228,8 @@ def send_one_job(
             )
             if sent:
                 outcome = JobOutcome("SENT", detail="SMTP_ACCEPTED")
-                final_disposition = "SENT"
             elif attempts is not None and attempts >= settings.policy.max_attempts:
                 outcome = JobOutcome("FAILED", detail="ATTEMPTS_EXHAUSTED")
-                final_disposition = "NOT_SENT"
             else:
                 retry_at = connection.scalar(
                     text("SELECT clock_timestamp() + (:seconds * interval '1 second')"),
@@ -217,12 +238,29 @@ def send_one_job(
                 outcome = JobOutcome(
                     "READY", not_before=retry_at, detail="RETRY_SCHEDULED"
                 )
-                final_disposition = "NOT_SENT"
-            return (
-                outcome.state
-                if finish_delivery_job(connection, claim, outcome)
-                else "STALE"
-            )
+            updated = finish_delivery_job(connection, claim, outcome)
+        if not updated:
+            if not sent:
+                final_disposition = "NOT_SENT"  # Transport was definitely absent.
+            return "STALE"
+        # Independent transaction readback: Node success or a DB commit call alone
+        # cannot prove the job was settled under this exact lease generation.
+        with engine.begin() as observer:
+            _tenant(observer, organization_id)
+            row = observer.execute(
+                text("""
+                    SELECT state, last_outcome, claim_generation
+                    FROM public.delivery_jobs WHERE id = :job
+                """),
+                {"job": claim.id},
+            ).one_or_none()
+        if (
+            row
+            and row.claim_generation == claim.generation
+            and (row.state, row.last_outcome) == (outcome.state, outcome.detail)
+        ):
+            final_disposition = "SENT" if sent else "NOT_SENT"
+        return outcome.state
     except Exception:
         if claimed_lease_gen is not None:
             final_disposition = "UNKNOWN"

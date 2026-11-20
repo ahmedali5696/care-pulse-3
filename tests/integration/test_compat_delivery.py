@@ -13,10 +13,12 @@ from carepulse.compat.admission import (
     record_attempt_disposition,
     release_invocation_permit,
 )
+from carepulse.notifications import email_sender
 from carepulse.notifications.evidence import ClaimPolicy, claim_delivery_job
+from sqlalchemy import text
 
 from ops.compat.control import claim_owner_epoch, release_owner_lock
-from ops.compat.drain import drain_and_settle
+from ops.compat.drain import DrainError, drain_and_settle
 from ops.compat.work import (
     WorkEvidenceError,
     assert_all_work_settled,
@@ -199,6 +201,56 @@ def test_ambiguous_sender_attempt_blocks_reclaim_and_drain() -> None:
                 correlation_id=str(job_id),
                 record_attempt=True,
             )
+            # The exact sender's own PENDING reservation is excluded only while
+            # it presents that same live attempt; a crashed sender leaves PENDING.
+            with sender_eng.begin() as conn:
+                conn.exec_driver_sql(
+                    "SELECT set_config('app.organization_id', %s, true)",
+                    (str(organization_id),),
+                )
+                conn.exec_driver_sql(
+                    "SELECT set_config('app.compat_attempt_id', %s, true)",
+                    (permit.attempt_id,),
+                )
+                assert not conn.scalar(
+                    text(
+                        "SELECT compat_control.has_unknown_sender_attempt(:job, :tenant)"
+                    ),
+                    {"job": str(job_id), "tenant": str(organization_id)},
+                )
+            with sender_eng.begin() as conn:
+                conn.exec_driver_sql(
+                    "SELECT set_config('app.organization_id', %s, true)",
+                    (str(organization_id),),
+                )
+                assert (
+                    claim_delivery_job(
+                        conn, ClaimPolicy(timedelta(seconds=30), 3), job_id=job_id
+                    )
+                    is None
+                )
+                assert (
+                    claim_delivery_job(conn, ClaimPolicy(timedelta(seconds=30), 3))
+                    is None
+                )
+            verify_pending = connect_role("carepulse_migration", dbname=dbname)
+            try:
+                row = verify_pending.execute(
+                    "SELECT disposition, correlation_id, lease_generation "
+                    "FROM compat_control.work_evidence WHERE attempt_id=%s",
+                    (permit.attempt_id,),
+                ).fetchone()
+                assert (
+                    row["disposition"],
+                    row["correlation_id"],
+                    row["lease_generation"],
+                ) == (
+                    "PENDING",
+                    str(job_id),
+                    None,
+                )
+            finally:
+                verify_pending.close()
             record_attempt_disposition(
                 pconn,
                 permit,
@@ -208,6 +260,23 @@ def test_ambiguous_sender_attempt_blocks_reclaim_and_drain() -> None:
                 lease_generation=original.generation,
             )
             release_invocation_permit(pconn, permit)
+
+            # Even a remembered attempt ID cannot exempt an UNKNOWN outcome.
+            with sender_eng.begin() as conn:
+                conn.exec_driver_sql(
+                    "SELECT set_config('app.organization_id', %s, true)",
+                    (str(organization_id),),
+                )
+                conn.exec_driver_sql(
+                    "SELECT set_config('app.compat_attempt_id', %s, true)",
+                    (permit.attempt_id,),
+                )
+                assert conn.scalar(
+                    text(
+                        "SELECT compat_control.has_unknown_sender_attempt(:job, :tenant)"
+                    ),
+                    {"job": str(job_id), "tenant": str(organization_id)},
+                )
 
             # Even after lease expiry or restart, claim_delivery_job refuses to reclaim UNKNOWN job_id!
             with sender_eng.begin() as conn:
@@ -265,10 +334,264 @@ def test_ambiguous_sender_attempt_blocks_reclaim_and_drain() -> None:
                 correlation_id=str(job_id),
             )
             assert_all_work_settled(owner_conn, target_id=target_id)
-            settled_ctrl = drain_and_settle(
-                owner_conn, target_id=target_id, owner_epoch=ctrl.owner_epoch
-            )
-            assert settled_ctrl.drain_verified_epoch == ctrl.owner_epoch
+            # Work disposition alone does not release a durable CLAIMED lease;
+            # a source sender claim must be settled independently first.
+            with pytest.raises(DrainError, match="Claimed sender jobs"):
+                drain_and_settle(
+                    owner_conn, target_id=target_id, owner_epoch=ctrl.owner_epoch
+                )
         finally:
             release_owner_lock(owner_conn, target_id)
             owner_conn.close()
+
+
+@pytest.mark.parametrize(
+    (
+        "transport_result",
+        "expected_result",
+        "expected_job_state",
+        "expected_disposition",
+    ),
+    [
+        ("NOT_SENT", "READY", "READY", "NOT_SENT"),
+        ("AMBIGUOUS", "AMBIGUOUS", "CLAIMED", "UNKNOWN"),
+        ("NOT_SENT", "INTERRUPTED", "READY", "UNKNOWN"),
+    ],
+)
+def test_real_sender_claim_transport_and_interrupted_settlement(
+    monkeypatch,
+    transport_result,
+    expected_result,
+    expected_job_state,
+    expected_disposition,
+) -> None:
+    with disposable_database("compat_send") as dbname:
+        admin = connect_role("carepulse_bootstrap", dbname=dbname, autocommit=True)
+        try:
+            ensure_roles_provisioned(admin, source_only=False)
+            grant_db_access(admin, dbname, source_only=False)
+            cluster_id = get_cluster_id(admin)
+        finally:
+            admin.close()
+        upgrade_to_revision(dbname, CANDIDATE_HEAD)
+        target_id = f"t-{dbname}"
+        source_manifest = build_manifest(
+            generation="source",
+            target_id=target_id,
+            cluster_id=cluster_id,
+            db_name=dbname,
+        )
+        candidate_manifest = build_manifest(
+            generation="candidate",
+            target_id=target_id,
+            cluster_id=cluster_id,
+            db_name=dbname,
+        )
+        migration = connect_role("carepulse_migration", dbname=dbname)
+        try:
+            provision_target_control(
+                migration,
+                target_id=target_id,
+                cluster_id=cluster_id,
+                db_name=dbname,
+                source_manifest_id=source_manifest.manifest_id,
+                target_manifest_id=candidate_manifest.manifest_id,
+            )
+            initial_activate_matched_target(
+                migration,
+                manifest=candidate_manifest,
+                expected_target_id=target_id,
+            )
+            job_id = uuid.uuid4()
+            tenant_id = _seed_claimable_job(migration, job_id)
+        finally:
+            migration.close()
+
+        monkeypatch.setenv("CP_COMPAT_TARGET_ID", target_id)
+        monkeypatch.setenv("CP_COMPAT_GENERATION", "candidate")
+        monkeypatch.setenv("CP_COMPAT_EXPECTED_HEAD", CANDIDATE_HEAD)
+        monkeypatch.setenv("CP_COMPAT_MANIFEST_ID", candidate_manifest.manifest_id)
+        monkeypatch.setenv("CP_DB_NAME", dbname)
+        transport_calls = []
+
+        def transport(payload, _timeout):
+            if payload is None:
+                return "SENT"  # Local config check; no SMTP connection.
+            transport_calls.append(job_id)
+            return transport_result
+
+        monkeypatch.setattr(email_sender, "_node_call", transport)
+        original_tenant = email_sender._tenant
+        if expected_result == "INTERRUPTED":
+            count = 0
+
+            def interrupted_readback(connection, organization_id, attempt_id=None):
+                nonlocal count
+                count += 1
+                if count == 4:  # Readback after the actual claim and finish commits.
+                    raise RuntimeError("Independent sender settlement read interrupted")
+                return original_tenant(connection, organization_id, attempt_id)
+
+            monkeypatch.setattr(email_sender, "_tenant", interrupted_readback)
+        sender = make_sa_engine("carepulse_sender", dbname=dbname)
+        settings = email_sender.SenderSettings(
+            ClaimPolicy(timedelta(seconds=30), 3),
+            5,
+            30,
+            sender.url,
+        )
+        try:
+            if expected_result == "INTERRUPTED":
+                with pytest.raises(RuntimeError, match="settlement read interrupted"):
+                    email_sender.send_one_job(tenant_id, job_id, settings)
+                monkeypatch.setattr(email_sender, "_tenant", original_tenant)
+            else:
+                assert (
+                    email_sender.send_one_job(tenant_id, job_id, settings)
+                    == expected_result
+                )
+            assert transport_calls == [job_id]
+            observer = connect_role("carepulse_migration", dbname=dbname)
+            try:
+                job = observer.execute(
+                    "SELECT state, attempts, claim_generation, last_outcome "
+                    "FROM public.delivery_jobs WHERE id=%s",
+                    (job_id,),
+                ).fetchone()
+                evidence = observer.execute(
+                    "SELECT disposition, correlation_id, lease_generation "
+                    "FROM compat_control.work_evidence "
+                    "WHERE target_id=%s AND service='sender'",
+                    (target_id,),
+                ).fetchone()
+                assert (job["state"], job["attempts"], job["claim_generation"]) == (
+                    expected_job_state,
+                    1,
+                    1,
+                )
+                assert (
+                    evidence["disposition"],
+                    evidence["correlation_id"],
+                    evidence["lease_generation"],
+                ) == (
+                    expected_disposition,
+                    str(job_id),
+                    1,
+                )
+                if transport_result == "NOT_SENT":
+                    assert job["last_outcome"] == "RETRY_SCHEDULED"
+                    if expected_result != "INTERRUPTED":
+                        assert (
+                            email_sender.send_one_job(tenant_id, job_id, settings)
+                            == "NOT_DUE"
+                        )
+                        assert transport_calls == [job_id]
+                    # Scheduled retry becomes due only after its persisted deadline.
+                    observer.execute(
+                        "ALTER TABLE public.delivery_jobs DISABLE TRIGGER delivery_jobs_guard"
+                    )
+                    observer.execute(
+                        "UPDATE public.delivery_jobs SET not_before=clock_timestamp()-interval '1 second' "
+                        "WHERE id=%s",
+                        (job_id,),
+                    )
+                    observer.execute(
+                        "ALTER TABLE public.delivery_jobs ENABLE TRIGGER delivery_jobs_guard"
+                    )
+                    observer.commit()
+                    assert email_sender.send_one_job(tenant_id, job_id, settings) == (
+                        "NOT_DUE" if expected_result == "INTERRUPTED" else "READY"
+                    )
+                    assert transport_calls == (
+                        [job_id]
+                        if expected_result == "INTERRUPTED"
+                        else [job_id, job_id]
+                    )
+                    retried = observer.execute(
+                        "SELECT state, attempts, claim_generation FROM public.delivery_jobs "
+                        "WHERE id=%s",
+                        (job_id,),
+                    ).fetchone()
+                    assert (
+                        retried["state"],
+                        retried["attempts"],
+                        retried["claim_generation"],
+                    ) == (
+                        ("READY", 1, 1)
+                        if expected_result == "INTERRUPTED"
+                        else ("READY", 2, 2)
+                    )
+                else:
+                    assert job["last_outcome"] is None
+                    observer.execute(
+                        "ALTER TABLE public.delivery_jobs DISABLE TRIGGER delivery_jobs_guard"
+                    )
+                    observer.execute(
+                        "UPDATE public.delivery_jobs SET "
+                        "claimed_at=clock_timestamp()-interval '2 hours', "
+                        "lease_expires_at=clock_timestamp()-interval '1 hour' "
+                        "WHERE id=%s",
+                        (job_id,),
+                    )
+                    observer.execute(
+                        "ALTER TABLE public.delivery_jobs ENABLE TRIGGER delivery_jobs_guard"
+                    )
+                    observer.commit()
+                    assert (
+                        email_sender.send_one_job(tenant_id, None, settings)
+                        == "NOT_DUE"
+                    )
+                    assert transport_calls == [job_id]
+                    unchanged = observer.execute(
+                        "SELECT state, attempts, claim_generation FROM public.delivery_jobs "
+                        "WHERE id=%s",
+                        (job_id,),
+                    ).fetchone()
+                    assert (
+                        unchanged["state"],
+                        unchanged["attempts"],
+                        unchanged["claim_generation"],
+                    ) == ("CLAIMED", 1, 1)
+            finally:
+                observer.close()
+
+            # An admitted HTTP invocation can finish its socket lifetime with
+            # no independently proved domain receipt. Releasing the permit
+            # preserves PENDING through a separate observer transaction.
+            api_engine = make_sa_engine("carepulse_api", dbname=dbname)
+            try:
+                api_cfg = CompatRuntimeConfig(
+                    target_id=target_id,
+                    manifest_id=candidate_manifest.manifest_id,
+                    generation="candidate",
+                    expected_head=CANDIDATE_HEAD,
+                    service="api",
+                    db_name=dbname,
+                )
+                http_permit, http_connection = acquire_invocation_permit(
+                    api_engine,
+                    config=api_cfg,
+                    expected_login="carepulse_api",
+                    invocation_class="http",
+                    record_attempt=True,
+                )
+                release_invocation_permit(http_connection, http_permit)
+                verification = connect_role("carepulse_migration", dbname=dbname)
+                try:
+                    http = verification.execute(
+                        "SELECT disposition, correlation_id "
+                        "FROM compat_control.work_evidence WHERE attempt_id=%s",
+                        (http_permit.attempt_id,),
+                    ).fetchone()
+                    assert (http["disposition"], http["correlation_id"]) == (
+                        "PENDING",
+                        None,
+                    )
+                    with pytest.raises(WorkEvidenceError):
+                        assert_all_work_settled(verification, target_id=target_id)
+                finally:
+                    verification.close()
+            finally:
+                api_engine.dispose()
+        finally:
+            sender.dispose()

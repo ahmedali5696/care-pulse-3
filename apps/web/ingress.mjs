@@ -63,22 +63,18 @@ createServer(async (request, response) => {
   }
 
   let released = false;
-  const finishPermit = (disposition) => {
+  const finishPermit = () => {
     if (!permit || released) return;
     released = true;
-    releaseWebAdmissionPermit(permit, disposition).catch(() => {});
+    releaseWebAdmissionPermit(permit).catch(() => {});
   };
   if (permit) {
-    response.once("finish", () =>
-      finishPermit(response.statusCode < 500 ? "COMMITTED" : "ROLLED_BACK"),
-    );
-    response.once("close", () =>
-      finishPermit(response.writableEnded && response.statusCode < 500 ? "COMMITTED" : "ROLLED_BACK"),
-    );
+    response.once("finish", finishPermit);
+    response.once("close", finishPermit);
   }
 
   handle(request, response).catch(() => {
-    finishPermit("ROLLED_BACK");
+    finishPermit();
     denyUnavailable(response);
   });
 }).listen(3000, "0.0.0.0");

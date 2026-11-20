@@ -14,6 +14,7 @@ from carepulse.compat.admission import (
     CompatRuntimeConfig,
     acquire_invocation_permit,
     check_pool_checkout,
+    probe_compat_readiness,
     release_invocation_permit,
 )
 
@@ -167,7 +168,7 @@ def test_real_logins_cannot_mutate_control_or_other_owner_work(
                 conn.close()
 
 
-def test_denies_missing_multiple_unknown_head_and_stale_pool() -> None:
+def test_denies_missing_multiple_unknown_head_and_stale_pool(monkeypatch) -> None:
     with disposable_database("compat_meta") as dbname:
         admin = connect_role("carepulse_bootstrap", dbname=dbname, autocommit=True)
         try:
@@ -224,6 +225,43 @@ def test_denies_missing_multiple_unknown_head_and_stale_pool() -> None:
             )
             release_invocation_permit(pconn, permit)
 
+            for name, value in {
+                "CP_COMPAT_TARGET_ID": target_id,
+                "CP_COMPAT_MANIFEST_ID": cand_m.manifest_id,
+                "CP_COMPAT_GENERATION": "candidate",
+                "CP_COMPAT_EXPECTED_HEAD": CANDIDATE_HEAD,
+                "CP_DB_NAME": dbname,
+            }.items():
+                monkeypatch.setenv(name, value)
+            assert probe_compat_readiness(api_engine, "api") is True
+
+            # Effective grants drift while an earlier pooled login survives.
+            with api_engine.connect() as surviving:
+                mig = connect_role("carepulse_migration", dbname=dbname)
+                try:
+                    mig.execute(
+                        "GRANT UPDATE ON compat_control.target_control TO carepulse_api"
+                    )
+                    mig.commit()
+                    with pytest.raises(CompatAdmissionError, match="privilege"):
+                        check_pool_checkout(
+                            surviving, config=cfg, expected_login="carepulse_api"
+                        )
+                    assert probe_compat_readiness(api_engine, "api") is False
+                finally:
+                    mig.execute(
+                        "REVOKE UPDATE ON compat_control.target_control FROM carepulse_api"
+                    )
+                    mig.commit()
+                    mig.close()
+                assert (
+                    check_pool_checkout(
+                        surviving, config=cfg, expected_login="carepulse_api"
+                    )
+                    == 1
+                )
+            assert probe_compat_readiness(api_engine, "api") is True
+
             mig = connect_role("carepulse_migration", dbname=dbname)
             try:
                 mig.execute("UPDATE compat_control.target_control SET phase = 'CLOSED'")
@@ -238,6 +276,7 @@ def test_denies_missing_multiple_unknown_head_and_stale_pool() -> None:
                 check_pool_checkout(
                     reused_conn, config=cfg, expected_login="carepulse_api"
                 )
+            assert probe_compat_readiness(api_engine, "api") is False
 
             # 2. Wrong service login (carepulse_gate pretending to be carepulse_api) denies
             gate_engine = make_sa_engine("carepulse_gate", dbname=dbname)
@@ -246,6 +285,7 @@ def test_denies_missing_multiple_unknown_head_and_stale_pool() -> None:
                     acquire_invocation_permit(
                         gate_engine, config=cfg, expected_login="carepulse_api"
                     )
+                assert probe_compat_readiness(gate_engine, "api") is False
             finally:
                 gate_engine.dispose()
 

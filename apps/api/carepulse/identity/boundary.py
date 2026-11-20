@@ -16,7 +16,6 @@ from carepulse.compat.admission import (
     acquire_invocation_permit,
     check_pool_checkout,
     is_compat_enabled,
-    record_attempt_disposition,
     release_invocation_permit,
 )
 from carepulse.identity.contracts import error_response
@@ -194,29 +193,11 @@ class ClosedServiceBoundary:
             envelope, payload, registered = await self._authenticate(scope, receive)
         except (KeyError, TypeError, ValueError, UnicodeError):
             if permit is not None and permit_conn is not None:
-                try:
-                    record_attempt_disposition(
-                        permit_conn,
-                        permit,
-                        invocation_class="http",
-                        disposition="ROLLED_BACK",
-                    )
-                except CompatAdmissionError:
-                    pass
                 release_invocation_permit(permit_conn, permit)
             await self._deny(401, scope, receive, send)
             return
         except BoundaryDenied as denied:
             if permit is not None and permit_conn is not None:
-                try:
-                    record_attempt_disposition(
-                        permit_conn,
-                        permit,
-                        invocation_class="http",
-                        disposition="ROLLED_BACK",
-                    )
-                except CompatAdmissionError:
-                    pass
                 release_invocation_permit(permit_conn, permit)
             await self._deny(denied.status, scope, receive, send)
             return
@@ -235,31 +216,13 @@ class ClosedServiceBoundary:
                 return {"type": "http.request", "body": payload, "more_body": False}
             return {"type": "http.disconnect"}
 
-        response_status = 500
-
-        async def tracked_send(message: dict) -> None:
-            nonlocal response_status
-            if message.get("type") == "http.response.start":
-                response_status = int(message.get("status", 500))
-            await send(message)
-
         token = current_request.set(registered)
         try:
-            await self.app(scope, replay_body, tracked_send)
+            await self.app(scope, replay_body, send)
         finally:
             current_request.reset(token)
             if permit is not None and permit_conn is not None:
-                try:
-                    record_attempt_disposition(
-                        permit_conn,
-                        permit,
-                        invocation_class="http",
-                        disposition=(
-                            "COMMITTED" if response_status < 500 else "ROLLED_BACK"
-                        ),
-                    )
-                except CompatAdmissionError:
-                    pass
+                # Leave PENDING until the exact transaction/receipt is proven.
                 release_invocation_permit(permit_conn, permit)
 
     async def _authenticate(

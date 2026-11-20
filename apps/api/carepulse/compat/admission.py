@@ -26,6 +26,11 @@ _EXPECTED_ROLE_BY_SERVICE: dict[str, frozenset[str]] = {
     "worker": frozenset({"carepulse_worker"}),
     "sender": frozenset({"carepulse_sender"}),
 }
+_SOURCE_ROLE_BY_SERVICE = {
+    "api": frozenset({"carepulse_runtime"}),
+    "worker": frozenset({"carepulse_runtime"}),
+    "sender": frozenset({"carepulse_sender"}),
+}
 
 
 class CompatAdmissionError(RuntimeError):
@@ -58,7 +63,10 @@ class CompatRuntimeConfig:
         expected_head = os.environ.get("CP_COMPAT_EXPECTED_HEAD", "").strip()
         manifest_id = os.environ.get("CP_COMPAT_MANIFEST_ID", "").strip()
         db_name = os.environ.get("CP_DB_NAME", "carepulse").strip()
-        if not expected_head or not manifest_id or not db_name:
+        build_head = SOURCE_HEAD if generation == "source" else CANDIDATE_HEAD
+        if expected_head != build_head:
+            raise CompatAdmissionError("Incompatible build head")
+        if not manifest_id or not db_name:
             raise CompatAdmissionError("Incomplete compatibility configuration")
         return cls(
             target_id=target_id,
@@ -107,7 +115,7 @@ def verify_connection_identity(
     config: CompatRuntimeConfig,
     expected_login: str | None = None,
 ) -> tuple[str, str]:
-    """Verify actual DB, session/current role, and non-privileged role flags on a connection."""
+    """Verify login identity and effective grants on the checked-out connection."""
     row = (
         session_or_conn.execute(
             text(
@@ -117,7 +125,35 @@ def verify_connection_identity(
                    current_user::text AS current_user,
                    r.rolsuper,
                    r.rolbypassrls,
-                   r.rolcanlogin
+                   r.rolcanlogin, r.rolcreatedb, r.rolcreaterole,
+                   r.rolreplication, r.rolinherit,
+                   EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid)
+                       AS role_member,
+                   has_database_privilege(current_user, current_database(), 'CONNECT')
+                       AS can_connect,
+                   has_schema_privilege(current_user, 'compat_control', 'USAGE')
+                       AS control_usage,
+                   has_function_privilege(current_user,
+                       'compat_control.read_target_control()', 'EXECUTE')
+                       AS control_reader,
+                   has_function_privilege(current_user,
+                       'compat_control.read_target_status()', 'EXECUTE')
+                       AS control_status_reader,
+                   has_table_privilege(current_user,
+                       'compat_control.target_control', 'UPDATE') AS control_update,
+                   has_table_privilege(current_user,
+                       'compat_control.target_control', 'DELETE') AS control_delete,
+                   has_schema_privilege(current_user, 'public', 'USAGE') AS public_usage,
+                   has_table_privilege(current_user, 'public.patients', 'SELECT')
+                       AS patient_read,
+                   has_table_privilege(current_user, 'public.delivery_jobs', 'UPDATE')
+                       AS delivery_update,
+                   has_table_privilege(current_user, 'public.auth_login_attempts', 'INSERT')
+                       AS web_attempt_insert,
+                   COALESCE(has_schema_privilege(current_user,
+                       to_regnamespace('f01_private'), 'USAGE'), false) AS private_usage,
+                   COALESCE(has_schema_privilege(current_user,
+                       to_regnamespace('f01_crypto'), 'USAGE'), false) AS crypto_usage
             FROM pg_roles r
             WHERE r.rolname = current_user
             """
@@ -131,17 +167,46 @@ def verify_connection_identity(
     if row["db_name"] != config.db_name:
         raise CompatAdmissionError("Target database mismatch")
     allowed_roles = (
-        {expected_login}
-        if expected_login is not None
+        _SOURCE_ROLE_BY_SERVICE[config.service]
+        if config.generation == "source"
         else _EXPECTED_ROLE_BY_SERVICE[config.service]
     )
     if (
         row["session_user"] not in allowed_roles
         or row["current_user"] not in allowed_roles
         or row["session_user"] != row["current_user"]
+        or (expected_login is not None and row["current_user"] != expected_login)
     ):
         raise CompatAdmissionError("Unexpected effective database role")
-    if row["rolsuper"] or row["rolbypassrls"] or not row["rolcanlogin"]:
+    if (
+        row["rolsuper"]
+        or row["rolbypassrls"]
+        or not row["rolcanlogin"]
+        or row["rolcreatedb"]
+        or row["rolcreaterole"]
+        or row["rolreplication"]
+        or row["rolinherit"]
+        or row["role_member"]
+        or not row["can_connect"]
+        or not row["control_usage"]
+        or not row["control_reader"]
+        or not row["control_status_reader"]
+        or row["control_update"]
+        or row["control_delete"]
+        or not row["public_usage"]
+        or row["private_usage"]
+        or row["crypto_usage"]
+        or bool(row["patient_read"])
+        != (
+            row["current_user"] == "carepulse_api"
+            or (
+                config.generation == "source"
+                and row["current_user"] == "carepulse_runtime"
+            )
+        )
+        or (row["current_user"] == "carepulse_api" and row["delivery_update"])
+        or (row["current_user"] == "carepulse_web" and not row["web_attempt_insert"])
+    ):
         raise CompatAdmissionError("Invalid role privilege attributes")
     return str(row["session_user"]), str(row["db_name"])
 
@@ -335,13 +400,21 @@ def check_pool_checkout(
 
 def probe_compat_readiness(engine: Engine, service: ServiceKind) -> bool:
     """Bounded readiness check for /health/ready and worker status."""
-    config = CompatRuntimeConfig.from_env(service)
-    if config is None:
-        return True
     try:
+        config = CompatRuntimeConfig.from_env(service)
+        if config is None:
+            return True
         with engine.connect() as conn:
             conn.execute(text("SET LOCAL statement_timeout = 2000"))
-            verify_connection_identity(conn, config=config)
+            verify_connection_identity(
+                conn,
+                config=config,
+                expected_login=(
+                    "carepulse_api"
+                    if service == "api" and config.generation == "candidate"
+                    else None
+                ),
+            )
             verify_control_and_head(conn, config=config, lock_for_share=False)
         return True
     except (CompatAdmissionError, SQLAlchemyError):

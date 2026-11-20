@@ -29,7 +29,11 @@ from ops.compat.migrate import (
     enter_migrating_phase,
     observe_committed_successor,
 )
-from ops.compat.preflight import PUBLISHED_SUCCESSORS, run_source_preflight
+from ops.compat.preflight import (
+    PUBLISHED_SUCCESSORS,
+    US1_EXECUTED_CHECKPOINT,
+    run_source_preflight,
+)
 from ops.compat.prerequisites import apply_missing_prerequisites
 from ops.compat.verify import RetainedBaseline
 from tests.integration.compat_ci_helpers import (
@@ -227,7 +231,8 @@ def committed_0046_cutover(lab: RecoveryLab) -> Iterator[CommittedCutover]:
             observer,
             source_manifest=lab.source_manifest,
             target_manifest=lab.target_manifest,
-            us1_checkpoint_executed=True,
+            source_baseline=lab.retained_baseline(),
+            us1_checkpoint=US1_EXECUTED_CHECKPOINT,
         )
         epoch = claim_owner_epoch(
             owner,
@@ -261,15 +266,24 @@ def committed_0046_cutover(lab: RecoveryLab) -> Iterator[CommittedCutover]:
                 )
             },
         )
-        enter_migrating_phase(owner, target_id=lab.target_id, owner_epoch=epoch)
+        enter_migrating_phase(
+            owner,
+            observer,
+            target_id=lab.target_id,
+            owner_epoch=epoch,
+            preflight=preflight,
+            drain_proof=proof,
+        )
         predecessor = SOURCE_HEAD
         for successor in PUBLISHED_SUCCESSORS:
             advance_one_successor(
                 owner,
+                observer,
                 target_id=lab.target_id,
                 owner_epoch=epoch,
                 expected_predecessor=predecessor,
                 target_successor=successor,
+                preflight=preflight,
             )
             observe_committed_successor(
                 observer,

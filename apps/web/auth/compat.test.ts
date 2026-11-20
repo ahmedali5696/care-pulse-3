@@ -9,8 +9,10 @@ import {
   CompatAdmissionError,
   loadCompatWebConfig,
   permitLockKey,
+  releaseWebAdmissionPermit,
   verifyControlAndHead,
   verifyPoolClientIdentity,
+  verifyWebReadinessCompat,
 } from "../compat/admission.ts";
 
 test("permitLockKey produces deterministic signed 64-bit integer string", () => {
@@ -74,6 +76,56 @@ test("loadCompatWebConfig rejects mismatched API peer", () => {
   } finally {
     process.env = saved;
   }
+});
+
+test("loadCompatWebConfig rejects source head for candidate Web", async () => {
+  const saved = { ...process.env };
+  try {
+    process.env.CP_COMPAT_TARGET_ID = "target-1";
+    process.env.CP_COMPAT_GENERATION = "candidate";
+    process.env.CP_COMPAT_EXPECTED_HEAD = "0040_t173_numeric_money";
+    process.env.CP_COMPAT_MANIFEST_ID = "candidate-v1";
+    assert.throws(() => loadCompatWebConfig("http://candidate-api:8000"), CompatAdmissionError);
+    assert.equal(await verifyWebReadinessCompat(), false);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test("Web role verifies effective grants and denies privilege drift on a surviving connection", async () => {
+  const config = {
+    targetId: "target-1", manifestId: "candidate-v1",
+    generation: "candidate" as const,
+    expectedHead: "0046_f01_audit_integrity", dbName: "carepulse",
+    expectedApiPeer: "http://candidate-api:8000",
+  };
+  const role = {
+    db_name: "carepulse", session_user: "carepulse_web", current_user: "carepulse_web",
+    rolsuper: false, rolbypassrls: false, rolcanlogin: true,
+    rolcreatedb: false, rolcreaterole: false, rolreplication: false,
+    rolinherit: false, role_member: false, can_connect: true,
+    control_usage: true, control_reader: true, control_status_reader: true,
+    control_update: false, control_delete: false, public_usage: true,
+    patient_read: false, web_attempt_insert: true,
+    private_usage: false, crypto_usage: false,
+  };
+  let current = { ...role };
+  const fakeClient = { query: async () => ({ rows: [{ ...current }] }) };
+  await verifyPoolClientIdentity(fakeClient as never, config, "carepulse_web");
+  for (const change of [
+    { control_reader: false }, { can_connect: false },
+    { control_update: true }, { patient_read: true },
+    { rolcanlogin: false }, { role_member: true },
+    { web_attempt_insert: false },
+  ]) {
+    current = { ...role, ...change };
+    await assert.rejects(
+      verifyPoolClientIdentity(fakeClient as never, config, "carepulse_web"),
+      CompatAdmissionError,
+    );
+  }
+  current = role;
+  await verifyPoolClientIdentity(fakeClient as never, config, "carepulse_web");
 });
 
 test("verifyPoolClientIdentity rejects superuser or wrong role", async () => {
@@ -140,4 +192,45 @@ test("verifyControlAndHead rejects closed or intermediate head", async () => {
     }),
     CompatAdmissionError,
   );
+});
+
+test("source and candidate Web control readers admit only their active generation", async () => {
+  for (const [generation, expectedHead, phase] of [
+    ["source", "0040_t173_numeric_money", "SOURCE_OPEN"],
+    ["candidate", "0046_f01_audit_integrity", "TARGET_OPEN"],
+  ] as const) {
+    const config = {
+      targetId: "target-1", manifestId: `${generation}-manifest`,
+      generation, expectedHead, dbName: "carepulse",
+      expectedApiPeer: `http://${generation}-api:8000`,
+    };
+    const row = {
+      target_id: "target-1", db_name: "carepulse", phase,
+      owner_epoch: 3, manifest_id: config.manifestId,
+      active_generation: generation, source_sealed: false, alembic_head: expectedHead,
+    };
+    const client = { query: async () => ({ rows: [{ ...row }] }) };
+    assert.equal(await verifyControlAndHead(client as never, config, false), 3);
+    Object.assign(row, { phase: "DRAINING", active_generation: "none" });
+    await assert.rejects(
+      verifyControlAndHead(client as never, config, false),
+      CompatAdmissionError,
+    );
+  }
+});
+
+test("Web permit release cannot settle an unproven HTTP attempt", async () => {
+  const statements: string[] = [];
+  let released = false;
+  const client = {
+    async query(statement: string) { statements.push(statement); return { rows: [] }; },
+    release() { released = true; },
+  };
+  await releaseWebAdmissionPermit({
+    attemptId: "attempt-1", targetId: "target-1", ownerEpoch: 1,
+    generation: "candidate", permitKey: "42", client: client as never,
+  });
+  assert.equal(released, true);
+  assert.equal(statements.length, 1);
+  assert.match(statements[0], /pg_advisory_unlock_shared/);
 });

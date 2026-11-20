@@ -336,6 +336,18 @@ def test_ordered_invocation_versus_drain_with_lock_observation() -> None:
             mark_source_sealed_in_control(
                 owner_conn, target_id=target_id, owner_epoch=ctrl.owner_epoch
             )
+            # A completed invocation can leave a pooled PostgreSQL backend idle.
+            # It remains a valid old login after NOLOGIN and must block migration.
+            with pytest.raises(DrainError, match="Surviving product sessions"):
+                observe_drain_complete(
+                    obs,
+                    target_id=target_id,
+                    expected_epoch=ctrl.owner_epoch,
+                    consumers_stopped=True,
+                    require_source_sealed=True,
+                )
+            rt_eng.dispose()
+            sender_eng.dispose()
             proof = observe_drain_complete(
                 obs,
                 target_id=target_id,

@@ -73,6 +73,16 @@ function getRuntimePool() {
   return _runtimePool;
 }
 
+async function sourceReady() {
+  const cfg = loadSourceConfig();
+  const client = await getRuntimePool().connect();
+  try {
+    await verifyClient(client, cfg, process.env.CP_DB_USER || "carepulse_runtime");
+  } finally {
+    client.release();
+  }
+}
+
 async function verifyClient(client, cfg, expectedRole) {
   const ident = await client.query(
     `SELECT current_database() AS db_name,
@@ -94,14 +104,9 @@ async function verifyClient(client, cfg, expectedRole) {
     throw new Error("Role/database mismatch");
   }
 
-  const rev = await client.query("SELECT version_num FROM public.alembic_version");
-  if (rev.rows.length !== 1 || rev.rows[0].version_num !== SOURCE_HEAD) {
-    throw new Error("Incompatible schema revision");
-  }
-
   const ctrl = await client.query(
     `SELECT target_id, db_name, phase, owner_epoch,
-            source_manifest_id, active_generation, source_sealed
+            source_manifest_id, active_generation, source_sealed, alembic_head
      FROM compat_control.read_target_control()`,
   );
   if (ctrl.rows.length !== 1) throw new Error("Missing target control");
@@ -109,6 +114,7 @@ async function verifyClient(client, cfg, expectedRole) {
   if (
     c.target_id !== cfg.targetId ||
     c.db_name !== cfg.dbName ||
+    c.alembic_head !== SOURCE_HEAD ||
     c.phase !== "SOURCE_OPEN" ||
     c.active_generation !== "source" ||
     c.source_sealed ||
@@ -160,13 +166,8 @@ async function acquireSourcePermit(cfg) {
   }
 }
 
-async function releaseSourcePermit(permit, disposition) {
-  try {
-    await permit.client.query(
-      `SELECT compat_control.record_own_attempt($1, $2, $3, 'source', 'web', 'http', NULL, NULL, $4)`,
-      [permit.attemptId, permit.targetId, permit.epoch, disposition],
-    );
-  } catch {}
+async function releaseSourcePermit(permit) {
+  // HTTP completion is not proof of the domain transaction or its receipt.
   try {
     await permit.client.query("SELECT pg_advisory_unlock_shared($1::bigint)", [
       permit.key,
@@ -209,7 +210,20 @@ http.createServer = function (optionsOrListener, maybeListener) {
     typeof optionsOrListener === "function" ? optionsOrListener : maybeListener;
   const wrappedListener = async (request, response) => {
     const urlPath = (request.url || "/").split("?")[0];
-    if (urlPath === "/health/live" || urlPath === "/health/ready") {
+    if (urlPath === "/health/live") {
+      return listener(request, response);
+    }
+    if (urlPath === "/health/ready") {
+      try {
+        await compatCheckActive.run(true, sourceReady);
+      } catch {
+        response.writeHead(503, {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+        });
+        response.end(JSON.stringify({ ready: false }));
+        return;
+      }
       return listener(request, response);
     }
     delete request.headers["x-carepulse-generation"];
@@ -229,23 +243,15 @@ http.createServer = function (optionsOrListener, maybeListener) {
     }
 
     let released = false;
-    const finish = (disp) => {
+    const finish = () => {
       if (released) return;
       released = true;
       compatCheckActive
-        .run(true, () => releaseSourcePermit(permit, disp))
+        .run(true, () => releaseSourcePermit(permit))
         .catch(() => {});
     };
-    response.once("finish", () =>
-      finish(response.statusCode < 500 ? "COMMITTED" : "ROLLED_BACK"),
-    );
-    response.once("close", () =>
-      finish(
-        response.writableEnded && response.statusCode < 500
-          ? "COMMITTED"
-          : "ROLLED_BACK",
-      ),
-    );
+    response.once("finish", finish);
+    response.once("close", finish);
     return listener(request, response);
   };
 

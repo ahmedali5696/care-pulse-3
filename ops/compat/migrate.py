@@ -12,12 +12,22 @@ from psycopg.rows import tuple_row
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-from ops.compat.control import assert_current_owner
-from ops.compat.preflight import PUBLISHED_SUCCESSORS
+from ops.compat.control import assert_current_owner, read_control_record
+from ops.compat.drain import (
+    DrainVerification,
+    assert_exclusive_drain_permit,
+    observe_drain_complete,
+)
+from ops.compat.preflight import (
+    PUBLISHED_SUCCESSORS,
+    PreflightReport,
+    verify_populated_source_basis,
+)
 from ops.compat.probes import (
     probe_alembic_head,
     probe_effective_table_privileges,
     probe_rls_and_triggers,
+    probe_target_identity,
 )
 from ops.compat.work import assert_all_work_settled
 
@@ -64,11 +74,78 @@ class StepObservation:
     phase: str
 
 
-def enter_migrating_phase(
-    conn: psycopg.Connection,
+def _recheck_migration_boundary(
+    owner_conn: psycopg.Connection,
+    observer_conn: psycopg.Connection,
     *,
     target_id: str,
     owner_epoch: int,
+    expected_head: str,
+    expected_phase: str,
+    preflight: PreflightReport,
+) -> None:
+    """Independently recheck the sealed target and retained source before DDL."""
+    ctrl = assert_current_owner(
+        owner_conn,
+        target_id=target_id,
+        expected_epoch=owner_epoch,
+        lock_mode="UPDATE",
+    )
+    assert_exclusive_drain_permit(owner_conn, target_id)
+    ident = probe_target_identity(
+        observer_conn,
+        expected_cluster_id=preflight.cluster_id,
+        expected_db_name=preflight.db_name,
+    )
+    observed = read_control_record(observer_conn)
+    if (
+        ident.db_name != preflight.db_name
+        or ctrl != observed
+        or ctrl.phase != expected_phase
+        or ctrl.active_generation != "none"
+        or not ctrl.source_sealed
+        or ctrl.drain_verified_epoch != owner_epoch
+        or ctrl.source_manifest_id != preflight.source_manifest_id
+        or ctrl.target_manifest_id != preflight.target_manifest_id
+    ):
+        raise MigrationStepError(
+            "Sealed owner, source manifest, or drain proof changed"
+        )
+    probe_alembic_head(owner_conn, expected_head=expected_head)
+    probe_alembic_head(observer_conn, expected_head=expected_head)
+    assert_all_work_settled(observer_conn, target_id=target_id)
+    claimed = observer_conn.execute(
+        "SELECT count(*) AS n FROM public.delivery_jobs WHERE state='CLAIMED'"
+    ).fetchone()["n"]
+    sessions = observer_conn.execute(
+        """
+        SELECT count(*) AS n FROM pg_stat_activity
+        WHERE datname=current_database() AND usename IN
+          ('carepulse_runtime','carepulse_api','carepulse_web','carepulse_worker',
+           'carepulse_gate','carepulse_auth','carepulse_sender')
+        """
+    ).fetchone()["n"]
+    if claimed or sessions:
+        raise MigrationStepError(
+            "Claims or surviving service sessions prevent migration"
+        )
+    verify_populated_source_basis(
+        observer_conn,
+        preflight.source_baseline,
+        preflight.target_id,
+        preflight.cluster_id,
+        preflight.db_name,
+    )
+
+
+def enter_migrating_phase(
+    conn: psycopg.Connection,
+    observer_conn: psycopg.Connection,
+    *,
+    target_id: str,
+    owner_epoch: int,
+    preflight: PreflightReport,
+    drain_proof: DrainVerification,
 ) -> None:
     """Transition DRAINING -> MIGRATING under current owner lock and verified drain."""
     ctrl = assert_current_owner(
@@ -78,6 +155,24 @@ def enter_migrating_phase(
         raise MigrationStepError(f"Cannot enter MIGRATING from {ctrl.phase}")
     if ctrl.drain_verified_epoch != owner_epoch:
         raise MigrationStepError("Drain not verified for current owner epoch")
+    if drain_proof.owner_epoch != owner_epoch or not drain_proof.consumers_stopped:
+        raise MigrationStepError("No verified stopped-consumer proof")
+    observe_drain_complete(
+        observer_conn,
+        target_id=target_id,
+        expected_epoch=owner_epoch,
+        consumers_stopped=drain_proof.consumers_stopped,
+        require_source_sealed=True,
+    )
+    _recheck_migration_boundary(
+        conn,
+        observer_conn,
+        target_id=target_id,
+        owner_epoch=owner_epoch,
+        expected_head=preflight.head,
+        expected_phase=ctrl.phase,
+        preflight=preflight,
+    )
     assert_all_work_settled(conn, target_id=target_id)
     conn.execute(
         """
@@ -94,11 +189,13 @@ def enter_migrating_phase(
 
 def advance_one_successor(
     owner_conn: psycopg.Connection,
+    observer_conn: psycopg.Connection,
     *,
     target_id: str,
     owner_epoch: int,
     expected_predecessor: str,
     target_successor: str,
+    preflight: PreflightReport,
     alembic_ini: Path | None = None,
 ) -> str:
     """Advance exactly one published successor on the same owner-lock backend connection (T038)."""
@@ -116,6 +213,15 @@ def advance_one_successor(
         raise MigrationStepError(
             f"Migration requires MIGRATING/none, observed {ctrl.phase}/{ctrl.active_generation}"
         )
+    _recheck_migration_boundary(
+        owner_conn,
+        observer_conn,
+        target_id=target_id,
+        owner_epoch=owner_epoch,
+        expected_head=expected_predecessor,
+        expected_phase="MIGRATING",
+        preflight=preflight,
+    )
     actual_head = probe_alembic_head(owner_conn, expected_head=expected_predecessor)
     assert actual_head == expected_predecessor
     owner_conn.commit()

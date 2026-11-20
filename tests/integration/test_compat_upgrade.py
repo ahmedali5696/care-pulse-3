@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import patch
 
 import psycopg
@@ -20,7 +21,7 @@ from ops.compat.control import (
     release_exclusive_drain_permit,
     release_owner_lock,
 )
-from ops.compat.drain import drain_and_settle, observe_drain_complete
+from ops.compat.drain import DrainError, drain_and_settle, observe_drain_complete
 from ops.compat.launch import mark_source_sealed_in_control
 from ops.compat.manifest import CANDIDATE_HEAD, SOURCE_HEAD
 from ops.compat.migrate import (
@@ -30,11 +31,13 @@ from ops.compat.migrate import (
 )
 from ops.compat.preflight import (
     PUBLISHED_SUCCESSORS,
+    US1_EXECUTED_CHECKPOINT,
     PreflightError,
     run_source_preflight,
 )
 from ops.compat.prerequisites import PrerequisiteError, apply_missing_prerequisites
 from ops.compat.probes import ProbeError, probe_alembic_head, probe_role_attributes
+from ops.compat.verify import RetainedBaseline
 from tests.integration.compat_ci_helpers import (
     build_manifest,
     connect_role,
@@ -185,18 +188,44 @@ def test_populated_0040_to_0046_cutover_and_t030_fencing() -> None:
         observer = connect_role("carepulse_bootstrap", dbname=dbname, autocommit=True)
         try:
             # 1. Read-only preflight passes at 0040; negative preflight with wrong target fails cleanly.
+            baseline = RetainedBaseline(
+                target_id=target_id,
+                cluster_id=cluster_id,
+                db_name=dbname,
+                tenant_ids=(inventory.org_a_id, inventory.org_b_id),
+                expected_rows=inventory.expected_rows,
+                nonce_reference=inventory.nonce_reference,
+            )
             preflight = run_source_preflight(
                 observer,
                 source_manifest=src_m,
                 target_manifest=cand_m,
-                us1_checkpoint_executed=True,
+                source_baseline=baseline,
+                us1_checkpoint=US1_EXECUTED_CHECKPOINT,
             )
+            assert preflight.checked_source_rows >= 12
             with pytest.raises(PreflightError):
                 run_source_preflight(
                     observer,
                     source_manifest=src_m,
                     target_manifest=cand_m,
-                    us1_checkpoint_executed=False,
+                    source_baseline=baseline,
+                )
+            bad_rows = dict(baseline.expected_rows)
+            bad_rows["appointments"] = (
+                {
+                    **bad_rows["appointments"][0],
+                    "id": "00000000-0000-0000-0000-000000000000",
+                },
+                *bad_rows["appointments"][1:],
+            )
+            with pytest.raises(PreflightError, match="Inconsistent populated"):
+                run_source_preflight(
+                    observer,
+                    source_manifest=src_m,
+                    target_manifest=cand_m,
+                    source_baseline=replace(baseline, expected_rows=bad_rows),
+                    us1_checkpoint=US1_EXECUTED_CHECKPOINT,
                 )
 
             # 2. Claim owner epoch, close/drain, seal source, and obtain T037 proof.
@@ -242,6 +271,31 @@ def test_populated_0040_to_0046_cutover_and_t030_fencing() -> None:
                     },
                 )
 
+            # An idle source connection surviving the drain invalidates the
+            # previous proof; neither delta preparation nor DDL may proceed.
+            survivor = connect_role("carepulse_runtime", dbname=dbname, autocommit=True)
+            try:
+                with pytest.raises(DrainError, match="Surviving product sessions"):
+                    apply_missing_prerequisites(
+                        admin_owner,
+                        observer,
+                        owner_conn=owner_conn,
+                        preflight=preflight,
+                        drain_proof=drain_proof,
+                        owner_epoch=ctrl.owner_epoch,
+                        role_passwords={
+                            r: read_secret(r)
+                            for r in (
+                                "carepulse_api",
+                                "carepulse_web",
+                                "carepulse_worker",
+                                "carepulse_gate",
+                            )
+                        },
+                    )
+            finally:
+                survivor.close()
+
             # 4. T030 succeeds under verified drain + current owner epoch.
             delta = apply_missing_prerequisites(
                 admin_owner,
@@ -264,7 +318,12 @@ def test_populated_0040_to_0046_cutover_and_t030_fencing() -> None:
 
             # 5. Enter MIGRATING and advance one published successor per commit + fresh observer readback.
             enter_migrating_phase(
-                owner_conn, target_id=target_id, owner_epoch=ctrl.owner_epoch
+                owner_conn,
+                observer,
+                target_id=target_id,
+                owner_epoch=ctrl.owner_epoch,
+                preflight=preflight,
+                drain_proof=drain_proof,
             )
 
             # The first real successor must roll back if control is lost between
@@ -286,10 +345,12 @@ def test_populated_0040_to_0046_cutover_and_t030_fencing() -> None:
             ):
                 advance_one_successor(
                     owner_conn,
+                    observer,
                     target_id=target_id,
                     owner_epoch=ctrl.owner_epoch,
                     expected_predecessor=SOURCE_HEAD,
                     target_successor=PUBLISHED_SUCCESSORS[0],
+                    preflight=preflight,
                 )
             assert (
                 probe_alembic_head(observer, expected_head=SOURCE_HEAD) == SOURCE_HEAD
@@ -300,10 +361,12 @@ def test_populated_0040_to_0046_cutover_and_t030_fencing() -> None:
             for successor in PUBLISHED_SUCCESSORS:
                 committed = advance_one_successor(
                     owner_conn,
+                    observer,
                     target_id=target_id,
                     owner_epoch=ctrl.owner_epoch,
                     expected_predecessor=current_rev,
                     target_successor=successor,
+                    preflight=preflight,
                 )
                 assert committed == successor
                 obs = observe_committed_successor(
@@ -323,10 +386,12 @@ def test_populated_0040_to_0046_cutover_and_t030_fencing() -> None:
             with pytest.raises(ProbeError):
                 advance_one_successor(
                     owner_conn,
+                    observer,
                     target_id=target_id,
                     owner_epoch=ctrl.owner_epoch,
                     expected_predecessor=PUBLISHED_SUCCESSORS[-2],
                     target_successor=CANDIDATE_HEAD,
+                    preflight=preflight,
                 )
             owner_conn.rollback()
             assert (

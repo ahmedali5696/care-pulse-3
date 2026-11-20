@@ -9,6 +9,7 @@ import { loadWebConfig } from "../config.ts";
 import { authDatabase, runtimeDatabase } from "../db.ts";
 
 export const CANDIDATE_HEAD = "0046_f01_audit_integrity";
+const SOURCE_HEAD = "0040_t173_numeric_money";
 
 export class CompatAdmissionError extends Error {
   constructor(message = "Compatibility admission denied") {
@@ -47,13 +48,16 @@ export function loadCompatWebConfig(apiUrlOverride?: string): CompatWebConfig | 
     throw new CompatAdmissionError("Invalid generation configuration");
   }
   const expectedHead = process.env.CP_COMPAT_EXPECTED_HEAD?.trim();
+  if (expectedHead !== (generation === "source" ? SOURCE_HEAD : CANDIDATE_HEAD)) {
+    throw new CompatAdmissionError("Incompatible build head");
+  }
   const manifestId = process.env.CP_COMPAT_MANIFEST_ID?.trim();
   const dbName = (process.env.CP_DB_NAME ?? "carepulse").trim();
   const actualApiUrl = apiUrlOverride ?? loadWebConfig().apiUrl;
   const expectedApiPeer = (
     process.env.CP_COMPAT_EXPECTED_API_PEER ?? actualApiUrl
   ).trim();
-  if (!expectedHead || !manifestId || !dbName || !expectedApiPeer) {
+  if (!manifestId || !dbName || !expectedApiPeer) {
     throw new CompatAdmissionError("Incomplete web compatibility configuration");
   }
   if (actualApiUrl !== expectedApiPeer) {
@@ -88,13 +92,50 @@ export async function verifyPoolClientIdentity(
     rolsuper: boolean;
     rolbypassrls: boolean;
     rolcanlogin: boolean;
+    rolcreatedb: boolean;
+    rolcreaterole: boolean;
+    rolreplication: boolean;
+    rolinherit: boolean;
+    role_member: boolean;
+    can_connect: boolean;
+    control_usage: boolean;
+    control_reader: boolean;
+    control_status_reader: boolean;
+    control_update: boolean;
+    control_delete: boolean;
+    public_usage: boolean;
+    patient_read: boolean;
+    web_attempt_insert: boolean;
+    private_usage: boolean;
+    crypto_usage: boolean;
   }>(
     `SELECT current_database() AS db_name,
             session_user::text AS session_user,
             current_user::text AS current_user,
             r.rolsuper,
             r.rolbypassrls,
-            r.rolcanlogin
+            r.rolcanlogin, r.rolcreatedb, r.rolcreaterole,
+            r.rolreplication, r.rolinherit,
+            EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid)
+                AS role_member,
+            has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
+            has_schema_privilege(current_user, 'compat_control', 'USAGE') AS control_usage,
+            has_function_privilege(current_user,
+                'compat_control.read_target_control()', 'EXECUTE') AS control_reader,
+            has_function_privilege(current_user,
+                'compat_control.read_target_status()', 'EXECUTE') AS control_status_reader,
+            has_table_privilege(current_user,
+                'compat_control.target_control', 'UPDATE') AS control_update,
+            has_table_privilege(current_user,
+                'compat_control.target_control', 'DELETE') AS control_delete,
+            has_schema_privilege(current_user, 'public', 'USAGE') AS public_usage,
+            has_table_privilege(current_user, 'public.patients', 'SELECT') AS patient_read,
+            has_table_privilege(current_user, 'public.auth_login_attempts', 'INSERT')
+                AS web_attempt_insert,
+            COALESCE(has_schema_privilege(current_user,
+                to_regnamespace('f01_private'), 'USAGE'), false) AS private_usage,
+            COALESCE(has_schema_privilege(current_user,
+                to_regnamespace('f01_crypto'), 'USAGE'), false) AS crypto_usage
      FROM pg_roles r
      WHERE r.rolname = current_user`,
   );
@@ -110,7 +151,13 @@ export async function verifyPoolClientIdentity(
     row.current_user !== expectedRole ||
     row.rolsuper ||
     row.rolbypassrls ||
-    !row.rolcanlogin
+    !row.rolcanlogin || row.rolcreatedb || row.rolcreaterole ||
+    row.rolreplication || row.rolinherit || row.role_member ||
+    !row.can_connect || !row.control_usage || !row.control_reader ||
+    !row.control_status_reader || row.control_update || row.control_delete ||
+    !row.public_usage || row.private_usage || row.crypto_usage ||
+    row.patient_read !== (config.generation === "source" && expectedRole === "carepulse_runtime") ||
+    (expectedRole === "carepulse_web" && !row.web_attempt_insert)
   ) {
     throw new CompatAdmissionError("Effective role privilege mismatch");
   }
@@ -239,30 +286,14 @@ export async function correlateWebAttempt(
 
 export async function releaseWebAdmissionPermit(
   permit: WebAdmissionPermit,
-  disposition: "COMMITTED" | "ROLLED_BACK" = "COMMITTED",
 ): Promise<void> {
   try {
-    await permit.client.query(
-      `SELECT compat_control.record_own_attempt($1, $2, $3, $4, 'web', 'http', NULL, NULL, $5)`,
-      [
-        permit.attemptId,
-        permit.targetId,
-        permit.ownerEpoch,
-        permit.generation,
-        disposition,
-      ],
-    );
+    await permit.client.query("SELECT pg_advisory_unlock_shared($1::bigint)", [
+      permit.permitKey,
+    ]);
+    permit.client.release();
   } catch {
-    // preserve best-effort disposition without leaking
-  } finally {
-    try {
-      await permit.client.query("SELECT pg_advisory_unlock_shared($1::bigint)", [
-        permit.permitKey,
-      ]);
-      permit.client.release();
-    } catch {
-      permit.client.release(true);
-    }
+    permit.client.release(true);
   }
 }
 
@@ -277,12 +308,12 @@ export async function checkWebPoolCheckout(
 }
 
 export async function verifyWebReadinessCompat(): Promise<boolean> {
-  const config = loadCompatWebConfig();
-  if (!config) return true;
-  const webCfg = loadWebConfig();
   let webClient: PoolClient | undefined;
   let authClient: PoolClient | undefined;
   try {
+    const config = loadCompatWebConfig();
+    if (!config) return true;
+    const webCfg = loadWebConfig();
     webClient = await runtimeDatabase(webCfg).connect();
     await verifyPoolClientIdentity(
       webClient,
@@ -292,6 +323,7 @@ export async function verifyWebReadinessCompat(): Promise<boolean> {
     await verifyControlAndHead(webClient, config, false);
     authClient = await authDatabase(webCfg).connect();
     await verifyPoolClientIdentity(authClient, config, "carepulse_auth");
+    await verifyControlAndHead(authClient, config, false);
     return true;
   } catch {
     return false;

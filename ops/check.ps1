@@ -70,6 +70,7 @@ require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9
 approved_bootstrap_files = {
     '.github/workflows/foundation.yml': '528ccd4f64bebbde8b9f439a18e43a10185cfeeee3e806f8c8348d67017a603b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
+    'compose.compat.yaml': '6cd8808e0c73502090062fde8c05622c76b37e83fd28143a8d483bc6e2da77a6',
     'apps/api/Dockerfile': '8465e11d5b90d94704ec63072180f10c56dcf4becf471da84258ea21de5208c8',
     'apps/web/Dockerfile': 'f4c68d5acdb939573661e8d79b1e08c901fa54cf87993464942eedab8f8df93b',
 }
@@ -1296,19 +1297,19 @@ run_compat_observer() {
 if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
     required_suites=(tests/unit/test_compat_admission.py tests/integration/test_compat_matrix.py tests/integration/test_compat_entry_denials.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    run_compat_observer compat-us1 15 "${required_suites[@]}"
+    run_compat_observer compat-us1 24 "${required_suites[@]}"
     docker compose -f compose.compat.yaml --profile candidate run --rm --no-deps -T --entrypoint node candidate-web --no-warnings --experimental-strip-types --test --test-reporter=tap auth/compat.test.ts | tee "$private/compat-us1-web.log"
     if [[ "$mode" = compat-full ]]; then
-      for result in '# tests 5' '# pass 5' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
+      for result in '# tests 9' '# pass 9' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
         grep -Fxq "$result" "$private/compat-us1-web.log" || { echo "FAIL mandatory compat Web test count: $result"; exit 1; }
       done
-      echo 'PASS compat-us1-web: 5 mandatory Web tests, zero skips'
+      echo 'PASS compat-us1-web: 9 mandatory Web tests, zero skips'
     fi
 fi
 if [[ "$mode" = compat-us2 || "$mode" = compat-full ]]; then
     required_suites=(tests/integration/test_compat_drain.py tests/integration/test_compat_delivery.py tests/integration/test_compat_upgrade.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    run_compat_observer compat-us2 5 "${required_suites[@]}"
+    run_compat_observer compat-us2 8 "${required_suites[@]}"
 fi
 if [[ "$mode" = compat-us3 || "$mode" = compat-full ]]; then
     required_suites=(tests/integration/test_compat_recovery_source.py tests/integration/test_compat_recovery_intermediate.py tests/integration/test_compat_recovery_target.py tests/integration/test_compat_preservation.py)
@@ -1378,7 +1379,7 @@ PY
     fi
 fi
 if [[ "$mode" = compat-full ]]; then
-  echo 'PASS mandatory compatibility: 30 Python cases (US1 15, US2 5, US3 10), 5 Web cases, zero skips'
+  echo 'PASS mandatory compatibility: 42 Python cases (US1 24, US2 8, US3 10), 9 Web cases, zero skips'
 fi
 '@
             & bash -e -c $compatScript -- $Check

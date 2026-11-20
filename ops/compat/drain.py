@@ -9,6 +9,7 @@ import psycopg
 from ops.compat.control import (
     ControlRecord,
     acquire_exclusive_drain_permit,
+    advisory_key,
     assert_current_owner,
     read_control_record,
 )
@@ -30,6 +31,27 @@ class DrainVerification:
     source_sealed: bool
     active_product_sessions: int
     unresolved_work_count: int
+    claimed_delivery_jobs: int
+    consumers_stopped: bool
+
+
+def assert_exclusive_drain_permit(conn: psycopg.Connection, target_id: str) -> None:
+    """Only the current owner backend may authorize DDL under a held drain lock."""
+    key = advisory_key("permit", target_id)
+    row = conn.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM pg_locks
+            WHERE locktype='advisory' AND pid=pg_backend_pid()
+              AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
+              AND classid::bigint=%s AND objid::bigint=%s
+              AND objsubid=1 AND mode='ExclusiveLock' AND granted
+        ) AS held
+        """,
+        ((key >> 32) & 0xFFFFFFFF, key & 0xFFFFFFFF),
+    ).fetchone()
+    if not row or not row["held"]:
+        raise DrainError("Current owner no longer holds exclusive drain permit")
 
 
 def commit_draining_fence(
@@ -89,10 +111,17 @@ def drain_and_settle(
     if not acquire_exclusive_drain_permit(conn, target_id, blocking=blocking):
         raise DrainError("Active invocation permits still held")
 
+    assert_exclusive_drain_permit(conn, target_id)
+
     assert_current_owner(
         conn, target_id=target_id, expected_epoch=owner_epoch, lock_mode="UPDATE"
     )
     assert_all_work_settled(conn, target_id=target_id)
+    claimed = conn.execute(
+        "SELECT count(*) AS n FROM public.delivery_jobs WHERE state = 'CLAIMED'"
+    ).fetchone()
+    if (claimed["n"] if isinstance(claimed, dict) else claimed[0]) != 0:
+        raise DrainError("Claimed sender jobs prevent completion of drain")
 
     conn.execute(
         """
@@ -112,7 +141,7 @@ def observe_drain_complete(
     *,
     target_id: str,
     expected_epoch: int,
-    consumers_stopped: bool = True,
+    consumers_stopped: bool,
     require_source_sealed: bool = False,
 ) -> DrainVerification:
     """Read-only independent observer verification of drain completion before T030."""
@@ -143,6 +172,13 @@ def observe_drain_complete(
     if unresolved != 0:
         raise DrainError(f"Unresolved work remains: {unresolved} attempts")
 
+    claimed_row = observer_conn.execute(
+        "SELECT count(*) AS n FROM public.delivery_jobs WHERE state = 'CLAIMED'"
+    ).fetchone()
+    claimed = int(claimed_row["n"] if isinstance(claimed_row, dict) else claimed_row[0])
+    if claimed:
+        raise DrainError("Claimed sender jobs remain during drain")
+
     sess_row = observer_conn.execute(
         """
         SELECT count(*) AS c
@@ -150,13 +186,12 @@ def observe_drain_complete(
         WHERE datname = current_database()
           AND usename IN ('carepulse_runtime', 'carepulse_api', 'carepulse_web', 'carepulse_gate', 'carepulse_auth', 'carepulse_worker', 'carepulse_sender')
           AND pid <> pg_backend_pid()
-          AND state <> 'idle'
         """
     ).fetchone()
     active_sessions = int(sess_row["c"] if isinstance(sess_row, dict) else sess_row[0])
     if active_sessions != 0:
         raise DrainError(
-            f"Active product transactions remain during drain: {active_sessions}"
+            f"Surviving product sessions remain during drain: {active_sessions}"
         )
 
     return DrainVerification(
@@ -167,4 +202,6 @@ def observe_drain_complete(
         source_sealed=ctrl.source_sealed,
         active_product_sessions=active_sessions,
         unresolved_work_count=unresolved,
+        claimed_delivery_jobs=claimed,
+        consumers_stopped=consumers_stopped,
     )

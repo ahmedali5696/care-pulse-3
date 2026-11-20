@@ -11,6 +11,8 @@ from carepulse.compat.admission import (
     CompatAdmissionError,
     CompatRuntimeConfig,
     acquire_invocation_permit,
+    probe_compat_readiness,
+    verify_connection_identity,
     verify_control_and_head,
 )
 
@@ -188,3 +190,91 @@ def test_acquire_permit_releases_lock_on_denial() -> None:
         acquire_invocation_permit(engine, config=cfg, expected_login="carepulse_api")
     conn.rollback.assert_called()
     conn.close.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "changed_field, changed_value",
+    [
+        ("can_connect", False),
+        ("control_reader", False),
+        ("control_status_reader", False),
+        ("control_update", True),
+        ("patient_read", False),
+        ("rolcreaterole", True),
+        ("role_member", True),
+    ],
+)
+def test_api_identity_denies_effective_privilege_drift(
+    changed_field: str, changed_value: bool
+) -> None:
+    cfg = CompatRuntimeConfig(
+        target_id="target-1",
+        manifest_id="candidate-v1",
+        generation="candidate",
+        expected_head=CANDIDATE_HEAD,
+        service="api",
+        db_name="carepulse",
+    )
+    row = {
+        "db_name": "carepulse",
+        "session_user": "carepulse_api",
+        "current_user": "carepulse_api",
+        "rolsuper": False,
+        "rolbypassrls": False,
+        "rolcanlogin": True,
+        "rolcreaterole": False,
+        "rolcreatedb": False,
+        "rolreplication": False,
+        "rolinherit": False,
+        "role_member": False,
+        "can_connect": True,
+        "control_usage": True,
+        "control_reader": True,
+        "control_status_reader": True,
+        "control_update": False,
+        "control_delete": False,
+        "public_usage": True,
+        "patient_read": True,
+        "delivery_update": False,
+        "private_usage": False,
+        "crypto_usage": False,
+        "web_attempt_insert": False,
+    }
+    session = MagicMock()
+    session.execute.return_value.mappings.return_value.first.return_value = row
+    assert verify_connection_identity(session, config=cfg) == (
+        "carepulse_api",
+        "carepulse",
+    )
+    row[changed_field] = changed_value
+    with pytest.raises(CompatAdmissionError, match="privilege"):
+        verify_connection_identity(session, config=cfg)
+
+
+def test_compat_runtime_env_rejects_mismatched_build_head(monkeypatch) -> None:
+    monkeypatch.setenv("CP_COMPAT_TARGET_ID", "target-1")
+    monkeypatch.setenv("CP_COMPAT_MANIFEST_ID", "candidate-v1")
+    monkeypatch.setenv("CP_COMPAT_GENERATION", "candidate")
+    monkeypatch.setenv("CP_COMPAT_EXPECTED_HEAD", "0040_t173_numeric_money")
+    with pytest.raises(CompatAdmissionError, match="head"):
+        CompatRuntimeConfig.from_env("api")
+    assert probe_compat_readiness(MagicMock(), "api") is False
+
+
+def test_api_readiness_uses_fenced_compat_probe(monkeypatch) -> None:
+    from carepulse import health
+
+    engine = MagicMock()
+    monkeypatch.setattr(health, "load_config", lambda _: object())
+    monkeypatch.setattr(health, "create_db_engine", lambda _: engine)
+    monkeypatch.setattr(health, "is_compat_enabled", lambda: True)
+    monkeypatch.setattr(
+        health, "probe_compat_readiness", lambda _engine, _service: False
+    )
+    monkeypatch.setattr(
+        health,
+        "transaction",
+        lambda _: pytest.fail("direct revision query on compat probe"),
+    )
+    assert health._database_ready("api") is False
+    engine.dispose.assert_called_once()
