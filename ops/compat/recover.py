@@ -109,7 +109,7 @@ def _classify(control: ControlRecord, head: str) -> tuple[RecoveryBranch, str | 
         return "FORWARD_ONLY", EXPECTED_TRANSITIONS[head]
 
     if head == "0046_f01_audit_integrity":
-        if control.phase not in ("CLOSED", "MIGRATING", "VERIFYING"):
+        if control.phase not in ("CLOSED", "DRAINING", "MIGRATING", "VERIFYING"):
             raise RecoveryError("0046 has an inconsistent verification phase")
         return "TARGET_VERIFY_ONLY", None
 

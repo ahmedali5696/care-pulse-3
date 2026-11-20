@@ -1,10 +1,12 @@
 """T052: fenced 0046 retirement, candidate eligibility and lost-reopen recovery."""
 
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import replace
+from urllib.request import urlopen
 
 import pytest
 from carepulse.compat.admission import (
@@ -26,9 +28,14 @@ from ops.compat.recover import (
     ExecutedUS2Checkpoint,
     RecoveryError,
     recover_ambiguous_open,
+    recover_owner,
 )
 from ops.compat.reopen import ReopenError, reopen_fenced_generation
-from ops.compat.verify import VerificationError, verify_fenced_security
+from ops.compat.verify import (
+    VerificationError,
+    verify_fenced_security,
+    verify_retained_evidence,
+)
 from tests.integration.compat_ci_helpers import (
     make_sa_engine,
     read_secret,
@@ -55,6 +62,11 @@ def _connection(role: str, dbname: str, password: str | None = None):
         "user": role,
         "password": password if password is not None else read_secret(role),
     }
+
+
+def _mail_count() -> int:
+    with urlopen("http://mail:8025/api/v1/messages", timeout=5) as response:
+        return int(json.load(response)["total"])
 
 
 def test_incomplete_0046_key_policy_and_unguarded_build_never_open() -> None:
@@ -272,6 +284,21 @@ def test_candidate_reopens_once_then_lost_ack_atomically_refences() -> None:
         finally:
             legacy.dispose()
 
+        retained_tables = (
+            "appointments",
+            "idempotency_receipts",
+            "sensitive_audit",
+            "outbox_events",
+            "delivery_jobs",
+        )
+        before_counts = {
+            table: cutover.observer.execute(
+                f"SELECT count(*) AS n FROM public.{table}"
+            ).fetchone()["n"]
+            for table in retained_tables
+        }
+        before_mail = _mail_count()
+
         # Simulate the owner receiving no reply after its OPEN commit. The
         # new operator must fence in the same transaction as epoch increment.
         cutover.owner.close()
@@ -289,7 +316,22 @@ def test_candidate_reopens_once_then_lost_ack_atomically_refences() -> None:
             assert fenced.control.active_generation == "none"
             assert fenced.unresolved_work == 0
             assert fenced.surviving_sessions == 0
+            assert fenced.control.drain_verified_epoch is None
             assert probe_alembic_head(cutover.observer) == CANDIDATE_HEAD
+            with pytest.raises(ReopenError, match="drain"):
+                reopen_fenced_generation(
+                    fenced.owner_conn,
+                    cutover.observer,
+                    source_manifest=source,
+                    target_manifest=candidate,
+                    baseline=lab.retained_baseline(),
+                    owner_epoch=fenced.control.owner_epoch,
+                    generation="candidate",
+                    observed_units=units,
+                    login_probes=logins,
+                    predecessor_login_probes=predecessor_logins,
+                )
+            assert read_control_record(cutover.observer).phase == "DRAINING"
             with (
                 pytest.raises(RecoveryError),
                 recover_ambiguous_open(
@@ -305,6 +347,98 @@ def test_candidate_reopens_once_then_lost_ack_atomically_refences() -> None:
                 pytest.fail("Competing owner cannot re-fence this event")
         assert read_control_record(cutover.observer).phase == "DRAINING"
         assert probe_alembic_head(cutover.observer) == CANDIDATE_HEAD
+        # The re-fencing owner also disappears before verification. A separate
+        # owner must establish its own drain proof in a newer epoch.
+        with recover_owner(
+            owner_connection=_connection("carepulse_migration", lab.dbname),
+            observer_connection=_connection("carepulse_bootstrap", lab.dbname),
+            source_manifest=source,
+            target_manifest=candidate,
+            executed_us2=CHECKPOINT,
+        ) as recovered:
+            assert recovered.committed_head == CANDIDATE_HEAD
+            assert recovered.branch == "TARGET_VERIFY_ONLY"
+            assert recovered.next_successor is None
+            assert recovered.control.phase == "DRAINING"
+            assert recovered.control.active_generation == "none"
+            assert recovered.control.owner_epoch == fenced.control.owner_epoch + 1
+            assert (
+                recovered.control.drain_verified_epoch == recovered.control.owner_epoch
+            )
+            with pytest.raises(VerificationError, match="Fenced target"):
+                verify_fenced_security(
+                    cutover.observer,
+                    source_manifest=source,
+                    target_manifest=candidate,
+                    expected_epoch=fenced.control.owner_epoch,
+                    expected_head=CANDIDATE_HEAD,
+                )
+            security = verify_fenced_security(
+                cutover.observer,
+                source_manifest=source,
+                target_manifest=candidate,
+                expected_epoch=recovered.control.owner_epoch,
+                expected_head=CANDIDATE_HEAD,
+            )
+            retained = verify_retained_evidence(
+                cutover.observer, baseline=lab.retained_baseline(), security=security
+            )
+            assert retained.checked_rows >= 20
+            assert retained.unresolved_work == 0
+            with pytest.raises(ReopenError, match="Untrusted or reused predecessor"):
+                reopen_fenced_generation(
+                    recovered.owner_conn,
+                    cutover.observer,
+                    source_manifest=source,
+                    target_manifest=candidate,
+                    baseline=lab.retained_baseline(),
+                    owner_epoch=recovered.control.owner_epoch,
+                    generation="candidate",
+                    observed_units=units,
+                    login_probes=logins,
+                    predecessor_login_probes={
+                        **predecessor_logins,
+                        "carepulse_auth": logins["carepulse_auth"],
+                    },
+                )
+            assert read_control_record(cutover.observer).phase == "DRAINING"
+            reopened = reopen_fenced_generation(
+                recovered.owner_conn,
+                cutover.observer,
+                source_manifest=source,
+                target_manifest=candidate,
+                baseline=lab.retained_baseline(),
+                owner_epoch=recovered.control.owner_epoch,
+                generation="candidate",
+                observed_units=units,
+                login_probes=logins,
+                predecessor_login_probes=predecessor_logins,
+            )
+            assert reopened.phase == "TARGET_OPEN"
+            assert reopened.owner_epoch == recovered.control.owner_epoch
+            with pytest.raises(VerificationError, match="Fenced target"):
+                reopen_fenced_generation(
+                    recovered.owner_conn,
+                    cutover.observer,
+                    source_manifest=source,
+                    target_manifest=candidate,
+                    baseline=lab.retained_baseline(),
+                    owner_epoch=recovered.control.owner_epoch,
+                    generation="candidate",
+                    observed_units=units,
+                    login_probes=logins,
+                    predecessor_login_probes=predecessor_logins,
+                )
+        assert read_control_record(cutover.observer).phase == "TARGET_OPEN"
+        assert probe_alembic_head(cutover.observer) == CANDIDATE_HEAD
+        compare_retained_inventory(cutover.observer, lab.inventory)
+        assert {
+            table: cutover.observer.execute(
+                f"SELECT count(*) AS n FROM public.{table}"
+            ).fetchone()["n"]
+            for table in retained_tables
+        } == before_counts
+        assert _mail_count() == before_mail
 
 
 def test_lost_open_refence_orders_held_work_before_new_admission() -> None:
@@ -552,6 +686,19 @@ def test_lost_open_refence_orders_held_work_before_new_admission() -> None:
                 recovery_future.result(timeout=15)
 
             assert read_control_record(cutover.observer).phase == "DRAINING"
+            before_recovery = read_control_record(cutover.observer)
+            with (
+                pytest.raises(RecoveryError, match="pending/unknown"),
+                recover_owner(
+                    owner_connection=_connection("carepulse_migration", lab.dbname),
+                    observer_connection=_connection("carepulse_bootstrap", lab.dbname),
+                    source_manifest=source,
+                    target_manifest=candidate,
+                    executed_us2=CHECKPOINT,
+                ),
+            ):
+                pytest.fail("An UNKNOWN sender attempt cannot authorize takeover")
+            assert read_control_record(cutover.observer) == before_recovery
             with (
                 pytest.raises(RecoveryError, match="changed"),
                 recover_ambiguous_open(
