@@ -27,6 +27,7 @@ def checkout(tmp_path):
         "apps/web/Dockerfile",
         "apps/api/Dockerfile",
         "compose.yaml",
+        "compose.compat.yaml",
         ".github/workflows/foundation.yml",
         "tests/integration/test_auth_mail.py",
         "tests/integration/test_tenant_isolation.py",
@@ -79,6 +80,14 @@ def test_floating_image_is_rejected_before_docker(checkout):
     completed = _check(checkout)
     assert completed.returncode != 0
     assert "approved image references" in completed.stdout + completed.stderr
+
+
+def test_compat_compose_drift_is_rejected_before_docker(checkout):
+    compat = checkout / "compose.compat.yaml"
+    compat.write_bytes(compat.read_bytes() + b"\n# synthetic unreviewed change\n")
+    completed = _check(checkout)
+    assert completed.returncode != 0
+    assert "compose.compat.yaml executable input drift" in completed.stdout + completed.stderr
 
 
 @pytest.mark.parametrize("filename", ["pnpm-lock.yaml", "requirements.lock"])
