@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import os
+import time
 from dataclasses import dataclass
+from pathlib import Path
+from uuid import uuid4
 
 import psycopg
 
@@ -33,6 +38,76 @@ class DrainVerification:
     unresolved_work_count: int
     claimed_delivery_jobs: int
     consumers_stopped: bool
+
+
+_CONSUMERS = frozenset(
+    f"{generation}-{service}"
+    for generation in ("source", "candidate")
+    for service in ("api", "web", "worker", "sender")
+)
+
+
+def assert_host_consumers_stopped(
+    observer_conn: psycopg.Connection, ctrl: ControlRecord
+) -> None:
+    """Require actual host-owned Docker and database shutdown evidence.
+
+    The observer has no Docker socket. A separate CI-host confirms the
+    current target, epoch, head, seal and absence of running consumers.
+    """
+    directory_str = os.environ.get("CP_COMPAT_T051_IPC_DIR", "")
+    directory = Path(directory_str) if directory_str else None
+    if (
+        os.environ.get("CI") != "true"
+        or directory is None
+        or not directory.is_dir()
+        or directory.is_symlink()
+    ):
+        raise DrainError("Independent host shutdown observer is unavailable")
+    heads = observer_conn.execute(
+        "SELECT version_num FROM public.alembic_version"
+    ).fetchall()
+    if len(heads) != 1:
+        raise DrainError("Head is not uniquely available for host shutdown proof")
+    head = heads[0]["version_num"] if isinstance(heads[0], dict) else heads[0][0]
+    nonce = uuid4().hex[:24]
+    payload = {
+        "version": 1,
+        "id": nonce,
+        "kind": "drain_proof",
+        "db_name": ctrl.db_name,
+        "target_id": ctrl.target_id,
+        "cluster_id": ctrl.cluster_id,
+        "source_manifest_id": ctrl.source_manifest_id,
+        "candidate_manifest_id": ctrl.target_manifest_id,
+        "owner_epoch": ctrl.owner_epoch,
+        "head": head,
+    }
+    temporary = directory / f"{nonce}.pending"
+    temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    os.replace(temporary, directory / f"{nonce}.request.json")
+    reply_path = directory / f"{nonce}.response.json"
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if reply_path.is_file():
+            try:
+                response = json.loads(reply_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise DrainError("Invalid host shutdown evidence") from exc
+            if (
+                any(response.get(k) != v for k, v in payload.items())
+                or response.get("ok") is not True
+                or response.get("status") != "stopped"
+                or response.get("stop_phase") != ctrl.phase
+                or response.get("launch_sealed") is not True
+                or response.get("running_consumer_count") != 0
+                or frozenset(response.get("stopped_services", ())) != _CONSUMERS
+                or len(response.get("stopped_services", ())) != len(_CONSUMERS)
+            ):
+                raise DrainError("Host shutdown evidence mismatches current target")
+            return
+        time.sleep(0.05)
+    raise DrainError("Host shutdown evidence was not delivered")
 
 
 def assert_exclusive_drain_permit(conn: psycopg.Connection, target_id: str) -> None:
@@ -193,6 +268,8 @@ def observe_drain_complete(
         raise DrainError(
             f"Surviving product sessions remain during drain: {active_sessions}"
         )
+
+    assert_host_consumers_stopped(observer_conn, ctrl)
 
     return DrainVerification(
         target_id=ctrl.target_id,

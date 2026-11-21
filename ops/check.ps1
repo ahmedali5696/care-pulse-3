@@ -269,6 +269,13 @@ cleanup() {
   trap - EXIT
   if [[ -n "${host_pid:-}" ]]; then
     kill -TERM "$host_pid" 2>/dev/null || true
+    if ! wait "$host_pid"; then
+      echo 'FAIL independent compatibility host supervisor'; cleanup_failed=1
+    fi
+    host_pid=''
+  fi
+  if [[ -n "${host_pid:-}" ]]; then
+    kill -TERM "$host_pid" 2>/dev/null || true
     wait "$host_pid" 2>/dev/null || true
     host_pid=''
   fi
@@ -1194,6 +1201,13 @@ rm -rf -- "$source_dir"
 cleanup() {
   local code=$? cleanup_failed=0
   trap - EXIT
+  if [[ -n "${host_pid:-}" ]]; then
+    kill -TERM "$host_pid" 2>/dev/null || true
+    if ! wait "$host_pid"; then
+      echo 'FAIL independent compatibility host supervisor'; cleanup_failed=1
+    fi
+    host_pid=''
+  fi
   if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" && "$private" = "$RUNNER_TEMP/foundation-ci-private" && -d "$private" && -O "$private" && ! -L "$private" ]]; then
     if ! docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer down --remove-orphans --volumes; then
       echo 'FAIL scoped compat Compose cleanup'; cleanup_failed=1
@@ -1287,11 +1301,15 @@ PY
 run_compat_observer() {
   local group="$1" expected="$2"
   shift 2
+  local ipc_args=()
+  if [[ "$group" = compat-us2 ]]; then
+    ipc_args=(-e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -v "$private/handshake:/tmp/compat-host:rw")
+  fi
   if [[ "$mode" = compat-full ]]; then
-    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/compat-results:/tmp/compat-results:rw" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "--junitxml=/tmp/compat-results/$group.xml" "$@"
+    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/compat-results:/tmp/compat-results:rw" "${ipc_args[@]}" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "--junitxml=/tmp/compat-results/$group.xml" "$@"
     assert_full_compat_count "$group" "$expected" "$private/compat-results/$group.xml"
   else
-    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "$@"
+    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" "${ipc_args[@]}" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "$@"
   fi
 }
 if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
@@ -1306,14 +1324,9 @@ if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
       echo 'PASS compat-us1-web: 9 mandatory Web tests, zero skips'
     fi
 fi
-if [[ "$mode" = compat-us2 || "$mode" = compat-full ]]; then
-    required_suites=(tests/integration/test_compat_drain.py tests/integration/test_compat_delivery.py tests/integration/test_compat_upgrade.py)
-    for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    run_compat_observer compat-us2 8 "${required_suites[@]}"
-fi
-if [[ "$mode" = compat-us3 || "$mode" = compat-full ]]; then
-    required_suites=(tests/integration/test_compat_recovery_source.py tests/integration/test_compat_recovery_intermediate.py tests/integration/test_compat_recovery_target.py tests/integration/test_compat_preservation.py)
-    for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
+# The independent Docker/PG supervisor attests every stopped-consumer proof
+# for US2 drain/migration and US3 recovery; observer never receives Docker.
+if [[ "$mode" = compat-us2 || "$mode" = compat-us3 || "$mode" = compat-full ]]; then
     python3 - "$private/compose.compat.json" "$private/observed.json" "$GITHUB_SHA" <<'PY'
 import json, re, subprocess, sys
 
@@ -1356,6 +1369,20 @@ PY
     mkdir -m 1777 "$private/handshake"
     python3 -u ops/compat/ci_host.py "$private/handshake" "$private/observed.json" > "$private/ci-host.log" 2>&1 &
     host_pid=$!
+fi
+if [[ "$mode" = compat-us2 || "$mode" = compat-full ]]; then
+    required_suites=(tests/integration/test_compat_drain.py tests/integration/test_compat_delivery.py tests/integration/test_compat_upgrade.py)
+    for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
+    run_compat_observer compat-us2 8 "${required_suites[@]}"
+    if [[ "$mode" = compat-us2 ]]; then
+      kill -TERM "$host_pid"
+      wait "$host_pid"
+      host_pid=''
+    fi
+fi
+if [[ "$mode" = compat-us3 || "$mode" = compat-full ]]; then
+    required_suites=(tests/integration/test_compat_recovery_source.py tests/integration/test_compat_recovery_intermediate.py tests/integration/test_compat_recovery_target.py tests/integration/test_compat_preservation.py)
+    for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
     set +e
     if [[ "$mode" = compat-full ]]; then
       timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" -v "$private/handshake:/tmp/compat-host:rw" -v "$private/compat-results:/tmp/compat-results:rw" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=35 --tb=short -p no:cacheprovider --junitxml=/tmp/compat-results/compat-us3.xml "${required_suites[@]}"

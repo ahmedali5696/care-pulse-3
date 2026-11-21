@@ -434,6 +434,19 @@ def test_real_sender_claim_transport_and_interrupted_settlement(
 
             monkeypatch.setattr(email_sender, "_tenant", interrupted_readback)
         sender = make_sa_engine("carepulse_sender", dbname=dbname)
+        with sender.connect() as sender_acl:
+            # Readback must work with the published column grants, which
+            # intentionally omit the internal SMTP outcome detail.
+            assert sender_acl.scalar(
+                text("""
+                    SELECT has_column_privilege(current_user, 'public.delivery_jobs',
+                                                'claim_owner', 'SELECT')
+                       AND has_column_privilege(current_user, 'public.delivery_jobs',
+                                                'not_before', 'SELECT')
+                       AND NOT has_column_privilege(current_user, 'public.delivery_jobs',
+                                                    'last_outcome', 'SELECT')
+                """)
+            )
         settings = email_sender.SenderSettings(
             ClaimPolicy(timedelta(seconds=30), 3),
             5,

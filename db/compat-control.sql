@@ -201,15 +201,16 @@ AS $$
           AND w.service = 'sender' AND w.disposition IN ('PENDING', 'UNKNOWN')
           AND p_organization_id IS NOT NULL
           AND p_organization_id = NULLIF(current_setting('app.organization_id', true), '')
-          AND NOT (
-              w.disposition = 'PENDING'
-              AND w.attempt_id = NULLIF(current_setting('app.compat_attempt_id', true), '')
-              AND w.created_by_role = session_user
-              AND w.owner_epoch = c.owner_epoch
-              AND w.generation = c.active_generation
-              AND w.invocation_class = 'sender_claim'
-              AND (w.correlation_id = p_job_id
-                   OR w.correlation_id = 'org:' || p_organization_id)
+          AND (
+              w.disposition <> 'PENDING' OR (
+                  w.attempt_id = NULLIF(current_setting('app.compat_attempt_id', true), '')
+                  AND w.created_by_role = session_user
+                  AND w.owner_epoch = c.owner_epoch
+                  AND w.generation = c.active_generation
+                  AND w.invocation_class = 'sender_claim'
+                  AND (w.correlation_id = p_job_id
+                       OR w.correlation_id = 'org:' || p_organization_id)
+              ) IS NOT TRUE
           )
           AND (
               (p_job_id IS NOT NULL AND w.correlation_id = p_job_id)

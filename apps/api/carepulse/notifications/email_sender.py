@@ -243,21 +243,24 @@ def send_one_job(
             if not sent:
                 final_disposition = "NOT_SENT"  # Transport was definitely absent.
             return "STALE"
-        # Independent transaction readback: Node success or a DB commit call alone
-        # cannot prove the job was settled under this exact lease generation.
+        # Independent readback using only the sender's column-scoped SELECT grants.
+        # An acknowledged finish does not prove the transaction committed.
         with engine.begin() as observer:
             _tenant(observer, organization_id)
             row = observer.execute(
                 text("""
-                    SELECT state, last_outcome, claim_generation
-                    FROM public.delivery_jobs WHERE id = :job
+                    SELECT state, claim_generation, claim_owner, not_before
+                    FROM public.delivery_jobs
+                    WHERE id = :job AND organization_id = :tenant
                 """),
-                {"job": claim.id},
+                {"job": claim.id, "tenant": organization_id},
             ).one_or_none()
         if (
             row
             and row.claim_generation == claim.generation
-            and (row.state, row.last_outcome) == (outcome.state, outcome.detail)
+            and row.claim_owner is None
+            and row.state == outcome.state
+            and (outcome.state != "READY" or row.not_before == outcome.not_before)
         ):
             final_disposition = "SENT" if sent else "NOT_SENT"
         return outcome.state

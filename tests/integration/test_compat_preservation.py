@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import replace
@@ -40,6 +41,7 @@ from ops.compat.verify import (
     verify_fenced_security,
     verify_retained_evidence,
 )
+from ops.compat.work import assert_all_work_settled, resolve_work_with_proof
 from tests.integration.compat_ci_helpers import connect_role, make_sa_engine
 from tests.integration.compat_fixture import compare_retained_inventory
 from tests.integration.compat_recovery_lab import (
@@ -505,12 +507,33 @@ def _immutable_source_api(lab):
         yield endpoint
     finally:
         if launched:
-            _host_signal(directory / f"{nonce}.stop.json", binding)
-            _host_reply(
+            stop_request = dict(binding)
+            with connect_role("carepulse_bootstrap", dbname=lab.dbname) as control:
+                stop_request["owner_epoch"] = control.execute(
+                    "SELECT owner_epoch FROM compat_control.target_control "
+                    "WHERE singleton_id=true"
+                ).fetchone()["owner_epoch"]
+            _host_signal(directory / f"{nonce}.stop.json", stop_request)
+            stopped = _host_reply(
                 directory / f"{nonce}.stopped.json",
-                {"db_name": lab.dbname, "target_id": lab.target_id},
+                {
+                    "db_name": lab.dbname,
+                    "target_id": lab.target_id,
+                    "source_manifest_id": lab.source_manifest.manifest_id,
+                    "owner_epoch": stop_request["owner_epoch"],
+                },
                 status="stopped",
             )
+            assert stopped["stop_phase"] == "SOURCE_OPEN"
+            assert stopped["launch_sealed"] is False
+            assert set(stopped["stopped_services"]) == {
+                "source-api",
+                "source-web",
+                "source-worker",
+                "source-sender",
+            }
+            assert re.fullmatch(r"[0-9a-f]{64}", stopped["source_container_id"])
+            assert re.fullmatch(r"sha256:[0-9a-f]{64}", stopped["source_image_id"])
 
 
 def _source_signed_booking(endpoint, *, tenant, staff, session, revision, body, key):
@@ -563,9 +586,9 @@ def _source_signed_booking(endpoint, *, tenant, staff, session, revision, body, 
     call = Request(endpoint + "/v1/appointments", data=raw, headers=headers)
     try:
         with urlopen(call, timeout=12) as result:
-            return result.status, json.load(result)
+            return result.status, json.load(result), signature
     except HTTPError as denied:
-        return denied.code, json.load(denied)
+        return denied.code, json.load(denied), signature
 
 
 def _booking_effects(observer, tenant):
@@ -690,7 +713,19 @@ def test_authentic_0040_signed_receipt_replays_with_f01_without_any_new_effect()
         }
         original_mail = _mail_count()
         with _immutable_source_api(lab) as endpoint:
-            status, original = _source_signed_booking(
+            with connect_role(
+                "carepulse_bootstrap", dbname=lab.dbname, autocommit=True
+            ) as before_request:
+                original_attempt_ids = {
+                    row["attempt_id"]
+                    for row in before_request.execute(
+                        "SELECT attempt_id FROM compat_control.work_evidence "
+                        "WHERE target_id=%s AND generation='source' "
+                        "AND service='api' AND invocation_class='http'",
+                        (lab.target_id,),
+                    )
+                }
+            status, original, signed = _source_signed_booking(
                 endpoint,
                 tenant=tenant,
                 staff=str(staff["id"]),
@@ -707,12 +742,15 @@ def test_authentic_0040_signed_receipt_replays_with_f01_without_any_new_effect()
             "carepulse_bootstrap", dbname=lab.dbname, autocommit=True
         )
         try:
-            receipt = observer.execute(
-                "SELECT to_jsonb(r) AS row FROM public.idempotency_receipts r "
+            original_receipt = observer.execute(
+                "SELECT to_jsonb(r) AS row, r.created_at AS committed_at "
+                "FROM public.idempotency_receipts r "
                 "WHERE organization_id=%s AND operation='appointments.book' "
                 "AND idempotency_key=%s",
                 (tenant, key),
-            ).fetchone()["row"]
+            ).fetchone()
+            assert original_receipt is not None
+            receipt = original_receipt["row"]
             assert receipt is not None
             assert receipt["operation"] == "appointments.book"
             assert receipt["idempotency_key"] == key
@@ -727,11 +765,57 @@ def test_authentic_0040_signed_receipt_replays_with_f01_without_any_new_effect()
             )
             assert receipt["result_projection"] == original["data"]
             assert receipt["result_revision"] == original["revision"]
+            assert (
+                signed.organization_id,
+                signed.staff_id,
+                signed.session_id,
+                signed.purpose,
+                signed.idempotency_key,
+                signed.method,
+                signed.path,
+                signed.security_revision,
+                signed.body_sha256,
+            ) == (
+                tenant,
+                str(staff["id"]),
+                session,
+                "APPOINTMENT_BOOKING",
+                key,
+                "POST",
+                "/v1/appointments",
+                str(staff["security_revision"]),
+                sha256(json.dumps(body, separators=(",", ":")).encode()).hexdigest(),
+            )
+            nonce = observer.execute(
+                "SELECT key_id, nonce, signed_at, accepted_at FROM public.request_nonces "
+                "WHERE key_id=%s AND nonce=%s",
+                (signed.key_id, signed.nonce),
+            ).fetchone()
+            assert nonce is not None
+            assert abs(
+                nonce["signed_at"]
+                - datetime.fromtimestamp(int(signed.timestamp) / 1000, UTC)
+            ) < timedelta(milliseconds=2)
+            authenticated_session = observer.execute(
+                'SELECT "userId" AS user_id, "securityRevision" AS revision, '
+                '"expiresAt" > clock_timestamp() AS active '
+                'FROM public."session" WHERE id=%s',
+                (session,),
+            ).fetchone()
+            assert authenticated_session == {
+                "user_id": lab.inventory.owner_user_ids[0],
+                "revision": staff["security_revision"],
+                "active": True,
+            }
             before = _booking_effects(observer, tenant)
             original_appointment = observer.execute(
                 "SELECT to_jsonb(a) AS row FROM public.appointments a WHERE id=%s",
                 (original["data"]["id"],),
             ).fetchone()["row"]
+            assert original_appointment["organization_id"] == tenant
+            assert original_appointment["patient_id"] == body["patient_id"]
+            assert str(original_appointment["doctor_staff_id"]) == str(staff["id"])
+            assert original_appointment["service_date"] == body["service_date"]
             provenance_sql = """
                 SELECT (SELECT to_jsonb(h) FROM public.appointment_history h
                         WHERE h.organization_id=%s AND h.appointment_id=%s
@@ -752,11 +836,80 @@ def test_authentic_0040_signed_receipt_replays_with_f01_without_any_new_effect()
                 original_provenance["audit"]["after_state"]["appointment_id"]
                 == original["data"]["id"]
             )
+            # The immutable wrapper admits an opaque attempt before dispatch.
+            # This isolated lab has one new source API invocation; only its
+            # original durable receipt and effect permit independent settlement.
+            attempts = observer.execute(
+                "SELECT attempt_id, target_id, owner_epoch, generation, service, "
+                "invocation_class, correlation_id, lease_generation, disposition, "
+                "created_by_role, created_at FROM compat_control.work_evidence "
+                "WHERE target_id=%s AND generation='source' "
+                "AND service='api' AND invocation_class='http'",
+                (lab.target_id,),
+            ).fetchall()
+            fresh = [a for a in attempts if a["attempt_id"] not in original_attempt_ids]
+            assert len(fresh) == 1
+            attempt = fresh[0]
+            source_control = read_control_record(observer)
+            assert source_control.phase == "SOURCE_OPEN"
+            assert source_control.active_generation == "source"
+            assert (
+                attempt["created_at"]
+                <= nonce["accepted_at"]
+                <= original_receipt["committed_at"]
+            )
+            assert (
+                attempt["target_id"],
+                attempt["owner_epoch"],
+                attempt["generation"],
+                attempt["service"],
+                attempt["invocation_class"],
+                attempt["disposition"],
+                attempt["created_by_role"],
+                attempt["correlation_id"],
+                attempt["lease_generation"],
+            ) == (
+                lab.target_id,
+                source_control.owner_epoch,
+                "source",
+                "api",
+                "http",
+                "PENDING",
+                "carepulse_runtime",
+                None,
+                None,
+            )
+            resolve_work_with_proof(
+                observer,
+                attempt_id=attempt["attempt_id"],
+                target_id=lab.target_id,
+                proven_disposition="COMMITTED",
+                correlation_id=str(receipt["id"]),
+            )
+            settled = observer.execute(
+                "SELECT attempt_id, correlation_id, disposition "
+                "FROM compat_control.work_evidence WHERE attempt_id=%s",
+                (attempt["attempt_id"],),
+            ).fetchone()
+            assert settled == {
+                "attempt_id": attempt["attempt_id"],
+                "correlation_id": str(receipt["id"]),
+                "disposition": "COMMITTED",
+            }
+            assert_all_work_settled(observer, target_id=lab.target_id)
         finally:
             observer.close()
 
         with committed_0046_cutover(lab) as cutover:
             assert _booking_effects(cutover.observer, tenant) == before
+            assert cutover.observer.execute(
+                "SELECT correlation_id, disposition FROM compat_control.work_evidence "
+                "WHERE attempt_id=%s AND target_id=%s",
+                (attempt["attempt_id"], lab.target_id),
+            ).fetchone() == {
+                "correlation_id": str(receipt["id"]),
+                "disposition": "COMMITTED",
+            }
             assert (
                 cutover.observer.execute(
                     "SELECT count(*) AS n FROM f01_private.activations"

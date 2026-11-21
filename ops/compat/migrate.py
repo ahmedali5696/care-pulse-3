@@ -16,6 +16,7 @@ from ops.compat.control import assert_current_owner, read_control_record
 from ops.compat.drain import (
     DrainVerification,
     assert_exclusive_drain_permit,
+    assert_host_consumers_stopped,
     observe_drain_complete,
 )
 from ops.compat.preflight import (
@@ -129,6 +130,7 @@ def _recheck_migration_boundary(
         raise MigrationStepError(
             "Claims or surviving service sessions prevent migration"
         )
+    assert_host_consumers_stopped(observer_conn, observed)
     verify_populated_source_basis(
         observer_conn,
         preflight.source_baseline,
@@ -157,13 +159,14 @@ def enter_migrating_phase(
         raise MigrationStepError("Drain not verified for current owner epoch")
     if drain_proof.owner_epoch != owner_epoch or not drain_proof.consumers_stopped:
         raise MigrationStepError("No verified stopped-consumer proof")
-    observe_drain_complete(
-        observer_conn,
-        target_id=target_id,
-        expected_epoch=owner_epoch,
-        consumers_stopped=drain_proof.consumers_stopped,
-        require_source_sealed=True,
-    )
+    if ctrl.phase == "DRAINING":
+        observe_drain_complete(
+            observer_conn,
+            target_id=target_id,
+            expected_epoch=owner_epoch,
+            consumers_stopped=drain_proof.consumers_stopped,
+            require_source_sealed=True,
+        )
     _recheck_migration_boundary(
         conn,
         observer_conn,

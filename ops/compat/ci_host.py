@@ -103,6 +103,8 @@ class Supervisor:
                 "CI-host observed image provenance differs from checkout"
             )
         self.active: dict[str, tuple[str, dict]] = {}
+        self.sealed_source_targets: set[str] = set()
+        self.stopped_source_ids: dict[str, str] = {}
         self.processed: set[str] = set()
         self.stopped = False
 
@@ -190,6 +192,11 @@ class Supervisor:
     def launch(
         self, service: str, request: dict, *, name: str, args: tuple[str, ...] = ()
     ) -> str:
+        if (
+            service in ("source-api", "source-web")
+            and request["target_id"] in self.sealed_source_targets
+        ):
+            raise RuntimeError("Source ingress launch is sealed")
         generation = service.split("-", 1)[0]
         manifest = (
             request["source_manifest_id"]
@@ -221,7 +228,7 @@ class Supervisor:
 
     @staticmethod
     def remove(cid: str) -> None:
-        command(("docker", "rm", "-f", cid), timeout=10)
+        required(("docker", "rm", "-f", cid), timeout=10)
 
     def mail_count(self) -> int:
         script = (
@@ -430,7 +437,7 @@ class Supervisor:
 
     def book_source(self, request: dict) -> dict:
         self.validate(request)
-        if self.active:
+        if self.active or request["target_id"] in self.sealed_source_targets:
             raise RuntimeError("Source runtime already running")
         name = f"{os.environ['CP_CI_PROJECT']}-{request['id'][:12]}-source-api"
         cid = self.launch("source-api", request, name=name)
@@ -462,19 +469,220 @@ class Supervisor:
                 self.remove(cid)
 
     def stop_source(self, request: dict) -> dict:
-        item = self.active.pop(request["id"], None)
+        item = self.active.get(request["id"])
         if item is None or any(
             item[1].get(k) != request.get(k)
-            for k in ("db_name", "target_id", "source_manifest_id")
+            for k in ("id", "kind", "db_name", "target_id", "source_manifest_id")
         ):
             raise RuntimeError("Source stop does not match launched generation")
+        db = request["db_name"]
+        target = request["target_id"]
+        if (
+            not IDENT.fullmatch(db)
+            or not db.startswith("compat_")
+            or target != f"t-{db}"
+        ):
+            raise RuntimeError("Source stop target identity mismatch")
+        record = compose(
+            "exec",
+            "-T",
+            "db",
+            "psql",
+            "-X",
+            "-qAt",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "carepulse_bootstrap",
+            "-d",
+            db,
+            "-c",
+            "SELECT concat_ws('|', target_id,db_name,phase,owner_epoch,"
+            "source_manifest_id,active_generation,"
+            "CASE WHEN source_sealed THEN 'true' ELSE 'false' END) "
+            "FROM compat_control.target_control WHERE singleton_id=true",
+        ).split("|")
+        if (
+            len(record) != 7
+            or record[0] != target
+            or record[1] != db
+            or record[4] != request["source_manifest_id"]
+            or record[2] not in ("SOURCE_OPEN", "DRAINING")
+            or record[5] != ("source" if record[2] == "SOURCE_OPEN" else "none")
+            or record[6] != "false"
+        ):
+            raise RuntimeError("Source stop control/phase mismatch")
+        epoch = int(record[3])
+        if request.get("owner_epoch") is not None and (
+            type(request["owner_epoch"]) is not int or request["owner_epoch"] != epoch
+        ):
+            raise RuntimeError("Source stop owner epoch mismatch")
+        if record[2] == "DRAINING" and request.get("owner_epoch") != epoch:
+            raise RuntimeError("Fenced source stop requires current owner epoch")
+        identity = required(
+            (
+                "docker",
+                "inspect",
+                "--format",
+                "{{.Id}}|{{.Image}}|{{.HostConfig.RestartPolicy.Name}}",
+                item[0],
+            )
+        ).split("|")
+        if (
+            len(identity) != 3
+            or not re.fullmatch(r"[0-9a-f]{64}", identity[0])
+            or (len(item[0]) == 64 and identity[0] != item[0])
+            or identity[1] != self.observed["services"]["source-api"]["image_id"]
+            or identity[2] != "no"
+        ):
+            raise RuntimeError("Source stop image/restart policy mismatch")
         self.remove(item[0])
-        self.validate(request)
+        if command(("docker", "inspect", identity[0])).returncode == 0:
+            raise RuntimeError("Removed source container still exists")
+        if required(
+            ("docker", "ps", "-aq", "--no-trunc", "--filter", f"id={identity[0]}")
+        ):
+            raise RuntimeError("Source container remains after removal")
+        self.active.pop(request["id"])
+        source_services = ("source-api", "source-web", "source-worker", "source-sender")
+        for _ in range(2):
+            running = required(
+                (
+                    "docker",
+                    "ps",
+                    "--filter",
+                    f"label=com.docker.compose.project={os.environ['CP_CI_PROJECT']}",
+                    "--format",
+                    '{{.Label "com.docker.compose.service"}}|{{.ID}}',
+                )
+            )
+            if any(
+                line.split("|", 1)[0] in source_services
+                for line in running.splitlines()
+            ):
+                raise RuntimeError("Live source consumer remains after stop")
+        self.sealed_source_targets.add(target)
+        self.stopped_source_ids[target] = identity[0]
         return {
             "version": 1,
             "status": "stopped",
-            "db_name": request["db_name"],
-            "target_id": request["target_id"],
+            "db_name": db,
+            "target_id": target,
+            "source_manifest_id": request["source_manifest_id"],
+            "owner_epoch": epoch,
+            "stop_phase": record[2],
+            "launch_sealed": record[2] == "DRAINING",
+            "stopped_services": list(source_services),
+            "source_container_id": identity[0],
+            "source_image_id": identity[1],
+        }
+
+    def drain_proof(self, request: dict) -> dict:
+        """Host-observed, epoch-bound absence of protected service consumers."""
+        db = request.get("db_name")
+        target = request.get("target_id")
+        if (
+            request.get("version") != 1
+            or request.get("kind") != "drain_proof"
+            or not isinstance(db, str)
+            or not IDENT.fullmatch(db)
+            or not db.startswith("compat_")
+            or target != f"t-{db}"
+            or request.get("source_manifest_id") != "source-0040"
+            or request.get("candidate_manifest_id") != "candidate-0046"
+            or request.get("head") not in (SOURCE_HEAD, *SUCCESSORS)
+            or not isinstance(request.get("cluster_id"), str)
+            or not request["cluster_id"].isdigit()
+            or type(request.get("owner_epoch")) is not int
+            or request["owner_epoch"] <= 0
+        ):
+            raise RuntimeError("Invalid drain-proof target/epoch binding")
+        record = compose(
+            "exec",
+            "-T",
+            "db",
+            "psql",
+            "-X",
+            "-qAt",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "carepulse_bootstrap",
+            "-d",
+            db,
+            "-c",
+            "SELECT concat_ws('|',t.target_id,t.cluster_id,t.db_name,t.phase,"
+            "t.owner_epoch,t.source_manifest_id,t.target_manifest_id,"
+            "t.active_generation,CASE WHEN t.source_sealed THEN 'true' ELSE 'false' END,"
+            "(SELECT CASE WHEN count(*)=1 THEN min(version_num) END "
+            "FROM public.alembic_version)) "
+            "FROM compat_control.target_control t WHERE singleton_id=true",
+        ).split("|")
+        if (
+            record[3] not in ("DRAINING", "MIGRATING")
+            or (record[3] == "DRAINING" and request["head"] != SOURCE_HEAD)
+            or record
+            != [
+                target,
+                request["cluster_id"],
+                db,
+                record[3],
+                str(request["owner_epoch"]),
+                request["source_manifest_id"],
+                request["candidate_manifest_id"],
+                "none",
+                "true",
+                request["head"],
+            ]
+        ):
+            raise RuntimeError("Drain proof control/head/epoch mismatch")
+        if any(item[1]["target_id"] == target for item in self.active.values()):
+            raise RuntimeError("Tracked source ingress is still active")
+        service_names = tuple(
+            f"{generation}-{service}"
+            for generation in ("source", "candidate")
+            for service in ("api", "web", "worker", "sender")
+        )
+        for _ in range(2):
+            running = required(
+                (
+                    "docker",
+                    "ps",
+                    "--filter",
+                    f"label=com.docker.compose.project={os.environ['CP_CI_PROJECT']}",
+                    "--format",
+                    '{{.Label "com.docker.compose.service"}}|{{.ID}}',
+                )
+            )
+            if any(
+                line.split("|", 1)[0] in service_names for line in running.splitlines()
+            ):
+                raise RuntimeError("Product consumer container is still running")
+        previous_id = self.stopped_source_ids.get(target)
+        if previous_id is not None:
+            if command(("docker", "inspect", previous_id)).returncode == 0:
+                raise RuntimeError("Previously stopped source container restarted")
+            if required(
+                (
+                    "docker",
+                    "ps",
+                    "-aq",
+                    "--no-trunc",
+                    "--filter",
+                    f"id={previous_id}",
+                )
+            ):
+                raise RuntimeError("Previously stopped source container remains")
+        self.sealed_source_targets.add(target)
+        return {
+            **request,
+            "status": "stopped",
+            "ok": True,
+            "stop_phase": record[3],
+            "launch_sealed": True,
+            "stopped_services": list(service_names),
+            "running_consumer_count": 0,
+            "prior_source_container_id": previous_id,
         }
 
     def handle(self, file: Path) -> None:
@@ -489,7 +697,9 @@ class Supervisor:
             if token in self.processed:
                 raise RuntimeError("Duplicate CI-host request")
             self.processed.add(token)
-            if request["kind"] == "intermediate":
+            if request["kind"] == "drain_proof":
+                response = self.drain_proof(request)
+            elif request["kind"] == "intermediate":
                 response = self.intermediate(request)
             elif request["kind"] == "booking_source":
                 response = self.book_source(request)
