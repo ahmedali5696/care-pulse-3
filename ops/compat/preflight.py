@@ -222,7 +222,7 @@ def _verify_source_effective_grants(conn: psycopg.Connection) -> None:
                 SELECT EXISTS (
                     SELECT 1 FROM pg_class c
                     JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = 'public' AND c.relname = ANY(%s)
+                    WHERE n.nspname = 'public' AND c.relname = ANY(%s::text[])
                       AND (
                           has_any_column_privilege(%s, c.oid, 'SELECT')
                           OR has_any_column_privilege(%s, c.oid, 'INSERT')
@@ -235,7 +235,7 @@ def _verify_source_effective_grants(conn: psycopg.Connection) -> None:
                       )
                 ) AS unexpected
                 """,
-                (_SOURCE_CLINICAL_TABLES, *((role,) * 8)),
+                (list(_SOURCE_CLINICAL_TABLES), *((role,) * 8)),
             ).fetchone()["unexpected"]
             if extra_clinical:
                 raise PreflightError("Source login clinical ACL drift")
