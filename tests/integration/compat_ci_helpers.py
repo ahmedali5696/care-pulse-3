@@ -280,9 +280,7 @@ def build_manifest(
                     "adapter_mount_path": "/run/compat-adapters",
                     "adapter_import_path": "compat/admission.ts",
                     "packaging_verified": True,
-                    "trusted_peers": [
-                        "http://api:8000" if is_source else "http://candidate-api:8000"
-                    ],
+                    "trusted_peers": ["http://api:8000"],
                     "allowed_credentials": (
                         ["carepulse_runtime", "carepulse_auth"]
                         if is_source

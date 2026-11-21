@@ -70,7 +70,7 @@ require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9
 approved_bootstrap_files = {
     '.github/workflows/foundation.yml': '528ccd4f64bebbde8b9f439a18e43a10185cfeeee3e806f8c8348d67017a603b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
-    'compose.compat.yaml': 'c7edd4270eff918b3dc899bcb20eb690fa2e13c8f3eab202f755debab941332d',
+    'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
     'apps/api/Dockerfile': '8465e11d5b90d94704ec63072180f10c56dcf4becf471da84258ea21de5208c8',
     'apps/web/Dockerfile': 'f4c68d5acdb939573661e8d79b1e08c901fa54cf87993464942eedab8f8df93b',
 }
@@ -1325,12 +1325,12 @@ if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
     docker compose -f compose.compat.yaml --profile source run --rm --no-deps -T --entrypoint node -e CP_SOURCE_WEB_ADAPTER_PATH=/run/compat-adapters/source-web.cjs -v "$PWD/tests/unit/source-web.test.cjs:/tmp/source-web.test.cjs:ro" source-web --test --test-reporter=tap /tmp/source-web.test.cjs | tee "$private/compat-us1-source-web.log"
     # Hosted immutable-source Web: genuine Node preload, Next HTTP and both real 0040 logins.
     docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T observer python -c 'from tests.integration.test_compat_source_web_runtime import prepare_source_web_http_lab; prepare_source_web_http_lab()'
-    docker compose -f compose.compat.yaml --profile source up -d --no-build --no-deps source-api source-web
+    docker compose -f compose.compat.yaml --profile source --profile candidate up -d --no-build --no-deps source-api source-web candidate-web
     docker compose -f compose.compat.yaml --profile source run -d --no-deps --name "${CP_CI_PROJECT}-source-peer" -e CP_COMPAT_EXPECTED_API_PEER=http://candidate-api:8000 source-web
     source_web_id="$(docker compose -f compose.compat.yaml --profile source ps -q source-web)"
     if [[ -z "$source_web_id" ]]; then
       echo 'FAIL immutable source Web stopped during HTTP test startup'
-      docker compose -f compose.compat.yaml --profile source ps -a source-api source-web
+      docker compose -f compose.compat.yaml --profile source --profile candidate ps -a source-api source-web candidate-web
       docker compose -f compose.compat.yaml --profile source logs --no-color --tail 30 source-web
       exit 1
     fi
@@ -1340,7 +1340,7 @@ if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
     test -n "$CP_SOURCE_WEB_DB_IP"
     run_compat_observer compat-us1-source-web-runtime 1 tests/integration/test_compat_source_web_runtime.py
     test "$(docker inspect --format '{{.State.Pid}}' "$source_web_id")" = "$source_web_host_pid"
-    docker compose -f compose.compat.yaml --profile source stop source-api source-web
+    docker compose -f compose.compat.yaml --profile source --profile candidate stop source-api source-web candidate-web
     docker rm -f "${CP_CI_PROJECT}-source-peer" >/dev/null
     if [[ "$mode" = compat-full ]]; then
       for result in '# tests 9' '# pass 9' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do

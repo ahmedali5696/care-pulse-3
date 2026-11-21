@@ -28,6 +28,7 @@ from tests.integration.compat_matrix_fixture import (
 from tests.integration.test_sessions import _seed_owner
 
 SOURCE = "http://source-web:3000"
+CANDIDATE = "http://candidate-web:3000"
 WRONG_PEER = f"http://{os.environ.get('CP_CI_PROJECT', 'unset')}-source-peer:3000"
 EMAIL = "source-web-runtime@example.invalid"
 PASSWORD = "Synthetic-Source-Web-0040-Test-Only!"
@@ -190,6 +191,7 @@ def test_original_source_web_http_rechecks_live_native_and_runtime_privileges() 
     web_ip = os.environ["CP_SOURCE_WEB_DB_IP"]
     _ready(SOURCE)
     _ready(WRONG_PEER)
+    _ready(CANDIDATE)
     admin = connect_role("carepulse_bootstrap", autocommit=True)
     try:
         control = admin.execute(
@@ -316,12 +318,15 @@ def test_original_source_web_http_rechecks_live_native_and_runtime_privileges() 
                 admin.execute(undo)
             assert _http(SOURCE, "/health/ready")[0] == 200
 
-        # A source process with an incompatible API peer stays fenced.
+        # Both the source's mismatched peer and inactive candidate Web remain fenced.
         admitted_web_attempts = _web_attempts(admin)
         previous_protected = _protected_digest(admin)
         assert _http(WRONG_PEER, "/health/live")[0] == 200
         _unavailable(_http(WRONG_PEER, "/health/ready"))
         _unavailable(_http(WRONG_PEER, "/api/session", cookie=cookie))
+        assert _http(CANDIDATE, "/health/live")[0] == 200
+        _unavailable(_http(CANDIDATE, "/health/ready"))
+        _unavailable(_http(CANDIDATE, "/api/session", cookie=cookie))
         assert _effects(admin) == original
         assert _protected_digest(admin) == previous_protected
         assert _web_attempts(admin) == admitted_web_attempts
@@ -331,7 +336,7 @@ def test_original_source_web_http_rechecks_live_native_and_runtime_privileges() 
             f"runtime_sessions={role_counts['carepulse_runtime']} "
             f"auth_sessions={role_counts['carepulse_auth']} "
             f"protected_effect_counts={original} delta=0 "
-            "ACL/phase/head/peer_denied=503 live=200"
+            "ACL/phase/head/peer_denied=503 live=200 candidate_fenced=503"
         )
     finally:
         admin.close()
