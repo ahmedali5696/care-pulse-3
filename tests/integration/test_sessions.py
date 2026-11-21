@@ -64,11 +64,11 @@ def _password_hash(password):
     return f"{salt}:{digest.hex()}"
 
 
-def _seed_owner(connection):
+def _seed_owner(connection, *, email=None, password=None):
     operator, clinic, staff = uuid4(), uuid4(), uuid4()
     user = f"synthetic-b02-{uuid4()}"
-    email = f"{uuid4()}@example.invalid"
-    password = f"Synthetic-B02-{uuid4()}!"
+    email = email or f"{uuid4()}@example.invalid"
+    password = password or f"Synthetic-B02-{uuid4()}!"
     invitation = uuid4()
     connection.execute(
         """INSERT INTO public.operator_identities

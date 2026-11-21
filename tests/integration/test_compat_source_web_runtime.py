@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from hashlib import sha256
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -24,7 +25,7 @@ from tests.integration.compat_matrix_fixture import (
     initial_activate_matched_target,
     provision_target_control,
 )
-from tests.integration.test_sessions import _password_hash, _seed_owner
+from tests.integration.test_sessions import _seed_owner
 
 SOURCE = "http://source-web:3000"
 CANDIDATE = "http://candidate-web:3000"
@@ -78,18 +79,7 @@ def prepare_source_web_http_lab() -> None:
 
     seed = connect_role("carepulse_bootstrap")
     try:
-        owner = _seed_owner(seed)
-        seed.execute(
-            'UPDATE public."user" SET email = %s WHERE id = %s', (EMAIL, owner.user)
-        )
-        seed.execute(
-            "UPDATE public.staff_accounts SET verified_email = %s WHERE auth_user_id = %s",
-            (EMAIL, owner.user),
-        )
-        seed.execute(
-            'UPDATE public."account" SET password = %s WHERE "userId" = %s',
-            (_password_hash(PASSWORD), owner.user),
-        )
+        _seed_owner(seed, email=EMAIL, password=PASSWORD)
         seed.commit()
     finally:
         seed.close()
@@ -179,6 +169,15 @@ def _web_attempts(conn: psycopg.Connection) -> int:
     ).fetchone()["n"]
 
 
+def _session_digest(conn: psycopg.Connection) -> str:
+    """Compare complete native session rows without disclosing tokens in test output."""
+    rows = conn.execute(
+        'SELECT to_jsonb(s) AS value FROM public."session" s ORDER BY id'
+    ).fetchall()
+    payload = json.dumps([row["value"] for row in rows], sort_keys=True, default=str)
+    return sha256(payload.encode()).hexdigest()
+
+
 def test_original_source_web_http_rechecks_live_native_and_runtime_privileges() -> None:
     require_compat_ci()
     web_ip = os.environ["CP_SOURCE_WEB_DB_IP"]
@@ -231,18 +230,35 @@ def test_original_source_web_http_rechecks_live_native_and_runtime_privileges() 
             (web_ip,),
         ).fetchall()
         assert source_pid
+        auth_pid = admin.execute(
+            """SELECT pid FROM pg_stat_activity
+               WHERE datname=current_database() AND client_addr=%s::inet
+                 AND usename='carepulse_auth'""",
+            (web_ip,),
+        ).fetchall()
+        assert auth_pid
 
         # Native-auth ACL drift is checked on an already-used auth pool, not a VM mock.
+        previous_session = _session_digest(admin)
         try:
             admin.execute("GRANT SELECT ON public.patients TO carepulse_auth")
+            assert (
+                admin.execute(
+                    "SELECT count(*) AS n FROM pg_stat_activity WHERE pid = ANY(%s)",
+                    ([r["pid"] for r in auth_pid],),
+                ).fetchone()["n"]
+                > 0
+            )
             _unavailable(_http(SOURCE, "/api/session", cookie=cookie))
             assert _effects(admin) == original
+            assert _session_digest(admin) == previous_session
         finally:
             admin.execute("REVOKE SELECT ON public.patients FROM carepulse_auth")
         assert _http(SOURCE, "/api/session", cookie=cookie)[0] == 200
 
         # An already-running source Web must recheck its runtime connection too.
         admitted_web_attempts = _web_attempts(admin)
+        previous_session = _session_digest(admin)
         try:
             admin.execute("REVOKE SELECT ON public.patients FROM carepulse_runtime")
             assert (
@@ -256,6 +272,7 @@ def test_original_source_web_http_rechecks_live_native_and_runtime_privileges() 
             _unavailable(_http(SOURCE, "/api/session", cookie=cookie))
             assert _http(SOURCE, "/health/live")[0] == 200
             assert _effects(admin) == original
+            assert _session_digest(admin) == previous_session
             assert _web_attempts(admin) == admitted_web_attempts
         finally:
             admin.execute("GRANT SELECT ON public.patients TO carepulse_runtime")
@@ -273,12 +290,14 @@ def test_original_source_web_http_rechecks_live_native_and_runtime_privileges() 
             ),
         ):
             admitted_web_attempts = _web_attempts(admin)
+            previous_session = _session_digest(admin)
             try:
                 admin.execute(mutation)
                 _unavailable(_http(SOURCE, "/health/ready"))
                 _unavailable(_http(SOURCE, "/api/session", cookie=cookie))
                 assert _http(SOURCE, "/health/live")[0] == 200
                 assert _effects(admin) == original
+                assert _session_digest(admin) == previous_session
                 assert _web_attempts(admin) == admitted_web_attempts
             finally:
                 admin.execute(undo)
@@ -286,11 +305,13 @@ def test_original_source_web_http_rechecks_live_native_and_runtime_privileges() 
 
         # The incompatible generation and a source instance bound to the wrong API peer stay fenced.
         admitted_web_attempts = _web_attempts(admin)
+        previous_session = _session_digest(admin)
         for base in (CANDIDATE, WRONG_PEER):
             assert _http(base, "/health/live")[0] == 200
             _unavailable(_http(base, "/health/ready"))
             _unavailable(_http(base, "/api/session", cookie=cookie))
         assert _effects(admin) == original
+        assert _session_digest(admin) == previous_session
         assert _web_attempts(admin) == admitted_web_attempts
         print(
             "SOURCE_WEB_HTTP 0040/SOURCE_OPEN login=200 session=200 runtime/auth=real-pg drift/phase/head/peer=503 live=200 effects=unchanged"
