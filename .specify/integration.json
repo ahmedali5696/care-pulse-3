@@ -1,5 +1,5 @@
 {
-  "version": "1.2.2",
+  "version": "1.4.3",
   "integration_state_schema": 1,
   "installed_integrations": [
     "opencode",
@@ -20,6 +20,6 @@
       "invoke_separator": "-"
     }
   },
-  "integration": "opencode",
-  "default_integration": "opencode"
+  "integration": "codex",
+  "default_integration": "codex"
 }
