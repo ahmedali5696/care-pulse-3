@@ -183,6 +183,14 @@ def _compat_settings() -> tuple[str, str]:
 def _verify_job_connection(
     conn, target_id: str, manifest_id: str, db_name: str, expected_role: str
 ) -> int:
+    # Resolve schema access before regclass literals in the sender ACL branch.
+    if (
+        conn.scalar(
+            text("SELECT has_schema_privilege(current_user, 'public', 'USAGE')")
+        )
+        is not True
+    ):
+        raise RuntimeError("Source job effective privilege mismatch")
     row = conn.execute(text(_SOURCE_ROLE_PROBE)).first()
     if (
         row is None
