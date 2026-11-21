@@ -1302,6 +1302,10 @@ run_compat_observer() {
   local group="$1" expected="$2"
   shift 2
   local ipc_args=()
+  if [[ "$group" = compat-us1-source-web-runtime ]]; then
+    test -n "${CP_SOURCE_WEB_DB_IP:-}"
+    ipc_args=(-e CP_SOURCE_WEB_DB_IP)
+  fi
   if [[ "$group" = compat-us2 ]]; then
     ipc_args=(-e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -e CP_COMPAT_T051_REPLY_DIR=/tmp/compat-host-replies -v "$private/handshake:/tmp/compat-host:rw" -v "$private/host-replies:/tmp/compat-host-replies:ro")
   fi
@@ -1319,6 +1323,19 @@ if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
     docker compose -f compose.compat.yaml --profile candidate run --rm --no-deps -T --entrypoint node candidate-web --no-warnings --experimental-strip-types --test --test-reporter=tap auth/compat.test.ts | tee "$private/compat-us1-web.log"
     test -f tests/unit/source-web.test.cjs || { echo 'FAIL missing source Web privilege regression'; exit 1; }
     docker compose -f compose.compat.yaml --profile source run --rm --no-deps -T --entrypoint node -e CP_SOURCE_WEB_ADAPTER_PATH=/run/compat-adapters/source-web.cjs -v "$PWD/tests/unit/source-web.test.cjs:/tmp/source-web.test.cjs:ro" source-web --test --test-reporter=tap /tmp/source-web.test.cjs | tee "$private/compat-us1-source-web.log"
+    # Hosted immutable-source Web: genuine Node preload, Next HTTP and both real 0040 logins.
+    docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T observer python -c 'from tests.integration.test_compat_source_web_runtime import prepare_source_web_http_lab; prepare_source_web_http_lab()'
+    docker compose -f compose.compat.yaml --profile source --profile candidate up -d --no-build --no-deps source-api source-web candidate-web
+    docker compose -f compose.compat.yaml --profile source run -d --no-build --no-deps --name "${CP_CI_PROJECT}-source-peer" -e CP_COMPAT_EXPECTED_API_PEER=http://candidate-api:8000 source-web
+    source_web_id="$(docker compose -f compose.compat.yaml --profile source ps -q source-web)"
+    test -n "$source_web_id"
+    source_web_host_pid="$(docker inspect --format '{{.State.Pid}}' "$source_web_id")"
+    export CP_SOURCE_WEB_DB_IP="$(docker inspect "$source_web_id" | python3 -c 'import json,sys; nets=json.load(sys.stdin)[0]["NetworkSettings"]["Networks"]; ips=[n["IPAddress"] for k,n in nets.items() if k.endswith("_compat_db")]; assert len(ips)==1; print(ips[0])')"
+    test -n "$CP_SOURCE_WEB_DB_IP"
+    run_compat_observer compat-us1-source-web-runtime 1 tests/integration/test_compat_source_web_runtime.py
+    test "$(docker inspect --format '{{.State.Pid}}' "$source_web_id")" = "$source_web_host_pid"
+    docker compose -f compose.compat.yaml --profile source --profile candidate stop source-api source-web candidate-web
+    docker rm -f "${CP_CI_PROJECT}-source-peer" >/dev/null
     if [[ "$mode" = compat-full ]]; then
       for result in '# tests 9' '# pass 9' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
         grep -Fxq "$result" "$private/compat-us1-web.log" || { echo "FAIL mandatory compat Web test count: $result"; exit 1; }
@@ -1417,7 +1434,7 @@ if [[ "$mode" = compat-us3 || "$mode" = compat-full ]]; then
     fi
 fi
 if [[ "$mode" = compat-full ]]; then
-  echo 'PASS mandatory compatibility: 43 Python cases (US1 25, US2 8, US3 10), 11 Web cases, zero skips'
+  echo 'PASS mandatory compatibility: 44 Python cases (US1 26, US2 8, US3 10), 11 Web cases, zero skips'
 fi
 '@
             & bash -e -c $compatScript -- $Check
