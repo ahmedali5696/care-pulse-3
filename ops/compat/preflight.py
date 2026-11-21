@@ -159,6 +159,12 @@ def _verify_source_effective_grants(conn: psycopg.Connection) -> None:
         ).fetchone()
         if row is None or row["safe"] is not True:
             raise PreflightError("Source login database, schema or control ACL drift")
+        has_public_usage = conn.execute(
+            "SELECT has_schema_privilege(%s, 'public', 'USAGE') AS allowed",
+            (role,),
+        ).fetchone()["allowed"]
+        if has_public_usage is not (role != "carepulse_operator"):
+            raise PreflightError("Source login public schema usage drift")
         if conn.execute(
             """
             SELECT EXISTS (
