@@ -281,7 +281,7 @@ def build_manifest(
                     "adapter_import_path": "compat/admission.ts",
                     "packaging_verified": True,
                     "trusted_peers": [
-                        f"http://{'source' if is_source else 'candidate'}-api:8000"
+                        "http://api:8000" if is_source else "http://candidate-api:8000"
                     ],
                     "allowed_credentials": (
                         ["carepulse_runtime", "carepulse_auth"]

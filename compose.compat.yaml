@@ -33,8 +33,10 @@ services:
     profiles:
       - source
     networks:
-      - compat_source_app
-      - compat_db
+      compat_source_app:
+        aliases:
+          - api
+      compat_db:
     depends_on:
       - db
     volumes:
@@ -102,8 +104,8 @@ services:
       CP_DB_PASSWORD_FILE: /run/secrets/source_runtime_db_password
       CP_AUTH_DB_USER: carepulse_auth
       CP_AUTH_DB_PASSWORD_FILE: /run/secrets/source_auth_db_password
-      CP_INTERNAL_API_URL: http://source-api:8000
-      CP_COMPAT_EXPECTED_API_PEER: http://source-api:8000
+      CP_INTERNAL_API_URL: http://api:8000
+      CP_COMPAT_EXPECTED_API_PEER: http://api:8000
       CP_SIGNING_KEY_ID: ${CP_SOURCE_SIGNING_KEY_ID:-synthetic-source-v1}
       CP_SERVICE_KEY_FILE: /run/secrets/source_service_key
       CP_AUTH_SECRET_FILE: /run/secrets/source_auth_secret
