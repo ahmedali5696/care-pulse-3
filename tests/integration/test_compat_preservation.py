@@ -482,7 +482,13 @@ def _host_signal(path: Path, payload: dict[str, str]) -> None:
 @contextmanager
 def _immutable_source_api(lab):
     directory = Path("/tmp/compat-host")
-    if os.environ.get("CI") != "true" or not directory.is_dir():
+    replies = Path("/tmp/compat-host-replies")
+    if (
+        os.environ.get("CI") != "true"
+        or not directory.is_dir()
+        or not replies.is_dir()
+        or os.environ.get("CP_COMPAT_T051_REPLY_DIR") != str(replies)
+    ):
         raise AssertionError("Authentic source writer requires scoped host IPC")
     nonce = uuid4().hex
     binding = {
@@ -497,9 +503,7 @@ def _immutable_source_api(lab):
     _host_signal(request, binding)
     launched = False
     try:
-        ready = _host_reply(
-            directory / f"{nonce}.response.json", binding, status="ready"
-        )
+        ready = _host_reply(replies / f"{nonce}.response.json", binding, status="ready")
         launched = True
         endpoint = ready.get("endpoint")
         if endpoint != "http://source-api:8000":
@@ -515,7 +519,7 @@ def _immutable_source_api(lab):
                 ).fetchone()["owner_epoch"]
             _host_signal(directory / f"{nonce}.stop.json", stop_request)
             stopped = _host_reply(
-                directory / f"{nonce}.stopped.json",
+                replies / f"{nonce}.stopped.json",
                 {
                     "db_name": lab.dbname,
                     "target_id": lab.target_id,

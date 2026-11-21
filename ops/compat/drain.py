@@ -86,7 +86,11 @@ def assert_host_consumers_stopped(
     temporary = directory / f"{nonce}.pending"
     temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
     os.replace(temporary, directory / f"{nonce}.request.json")
-    reply_path = directory / f"{nonce}.response.json"
+    replies_str = os.environ.get("CP_COMPAT_T051_REPLY_DIR", "")
+    replies = Path(replies_str) if replies_str else None
+    if replies is None or not replies.is_dir() or replies.is_symlink():
+        raise DrainError("Independent host response mount is unavailable")
+    reply_path = replies / f"{nonce}.response.json"
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         if reply_path.is_file():

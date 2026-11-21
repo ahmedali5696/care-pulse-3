@@ -87,7 +87,9 @@ def emit(path: Path, payload: dict) -> None:
 
 
 class Supervisor:
-    def __init__(self, directory: Path, observed_path: Path) -> None:
+    def __init__(
+        self, directory: Path, observed_path: Path, response_directory: Path
+    ) -> None:
         if (
             not trusted_foundation_event()
             or not re.fullmatch(
@@ -96,7 +98,18 @@ class Supervisor:
             or os.environ.get("COMPOSE_PROJECT_NAME") != os.environ.get("CP_CI_PROJECT")
         ):
             raise RuntimeError("CI-host requires a matched disposable runner")
+        if (
+            not directory.is_dir()
+            or not response_directory.is_dir()
+            or directory.is_symlink()
+            or response_directory.is_symlink()
+            or directory.resolve() == response_directory.resolve()
+        ):
+            raise RuntimeError(
+                "CI-host request and response directories must be separate"
+            )
         self.directory = directory
+        self.response_directory = response_directory
         self.observed = json.loads(observed_path.read_text(encoding="utf-8"))
         if self.observed["candidate_sha"] != os.environ.get("GITHUB_SHA"):
             raise RuntimeError(
@@ -619,7 +632,8 @@ class Supervisor:
             "FROM compat_control.target_control t WHERE singleton_id=true",
         ).split("|")
         if (
-            record[3] not in ("DRAINING", "MIGRATING")
+            len(record) != 10
+            or record[3] not in ("DRAINING", "MIGRATING")
             or (record[3] == "DRAINING" and request["head"] != SOURCE_HEAD)
             or record
             != [
@@ -705,10 +719,10 @@ class Supervisor:
                 response = self.book_source(request)
             else:
                 raise RuntimeError("Unknown CI-host kind")
-            emit(self.directory / f"{token}.response.json", response)
+            emit(self.response_directory / f"{token}.response.json", response)
         else:
             response = self.stop_source(request)
-            emit(self.directory / f"{token}.stopped.json", response)
+            emit(self.response_directory / f"{token}.stopped.json", response)
 
     def run(self) -> None:
         while not self.stopped:
@@ -728,7 +742,8 @@ class Supervisor:
                             else "response.json"
                         )
                         emit(
-                            self.directory / f"{file.name.split('.')[0]}.{suffix}",
+                            self.response_directory
+                            / f"{file.name.split('.')[0]}.{suffix}",
                             {"version": 1, "status": "blocked", "ok": False},
                         )
                         self.stopped = True
@@ -742,9 +757,9 @@ class Supervisor:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 4:
         return 2
-    supervisor = Supervisor(Path(sys.argv[1]), Path(sys.argv[2]))
+    supervisor = Supervisor(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
     signal.signal(signal.SIGTERM, lambda _s, _f: setattr(supervisor, "stopped", True))
     try:
         supervisor.run()

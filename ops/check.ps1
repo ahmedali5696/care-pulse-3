@@ -1303,7 +1303,7 @@ run_compat_observer() {
   shift 2
   local ipc_args=()
   if [[ "$group" = compat-us2 ]]; then
-    ipc_args=(-e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -v "$private/handshake:/tmp/compat-host:rw")
+    ipc_args=(-e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -e CP_COMPAT_T051_REPLY_DIR=/tmp/compat-host-replies -v "$private/handshake:/tmp/compat-host:rw" -v "$private/host-replies:/tmp/compat-host-replies:ro")
   fi
   if [[ "$mode" = compat-full ]]; then
     timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/compat-results:/tmp/compat-results:rw" "${ipc_args[@]}" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "--junitxml=/tmp/compat-results/$group.xml" "$@"
@@ -1367,7 +1367,8 @@ with open(output_path, 'w', encoding='utf-8') as stream:
 PY
     chmod 0444 "$private/observed.json"
     mkdir -m 1777 "$private/handshake"
-    python3 -u ops/compat/ci_host.py "$private/handshake" "$private/observed.json" > "$private/ci-host.log" 2>&1 &
+    mkdir -m 0755 "$private/host-replies"
+    python3 -u ops/compat/ci_host.py "$private/handshake" "$private/observed.json" "$private/host-replies" > "$private/ci-host.log" 2>&1 &
     host_pid=$!
 fi
 if [[ "$mode" = compat-us2 || "$mode" = compat-full ]]; then
@@ -1375,8 +1376,12 @@ if [[ "$mode" = compat-us2 || "$mode" = compat-full ]]; then
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
     run_compat_observer compat-us2 8 "${required_suites[@]}"
     if [[ "$mode" = compat-us2 ]]; then
-      kill -TERM "$host_pid"
-      wait "$host_pid"
+      kill -TERM "$host_pid" 2>/dev/null || true
+      if ! wait "$host_pid"; then
+        echo 'FAIL independent compatibility host supervisor'
+        cat "$private/ci-host.log"
+        exit 1
+      fi
       host_pid=''
     fi
 fi
@@ -1385,10 +1390,10 @@ if [[ "$mode" = compat-us3 || "$mode" = compat-full ]]; then
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
     set +e
     if [[ "$mode" = compat-full ]]; then
-      timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" -v "$private/handshake:/tmp/compat-host:rw" -v "$private/compat-results:/tmp/compat-results:rw" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=35 --tb=short -p no:cacheprovider --junitxml=/tmp/compat-results/compat-us3.xml "${required_suites[@]}"
+      timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -e CP_COMPAT_T051_REPLY_DIR=/tmp/compat-host-replies -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" -v "$private/handshake:/tmp/compat-host:rw" -v "$private/host-replies:/tmp/compat-host-replies:ro" -v "$private/compat-results:/tmp/compat-results:rw" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=35 --tb=short -p no:cacheprovider --junitxml=/tmp/compat-results/compat-us3.xml "${required_suites[@]}"
       test_code=$?
     else
-      timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" -v "$private/handshake:/tmp/compat-host:rw" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=35 --tb=short -p no:cacheprovider "${required_suites[@]}"
+      timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -e CP_COMPAT_T051_REPLY_DIR=/tmp/compat-host-replies -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" -v "$private/handshake:/tmp/compat-host:rw" -v "$private/host-replies:/tmp/compat-host-replies:ro" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=35 --tb=short -p no:cacheprovider "${required_suites[@]}"
       test_code=$?
     fi
     kill -TERM "$host_pid" 2>/dev/null || true

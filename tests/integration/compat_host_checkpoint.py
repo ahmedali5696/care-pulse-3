@@ -14,6 +14,7 @@ from secrets import token_hex
 from ops.compat.preflight import PUBLISHED_SUCCESSORS
 
 _ROOT = Path("/tmp/compat-host")
+_REPLIES = Path("/tmp/compat-host-replies")
 _OBSERVED = Path("/tmp/compat-observed.json")
 
 
@@ -34,6 +35,8 @@ def checkpoint_restarted_jobs(
     if (
         os.environ.get("CP_COMPAT_T051_IPC_DIR") != str(_ROOT)
         or not _ROOT.is_dir()
+        or os.environ.get("CP_COMPAT_T051_REPLY_DIR") != str(_REPLIES)
+        or not _REPLIES.is_dir()
         or _ROOT.is_symlink()
         or not os.access(_ROOT, os.W_OK)
         or not re.fullmatch(r"compat_mid_[0-9a-f]{12}", db_name)
@@ -79,7 +82,7 @@ def checkpoint_restarted_jobs(
         "job_id": job_id,
     }
     path = _ROOT / f"{request_id}.request.json"
-    response_path = _ROOT / f"{request_id}.response.json"
+    response_path = _REPLIES / f"{request_id}.response.json"
     descriptor, temporary = tempfile.mkstemp(prefix=f".{request_id}.", dir=_ROOT)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:

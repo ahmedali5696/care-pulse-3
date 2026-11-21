@@ -6,6 +6,8 @@ import os
 import threading
 import time
 from contextlib import ExitStack
+from pathlib import Path
+from uuid import uuid4
 
 import psycopg
 import pytest
@@ -133,6 +135,14 @@ def test_matching_epoch_cannot_mutate_without_claimed_session_owner_lock() -> No
 
 
 def test_ordered_invocation_versus_drain_with_lock_observation() -> None:
+    # The observer can write requests but cannot fabricate a positive host
+    # response, even when it knows the exact token and expected JSON.
+    replies = Path(os.environ["CP_COMPAT_T051_REPLY_DIR"])
+    assert replies.is_dir()
+    with pytest.raises(OSError):
+        (replies / f"{uuid4().hex}.response.json").write_text(
+            '{"status":"stopped","ok":true}', encoding="utf-8"
+        )
     with disposable_database("compat_drain") as dbname:
         admin = connect_role("carepulse_bootstrap", dbname=dbname, autocommit=True)
         try:
