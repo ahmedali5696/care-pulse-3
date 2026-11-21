@@ -40,6 +40,8 @@ function loadSourceConfig() {
     !manifestId ||
     generation !== "source" ||
     expectedHead !== SOURCE_HEAD ||
+    (process.env.CP_DB_USER || "carepulse_runtime") !== "carepulse_runtime" ||
+    (process.env.CP_AUTH_DB_USER || "carepulse_auth") !== "carepulse_auth" ||
     !expectedPeer ||
     actualPeer !== expectedPeer
   ) {
@@ -77,7 +79,7 @@ async function sourceReady() {
   const cfg = loadSourceConfig();
   const client = await getRuntimePool().connect();
   try {
-    await verifyClient(client, cfg, process.env.CP_DB_USER || "carepulse_runtime");
+    await verifyClient(client, cfg, "carepulse_runtime");
   } finally {
     client.release();
   }
@@ -88,7 +90,139 @@ async function verifyClient(client, cfg, expectedRole) {
     `SELECT current_database() AS db_name,
             session_user::text AS session_user,
             current_user::text AS current_user,
-            r.rolsuper, r.rolbypassrls, r.rolcanlogin
+            r.rolsuper, r.rolbypassrls, r.rolcanlogin,
+            r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolinherit,
+            EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid) AS role_member,
+            has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
+            has_database_privilege(current_user, current_database(), 'CREATE,TEMP') AS db_create_temp,
+            has_schema_privilege(current_user, 'public', 'USAGE') AS public_usage,
+            has_schema_privilege(current_user, 'public', 'CREATE') AS public_create,
+            has_schema_privilege(current_user, 'compat_control', 'USAGE') AS control_usage,
+            has_schema_privilege(current_user, 'compat_control', 'CREATE') AS control_create,
+            has_function_privilege(current_user,
+                'compat_control.read_target_control()', 'EXECUTE') AS control_reader,
+            has_function_privilege(current_user,
+                'compat_control.read_target_status()', 'EXECUTE') AS control_status_reader,
+            has_function_privilege(current_user,
+                'compat_control.record_own_attempt(text,text,bigint,text,text,text,text,bigint,text)',
+                'EXECUTE') AS attempt_writer,
+            has_function_privilege(current_user,
+                'compat_control.has_unknown_sender_attempt(text,text)',
+                'EXECUTE') AS sender_authority,
+            has_table_privilege(current_user, 'compat_control.target_control', 'SELECT') AS control_select,
+            has_table_privilege(current_user, 'compat_control.target_control',
+                'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') AS control_mutation,
+            has_any_column_privilege(current_user, 'compat_control.target_control',
+                'INSERT,UPDATE,REFERENCES') AS control_column_mutation,
+            has_table_privilege(current_user, 'compat_control.work_evidence',
+                'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') AS work_access,
+            has_any_column_privilege(current_user, 'compat_control.work_evidence',
+                'SELECT,INSERT,UPDATE,REFERENCES') AS work_column_access,
+            EXISTS (
+              SELECT 1 FROM pg_namespace n
+              WHERE n.nspname NOT IN ('public', 'compat_control', 'pg_catalog', 'information_schema')
+                AND n.nspname NOT LIKE 'pg_%'
+                AND has_schema_privilege(current_user, n.oid, 'USAGE,CREATE')
+            ) AS other_schema_access,
+            has_table_privilege(current_user, 'public.patients', 'SELECT') AS patient_read,
+            has_table_privilege(current_user, 'public.appointments', 'INSERT') AS appointment_write,
+            (SELECT bool_and(
+                has_table_privilege(current_user, format('public.%I', native_table), 'SELECT')
+                AND has_table_privilege(current_user, format('public.%I', native_table), 'INSERT')
+                AND has_table_privilege(current_user, format('public.%I', native_table), 'UPDATE')
+                AND has_table_privilege(current_user, format('public.%I', native_table), 'DELETE')
+             ) FROM (VALUES ('user'), ('session'), ('account'), ('verification'))
+               AS native_tables(native_table)) AS auth_native_crud,
+            EXISTS (
+              SELECT 1 FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public' AND c.relname IN ('user', 'verification')
+                AND (has_table_privilege(current_user, c.oid,
+                    'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+                  OR has_any_column_privilege(current_user, c.oid,
+                    'INSERT,UPDATE,REFERENCES'))
+            ) OR has_table_privilege(current_user, 'public."account"',
+                'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+              OR has_any_column_privilege(current_user, 'public."account"',
+                'SELECT,INSERT,UPDATE,REFERENCES')
+              OR has_table_privilege(current_user, 'public."session"',
+                'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+              OR has_any_column_privilege(current_user, 'public."session"',
+                'SELECT,INSERT,UPDATE,REFERENCES') AS runtime_native_access,
+            EXISTS (
+              SELECT 1 FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public'
+                AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                AND c.relname NOT IN (
+                  'user', 'session', 'account', 'verification', 'organizations',
+                  'staff_accounts', 'invitations', 'recovery_operations',
+                  'auth_recovery_completions', 'delivery_jobs',
+                  'protected_delivery_material', 'sensitive_audit'
+                )
+                AND (
+                  has_table_privilege(current_user, c.oid,
+                    'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+                  OR has_any_column_privilege(current_user, c.oid,
+                    'SELECT,INSERT,UPDATE,REFERENCES')
+                )
+            ) AS auth_unexpected_relation_access,
+            EXISTS (
+              SELECT 1 FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public'
+                AND c.relname IN (
+                  'organizations', 'staff_accounts', 'invitations',
+                  'auth_recovery_completions'
+                )
+                AND (has_table_privilege(current_user, c.oid,
+                    'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+                  OR has_any_column_privilege(current_user, c.oid,
+                    'INSERT,UPDATE,REFERENCES'))
+            ) OR has_table_privilege(current_user, 'public.recovery_operations',
+                'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+              OR has_any_column_privilege(current_user, 'public.recovery_operations',
+                'INSERT,REFERENCES')
+              OR EXISTS (
+                SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = 'public.recovery_operations'::regclass
+                  AND a.attnum > 0 AND NOT a.attisdropped AND a.attname <> 'auth_fence'
+                  AND has_column_privilege(current_user, a.attrelid, a.attnum, 'UPDATE')
+              )
+              OR has_table_privilege(current_user, 'public.delivery_jobs',
+                'UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+              OR has_any_column_privilege(current_user, 'public.delivery_jobs',
+                'UPDATE,REFERENCES')
+              OR has_table_privilege(current_user, 'public.protected_delivery_material',
+                'SELECT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+              OR has_any_column_privilege(current_user, 'public.protected_delivery_material',
+                'SELECT,UPDATE,REFERENCES')
+              OR has_table_privilege(current_user, 'public.sensitive_audit',
+                'SELECT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+              OR has_any_column_privilege(current_user, 'public.sensitive_audit',
+                'SELECT,UPDATE,REFERENCES')
+              OR EXISTS (
+                SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = 'public.organizations'::regclass
+                  AND a.attnum > 0 AND NOT a.attisdropped
+                  AND a.attname NOT IN ('id', 'state', 'lifecycle_revision', 'first_activated_at')
+                  AND has_column_privilege(current_user, a.attrelid, a.attnum, 'SELECT')
+              )
+              OR EXISTS (
+                SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = 'public.delivery_jobs'::regclass
+                  AND a.attnum > 0 AND NOT a.attisdropped
+                  AND a.attname NOT IN ('id', 'organization_id', 'state', 'purpose')
+                  AND has_column_privilege(current_user, a.attrelid, a.attnum, 'SELECT')
+              )
+              OR EXISTS (
+                SELECT 1 FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public'
+                  AND c.relname IN ('user', 'session', 'account', 'verification')
+                  AND has_table_privilege(current_user, c.oid,
+                    'TRUNCATE,REFERENCES,TRIGGER')
+              ) AS auth_widened_metadata
      FROM pg_roles r WHERE r.rolname = current_user`,
   );
   if (ident.rows.length !== 1) throw new Error("Role identity unavailable");
@@ -99,9 +233,22 @@ async function verifyClient(client, cfg, expectedRole) {
     r.current_user !== expectedRole ||
     r.rolsuper ||
     r.rolbypassrls ||
-    !r.rolcanlogin
+    !r.rolcanlogin ||
+    r.rolcreatedb || r.rolcreaterole || r.rolreplication ||
+    r.rolinherit || r.role_member ||
+    !r.can_connect || r.db_create_temp ||
+    !r.public_usage || r.public_create ||
+    !r.control_usage || r.control_create ||
+    !r.control_reader || !r.control_status_reader || !r.attempt_writer || r.sender_authority ||
+    !r.control_select || r.control_mutation || r.control_column_mutation ||
+    r.work_access || r.work_column_access || r.other_schema_access ||
+    (expectedRole === 'carepulse_auth'
+      ? r.patient_read || r.appointment_write || r.auth_unexpected_relation_access ||
+        r.auth_widened_metadata ||
+        !r.auth_native_crud
+      : !r.patient_read || !r.appointment_write || r.runtime_native_access)
   ) {
-    throw new Error("Role/database mismatch");
+    throw new Error("Effective source role privilege mismatch");
   }
 
   const ctrl = await client.query(
@@ -140,11 +287,7 @@ async function acquireSourcePermit(cfg) {
     }
     locked = true;
     await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
-    const epoch = await verifyClient(
-      client,
-      cfg,
-      process.env.CP_DB_USER || "carepulse_runtime",
-    );
+    const epoch = await verifyClient(client, cfg, "carepulse_runtime");
     const attemptId = crypto.randomUUID();
     await client.query(
       `SELECT compat_control.record_own_attempt($1, $2, $3, 'source', 'web', 'http', NULL, NULL, 'PENDING')`,
@@ -182,22 +325,30 @@ async function releaseSourcePermit(permit) {
 try {
   const pg = getPg();
   const origConnect = pg.Pool.prototype.connect;
-  pg.Pool.prototype.connect = async function (...args) {
-    const client = await origConnect.apply(this, args);
-    if (!compatCheckActive.getStore()) {
-      try {
-        const cfg = loadSourceConfig();
-        const role =
-          this.options && this.options.user === "carepulse_auth"
-            ? "carepulse_auth"
-            : process.env.CP_DB_USER || "carepulse_runtime";
-        await compatCheckActive.run(true, () => verifyClient(client, cfg, role));
-      } catch (err) {
-        client.release(true);
-        throw err;
+  pg.Pool.prototype.connect = function (callback) {
+    const check = async (client) => {
+      if (!compatCheckActive.getStore()) {
+        try {
+          const cfg = loadSourceConfig();
+          const role = this.options && this.options.user;
+          if (role !== "carepulse_runtime" && role !== "carepulse_auth") {
+            throw new Error("Unexpected source PostgreSQL login");
+          }
+          await compatCheckActive.run(true, () => verifyClient(client, cfg, role));
+        } catch (err) {
+          client.release(true);
+          throw err;
+        }
       }
+      return client;
+    };
+    if (typeof callback === "function") {
+      return origConnect.call(this, (err, client, release) => {
+        if (err) return callback(err);
+        check(client).then(() => callback(null, client, release), callback);
+      });
     }
-    return client;
+    return origConnect.call(this).then(check);
   };
 } catch {
   // pg resolution failure will fail closed at request time

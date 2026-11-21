@@ -42,11 +42,12 @@ The following are **mandatory executed test counts**, not merely discovered file
 
 | Coverage | Executed suite | Required result |
 | --- | --- | --- |
-| `compat-us1` matrix, real-login/entry denial, admitted-control unit checks | `tests/unit/test_compat_admission.py`, `tests/integration/test_compat_matrix.py`, `tests/integration/test_compat_entry_denials.py` | **24/24 Python** (13 + 7 + 4) |
+| `compat-us1` matrix, real-login/entry denial, admitted-control unit checks, surviving 0040 privilege drift | `tests/unit/test_compat_admission.py`, `tests/integration/test_compat_matrix.py`, `tests/integration/test_compat_entry_denials.py`, `tests/integration/test_compat_source_privileges.py` | **25/25 Python** (13 + 7 + 4 + 1) |
 | `compat-us1` guarded Web/native admission and pooled-query regression | `apps/web/auth/compat.test.ts` in actual candidate Web image | **9/9 Node** |
+| `compat-us1` source Web/native-auth callback, pooled connection and privilege drift regression | `tests/unit/source-web.test.cjs` in immutable 0040 source Web image with mounted current source adapter | **2/2 Node** |
 | `compat-us2` ordered drain, uncertain sender and populated upgrade | `tests/integration/test_compat_drain.py`, `tests/integration/test_compat_delivery.py`, `tests/integration/test_compat_upgrade.py` | **8/8 Python** (3 + 4 + 1) |
 | `compat-us3` source/intermediate/target recovery and authentic preservation | `tests/integration/test_compat_recovery_source.py`, `tests/integration/test_compat_recovery_intermediate.py`, `tests/integration/test_compat_recovery_target.py`, `tests/integration/test_compat_preservation.py` | **10/10 Python** (2 + 1 + 3 + 4) |
-| **Total ordinary-full compatibility** | One pinned-image compatibility topology and its independently supervised real source/candidate actors | **42/42 Python + 9/9 Node; zero skips** (35 original mandatory cases + 16 focused regressions) |
+| **Total ordinary-full compatibility** | One pinned-image compatibility topology and its independently supervised real source/candidate actors | **43/43 Python + 11/11 Node; zero skips** (35 original mandatory cases + 19 focused regressions) |
 
 The ordinary full path is **not** a replacement for the existing Foundation unit, Web, imports, authorized clinical integration, historic-only writer checks, private-network tests or synthetic Mailpit checks. T133 terminal acceptance is separately protected and must not be called by this ordinary route. `compat-us1/2/3` are diagnostics, not substitutes for `postgres_diagnostic=full`.
 

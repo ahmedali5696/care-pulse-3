@@ -21,6 +21,122 @@ from sqlalchemy.exc import SQLAlchemyError
 
 SOURCE_HEAD = "0040_t173_numeric_money"
 
+_SOURCE_ROLE_PROBE = """
+    SELECT current_database(), session_user::text, current_user::text,
+           COALESCE((
+               SELECT r.rolcanlogin AND NOT (
+                   r.rolsuper OR r.rolbypassrls OR r.rolcreaterole
+                   OR r.rolcreatedb OR r.rolinherit OR r.rolreplication
+                   OR EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid)
+               )
+               FROM pg_roles r WHERE r.rolname = current_user
+           ), FALSE)
+           AND has_database_privilege(current_user, current_database(), 'CONNECT')
+           AND NOT has_database_privilege(current_user, current_database(), 'CREATE')
+           AND NOT has_database_privilege(current_user, current_database(), 'TEMPORARY')
+           AND has_schema_privilege(current_user, 'public', 'USAGE')
+           AND NOT has_schema_privilege(current_user, 'public', 'CREATE')
+           AND has_schema_privilege(current_user, 'compat_control', 'USAGE')
+           AND NOT has_schema_privilege(current_user, 'compat_control', 'CREATE')
+           AND has_table_privilege(current_user, 'compat_control.target_control', 'SELECT')
+           AND has_function_privilege(current_user, 'compat_control.read_target_status()', 'EXECUTE')
+           AND has_function_privilege(current_user, 'compat_control.read_target_control()', 'EXECUTE')
+           AND has_function_privilege(
+               current_user,
+               'compat_control.record_own_attempt(text,text,bigint,text,text,text,text,bigint,text)',
+               'EXECUTE'
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'compat_control' AND c.relkind IN ('r','p','v','m')
+                 AND (
+                   has_table_privilege(current_user, c.oid, 'INSERT')
+                   OR has_table_privilege(current_user, c.oid, 'UPDATE')
+                   OR has_table_privilege(current_user, c.oid, 'DELETE')
+                   OR has_table_privilege(current_user, c.oid, 'TRUNCATE')
+                   OR has_any_column_privilege(current_user, c.oid, 'INSERT')
+                   OR has_any_column_privilege(current_user, c.oid, 'UPDATE')
+                   OR has_any_column_privilege(current_user, c.oid, 'REFERENCES')
+                   OR (c.relname <> 'target_control'
+                       AND has_any_column_privilege(current_user, c.oid, 'SELECT'))
+                 )
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_namespace n
+               WHERE n.nspname NOT IN ('public', 'compat_control', 'pg_catalog', 'information_schema')
+                 AND n.nspname NOT LIKE 'pg_%'
+                 AND (has_schema_privilege(current_user, n.oid, 'USAGE')
+                      OR has_schema_privilege(current_user, n.oid, 'CREATE'))
+           )
+           AND CASE
+               WHEN current_user = 'carepulse_runtime' THEN
+                   has_table_privilege(current_user, 'public.patients', 'SELECT')
+                   AND has_table_privilege(current_user, 'public.appointments', 'INSERT')
+                   AND has_table_privilege(current_user, 'public.delivery_jobs', 'UPDATE')
+                   AND NOT has_table_privilege(current_user, 'public.patients', 'DELETE')
+                   AND NOT has_table_privilege(current_user, 'public.appointments', 'DELETE')
+                   AND NOT has_table_privilege(current_user, 'public.visits', 'DELETE')
+                   AND NOT has_any_column_privilege(current_user, 'public."account"', 'SELECT')
+                   AND NOT has_any_column_privilege(current_user, 'public."account"', 'UPDATE')
+                   AND NOT has_any_column_privilege(current_user, 'public."account"', 'INSERT')
+                   AND NOT has_table_privilege(current_user, 'public."account"', 'DELETE')
+                   AND NOT has_any_column_privilege(current_user, 'public."session"', 'SELECT')
+                   AND NOT has_any_column_privilege(current_user, 'public."session"', 'UPDATE')
+                   AND NOT has_any_column_privilege(current_user, 'public."session"', 'INSERT')
+                   AND NOT has_table_privilege(current_user, 'public."session"', 'DELETE')
+                   AND NOT has_function_privilege(
+                       current_user, 'compat_control.has_unknown_sender_attempt(text,text)', 'EXECUTE'
+                   )
+               WHEN current_user = 'carepulse_sender' THEN
+                   has_function_privilege(
+                       current_user, 'compat_control.has_unknown_sender_attempt(text,text)', 'EXECUTE'
+                   )
+                   AND
+                   has_column_privilege(current_user, 'public.delivery_jobs', 'id', 'SELECT')
+                   AND has_column_privilege(current_user, 'public.delivery_jobs', 'claim_generation', 'SELECT')
+                   AND has_table_privilege(current_user, 'public.delivery_jobs', 'UPDATE')
+                   AND NOT has_table_privilege(current_user, 'public.delivery_jobs', 'INSERT')
+                   AND NOT has_column_privilege(current_user, 'public."verification"', 'value', 'SELECT')
+                   AND NOT has_column_privilege(
+                       current_user, 'public.protected_delivery_material', 'ciphertext_base64url', 'SELECT'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                       WHERE n.nspname = 'public' AND c.relname IN ('user', 'session', 'account')
+                         AND (has_any_column_privilege(current_user, c.oid, 'SELECT')
+                              OR has_any_column_privilege(current_user, c.oid, 'INSERT')
+                              OR has_any_column_privilege(current_user, c.oid, 'UPDATE')
+                              OR has_table_privilege(current_user, c.oid, 'DELETE')
+                              OR has_table_privilege(current_user, c.oid, 'TRUNCATE'))
+                   )
+                   AND NOT has_any_column_privilege(
+                       current_user, 'public."verification"', 'INSERT'
+                   )
+                   AND NOT has_any_column_privilege(
+                       current_user, 'public."verification"', 'UPDATE'
+                   )
+                   AND NOT has_table_privilege(
+                       current_user, 'public."verification"', 'DELETE'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                       WHERE n.nspname = 'public'
+                         AND c.relname IN (
+                             'patients', 'appointments', 'appointment_price_snapshots',
+                             'appointment_history', 'visits', 'clinical_revisions',
+                             'clinical_audit', 'followup_claims', 'followup_source_state'
+                         ) AND (
+                             has_any_column_privilege(current_user, c.oid, 'SELECT')
+                             OR has_table_privilege(current_user, c.oid, 'INSERT')
+                             OR has_table_privilege(current_user, c.oid, 'UPDATE')
+                             OR has_table_privilege(current_user, c.oid, 'DELETE')
+                             OR has_table_privilege(current_user, c.oid, 'TRUNCATE')
+                         )
+                   )
+               ELSE FALSE
+           END AS privileges_ok
+"""
+
 
 def _permit_key(target_id: str) -> int:
     digest = hashlib.sha256(f"compat:permit:{target_id}".encode()).digest()
@@ -45,26 +161,15 @@ def _compat_settings() -> tuple[str, str]:
 def _verify_job_connection(
     conn, target_id: str, manifest_id: str, db_name: str, expected_role: str
 ) -> int:
-    row = (
-        conn.execute(
-            text(
-                """
-            SELECT current_database() AS db_name,
-                   session_user::text AS session_user,
-                   current_user::text AS current_user
-            """
-            )
-        )
-        .mappings()
-        .first()
-    )
+    row = conn.execute(text(_SOURCE_ROLE_PROBE)).first()
     if (
         row is None
-        or row["db_name"] != db_name
-        or row["session_user"] != expected_role
-        or row["current_user"] != expected_role
+        or row[0] != db_name
+        or row[1] != expected_role
+        or row[2] != expected_role
+        or row[3] is not True
     ):
-        raise RuntimeError("Source job role/database mismatch")
+        raise RuntimeError("Source job effective privilege mismatch")
     ctrl = (
         conn.execute(
             text(
@@ -204,6 +309,13 @@ def _run_source_sender(argv: list[str]) -> int:
 
     def reserved_claim(connection, policy, job_id=None):
         nonlocal claimed
+        if (
+            _verify_job_connection(
+                connection, target_id, manifest_id, db_name, "carepulse_sender"
+            )
+            != epoch
+        ):
+            raise RuntimeError("Source sender admission changed")
         if connection.scalar(
             text("SELECT compat_control.has_unknown_sender_attempt(:job, :org)"),
             {"job": str(job_id) if job_id else None, "org": str(args.organization_id)},
@@ -232,6 +344,13 @@ def _run_source_sender(argv: list[str]) -> int:
 
     def observed_node(payload, timeout):
         nonlocal transport
+        if (
+            _verify_job_connection(
+                conn, target_id, manifest_id, db_name, "carepulse_sender"
+            )
+            != epoch
+        ):
+            raise RuntimeError("Source sender admission changed")
         acknowledged = original_node(payload, timeout)
         if payload is not None:
             if not acknowledged:

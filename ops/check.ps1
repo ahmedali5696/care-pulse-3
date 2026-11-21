@@ -1313,15 +1313,21 @@ run_compat_observer() {
   fi
 }
 if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
-    required_suites=(tests/unit/test_compat_admission.py tests/integration/test_compat_matrix.py tests/integration/test_compat_entry_denials.py)
+    required_suites=(tests/unit/test_compat_admission.py tests/integration/test_compat_matrix.py tests/integration/test_compat_entry_denials.py tests/integration/test_compat_source_privileges.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
-    run_compat_observer compat-us1 24 "${required_suites[@]}"
+    run_compat_observer compat-us1 25 "${required_suites[@]}"
     docker compose -f compose.compat.yaml --profile candidate run --rm --no-deps -T --entrypoint node candidate-web --no-warnings --experimental-strip-types --test --test-reporter=tap auth/compat.test.ts | tee "$private/compat-us1-web.log"
+    test -f tests/unit/source-web.test.cjs || { echo 'FAIL missing source Web privilege regression'; exit 1; }
+    docker compose -f compose.compat.yaml --profile source run --rm --no-deps -T --entrypoint node -e CP_SOURCE_WEB_ADAPTER_PATH=/run/compat-adapters/source-web.cjs -v "$PWD/tests/unit/source-web.test.cjs:/tmp/source-web.test.cjs:ro" source-web --test --test-reporter=tap /tmp/source-web.test.cjs | tee "$private/compat-us1-source-web.log"
     if [[ "$mode" = compat-full ]]; then
       for result in '# tests 9' '# pass 9' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
         grep -Fxq "$result" "$private/compat-us1-web.log" || { echo "FAIL mandatory compat Web test count: $result"; exit 1; }
       done
       echo 'PASS compat-us1-web: 9 mandatory Web tests, zero skips'
+      for result in '# tests 2' '# pass 2' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
+        grep -Fxq "$result" "$private/compat-us1-source-web.log" || { echo "FAIL mandatory source Web test count: $result"; exit 1; }
+      done
+      echo 'PASS compat-us1-source-web: 2 mandatory source image tests, zero skips'
     fi
 fi
 # The independent Docker/PG supervisor attests every stopped-consumer proof
@@ -1411,7 +1417,7 @@ if [[ "$mode" = compat-us3 || "$mode" = compat-full ]]; then
     fi
 fi
 if [[ "$mode" = compat-full ]]; then
-  echo 'PASS mandatory compatibility: 42 Python cases (US1 24, US2 8, US3 10), 9 Web cases, zero skips'
+  echo 'PASS mandatory compatibility: 43 Python cases (US1 25, US2 8, US3 10), 11 Web cases, zero skips'
 fi
 '@
             & bash -e -c $compatScript -- $Check

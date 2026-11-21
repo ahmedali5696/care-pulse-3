@@ -21,6 +21,86 @@ from sqlalchemy.exc import SQLAlchemyError
 
 SOURCE_HEAD = "0040_t173_numeric_money"
 
+# Consult the PostgreSQL login on every admission and pool checkout. Source
+# image code is immutable, so the reviewed adapter must enforce its 0040 ACL.
+_SOURCE_ROLE_PROBE = """
+    SELECT current_database(), session_user::text, current_user::text,
+           COALESCE((
+               SELECT r.rolcanlogin AND NOT (
+                   r.rolsuper OR r.rolbypassrls OR r.rolcreaterole
+                   OR r.rolcreatedb OR r.rolinherit OR r.rolreplication
+                   OR EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid)
+               )
+               FROM pg_roles r WHERE r.rolname = current_user
+           ), FALSE)
+           AND has_database_privilege(current_user, current_database(), 'CONNECT')
+           AND NOT has_database_privilege(current_user, current_database(), 'CREATE')
+           AND NOT has_database_privilege(current_user, current_database(), 'TEMPORARY')
+           AND has_schema_privilege(current_user, 'public', 'USAGE')
+           AND NOT has_schema_privilege(current_user, 'public', 'CREATE')
+           AND has_schema_privilege(current_user, 'compat_control', 'USAGE')
+           AND NOT has_schema_privilege(current_user, 'compat_control', 'CREATE')
+           AND has_table_privilege(current_user, 'compat_control.target_control', 'SELECT')
+           AND has_function_privilege(current_user, 'compat_control.read_target_status()', 'EXECUTE')
+           AND has_function_privilege(current_user, 'compat_control.read_target_control()', 'EXECUTE')
+           AND has_function_privilege(
+               current_user,
+               'compat_control.record_own_attempt(text,text,bigint,text,text,text,text,bigint,text)',
+               'EXECUTE'
+           )
+           AND NOT has_function_privilege(
+               current_user, 'compat_control.has_unknown_sender_attempt(text,text)', 'EXECUTE'
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'compat_control' AND c.relkind IN ('r','p','v','m')
+                 AND (
+                   has_table_privilege(current_user, c.oid, 'INSERT')
+                   OR has_table_privilege(current_user, c.oid, 'UPDATE')
+                   OR has_table_privilege(current_user, c.oid, 'DELETE')
+                   OR has_table_privilege(current_user, c.oid, 'TRUNCATE')
+                   OR has_any_column_privilege(current_user, c.oid, 'INSERT')
+                   OR has_any_column_privilege(current_user, c.oid, 'UPDATE')
+                   OR has_any_column_privilege(current_user, c.oid, 'REFERENCES')
+                   OR (c.relname <> 'target_control'
+                       AND has_any_column_privilege(current_user, c.oid, 'SELECT'))
+                 )
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_namespace n
+               WHERE n.nspname NOT IN ('public', 'compat_control', 'pg_catalog', 'information_schema')
+                 AND n.nspname NOT LIKE 'pg_%'
+                 AND (has_schema_privilege(current_user, n.oid, 'USAGE')
+                      OR has_schema_privilege(current_user, n.oid, 'CREATE'))
+           )
+           AND has_table_privilege(current_user, 'public.patients', 'SELECT')
+           AND has_table_privilege(current_user, 'public.appointments', 'INSERT')
+           AND has_table_privilege(current_user, 'public.delivery_jobs', 'UPDATE')
+           AND NOT has_table_privilege(current_user, 'public.patients', 'DELETE')
+           AND NOT has_table_privilege(current_user, 'public.appointments', 'DELETE')
+           AND NOT has_table_privilege(current_user, 'public.visits', 'DELETE')
+           AND NOT has_any_column_privilege(current_user, 'public."account"', 'SELECT')
+           AND NOT has_any_column_privilege(current_user, 'public."account"', 'UPDATE')
+           AND NOT has_any_column_privilege(current_user, 'public."account"', 'INSERT')
+           AND NOT has_table_privilege(current_user, 'public."account"', 'DELETE')
+           AND NOT has_any_column_privilege(current_user, 'public."session"', 'SELECT')
+           AND NOT has_any_column_privilege(current_user, 'public."session"', 'UPDATE')
+           AND NOT has_any_column_privilege(current_user, 'public."session"', 'INSERT')
+           AND NOT has_table_privilege(current_user, 'public."session"', 'DELETE')
+           AS privileges_ok
+"""
+
+
+def _assert_source_role(row, db_name: str) -> None:
+    if (
+        row is None
+        or row[0] != db_name
+        or row[1] != "carepulse_runtime"
+        or row[2] != "carepulse_runtime"
+        or row[3] is not True
+    ):
+        raise RuntimeError("Source API effective privilege mismatch")
+
 
 def _permit_key(target_id: str) -> int:
     digest = hashlib.sha256(f"compat:permit:{target_id}".encode()).digest()
@@ -45,31 +125,7 @@ def _compat_settings() -> tuple[str, str, str, str]:
 def _verify_source_connection(
     conn, target_id: str, manifest_id: str, db_name: str
 ) -> int:
-    row = (
-        conn.execute(
-            text(
-                """
-            SELECT current_database() AS db_name,
-                   session_user::text AS session_user,
-                   current_user::text AS current_user,
-                   r.rolsuper, r.rolbypassrls, r.rolcanlogin
-            FROM pg_roles r WHERE r.rolname = current_user
-            """
-            )
-        )
-        .mappings()
-        .first()
-    )
-    if (
-        row is None
-        or row["db_name"] != db_name
-        or row["session_user"] != "carepulse_runtime"
-        or row["current_user"] != "carepulse_runtime"
-        or row["rolsuper"]
-        or row["rolbypassrls"]
-        or not row["rolcanlogin"]
-    ):
-        raise RuntimeError("Source API role/database mismatch")
+    _assert_source_role(conn.execute(text(_SOURCE_ROLE_PROBE)).first(), db_name)
 
     ctrl = (
         conn.execute(
@@ -107,15 +163,8 @@ def _guard_source_pool_checkout(
     db_name = os.environ.get("CP_DB_NAME", "carepulse").strip()
     cur = dbapi_connection.cursor()
     try:
-        cur.execute("SELECT current_database(), session_user::text, current_user::text")
-        ident = cur.fetchone()
-        if (
-            not ident
-            or ident[0] != db_name
-            or ident[1] != "carepulse_runtime"
-            or ident[2] != "carepulse_runtime"
-        ):
-            raise RuntimeError("Source pool role/database mismatch")
+        cur.execute(_SOURCE_ROLE_PROBE)
+        _assert_source_role(cur.fetchone(), db_name)
         cur.execute(
             """
             SELECT target_id, db_name, phase, active_generation, source_sealed,

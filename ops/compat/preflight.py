@@ -54,6 +54,18 @@ _SOURCE_INVENTORY_TABLES = (
     "request_nonces",
 )
 
+_SOURCE_CLINICAL_TABLES = (
+    "patients",
+    "appointments",
+    "appointment_price_snapshots",
+    "appointment_history",
+    "visits",
+    "clinical_revisions",
+    "clinical_audit",
+    "followup_claims",
+    "followup_source_state",
+)
+
 
 class PreflightError(RuntimeError):
     """Raised when read-only preflight fails closed (leaves revision and data untouched)."""
@@ -75,6 +87,196 @@ class PreflightReport:
     source_baseline: RetainedBaseline
     source_manifest_id: str
     target_manifest_id: str
+
+
+def _verify_source_effective_grants(conn: psycopg.Connection) -> None:
+    """Check the existing 0040 login ACL, including grants inherited via PUBLIC."""
+    required = {
+        "carepulse_runtime": (
+            ("public.patients", "SELECT"),
+            ("public.appointments", "INSERT"),
+            ("public.delivery_jobs", "UPDATE"),
+        ),
+        "carepulse_auth": (
+            ('public."user"', "SELECT"),
+            ('public."session"', "INSERT"),
+        ),
+        "carepulse_sender": (("public.delivery_jobs", "UPDATE"),),
+    }
+    forbidden = {
+        "carepulse_runtime": (
+            ("public.patients", "DELETE"),
+            ("public.appointments", "DELETE"),
+            ("public.visits", "DELETE"),
+            ('public."account"', "SELECT"),
+            ('public."session"', "SELECT"),
+        ),
+        "carepulse_auth": (),
+        "carepulse_sender": (("public.delivery_jobs", "INSERT"),),
+        "carepulse_operator": (),
+    }
+    for role, forbidden_grants in forbidden.items():
+        row = conn.execute(
+            """
+            SELECT has_database_privilege(%s, current_database(), 'CONNECT')
+                   AND NOT has_database_privilege(%s, current_database(), 'CREATE')
+                   AND NOT has_database_privilege(%s, current_database(), 'TEMPORARY')
+                   AND NOT has_schema_privilege(%s, 'public', 'CREATE')
+                   AND has_schema_privilege(%s, 'compat_control', 'USAGE')
+                   AND NOT has_schema_privilege(%s, 'compat_control', 'CREATE')
+                   AND has_table_privilege(%s, 'compat_control.target_control', 'SELECT')
+                   AND has_function_privilege(%s, 'compat_control.read_target_control()', 'EXECUTE')
+                   AND has_function_privilege(%s, 'compat_control.read_target_status()', 'EXECUTE')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pg_class c
+                       JOIN pg_namespace n ON n.oid = c.relnamespace
+                       WHERE n.nspname = 'compat_control'
+                         AND c.relkind IN ('r','p','v','m')
+                         AND (
+                             has_table_privilege(%s, c.oid, 'INSERT')
+                             OR has_table_privilege(%s, c.oid, 'UPDATE')
+                             OR has_table_privilege(%s, c.oid, 'DELETE')
+                             OR has_table_privilege(%s, c.oid, 'TRUNCATE')
+                             OR has_any_column_privilege(%s, c.oid, 'INSERT')
+                             OR has_any_column_privilege(%s, c.oid, 'UPDATE')
+                             OR has_any_column_privilege(%s, c.oid, 'REFERENCES')
+                             OR (c.relname <> 'target_control'
+                                 AND has_any_column_privilege(%s, c.oid, 'SELECT'))
+                         )
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pg_namespace n
+                       WHERE n.nspname NOT IN (
+                           'public','compat_control','pg_catalog','information_schema'
+                       ) AND n.nspname NOT LIKE 'pg_%'
+                       AND (
+                           has_schema_privilege(%s, n.oid, 'USAGE')
+                           OR has_schema_privilege(%s, n.oid, 'CREATE')
+                       )
+                   ) AS safe
+            """,
+            (role,) * 19,
+        ).fetchone()
+        if row is None or row["safe"] is not True:
+            raise PreflightError("Source login database, schema or control ACL drift")
+        can_record = conn.execute(
+            """
+            SELECT has_function_privilege(
+                %s, 'compat_control.record_own_attempt(text,text,bigint,text,text,text,text,bigint,text)',
+                'EXECUTE'
+            ) AS permitted
+            """,
+            (role,),
+        ).fetchone()["permitted"]
+        if can_record is not (role != "carepulse_operator"):
+            raise PreflightError("Source control attempt-function grant drift")
+        sender_guard = conn.execute(
+            """
+            SELECT has_function_privilege(
+                %s, 'compat_control.has_unknown_sender_attempt(text,text)', 'EXECUTE'
+            ) AS permitted
+            """,
+            (role,),
+        ).fetchone()["permitted"]
+        if sender_guard is not (role == "carepulse_sender"):
+            raise PreflightError("Source sender function grant drift")
+        for obj, privilege in required.get(role, ()):
+            if not conn.execute(
+                "SELECT has_table_privilege(%s, %s, %s) AS permitted",
+                (role, obj, privilege),
+            ).fetchone()["permitted"]:
+                raise PreflightError("Source login required grant missing")
+        for obj, privilege in forbidden_grants:
+            if conn.execute(
+                "SELECT has_table_privilege(%s, %s, %s) AS permitted",
+                (role, obj, privilege),
+            ).fetchone()["permitted"]:
+                raise PreflightError("Source login forbidden grant present")
+        if role == "carepulse_runtime":
+            for relation in ('public."account"', 'public."session"'):
+                for permission in ("SELECT", "INSERT", "UPDATE"):
+                    if conn.execute(
+                        "SELECT has_any_column_privilege(%s, %s, %s) AS permitted",
+                        (role, relation, permission),
+                    ).fetchone()["permitted"]:
+                        raise PreflightError("Source runtime native-auth ACL drift")
+                if conn.execute(
+                    "SELECT has_table_privilege(%s, %s, 'DELETE') AS permitted",
+                    (role, relation),
+                ).fetchone()["permitted"]:
+                    raise PreflightError("Source runtime native-auth ACL drift")
+        if role in ("carepulse_auth", "carepulse_sender", "carepulse_operator"):
+            extra_clinical = conn.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public' AND c.relname = ANY(%s)
+                      AND (
+                          has_any_column_privilege(%s, c.oid, 'SELECT')
+                          OR has_table_privilege(%s, c.oid, 'INSERT')
+                          OR has_table_privilege(%s, c.oid, 'UPDATE')
+                          OR has_table_privilege(%s, c.oid, 'DELETE')
+                          OR has_table_privilege(%s, c.oid, 'TRUNCATE')
+                      )
+                ) AS unexpected
+                """,
+                (_SOURCE_CLINICAL_TABLES, *((role,) * 5)),
+            ).fetchone()["unexpected"]
+            if extra_clinical:
+                raise PreflightError("Source login clinical ACL drift")
+        if role == "carepulse_auth":
+            for relation in ('"user"', '"session"', '"account"', '"verification"'):
+                for permission in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                    if not conn.execute(
+                        "SELECT has_table_privilege(%s, %s, %s) AS permitted",
+                        (role, f"public.{relation}", permission),
+                    ).fetchone()["permitted"]:
+                        raise PreflightError(
+                            "Source native-auth required grant missing"
+                        )
+        if role == "carepulse_sender":
+            for relation in ('"user"', '"session"', '"account"'):
+                for permission in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                    function = (
+                        "has_table_privilege"
+                        if permission == "DELETE"
+                        else "has_any_column_privilege"
+                    )
+                    granted = conn.execute(
+                        sql.SQL("SELECT {}(%s, %s, %s) AS permitted").format(
+                            sql.Identifier(function)
+                        ),
+                        (role, f"public.{relation}", permission),
+                    ).fetchone()["permitted"]
+                    if granted:
+                        raise PreflightError("Source sender native-auth ACL drift")
+            if conn.execute(
+                """
+                SELECT has_any_column_privilege(%s, 'public."verification"', 'INSERT')
+                       OR has_any_column_privilege(%s, 'public."verification"', 'UPDATE')
+                       OR has_table_privilege(%s, 'public."verification"', 'DELETE')
+                       AS permitted
+                """,
+                (role, role, role),
+            ).fetchone()["permitted"]:
+                raise PreflightError("Source sender native-auth ACL drift")
+    for role, col, permission in (
+        ("carepulse_sender", "claim_generation", True),
+        ("carepulse_sender", "id", True),
+        ("carepulse_sender", "ciphertext_base64url", False),
+    ):
+        relation = (
+            "public.protected_delivery_material"
+            if col == "ciphertext_base64url"
+            else "public.delivery_jobs"
+        )
+        actual = conn.execute(
+            "SELECT has_column_privilege(%s, %s, %s, 'SELECT') AS permitted",
+            (role, relation, col),
+        ).fetchone()["permitted"]
+        if actual is not permission:
+            raise PreflightError("Source sender column privilege drift")
 
 
 def verify_populated_source_basis(
@@ -190,10 +392,31 @@ def run_source_preflight(
     snaps = probe_role_attributes(conn, required_0040)
     for role_name in required_0040:
         snap = snaps.get(role_name)
-        if snap is None or snap.rolsuper or snap.rolbypassrls:
+        if (
+            snap is None
+            or snap.rolsuper
+            or snap.rolbypassrls
+            or snap.rolcreaterole
+            or snap.rolcreatedb
+            or snap.rolinherit
+            or snap.rolreplication
+        ):
             raise PreflightError(f"Missing or overprivileged 0040 role: {role_name}")
         if role_name != "carepulse_policy_seed" and not snap.rolcanlogin:
             raise PreflightError(f"0040 login role {role_name} cannot log in")
+        if role_name == "carepulse_policy_seed" and snap.rolcanlogin:
+            raise PreflightError("0040 private executor gained LOGIN")
+        if role_name != "carepulse_migration" and (
+            snap.member_of or snap.set_memberships
+        ):
+            raise PreflightError("0040 product role membership escalation")
+        if role_name == "carepulse_migration" and (
+            not {"carepulse_policy_seed"}.issubset(snap.set_memberships)
+            or snap.member_of - {"carepulse_policy_seed", "carepulse_identity_owner"}
+        ):
+            raise PreflightError("0040 migration-role membership drift")
+
+    _verify_source_effective_grants(conn)
 
     candidate_roles = (
         "carepulse_api",

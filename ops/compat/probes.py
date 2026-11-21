@@ -43,6 +43,7 @@ class RoleAttributeSnapshot:
     rolcreaterole: bool
     rolcreatedb: bool
     rolbypassrls: bool
+    rolreplication: bool
     member_of: frozenset[str]
     set_memberships: frozenset[str]
 
@@ -121,7 +122,7 @@ def probe_role_attributes(
     rows = conn.execute(
         """
         SELECT r.rolname, r.rolcanlogin, r.rolsuper, r.rolinherit,
-               r.rolcreaterole, r.rolcreatedb, r.rolbypassrls
+               r.rolcreaterole, r.rolcreatedb, r.rolbypassrls, r.rolreplication
         FROM pg_roles r
         WHERE r.rolname = ANY(%s)
         """,
@@ -164,6 +165,9 @@ def probe_role_attributes(
             ),
             rolcreatedb=bool(row["rolcreatedb"] if isinstance(row, dict) else row[5]),
             rolbypassrls=bool(row["rolbypassrls"] if isinstance(row, dict) else row[6]),
+            rolreplication=bool(
+                row["rolreplication"] if isinstance(row, dict) else row[7]
+            ),
             member_of=frozenset(memberships.get(rolname, set())),
             set_memberships=frozenset(set_opts.get(rolname, set())),
         )
