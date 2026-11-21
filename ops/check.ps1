@@ -1328,7 +1328,13 @@ if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
     docker compose -f compose.compat.yaml --profile source --profile candidate up -d --no-build --no-deps source-api source-web candidate-web
     docker compose -f compose.compat.yaml --profile source run -d --no-deps --name "${CP_CI_PROJECT}-source-peer" -e CP_COMPAT_EXPECTED_API_PEER=http://candidate-api:8000 source-web
     source_web_id="$(docker compose -f compose.compat.yaml --profile source ps -q source-web)"
-    test -n "$source_web_id"
+    if [[ -z "$source_web_id" ]]; then
+      echo 'FAIL immutable source Web stopped during HTTP test startup'
+      docker compose -f compose.compat.yaml --profile source --profile candidate ps -a source-api source-web candidate-web
+      docker compose -f compose.compat.yaml --profile source logs --no-color --tail 30 source-web
+      exit 1
+    fi
+    echo 'PASS immutable source Web process running before HTTP test'
     source_web_host_pid="$(docker inspect --format '{{.State.Pid}}' "$source_web_id")"
     export CP_SOURCE_WEB_DB_IP="$(docker inspect "$source_web_id" | python3 -c 'import json,sys; nets=json.load(sys.stdin)[0]["NetworkSettings"]["Networks"]; ips=[n["IPAddress"] for k,n in nets.items() if k.endswith("_compat_db")]; assert len(ips)==1; print(ips[0])')"
     test -n "$CP_SOURCE_WEB_DB_IP"
