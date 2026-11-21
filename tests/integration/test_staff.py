@@ -10,9 +10,10 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from carepulse.db import transaction
-from carepulse.identity.authorization import AuthorizedStaff
+from carepulse.config import _load_policy
+from carepulse.identity.signing import PROTOCOL_VERSION, CanonicalEnvelope
 from carepulse.identity.staff import list_receptionists
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import event
 from test_sessions import (
     _database,
@@ -21,6 +22,7 @@ from test_sessions import (
     _password_hash,
     _request,
     _seed_owner,
+    _session_token,
 )
 
 
@@ -134,14 +136,41 @@ def test_receptionist_listing_paginates_full_projection_in_one_query(
         assert after == (items[-1]["id"] if page_index < len(page_sizes) - 1 else None)
     assert page_ids == sorted(expected)
 
-    engine = role_engine("carepulse_runtime")
+    with _database() as connection:
+        session_id, _, revision = _session_token(connection, owner.user)
+    identity = CanonicalEnvelope(
+        PROTOCOL_VERSION,
+        "v1",
+        "web",
+        "GET",
+        "/v1/staff/receptionists",
+        "",
+        sha256(b"").hexdigest(),
+        str(owner.clinic),
+        str(owner.staff),
+        session_id,
+        "DOCTOR_OWNER",
+        str(revision),
+        "0",
+        "",
+        "STAFF_MANAGEMENT",
+        "",
+    )
+    engine = role_engine("carepulse_api")
+    gate = role_engine("carepulse_gate")
+    clinic = SimpleNamespace(
+        runtime=engine, gate=gate, config=SimpleNamespace(policy=_load_policy())
+    )
     statements = []
     event.listen(engine, "before_cursor_execute", lambda *args: statements.append(1))
     try:
-        actor = AuthorizedStaff(
-            owner.clinic, owner.staff, "DOCTOR_OWNER", False, 0, 0, 0
-        )
-        with transaction(engine, owner.clinic) as connection:
+        with signed_test_transaction(
+            clinic,
+            identity,
+            method="GET",
+            path="/v1/staff/receptionists",
+            purpose="STAFF_MANAGEMENT",
+        ) as (connection, actor):
             for limit in (1, 100):
                 statements.clear()
                 result = list_receptionists(connection, actor, None, limit)
@@ -151,6 +180,7 @@ def test_receptionist_listing_paginates_full_projection_in_one_query(
                 assert len(result["items"]) == limit
     finally:
         engine.dispose()
+        gate.dispose()
 
 
 def test_owner_creates_invites_and_revokes_without_partial_sender_job(owner_session):
@@ -585,10 +615,14 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
         assert status == 401
 
     refreshed_cookie = _login(recipient)
-    with _database() as connection:
+    with _database(bootstrap=True) as connection:
+        assert connection.execute(
+            "SELECT has_function_privilege('carepulse_api', "
+            "'public.delete_staff_sessions(uuid,text)', 'EXECUTE')"
+        ).fetchone()[0]
         connection.execute(
             "REVOKE EXECUTE ON FUNCTION public.delete_staff_sessions(uuid,text) "
-            "FROM carepulse_runtime"
+            "FROM carepulse_api"
         )
     try:
         status, withdrawn = _staff_command(
@@ -607,10 +641,10 @@ def test_owner_grant_and_disable_immediately_deny_two_old_sessions(owner_session
         old_session_status, _, _ = _request("/api/session", cookie=refreshed_cookie)
         assert old_session_status == 401
     finally:
-        with _database() as connection:
+        with _database(bootstrap=True) as connection:
             connection.execute(
                 "GRANT EXECUTE ON FUNCTION public.delete_staff_sessions(uuid,text) "
-                "TO carepulse_runtime"
+                "TO carepulse_api"
             )
     assert status == 200, withdrawn
     assert withdrawn["data"]["operational_manager"] is False

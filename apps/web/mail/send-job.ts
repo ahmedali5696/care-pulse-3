@@ -2,7 +2,7 @@ import { loadSenderMailConfig } from "./config.ts";
 import {
   decryptDeliveryToken, type DeliveryContext, type DeliveryMaterial,
 } from "./delivery-material.ts";
-import { sendSyntheticMail } from "./transport.ts";
+import { PreSmtpConnectionFailure, sendSyntheticMail } from "./transport.ts";
 
 type CommittedJob = {
   context: DeliveryContext;
@@ -52,6 +52,14 @@ function deliveryLink(job: CommittedJob, token: string, origin: string): string 
 }
 
 async function sendCommittedJob(): Promise<void> {
+  if (process.env.CP_COMPAT_TARGET_ID?.trim()) {
+    if (
+      process.env.CP_COMPAT_GENERATION !== "candidate" ||
+      process.env.CP_COMPAT_SERVICE !== "sender"
+    ) {
+      throw new Error("Delivery unavailable");
+    }
+  }
   const settings = loadSenderMailConfig();
   if (process.argv.length === 3 && process.argv[2] === "--check") return;
   if (process.argv.length !== 2) throw new Error("Invalid sender entrypoint");
@@ -61,13 +69,22 @@ async function sendCommittedJob(): Promise<void> {
   );
   const link = deliveryLink(job, proof, settings.origin);
   const kind = job.context.purpose === "PASSWORD_RESET" ? "reset" : "invitation";
-  await sendSyntheticMail(kind, job.context.committed_recipient, link);
+  try {
+    await sendSyntheticMail(kind, job.context.committed_recipient, link);
+  } catch (error) {
+    if (error instanceof PreSmtpConnectionFailure) throw error;
+    process.stderr.write("AMBIGUOUS_TRANSPORT\n");
+    throw new Error("AMBIGUOUS_TRANSPORT");
+  }
 }
 
 try {
   await sendCommittedJob();
   process.stdout.write("SENT\n");
-} catch {
+} catch (err) {
+  if (!(err instanceof Error && err.message === "AMBIGUOUS_TRANSPORT")) {
+    process.stderr.write("NOT_SENT\n");
+  }
   process.stderr.write("Delivery unavailable\n");
   process.exitCode = 1;
 }

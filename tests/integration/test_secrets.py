@@ -61,6 +61,7 @@ def _ci_env() -> dict[str, str]:
     required = (
         *SHARED_REQUIRED,
         "CP_SERVICE_KEY_FILE",
+        "CP_GATE_DB_PASSWORD_FILE",
         "CP_SIGNING_KEY_ID",
         "CP_DELIVERY_KEY_ID",
         "CP_DELIVERY_PUBLIC_KEY_FILE",
@@ -81,6 +82,7 @@ def _probe(script: str, env: dict[str, str], *, should_start: bool) -> None:
     output = result.stdout + result.stderr
     for secret_name in (
         "CP_DB_PASSWORD_FILE",
+        "CP_GATE_DB_PASSWORD_FILE",
         "CP_SERVICE_KEY_FILE",
         "CP_FILE_ENCRYPTION_KEY_FILE",
     ):
@@ -109,6 +111,7 @@ def test_complete_synthetic_profile_starts() -> None:
         *SHARED_REQUIRED,
         "CP_SERVICE_KEY_FILE",
         "CP_SIGNING_KEY_ID",
+        "CP_GATE_DB_PASSWORD_FILE",
         "CP_DELIVERY_KEY_ID",
         "CP_DELIVERY_PUBLIC_KEY_FILE",
     ),

@@ -283,6 +283,7 @@ async function recoveryCommand(
     organizationId: identity.tenant, staffId: identity.staff,
     sessionId: "", role: "BOOTSTRAP", securityRevision: 0, purpose: "OWNER_RECOVERY",
     keyId: config.signingKeyId, serviceKey: config.serviceKey,
+    dbIdentityKeyId: config.dbIdentityKeyId, dbIdentityKey: config.dbIdentityKey,
   });
   signed.headers.set("Content-Type", "application/json");
   const response = await fetch(`${config.apiUrl}${signed.path}`, {

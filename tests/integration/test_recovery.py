@@ -19,10 +19,9 @@ from uuid import uuid4
 import pytest
 from carepulse.config import _load_policy
 from carepulse.notifications.email_sender import _settings, send_one_job
-from carepulse.provisioning.operators import VerifiedOperator
+from carepulse.provisioning.operators import authenticate_operator
 from carepulse.provisioning.service import change_clinic_state
 from psycopg.rows import dict_row
-from sqlalchemy import URL, create_engine
 from test_sessions import (
     _database,
     _login,
@@ -291,7 +290,7 @@ def test_issuance_write_failure_keeps_native_proof_and_delivery_atomic(
 def test_identity_dependent_lookup_failure_does_not_disclose_owner_email(
     owner, revoke, restore, privilege
 ):
-    with _database() as connection:
+    with _database(bootstrap=True) as connection:
         connection.execute(revoke)
     try:
         with _database() as connection:
@@ -302,7 +301,7 @@ def test_identity_dependent_lookup_failure_does_not_disclose_owner_email(
         )
         assert eligible == unknown == (200, {"data": {"acknowledged": True}})
     finally:
-        with _database() as connection:
+        with _database(bootstrap=True) as connection:
             connection.execute(restore)
 
     with _database() as connection:
@@ -754,7 +753,7 @@ def test_expired_prior_verification_cleanup_does_not_block_replacement(
 
 
 def test_revocation_invalidated_auth_done_requires_distinct_proof_after_reactivation(
-    owner, sender_lab
+    owner, sender_lab, role_engine
 ):
     first = _issue(owner, sender_lab)
     first_password = f"Synthetic-Revoked-{uuid4()}!"
@@ -767,24 +766,15 @@ def test_revocation_invalidated_auth_done_requires_distinct_proof_after_reactiva
             "SELECT created_by_operator_id, lifecycle_revision FROM public.organizations WHERE id=%s",
             (owner.clinic,),
         ).fetchone()
-        secret = f"synthetic-operator-{uuid4()}".encode()
-        digest = sha256(secret).hexdigest()
+        secret = f"synthetic-operator-{uuid4()}"
+        digest = sha256(secret.encode()).hexdigest()
         connection.execute(
             "UPDATE public.operator_identities SET credential_digest=%s WHERE id=%s",
             (digest, actor),
         )
-    engine = create_engine(
-        URL.create(
-            "postgresql+psycopg",
-            username="carepulse_bootstrap",
-            password=Path("/run/secrets/postgres_password").read_text().strip(),
-            host="db",
-            database="carepulse",
-        ),
-        hide_parameters=True,
-    )
+    engine = role_engine("carepulse_operator")
     try:
-        operator = VerifiedOperator(actor, digest)
+        operator = authenticate_operator(engine, actor, secret, _load_policy())
         suspended = change_clinic_state(
             engine,
             operator,
@@ -837,7 +827,7 @@ def test_revocation_invalidated_auth_done_requires_distinct_proof_after_reactiva
 
 @pytest.mark.parametrize("missing_evidence", ["native_completion", "revocation_audit"])
 def test_revoked_auth_done_with_missing_evidence_cannot_transfer_block(
-    owner, sender_lab, missing_evidence
+    owner, sender_lab, missing_evidence, role_engine
 ):
     proof_a = _issue(owner, sender_lab)
     password_a = f"Synthetic-Missing-Evidence-A-{uuid4()}!"
@@ -851,23 +841,15 @@ def test_revoked_auth_done_with_missing_evidence_cannot_transfer_block(
             "SELECT created_by_operator_id, lifecycle_revision FROM public.organizations WHERE id=%s",
             (owner.clinic,),
         ).fetchone()
-        digest = sha256(f"synthetic-missing-{uuid4()}".encode()).hexdigest()
+        secret = f"synthetic-missing-{uuid4()}"
+        digest = sha256(secret.encode()).hexdigest()
         connection.execute(
             "UPDATE public.operator_identities SET credential_digest=%s WHERE id=%s",
             (digest, actor),
         )
-    engine = create_engine(
-        URL.create(
-            "postgresql+psycopg",
-            username="carepulse_bootstrap",
-            password=Path("/run/secrets/postgres_password").read_text().strip(),
-            host="db",
-            database="carepulse",
-        ),
-        hide_parameters=True,
-    )
+    engine = role_engine("carepulse_operator")
     try:
-        operator = VerifiedOperator(actor, digest)
+        operator = authenticate_operator(engine, actor, secret, _load_policy())
         assert (
             change_clinic_state(
                 engine,

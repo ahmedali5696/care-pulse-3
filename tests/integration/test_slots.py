@@ -14,6 +14,7 @@ import pytest
 from carepulse.db import transaction
 from carepulse.identity.signing import canonical_payload, canonical_query
 from carepulse.main import app
+from runtime_identity_fixture import db_proof_headers
 from sqlalchemy import text
 from test_booking import (
     booking_body,
@@ -29,12 +30,11 @@ from test_queue_capacity import _policy_capacity
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 from test_schedule import (
     SERVICE_DAY,
-    _actor,
     _booking,
     _config,
     _patch,
-    _publish,
     _schedule_request,
+    publish_signed_schedule,
 )
 
 
@@ -83,6 +83,7 @@ def _slots_request(clinic, actor, day, *, other_fields=None):
             .encode(),
         ),
     ]
+    headers.extend(db_proof_headers(envelope))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -114,9 +115,8 @@ def test_both_roles_see_occupied_candidates_without_settings_or_reservation(
 ):
     clinic = patient_backend
     app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(connection, _actor(clinic.tenant, clinic.staff), _config())
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    publish_signed_schedule(clinic, _config())
+    with transaction(clinic.migration, clinic.tenant) as connection:
         booked = _booking(connection, clinic.tenant, clinic.staff, start=9, end=10)
     for actor in (clinic.owner, clinic.receptionist):
         status, response = _slots_request(clinic, actor, SERVICE_DAY)
@@ -146,11 +146,20 @@ def test_both_roles_see_occupied_candidates_without_settings_or_reservation(
             set(slot) == {"starts_at", "ends_at", "origin", "available"}
             for slot in slots["candidates"]
         )
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        assert connection.scalar(text("SELECT count(*) FROM public.appointments")) == 1
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
-                text("SELECT status FROM public.appointments WHERE id=:id"),
+                text(
+                    "SELECT count(*) FROM public.appointments WHERE organization_id = current_setting('app.organization_id')::uuid"
+                )
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT status FROM public.appointments WHERE organization_id = current_setting('app.organization_id')::uuid AND id=:id"
+                ),
                 {"id": booked["id"]},
             )
             == "Booked"
@@ -162,7 +171,7 @@ def test_retained_decimal_capacity_matches_signed_schedule_slots_and_booking(
 ):
     clinic = booking_clinic
     app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         _policy_capacity(connection, clinic.tenant, capacity=2.0)
         assert (
             connection.scalar(
@@ -233,8 +242,7 @@ def test_retained_decimal_capacity_matches_signed_schedule_slots_and_booking(
 def test_open_mode_long_horizon_and_unknown_query_are_handled(patient_backend):
     clinic = patient_backend
     app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(connection, _actor(clinic.tenant, clinic.staff), _config(mode="OPEN"))
+    publish_signed_schedule(clinic, _config(mode="OPEN"))
     status, response = _slots_request(clinic, clinic.receptionist, SERVICE_DAY)
     assert status == 200 and response["data"]["open_eligible"] is True
     assert response["data"]["candidates"] == []
@@ -267,8 +275,7 @@ def test_max_supported_date_signed_exact_slots_and_booking_boundary(booking_clin
             {"weekday": weekday, "starts_at": "22:00", "ends_at": "23:59"}
         ],
     )
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(connection, _actor(clinic.tenant, clinic.staff), config, revision=2)
+    publish_signed_schedule(clinic, config, revision=2)
 
     status, response = _slots_request(clinic, clinic.owner, day)
     assert status == 200, response
@@ -324,17 +331,15 @@ def test_max_supported_date_signed_exact_slots_and_booking_boundary(booking_clin
 def test_max_supported_date_signed_open_booking(booking_clinic):
     clinic = booking_clinic
     day = date.max
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(
-            connection,
-            _actor(clinic.tenant, clinic.staff),
-            _config(
-                mode="OPEN",
-                working_weekdays=[day.isoweekday()],
-                holiday_booking_enabled=True,
-            ),
-            revision=2,
-        )
+    publish_signed_schedule(
+        clinic,
+        _config(
+            mode="OPEN",
+            working_weekdays=[day.isoweekday()],
+            holiday_booking_enabled=True,
+        ),
+        revision=2,
+    )
     status, response = _slots_request(clinic, clinic.receptionist, day)
     assert status == 200, response
     assert response["data"]["open_eligible"] is True
@@ -397,13 +402,7 @@ def test_fold_break_excludes_mixed_manual_interval_from_preview_and_confirmation
             fold_day.isoformat(): [{"starts_at": "23:45", "ends_at": "23:55"}]
         },
     )
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(
-            connection,
-            _actor(clinic.tenant, clinic.staff),
-            config,
-            revision=2,
-        )
+    publish_signed_schedule(clinic, config, revision=2)
     status, response = _slots_request(clinic, clinic.owner, fold_day)
     assert status == 200, response
     offered = response["data"]["candidates"]
@@ -460,8 +459,7 @@ def test_narrow_fold_work_period_rejects_mixed_manual_booking(booking_clinic):
             fold_day.isoformat(): [{"starts_at": "23:25", "ends_at": "23:35"}]
         },
     )
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(connection, _actor(clinic.tenant, clinic.staff), config, revision=2)
+    publish_signed_schedule(clinic, config, revision=2)
     status, response = _slots_request(clinic, clinic.owner, fold_day)
     assert status == 200, response
     offered = response["data"]["candidates"]

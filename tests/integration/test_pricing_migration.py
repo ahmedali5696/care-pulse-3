@@ -22,6 +22,7 @@ from test_appointment_persistence import (
     _patient,
     _query,
 )
+from test_appointment_persistence import appointment_api as appointment_api  # noqa: PLC0414
 from test_appointment_persistence import (
     appointment_storage as appointment_storage,  # noqa: PLC0414 - fixture export
 )
@@ -40,7 +41,7 @@ from test_database import (
 from test_database import (
     empty_database as empty_database,  # noqa: PLC0414 - fixture export
 )
-from test_followup_persistence import _v2_priced_followup
+from test_followup_persistence import _signed_v2_priced_followup
 
 MIGRATION = ROOT / "db/migrations/versions/0019_b06_price_policy_strings.py"
 T145_BEFORE = "0033_d08_terminal_writer"
@@ -382,7 +383,15 @@ def test_failed_following_revision_keeps_head_and_ddl_atomic(
     ],
 )
 def test_postgresql_final_check_accepts_python_confirmed_corpus(
-    appointment_storage, service, classification, base, standard, kind, discount, reason
+    appointment_storage,
+    appointment_api,
+    service,
+    classification,
+    base,
+    standard,
+    kind,
+    discount,
+    reason,
 ):
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
     quote = quote_price(base, standard, service, classification, kind, discount)
@@ -401,11 +410,11 @@ def test_postgresql_final_check_accepts_python_confirmed_corpus(
         "entitlement_provenance": None,
     }
     # If PostgreSQL's unchanged D-05 CHECK diverges, surface this exact corpus value.
-    with transaction(runtime, tenant) as conn:
-        if service == "FOLLOW_UP":
-            saved = _v2_priced_followup(conn, tenant, doctor, frozen)
-            frozen["entitlement_provenance"] = saved["entitlement_provenance"]
-        else:
+    if service == "FOLLOW_UP":
+        saved = _signed_v2_priced_followup(appointment_api, tenant, doctor, frozen)
+        frozen["entitlement_provenance"] = saved["entitlement_provenance"]
+    else:
+        with transaction(runtime, tenant) as conn:
             saved = persist_appointment(
                 conn,
                 _draft(
@@ -417,8 +426,8 @@ def test_postgresql_final_check_accepts_python_confirmed_corpus(
                 ),
                 _query(tenant, doctor),
             )
-        assert validate_price_snapshot(frozen)["net_egp"] == quote.net_egp
-        assert saved["net_egp"] == format(quote.net_egp, ".2f"), frozen
+    assert validate_price_snapshot(frozen)["net_egp"] == quote.net_egp
+    assert saved["net_egp"] == format(quote.net_egp, ".2f"), frozen
 
 
 def test_t145_upgrade_preserves_historical_numeric_percentage_and_receipt(

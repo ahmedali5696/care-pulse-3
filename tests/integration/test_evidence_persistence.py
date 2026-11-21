@@ -2,12 +2,14 @@
 
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import timedelta
 from hashlib import sha256
 from threading import Barrier
 from uuid import uuid4
 
 import pytest
+from carepulse.identity.authorization import protected_transaction
 from carepulse.identity.receipts import (
     Receipt,
     ReceiptConflict,
@@ -20,7 +22,6 @@ from carepulse.identity.receipts import (
 from carepulse.notifications.evidence import (
     ClaimPolicy,
     JobOutcome,
-    accept_verified_nonce,
     append_clinical_audit,
     append_outbox,
     append_sensitive_audit,
@@ -29,8 +30,14 @@ from carepulse.notifications.evidence import (
     finish_delivery_job,
     get_claimed_delivery_material,
 )
+from carepulse.patients.contracts import CreatePatient
+from carepulse.patients.service import register_patient
+from runtime_identity_fixture import registered_test_request, signed_test_transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from test_patients import patient_backend as patient_backend  # noqa: PLC0414
+from test_request_boundary import _signed
+from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 
 
 @pytest.fixture
@@ -127,15 +134,29 @@ def _audit_fields(tenant_id, staff_id):
     }
 
 
-def _scope_job(connection, job_id):
-    tenant_id = connection.scalar(
-        text("SELECT organization_id FROM public.delivery_jobs WHERE id = :id"),
-        {"id": job_id},
-    )
-    connection.execute(
-        text("SELECT set_config('app.organization_id', :tenant, true)"),
-        {"tenant": str(tenant_id)},
-    )
+@pytest.fixture
+def sender_transaction(role_engine, evidence):
+    migration, _, _, _ = evidence
+    sender = role_engine("carepulse_sender")
+
+    @contextmanager
+    def scoped(job_id):
+        with migration.connect() as observer:
+            tenant = observer.scalar(
+                text("SELECT organization_id FROM public.delivery_jobs WHERE id=:job"),
+                {"job": job_id},
+            )
+        with sender.begin() as connection:
+            connection.execute(
+                text("SELECT set_config('app.organization_id', :tenant, true)"),
+                {"tenant": str(tenant)},
+            )
+            yield connection
+
+    try:
+        yield scoped
+    finally:
+        sender.dispose()
 
 
 def _new_delivery(connection, operator_id):
@@ -288,7 +309,7 @@ def test_audit_access_fails_for_operator_and_without_doctor_context(
             },
         )
     operator = role_engine("carepulse_operator")
-    runtime = role_engine("carepulse_runtime")
+    runtime = role_engine("carepulse_api")
     try:
         with operator.connect() as connection, pytest.raises(DBAPIError):
             connection.execute(text("SELECT * FROM public.clinical_audit")).all()
@@ -297,85 +318,111 @@ def test_audit_access_fails_for_operator_and_without_doctor_context(
                 connection.scalar(text("SELECT count(*) FROM public.sensitive_audit"))
                 == 0
             )
-            assert (
-                connection.scalar(text("SELECT count(*) FROM public.clinical_audit"))
-                == 0
-            )
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(text("SELECT count(*) FROM public.clinical_audit"))
+            assert denied.value.orig.sqlstate == "42501"
             connection.execute(
                 text("SELECT set_config('app.organization_id', :org, true)"),
                 {"org": str(tenant_id)},
             )
-            assert (
-                connection.scalar(text("SELECT count(*) FROM public.clinical_audit"))
-                == 0
-            )
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(text("SELECT count(*) FROM public.clinical_audit"))
+            assert denied.value.orig.sqlstate == "42501"
             connection.execute(
                 text("SELECT set_config('app.staff_id', :id, true)"),
                 {"id": str(staff_id)},
             )
-            assert (
-                connection.scalar(text("SELECT count(*) FROM public.clinical_audit"))
-                == 1
-            )
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(text("SELECT count(*) FROM public.clinical_audit"))
+            assert denied.value.orig.sqlstate == "42501"
     finally:
         operator.dispose()
         runtime.dispose()
 
 
-def test_receptionist_cannot_forge_doctor_clinical_audit(evidence, role_engine):
-    migration, _, tenant_id, doctor_id = evidence
-    receptionist = uuid4()
-    native_user = f"synthetic-{uuid4()}"
-    email = f"{uuid4()}@example.invalid"
-    with migration.begin() as connection:
-        connection.execute(
-            text("""
-                INSERT INTO public."user"
-                    (id, name, email, "emailVerified", "createdAt", "updatedAt")
-                VALUES (:id, 'Synthetic receptionist', :email, true,
-                        clock_timestamp(), clock_timestamp())
-            """),
-            {"id": native_user, "email": email},
-        )
-        connection.execute(
-            text("""
-                INSERT INTO public.staff_accounts
-                    (id, organization_id, auth_user_id, verified_email,
-                     role, enabled, verified)
-                VALUES (:id, :tenant, :user, :email, 'RECEPTIONIST', true, true)
-            """),
+def test_current_head_clinical_audit_denied_without_or_with_signed_doctor_context(
+    boundary_data, role_engine
+):
+    clinic = boundary_data
+    with clinic.migration.begin() as connection:
+        append_sensitive_audit(connection, _audit_fields(clinic.tenant, clinic.staff))
+        append_clinical_audit(
+            connection,
             {
-                "id": receptionist,
-                "tenant": tenant_id,
-                "user": native_user,
-                "email": email,
+                "organization_id": clinic.tenant,
+                "doctor_staff_id": clinic.staff,
+                "clinical_revision": 2,
+                "before_ref": "before",
+                "after_ref": "after",
+                "correlation_id": str(uuid4()),
             },
         )
-    runtime = role_engine("carepulse_runtime")
+    operator = role_engine("carepulse_operator")
     try:
-        with pytest.raises(DBAPIError), runtime.begin() as connection:
-            connection.execute(
-                text("SELECT set_config('app.organization_id', :tenant, true)"),
-                {"tenant": str(tenant_id)},
+        with pytest.raises(DBAPIError) as denied, operator.connect() as connection:
+            connection.execute(text("SELECT * FROM public.clinical_audit"))
+        assert denied.value.orig.sqlstate == "42501"
+        with clinic.runtime.begin() as connection:
+            assert (
+                connection.scalar(text("SELECT count(*) FROM public.sensitive_audit"))
+                == 0
             )
-            connection.execute(
-                text("SELECT set_config('app.staff_id', :staff, true)"),
-                {"staff": str(receptionist)},
-            )
-            append_clinical_audit(
-                connection,
-                {
-                    "organization_id": tenant_id,
-                    "doctor_staff_id": doctor_id,
-                    "clinical_revision": 2,
-                    "before_ref": "before",
-                    "after_ref": "forged",
-                    "correlation_id": str(uuid4()),
-                },
-            )
+            for name, value in (
+                ("app.organization_id", str(clinic.tenant)),
+                ("app.staff_id", str(clinic.staff)),
+            ):
+                connection.execute(
+                    text("SELECT set_config(:name, :value, true)"),
+                    {"name": name, "value": value},
+                )
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    connection.execute(
+                        text("SELECT count(*) FROM public.clinical_audit")
+                    )
+                assert denied.value.orig.sqlstate == "42501"
+        with signed_test_transaction(
+            clinic,
+            _signed(clinic)[0],
+            method="GET",
+            path="/v1/patients",
+            purpose="PATIENT_REGISTRY",
+        ) as (connection, _):
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(text("SELECT count(*) FROM public.clinical_audit"))
+            assert denied.value.orig.sqlstate == "42501"
     finally:
-        runtime.dispose()
-    with migration.connect() as connection:
+        operator.dispose()
+
+
+def test_receptionist_cannot_forge_doctor_clinical_audit(patient_backend):
+    clinic = patient_backend
+    with (
+        pytest.raises(DBAPIError) as denied,
+        signed_test_transaction(
+            clinic,
+            clinic.receptionist,
+            method="GET",
+            path="/v1/patients",
+            purpose="PATIENT_REGISTRY",
+        ) as (connection, _),
+    ):
+        connection.execute(
+            text("SELECT set_config('app.staff_id', :staff, true)"),
+            {"staff": clinic.owner.staff_id},
+        )
+        append_clinical_audit(
+            connection,
+            {
+                "organization_id": clinic.tenant,
+                "doctor_staff_id": clinic.staff,
+                "clinical_revision": 2,
+                "before_ref": "before",
+                "after_ref": "forged",
+                "correlation_id": str(uuid4()),
+            },
+        )
+    assert denied.value.orig.sqlstate == "42501"
+    with clinic.migration.connect() as connection:
         assert (
             connection.scalar(
                 text(
@@ -471,21 +518,22 @@ def test_nonclinical_job_issuance_rolls_back_without_deliverable_material(eviden
         )
 
 
-def test_job_claim_is_owned_and_material_disposed_on_success(evidence):
+def test_job_claim_is_owned_and_material_disposed_on_success(
+    evidence, sender_transaction
+):
     migration, operator_id, _, _ = evidence
     with migration.begin() as connection:
         job_id, _ = _new_delivery(connection, operator_id)
-    with migration.begin() as connection:
+    with sender_transaction(job_id) as connection:
         claim = claim_delivery_job(
             connection, ClaimPolicy(timedelta(minutes=4), 3), job_id
         )
         assert claim and claim.generation == 1
-    with migration.begin() as connection:
+    with sender_transaction(job_id) as connection:
         assert (
             claim_delivery_job(connection, ClaimPolicy(timedelta(minutes=4), 3), job_id)
             is None
         )
-        _scope_job(connection, job_id)
         material = get_claimed_delivery_material(connection, claim)
         assert material["format_version"] == 1
         assert finish_delivery_job(connection, claim, JobOutcome("SENT"))
@@ -510,19 +558,20 @@ def test_job_claim_is_owned_and_material_disposed_on_success(evidence):
 
 @pytest.mark.parametrize("spoof_claim", [False, True])
 def test_direct_runtime_update_cannot_fail_another_live_delivery_claim(
-    evidence, role_engine, spoof_claim
+    evidence, role_engine, sender_transaction, spoof_claim
 ):
     migration, operator_id, _, _ = evidence
     with migration.begin() as connection:
         job_id, _ = _new_delivery(connection, operator_id)
-        claim = claim_delivery_job(
-            connection, ClaimPolicy(timedelta(minutes=4), 3), job_id
-        )
         tenant_id = connection.scalar(
             text("SELECT organization_id FROM public.delivery_jobs WHERE id = :id"),
             {"id": job_id},
         )
-    runtime = role_engine("carepulse_runtime")
+    with sender_transaction(job_id) as connection:
+        claim = claim_delivery_job(
+            connection, ClaimPolicy(timedelta(minutes=4), 3), job_id
+        )
+    runtime = role_engine("carepulse_api")
     try:
         with pytest.raises(DBAPIError) as denial, runtime.begin() as connection:
             connection.execute(
@@ -547,6 +596,30 @@ def test_direct_runtime_update_cannot_fail_another_live_delivery_claim(
             """),
                 {"job": job_id},
             )
+        assert denial.value.orig.sqlstate == "42501"
+        # The actual sender still has UPDATE grants; its lease guard must reject
+        # the same raw update with the original constraint SQLSTATE.
+        with (
+            pytest.raises(DBAPIError) as denial,
+            sender_transaction(job_id) as connection,
+        ):
+            if spoof_claim:
+                connection.execute(
+                    text("""
+                    SELECT set_config('app.delivery_claim_owner', :wrong_owner, true),
+                           set_config('app.delivery_claim_generation', :generation, true)
+                """),
+                    {"wrong_owner": str(uuid4()), "generation": str(claim.generation)},
+                )
+            connection.execute(
+                text("""
+                UPDATE public.delivery_jobs
+                SET state = 'FAILED', claim_owner = NULL,
+                    claimed_at = NULL, lease_expires_at = NULL
+                WHERE id = :job
+            """),
+                {"job": job_id},
+            )
         assert denial.value.orig.sqlstate == "23514"
         with migration.connect() as connection:
             assert connection.execute(
@@ -556,11 +629,7 @@ def test_direct_runtime_update_cannot_fail_another_live_delivery_claim(
             """),
                 {"job": job_id},
             ).one() == ("CLAIMED", claim.owner, claim.generation)
-        with runtime.begin() as connection:
-            connection.execute(
-                text("SELECT set_config('app.organization_id', :tenant, true)"),
-                {"tenant": str(tenant_id)},
-            )
+        with sender_transaction(job_id) as connection:
             assert finish_delivery_job(connection, claim, JobOutcome("FAILED"))
     finally:
         runtime.dispose()
@@ -587,14 +656,14 @@ def test_lease_expiry_comparisons_at_one_exact_database_instant(evidence):
         ).one() == (True, True, False, False, False, True)
 
 
-def test_two_claimers_get_only_one_delivery_lease(evidence):
+def test_two_claimers_get_only_one_delivery_lease(evidence, sender_transaction):
     migration, operator_id, _, _ = evidence
     with migration.begin() as connection:
         job_id, _ = _new_delivery(connection, operator_id)
     barrier = Barrier(2)
 
     def attempt():
-        with migration.begin() as connection:
+        with sender_transaction(job_id) as connection:
             barrier.wait(timeout=10)
             claim = claim_delivery_job(
                 connection, ClaimPolicy(timedelta(minutes=4), 3), job_id
@@ -617,10 +686,12 @@ def test_two_claimers_get_only_one_delivery_lease(evidence):
 
 def test_expired_owner_is_fenced_and_competing_reclaimers_get_one_new_generation(
     evidence,
+    sender_transaction,
 ):
     migration, operator_id, _, _ = evidence
     with migration.begin() as connection:
         job_id, _ = _new_delivery(connection, operator_id)
+    with sender_transaction(job_id) as connection:
         old = claim_delivery_job(
             connection, ClaimPolicy(timedelta(minutes=4), 4), job_id
         )
@@ -644,15 +715,14 @@ def test_expired_owner_is_fenced_and_competing_reclaimers_get_one_new_generation
             text("ALTER TABLE public.delivery_jobs ENABLE TRIGGER delivery_jobs_guard")
         )
 
-    with migration.begin() as connection:
-        _scope_job(connection, job_id)
+    with sender_transaction(job_id) as connection:
         assert not finish_delivery_job(connection, old, JobOutcome("SENT"))
         assert get_claimed_delivery_material(connection, old) is None
 
     barrier = Barrier(2)
 
     def attempt():
-        with migration.begin() as connection:
+        with sender_transaction(job_id) as connection:
             barrier.wait(timeout=10)
             return claim_delivery_job(
                 connection, ClaimPolicy(timedelta(minutes=4), 4), job_id
@@ -665,8 +735,7 @@ def test_expired_owner_is_fenced_and_competing_reclaimers_get_one_new_generation
     new = claims[0]
     assert new.generation == old.generation + 1
     assert new.owner != old.owner
-    with migration.begin() as connection:
-        _scope_job(connection, job_id)
+    with sender_transaction(job_id) as connection:
         retry_at = connection.scalar(text("SELECT clock_timestamp()"))
         assert not finish_delivery_job(connection, old, JobOutcome("READY", retry_at))
         assert not finish_delivery_job(connection, old, JobOutcome("FAILED"))
@@ -682,16 +751,16 @@ def test_expired_owner_is_fenced_and_competing_reclaimers_get_one_new_generation
         ).one() == ("SENT", 2, 2)
 
 
-def test_stale_claim_cannot_finish_or_read_material(evidence):
+def test_stale_claim_cannot_finish_or_read_material(evidence, sender_transaction):
     migration, operator_id, _, _ = evidence
     with migration.begin() as connection:
         job_id, _ = _new_delivery(connection, operator_id)
+    with sender_transaction(job_id) as connection:
         claim = claim_delivery_job(
             connection, ClaimPolicy(timedelta(minutes=4), 3), job_id
         )
     stale = type(claim)(claim.id, uuid4(), claim.generation, claim.lease_expires_at)
-    with migration.begin() as connection:
-        _scope_job(connection, job_id)
+    with sender_transaction(job_id) as connection:
         assert get_claimed_delivery_material(connection, stale) is None
         assert not finish_delivery_job(connection, stale, JobOutcome("SENT"))
     with migration.connect() as connection:
@@ -706,18 +775,20 @@ def test_stale_claim_cannot_finish_or_read_material(evidence):
         )
 
 
-def test_retry_bound_exhaustion_is_terminal_and_disposes_ciphertext(evidence):
+def test_retry_bound_exhaustion_is_terminal_and_disposes_ciphertext(
+    evidence, sender_transaction
+):
     migration, operator_id, _, _ = evidence
     with migration.begin() as connection:
         job_id, _ = _new_delivery(connection, operator_id)
+    with sender_transaction(job_id) as connection:
         claim = claim_delivery_job(
             connection, ClaimPolicy(timedelta(minutes=4), 1), job_id
         )
-    with migration.begin() as connection:
-        _scope_job(connection, job_id)
+    with sender_transaction(job_id) as connection:
         now = connection.scalar(text("SELECT clock_timestamp()"))
         assert finish_delivery_job(connection, claim, JobOutcome("READY", now))
-    with migration.begin() as connection:
+    with sender_transaction(job_id) as connection:
         assert (
             claim_delivery_job(connection, ClaimPolicy(timedelta(minutes=4), 1), job_id)
             is None
@@ -783,7 +854,7 @@ def test_one_delivery_job_per_logical_issuance(evidence):
         )
 
 
-def test_claim_cancels_unusable_proof_without_delivery(evidence):
+def test_claim_cancels_unusable_proof_without_delivery(evidence, sender_transaction):
     migration, operator_id, _, _ = evidence
     with migration.begin() as connection:
         job_id, proof_id = _new_delivery(connection, operator_id)
@@ -795,7 +866,7 @@ def test_claim_cancels_unusable_proof_without_delivery(evidence):
             """),
             {"id": proof_id},
         )
-    with migration.begin() as connection:
+    with sender_transaction(job_id) as connection:
         assert (
             claim_delivery_job(connection, ClaimPolicy(timedelta(minutes=4), 3), job_id)
             is None
@@ -818,7 +889,7 @@ def test_runtime_cannot_read_delivery_ownership_or_ciphertext(evidence, role_eng
             text("SELECT organization_id FROM public.delivery_jobs WHERE id = :id"),
             {"id": job_id},
         )
-    runtime = role_engine("carepulse_runtime")
+    runtime = role_engine("carepulse_api")
     try:
         for forbidden in (
             "SELECT claim_owner FROM public.delivery_jobs WHERE id = :id",
@@ -838,7 +909,7 @@ def test_runtime_cannot_read_delivery_ownership_or_ciphertext(evidence, role_eng
 
 
 def test_runtime_cannot_shortcut_nonce_retention(evidence, role_engine):
-    runtime = role_engine("carepulse_runtime")
+    runtime = role_engine("carepulse_api")
     try:
         with pytest.raises(DBAPIError), runtime.begin() as connection:
             connection.execute(
@@ -848,57 +919,66 @@ def test_runtime_cannot_shortcut_nonce_retention(evidence, role_engine):
         runtime.dispose()
 
 
-def test_nonce_survives_failed_business_and_replay_is_denied(evidence, role_engine):
-    migration, _, tenant_id, _ = evidence
-    runtime = role_engine("carepulse_runtime")
-    try:
-        with migration.connect() as connection:
-            signed = connection.scalar(text("SELECT clock_timestamp()"))
-        nonce = f"synthetic-{uuid4()}"
-        accept_verified_nonce(runtime, "synthetic-key", nonce, signed)
-        with pytest.raises(RuntimeError), migration.begin() as connection:
-            append_outbox(connection, _outbox_fields(tenant_id))
-            raise RuntimeError("failed domain")
-        with pytest.raises(IntegrityError):
-            accept_verified_nonce(runtime, "synthetic-key", nonce, signed)
-        with migration.connect() as connection:
-            assert (
-                connection.scalar(
-                    text(
-                        "SELECT count(*) FROM public.request_nonces WHERE nonce = :nonce"
-                    ),
-                    {"nonce": nonce},
-                )
-                == 1
+def test_nonce_survives_failed_business_and_replay_is_denied(boundary_data):
+    clinic = boundary_data
+    command = {
+        "name_parts": ["Synthetic", "Nonce", "Patient"],
+        "date_of_birth": "2000-01-01",
+    }
+    identity, body, _ = _signed(clinic, command=command)
+    with (
+        registered_test_request(clinic, identity, body),
+        pytest.raises(RuntimeError, match="failed domain"),
+        protected_transaction(
+            clinic.runtime, identity, clinic.config.policy.session_idle_minutes
+        ) as (connection, actor),
+    ):
+        patient_id = register_patient(
+            connection,
+            actor,
+            CreatePatient.model_validate(command),
+            identity.idempotency_key,
+        )["id"]
+        assert patient_id
+        raise RuntimeError("failed domain")
+    with pytest.raises(IntegrityError), registered_test_request(clinic, identity, body):
+        pytest.fail("Replayed nonce accepted")
+    with clinic.migration.begin() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM public.patients WHERE id=:id"),
+                {"id": patient_id},
             )
-    finally:
-        runtime.dispose()
+            == 0
+        )
+        connection.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM f01_private.nonces WHERE nonce=:nonce"),
+                {"nonce": identity.nonce},
+            )
+            == 1
+        )
 
 
-def test_duplicate_nonce_competition_has_one_committed_winner(role_engine, evidence):
-    migration, _, _, _ = evidence
-    with migration.connect() as connection:
-        signed = connection.scalar(text("SELECT clock_timestamp()"))
-    nonce = f"parallel-{uuid4()}"
+def test_duplicate_nonce_competition_has_one_committed_winner(boundary_data):
+    clinic = boundary_data
+    identity, body, _ = _signed(clinic)
     barrier = Barrier(2)
-    runtime = role_engine("carepulse_runtime")
 
     def attempt():
         barrier.wait(timeout=10)
         try:
-            accept_verified_nonce(runtime, "synthetic-key", nonce, signed)
-            return "inserted"
+            with registered_test_request(clinic, identity, body):
+                return "inserted"
         except IntegrityError:
             return "duplicate"
 
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            outcomes = [
-                future.result() for future in [pool.submit(attempt) for _ in range(2)]
-            ]
-        assert sorted(outcomes) == ["duplicate", "inserted"]
-    finally:
-        runtime.dispose()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = [
+            future.result() for future in [pool.submit(attempt) for _ in range(2)]
+        ]
+    assert sorted(outcomes) == ["duplicate", "inserted"]
 
 
 def test_operator_receipt_deduplicates_clinic_creation_and_conflicts_on_body(evidence):
@@ -1005,8 +1085,9 @@ def test_parallel_operator_create_receipt_rolls_back_loser(evidence):
         )
 
 
-def test_tenant_receipt_is_not_accessible_to_operator(evidence, role_engine):
-    migration, _, tenant_id, staff_id = evidence
+def test_tenant_receipt_is_not_accessible_to_operator(boundary_data, role_engine):
+    clinic = boundary_data
+    migration, tenant_id, staff_id = clinic.migration, clinic.tenant, clinic.staff
     receipt = Receipt(
         staff_id,
         "patients.create",
@@ -1019,14 +1100,17 @@ def test_tenant_receipt_is_not_accessible_to_operator(evidence, role_engine):
     )
     with migration.begin() as connection:
         insert_tenant_receipt(connection, receipt)
-    runtime = role_engine("carepulse_runtime")
     operator = role_engine("carepulse_operator")
     try:
-        with runtime.begin() as connection:
-            connection.execute(
-                text("SELECT set_config('app.organization_id', :id, true)"),
-                {"id": str(tenant_id)},
-            )
+        with signed_test_transaction(
+            clinic,
+            _signed(clinic)[0],
+            method="POST",
+            path="/v1/patients",
+            purpose="PATIENT_REGISTRY",
+            body={"name_parts": ["Synthetic", "Receipt", "Patient"]},
+            key=receipt.idempotency_key,
+        ) as (connection, _):
             assert lookup_tenant_receipt(
                 connection,
                 tenant_id,
@@ -1041,5 +1125,4 @@ def test_tenant_receipt_is_not_accessible_to_operator(evidence, role_engine):
                 """)
             ).all()
     finally:
-        runtime.dispose()
         operator.dispose()

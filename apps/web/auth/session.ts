@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { PoolClient } from "pg";
 import { loadWebConfig } from "../config.ts";
+import { checkWebPoolCheckout, isCompatEnabled } from "../compat/admission.ts";
 import { authDatabase } from "../db.ts";
 import { getAuth } from "../auth.ts";
 import { scopedAuthClient } from "./postgres-adapter.ts";
@@ -35,7 +36,10 @@ async function inTenant<T>(tenant: string, action: (client: PoolClient) => Promi
   // revision change waiting on that INSERT; the post-commit currentActor
   // rechecks live authority under the organization lock before issuing cookies.
   const joined = scopedAuthClient(pool, tenant);
-  if (joined) return action(joined);
+  if (joined) {
+    if (isCompatEnabled()) await checkWebPoolCheckout(joined, "carepulse_auth");
+    return action(joined);
+  }
   const client = await pool.connect();
   try {
     await client.query("BEGIN");

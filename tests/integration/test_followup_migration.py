@@ -2,24 +2,33 @@
 
 import runpy
 import shutil
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from alembic.script import ScriptDirectory
 from carepulse.appointments.followups import qualify_followup
 from carepulse.appointments.persistence import persist_appointment
 from carepulse.appointments.queries import followup_qualification
 from carepulse.db import transaction
 from carepulse.identity.contracts import ContractError, normalize_typed_body
 from carepulse.identity.receipts import Receipt, insert_tenant_receipt
+from carepulse.identity.signing import (
+    PROTOCOL_VERSION,
+    CanonicalEnvelope,
+    raw_body_sha256,
+)
 from carepulse.policies.versions import append_version
 from carepulse.visits.eligibility import extend_followup
 from carepulse.visits.eligibility_contracts import ExtendFollowup
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _activate_clinic, _draft, _patient, _query
+from test_appointment_persistence import appointment_api as appointment_api  # noqa: PLC0414
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_database import _create_empty_database, _engine
 from test_database import admin as admin  # noqa: PLC0414
@@ -29,8 +38,11 @@ from test_followup_decisions import _actor
 from test_followup_decisions import _staff_context as _doctor_context
 from test_followup_persistence import (
     _claim,
+    _followup_actor,
     _outcome,
     _provenance,
+    _signed_v2_command,
+    _signed_v2_transaction,
     _source,
     _v2_booking,
     _v2_command,
@@ -113,13 +125,15 @@ def _d08_snapshot(connection):
     }
 
 
-def test_retained_active_unattested_claim_conflicts_at_current_head(
-    admin, empty_database
+def test_f01_retained_active_unattested_claim_conflicts_at_current_head(
+    admin, empty_database, role_engine
 ):
     migration, runtime, tenant, doctor = _predecessor(admin, empty_database)
     try:
         _upgrade(migration, "0024_b06_followup_window")
-        with transaction(runtime, tenant) as connection:
+        # Seed predecessor storage through maintenance; the original predecessor
+        # runtime contract runs unchanged in the separate historical lane.
+        with transaction(migration, tenant) as connection:
             active_source = _source(connection, tenant, doctor)
             active = _claim(connection, tenant, active_source)
             released_source = _source(connection, tenant, doctor)
@@ -129,110 +143,280 @@ def test_retained_active_unattested_claim_conflicts_at_current_head(
             consumed = _claim(connection, tenant, consumed_source)
             _outcome(connection, tenant, doctor, consumed, status="Completed")
 
-        _upgrade(migration, "head")
-        with migration.connect() as connection:
-            assert (
-                connection.scalar(
-                    text(
-                        "SELECT count(*) FROM public.completion_attestations WHERE organization_id=:tenant"
-                    ),
-                    {"tenant": tenant},
-                )
-                == 0
+        # Upgrade genuine predecessor rows, with the same separate gate bootstrap
+        # as the disposable Foundation database (never restore retired runtime).
+        with _retained_head_api(migration, role_engine, tenant, doctor) as clinic:
+            _assert_retained_unattested_claims(
+                migration,
+                clinic,
+                tenant,
+                doctor,
+                active_source,
+                active,
+                released_source,
+                released,
+                consumed_source,
+                consumed,
             )
-            assert connection.execute(
+    finally:
+        runtime.dispose()
+        migration.dispose()
+
+
+@contextmanager
+def _retained_head_api(migration, role_engine, tenant, doctor):
+    """Bootstrap a predecessor database's real F-01 gate and upgrade it to head."""
+    bootstrap = _engine("carepulse_bootstrap", migration.url.database)
+    deployed = _engine("carepulse_bootstrap")
+    api_template, gate_template = (
+        role_engine("carepulse_api"),
+        role_engine("carepulse_gate"),
+    )
+    api = create_engine(
+        api_template.url.set(database=migration.url.database), hide_parameters=True
+    )
+    gate = create_engine(
+        gate_template.url.set(database=migration.url.database), hide_parameters=True
+    )
+    try:
+        with bootstrap.begin() as connection:
+            connection.execute(
                 text("""
+                CREATE SCHEMA f01_private AUTHORIZATION carepulse_identity_owner;
+                CREATE SCHEMA f01_crypto AUTHORIZATION carepulse_migration;
+                CREATE EXTENSION pgcrypto WITH SCHEMA f01_crypto;
+                REVOKE ALL ON SCHEMA f01_private, f01_crypto FROM PUBLIC;
+                REVOKE ALL ON ALL FUNCTIONS IN SCHEMA f01_crypto FROM PUBLIC;
+                GRANT USAGE ON SCHEMA f01_crypto TO carepulse_identity_owner;
+                GRANT EXECUTE ON FUNCTION f01_crypto.hmac(bytea,bytea,text),
+                    f01_crypto.digest(bytea,text), f01_crypto.gen_random_bytes(integer)
+                    TO carepulse_identity_owner;
+            """)
+            )
+            database = connection.dialect.identifier_preparer.quote(
+                migration.url.database
+            )
+            connection.execute(
+                text(
+                    f"GRANT CONNECT ON DATABASE {database} TO carepulse_api, carepulse_gate"
+                )
+            )
+        _upgrade(migration, "head")
+        with deployed.connect() as connection:
+            policy = (
+                connection.execute(
+                    text(
+                        "SELECT signed_request_freshness_seconds AS freshness, signed_request_max_skew_seconds AS skew, session_idle_minutes AS idle FROM f01_private.policy"
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            keys = (
+                connection.execute(
+                    text(
+                        "SELECT key_id, secret, status, issuance_cutoff_ms FROM f01_private.keys"
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        with bootstrap.begin() as connection:
+            connection.execute(text("SET LOCAL ROLE carepulse_identity_owner"))
+            connection.execute(
+                text(
+                    "INSERT INTO f01_private.policy (signed_request_freshness_seconds,signed_request_max_skew_seconds,session_idle_minutes) VALUES (:freshness,:skew,:idle)"
+                ),
+                dict(policy),
+            )
+            for key in keys:
+                connection.execute(
+                    text(
+                        "INSERT INTO f01_private.keys (key_id,secret,status,issuance_cutoff_ms) VALUES (:key_id,:secret,:status,:issuance_cutoff_ms)"
+                    ),
+                    dict(key),
+                )
+        owner = CanonicalEnvelope(
+            PROTOCOL_VERSION,
+            "v1",
+            "web",
+            "GET",
+            "/v1/patients",
+            "",
+            raw_body_sha256(b""),
+            str(tenant),
+            str(doctor),
+            "",
+            "DOCTOR_OWNER",
+            "0",
+            "0",
+            "",
+            "PATIENT_REGISTRY",
+            "",
+        )
+        clinic = SimpleNamespace(
+            runtime=api, gate=gate, migration=migration, owner=owner
+        )
+        with migration.begin() as connection:
+            clinic.owner = _followup_actor(connection, clinic, doctor)
+        yield clinic
+    finally:
+        for engine in (bootstrap, deployed, api_template, gate_template, api, gate):
+            engine.dispose()
+
+
+def _assert_retained_unattested_claims(
+    migration,
+    clinic,
+    tenant,
+    doctor,
+    active_source,
+    active,
+    released_source,
+    released,
+    consumed_source,
+    consumed,
+):
+    with migration.connect() as connection:
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.completion_attestations WHERE organization_id=:tenant"
+                ),
+                {"tenant": tenant},
+            )
+            == 0
+        )
+        assert connection.execute(
+            text("""
                     SELECT state FROM public.followup_claims
                     WHERE organization_id=:tenant AND id IN (:active, :released, :consumed)
                     ORDER BY state
                 """),
-                {
-                    "tenant": tenant,
-                    "active": active["claim"],
-                    "released": released["claim"],
-                    "consumed": consumed["claim"],
-                },
-            ).scalars().all() == ["ACTIVE", "CONSUMED", "RELEASED"]
-            tracked = (
-                "appointments",
-                "appointment_number_assignments",
-                "followup_claims",
-                "idempotency_receipts",
-                "completion_attestations",
-            )
-            before = {
-                name: connection.scalar(
-                    text(
-                        f"SELECT count(*) FROM public.{name} WHERE organization_id=:tenant"
-                    ),
-                    {"tenant": tenant},
-                )
-                for name in tracked
-            }
-
-        intended = active_source["day"] + timedelta(days=1)
-        with transaction(runtime, tenant) as connection:
-            with pytest.raises(ContractError) as conflict:
-                followup_qualification(
-                    connection,
-                    _actor(tenant, doctor),
-                    active_source["appointment"],
-                    intended,
-                )
-            assert conflict.value.status_code == 409
-            revision = connection.scalar(
+            {
+                "tenant": tenant,
+                "active": active["claim"],
+                "released": released["claim"],
+                "consumed": consumed["claim"],
+            },
+        ).scalars().all() == ["ACTIVE", "CONSUMED", "RELEASED"]
+        tracked = (
+            "appointments",
+            "appointment_number_assignments",
+            "followup_claims",
+            "idempotency_receipts",
+            "completion_attestations",
+        )
+        before = {
+            name: connection.scalar(
                 text(
-                    "SELECT clinical_revision FROM public.visits WHERE organization_id=:tenant AND id=:visit"
+                    f"SELECT count(*) FROM public.{name} WHERE organization_id=:tenant"
                 ),
-                {"tenant": tenant, "visit": active_source["visit"]},
+                {"tenant": tenant},
             )
-            assert (
-                qualify_followup(
-                    connection,
-                    tenant,
-                    active_source["patient"],
-                    intended,
-                    active_source["visit"],
-                    revision,
-                    datetime.now(UTC),
-                    actor_role="RECEPTIONIST",
-                ).outcome
-                == "BUSY"
+            for name in tracked
+        }
+
+    intended = active_source["day"] + timedelta(days=1)
+    with _signed_v2_transaction(
+        clinic, "create_followup_claim", {**active_source, "tenant": tenant}
+    ) as connection:
+        with pytest.raises(ContractError) as conflict:
+            followup_qualification(
+                connection,
+                _actor(tenant, doctor),
+                active_source["appointment"],
+                intended,
             )
-            for source in (released_source, consumed_source):
-                result = followup_qualification(
-                    connection,
-                    _actor(tenant, doctor),
-                    source["appointment"],
-                    source["day"] + timedelta(days=1),
-                )
-                assert result["actual_service_type"] == "NEW_EXAMINATION"
-                assert result["preferential_available"] is False
+        assert conflict.value.status_code == 409
+    receptionist = _receptionist(migration, tenant)
+    with migration.begin() as connection:
+        receptionist_identity = _followup_actor(connection, clinic, receptionist)
+    with _signed_v2_transaction(
+        clinic,
+        "create_followup_claim",
+        {**active_source, "tenant": tenant},
+        actor=receptionist_identity,
+    ) as connection:
+        revision = connection.scalar(
+            text(
+                "SELECT clinical_revision FROM public.visits WHERE organization_id=:tenant AND id=:visit"
+            ),
+            {"tenant": tenant, "visit": active_source["visit"]},
+        )
+        assert (
+            qualify_followup(
+                connection,
+                tenant,
+                active_source["patient"],
+                intended,
+                active_source["visit"],
+                revision,
+                datetime.now(UTC),
+                actor_role="RECEPTIONIST",
+            ).outcome
+            == "BUSY"
+        )
+    for source in (released_source, consumed_source):
+        with _signed_v2_transaction(
+            clinic, "create_followup_claim", {**source, "tenant": tenant}
+        ) as connection:
+            result = followup_qualification(
+                connection,
+                _actor(tenant, doctor),
+                source["appointment"],
+                source["day"] + timedelta(days=1),
+            )
+            assert result["actual_service_type"] == "NEW_EXAMINATION"
+            assert result["preferential_available"] is False
 
-        foreign_tenant = uuid4()
-        with transaction(runtime, foreign_tenant) as connection:
-            with pytest.raises(ContractError) as foreign:
-                followup_qualification(
-                    connection,
-                    _actor(foreign_tenant, doctor),
-                    active_source["appointment"],
-                    intended,
-                )
-            assert foreign.value.status_code == 404
+    foreign_tenant = uuid4()
+    with migration.begin() as connection:
+        operator = connection.scalar(
+            text(
+                "SELECT created_by_operator_id FROM public.organizations WHERE id=:tenant"
+            ),
+            {"tenant": tenant},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO public.organizations (id,branch,created_by_operator_id) VALUES (:tenant,'Synthetic foreign clinic',:operator)"
+            ),
+            {"tenant": foreign_tenant, "operator": operator},
+        )
+        foreign_doctor = _activate_clinic(connection, foreign_tenant, operator)
+        foreign_clinic = SimpleNamespace(owner=clinic.owner)
+        from dataclasses import replace
 
-        with migration.connect() as connection:
-            assert before == {
-                name: connection.scalar(
-                    text(
-                        f"SELECT count(*) FROM public.{name} WHERE organization_id=:tenant"
-                    ),
-                    {"tenant": tenant},
-                )
-                for name in tracked
-            }
-    finally:
-        runtime.dispose()
-        migration.dispose()
+        foreign_clinic.owner = replace(
+            clinic.owner, organization_id=str(foreign_tenant)
+        )
+        foreign_actor = _followup_actor(connection, foreign_clinic, foreign_doctor)
+    with _signed_v2_transaction(
+        clinic,
+        "create_followup_claim",
+        {**active_source, "tenant": foreign_tenant},
+        actor=foreign_actor,
+    ) as connection:
+        with pytest.raises(ContractError) as foreign:
+            followup_qualification(
+                connection,
+                _actor(foreign_tenant, foreign_doctor),
+                active_source["appointment"],
+                intended,
+            )
+        assert foreign.value.status_code == 404
+
+    with migration.connect() as connection:
+        assert before == {
+            name: connection.scalar(
+                text(
+                    f"SELECT count(*) FROM public.{name} WHERE organization_id=:tenant"
+                ),
+                {"tenant": tenant},
+            )
+            for name in tracked
+        }
 
 
 def test_v2_populated_immediate_predecessor_preserves_legacy_evidence_and_denies_unattested_actions(
@@ -756,6 +940,12 @@ def test_fresh_and_failed_following_migration_keep_one_head(
         scripts = tmp_path / "migrations"
         shutil.copytree(ROOT / "db/migrations", scripts)
         # Isolate D-08 from later M1/B-06 heads for this rollback proof.
+        (scripts / "versions/0046_f01_audit_integrity.py").unlink()
+        (scripts / "versions/0045_f01_revocation_evidence.py").unlink()
+        (scripts / "versions/0044_f01_delivery_acl.py").unlink()
+        (scripts / "versions/0043_f01_writer_boundary.py").unlink()
+        (scripts / "versions/0042_f01_effective_grants.py").unlink()
+        (scripts / "versions/0041_f01_runtime_identity.py").unlink()
         (scripts / "versions/0040_t173_numeric_money.py").unlink()
         (scripts / "versions/0039_t160_capacity_numeric.py").unlink()
         (scripts / "versions/0038_t159_duration_numeric.py").unlink()
@@ -1248,40 +1438,23 @@ def test_populated_0023_followup_evidence_survives_0024_and_new_claims_use_live_
 
 @pytest.mark.parametrize("actor_kind", ["doctor", "receptionist", "manager"])
 def test_final_head_source_and_extension_evidence_names_actual_staff(
-    appointment_storage, actor_kind
+    appointment_storage, appointment_api, actor_kind
 ):
     runtime, migration, (tenant, _), (doctor, _) = appointment_storage
     actor = doctor if actor_kind == "doctor" else _receptionist(migration, tenant)
     if actor_kind == "manager":
         with transaction(runtime, tenant) as connection:
-            revision, security_revision = connection.execute(
-                text("""
-                    SELECT revision, security_revision FROM public.staff_accounts
-                    WHERE organization_id=:tenant AND id=:staff
-                """),
-                {"tenant": tenant, "staff": actor},
-            ).one()
-            _doctor_context(connection, doctor)
             connection.execute(
-                text("""
-                    SELECT public.set_receptionist_operational_manager(
-                        :tenant, :doctor, :staff, true, :revision,
-                        :security_revision, 'Delegated synthetic manager', :correlation)
-                """),
-                {
-                    "tenant": tenant,
-                    "doctor": doctor,
-                    "staff": actor,
-                    "revision": revision,
-                    "security_revision": security_revision,
-                    "correlation": uuid4(),
-                },
+                text(
+                    "UPDATE public.staff_accounts SET operational_manager=true, security_revision=security_revision+1 WHERE id=:staff"
+                ),
+                {"staff": actor},
             )
     role = "DOCTOR_OWNER" if actor == doctor else "RECEPTIONIST"
     with migration.connect() as connection:
         assert (
             connection.scalar(text("SELECT version_num FROM public.alembic_version"))
-            == "0040_t173_numeric_money"
+            == ScriptDirectory(str(ROOT / "db/migrations")).get_current_head()
         )
         if actor_kind == "manager":
             assert (
@@ -1295,21 +1468,23 @@ def test_final_head_source_and_extension_evidence_names_actual_staff(
             )
     with transaction(runtime, tenant) as connection:
         source = _v2_source(connection, tenant, doctor)
+        identity = _followup_actor(connection, appointment_api, actor)
+    with transaction(runtime, tenant) as connection:
         assert (
-            _v2_command(
-                connection,
+            _signed_v2_command(
+                appointment_api,
                 "record_followup_source_decision",
                 source,
-                actor=actor,
+                actor=identity,
                 kind="DEFAULT",
             )
             == 1
         )
-        claim = _v2_command(
-            connection,
+        claim = _signed_v2_command(
+            appointment_api,
             "create_followup_claim",
             source,
-            actor=actor,
+            actor=identity,
             expected={
                 "source_revision": 1,
                 "clinical_revision": 0,
@@ -1325,11 +1500,11 @@ def test_final_head_source_and_extension_evidence_names_actual_staff(
             {"id": record["id"]},
         )
         assert (
-            _v2_command(
-                connection,
+            _signed_v2_command(
+                appointment_api,
                 "extend_followup_claim",
                 source,
-                actor=actor,
+                actor=identity,
                 reference=claim,
                 expected={
                     "source_revision": 1,
@@ -1360,8 +1535,7 @@ def test_final_head_source_and_extension_evidence_names_actual_staff(
             {"visit": source["visit"]},
         ).one() == (0, None)
         connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
-    # Migration reads prove persisted attribution; SQL-set runtime GUCs cannot
-    # authenticate the human session (the open Issue #26 trust boundary).
+    # Maintenance reads verify attribution persisted by the real signed writer.
     with migration.connect() as connection:
         rows = connection.execute(
             text("""

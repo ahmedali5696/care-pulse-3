@@ -36,13 +36,17 @@ def disposable_project():
     assert not config["services"]["api"].get("ports")
 
 
-def _database():
-    return psycopg.connect(
+def _database(*, bootstrap=False):
+    """Use migration-owned fixtures; bootstrap is only for grants and backend stats."""
+    connection = psycopg.connect(
         host="db",
         dbname="carepulse",
         user="carepulse_bootstrap",
         password=Path("/run/secrets/postgres_password").read_text().strip(),
     )
+    if not bootstrap:
+        connection.execute("SET SESSION AUTHORIZATION carepulse_migration")
+    return connection
 
 
 def _password_hash(password):
@@ -60,11 +64,11 @@ def _password_hash(password):
     return f"{salt}:{digest.hex()}"
 
 
-def _seed_owner(connection):
+def _seed_owner(connection, *, email=None, password=None):
     operator, clinic, staff = uuid4(), uuid4(), uuid4()
     user = f"synthetic-b02-{uuid4()}"
-    email = f"{uuid4()}@example.invalid"
-    password = f"Synthetic-B02-{uuid4()}!"
+    email = email or f"{uuid4()}@example.invalid"
+    password = password or f"Synthetic-B02-{uuid4()}!"
     invitation = uuid4()
     connection.execute(
         """INSERT INTO public.operator_identities
@@ -409,7 +413,7 @@ def test_two_valid_signins_share_bounded_web_pool_without_leaking_tenant(owner):
         return _login(actor)
 
     with ThreadPoolExecutor(max_workers=2) as workers:
-        with _database() as observer:
+        with _database(bootstrap=True) as observer:
             # Hold session INSERTs only until both actual PostgreSQL backends
             # are concurrently waiting; a mere thread barrier is insufficient.
             observer.execute('LOCK TABLE public."session" IN SHARE MODE')
@@ -469,7 +473,7 @@ def test_two_valid_signins_share_bounded_web_pool_without_leaking_tenant(owner):
             "role": "DOCTOR_OWNER",
             "revision": 0,
         }
-    with _database() as connection:
+    with _database(bootstrap=True) as connection:
         for actor in (owner, other):
             session = connection.execute(
                 """SELECT s."securityRevision", staff.security_revision

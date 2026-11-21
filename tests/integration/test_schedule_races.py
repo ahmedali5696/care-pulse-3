@@ -1,7 +1,7 @@
 """B-07 publication barrier races against real PostgreSQL booking transactions."""
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event
+from threading import Event
 from time import monotonic
 from uuid import UUID, uuid4
 
@@ -15,10 +15,12 @@ from carepulse.policies.schedule import date_rules
 from carepulse.policies.schedule_service import load_current_schedule
 from carepulse.policies.versions import lock_schedule_barrier
 from postgres_locks import wait_for_postgres_lock
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _draft, _patient, _query
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
+from test_booking_races import _activation_checkpoint
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 from test_schedule import (
@@ -58,27 +60,50 @@ def test_signed_identical_concurrent_schedule_stage_reuses_one_preview(
     app.state.service_config, app.state.db_engine = clinic.config, clinic.runtime
     body = _patch(_config()).model_dump(mode="json")
     key = str(uuid4())
-    barrier = Barrier(2)
+    receipt_inserted, release_original, ready = Event(), Event(), Event()
+    holder_pid, waiter_pid = [], []
+
+    def hold_receipt(connection, _cursor, statement, _parameters, _context, _many):
+        if (
+            "INSERT INTO public.idempotency_receipts" in statement
+            and not receipt_inserted.is_set()
+        ):
+            holder_pid.append(connection.connection.driver_connection.info.backend_pid)
+            receipt_inserted.set()
+            assert release_original.wait(timeout=30)
 
     def send():
-        barrier.wait(timeout=15)
         return _schedule_request(
             clinic, clinic.owner, method=method, suffix=suffix, body=body, key=key
         )
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        first, second = [
-            future.result(timeout=35)
-            for future in (pool.submit(send), pool.submit(send))
-        ]
+    event.listen(clinic.runtime, "after_cursor_execute", hold_receipt)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            original = pool.submit(send)
+            try:
+                assert receipt_inserted.wait(timeout=15)
+                with _activation_checkpoint(clinic, waiter_pid, ready):
+                    replay = pool.submit(send)
+                    assert ready.wait(timeout=15)
+                    with clinic.migration.connect() as observer:
+                        wait_for_postgres_lock(observer, waiter_pid[0], holder_pid[0])
+            finally:
+                release_original.set()
+            first, second = original.result(timeout=30), replay.result(timeout=30)
+    finally:
+        release_original.set()
+        event.remove(clinic.runtime, "after_cursor_execute", hold_receipt)
     assert first == second
     assert first[0] == 200
     assert first[1]["data"]["revisions"]["active_schedule"] == 1
     assert first[1]["data"]["revisions"]["proposed_schedule"] == 2
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
-                text("SELECT count(*) FROM public.clinic_policy_previews WHERE id=:id"),
+                text(
+                    "SELECT count(*) FROM public.clinic_policy_previews WHERE organization_id = current_setting('app.organization_id')::uuid AND id=:id"
+                ),
                 {"id": first[1]["data"]["preview_id"]},
             )
             == 1
@@ -87,7 +112,8 @@ def test_signed_identical_concurrent_schedule_stage_reuses_one_preview(
             connection.scalar(
                 text(
                     "SELECT count(*) FROM public.idempotency_receipts "
-                    "WHERE operation=:operation AND idempotency_key=:key"
+                    "WHERE organization_id = current_setting('app.organization_id')::uuid "
+                    "AND operation=:operation AND idempotency_key=:key"
                 ),
                 {
                     "operation": "settings.schedule.stage"
@@ -143,7 +169,7 @@ def test_signed_identical_activation_waits_for_original_and_replays_receipt(
     def observe_signed_wait(
         connection, _cursor, statement, _parameters, _context, _many
     ):
-        if receipt_inserted.is_set() and "public.lock_active_organization" in statement:
+        if receipt_inserted.is_set() and "public.f01_activate()" in statement:
             waiting_pid.append(connection.connection.driver_connection.info.backend_pid)
             signed_started.set()
 
@@ -166,7 +192,7 @@ def test_signed_identical_activation_waits_for_original_and_replays_receipt(
                 assert receipt_inserted.wait(timeout=15)
                 replay_future = pool.submit(send_activation)
                 assert signed_started.wait(timeout=15)
-                with transaction(clinic.runtime, clinic.tenant) as observer:
+                with transaction(clinic.migration, clinic.tenant) as observer:
                     wait_for_postgres_lock(observer, waiting_pid[0], original_pid[0])
             finally:
                 release_original.set()
@@ -180,7 +206,7 @@ def test_signed_identical_activation_waits_for_original_and_replays_receipt(
     assert original == replay
     assert original[0] == 200 and original[1]["data"]["schedule_revision"] == 2
     assert original[1]["revision"] == 2
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert connection.execute(
             text(
                 "SELECT current_version, revision FROM public.clinic_policy_heads "
@@ -222,37 +248,111 @@ def test_signed_identical_activation_waits_for_original_and_replays_receipt(
         )
 
 
-def test_direct_identical_activation_rechecks_receipt_after_schedule_lock(
+def test_direct_identical_activation_rechecks_receipt_after_authority_lock(
+    patient_backend,
+):
+    clinic = patient_backend
+    status, response = _schedule_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        suffix="/preview",
+        body=_patch(_config()).model_dump(mode="json"),
+        key=str(uuid4()),
+    )
+    assert status == 200, response
+    preview = response["data"]
+    key = str(uuid4())
+    body = {
+        "preview_id": preview["preview_id"],
+        "expected_schedule_revision": preview["revisions"]["schedule"],
+        "expected_capacity_revision": preview["revisions"]["capacity"],
+        "reason": "Synthetic reviewed schedule publication",
+    }
+
+    def activation_transaction():
+        return signed_test_transaction(
+            clinic,
+            clinic.owner,
+            method="POST",
+            path="/v1/settings/schedule/activate",
+            purpose="SETTINGS_SCHEDULE",
+            body=body,
+            key=key,
+        )
+
+    def retry():
+        with activation_transaction() as (connection, actor):
+            return _activate(connection, actor, preview, key=key)
+
+    waiting_pid, ready = [], Event()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with activation_transaction() as (holder, actor):
+            original = _activate(holder, actor, preview, key=key)
+            holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
+            # F01 serializes requests before the schedule-head lock can be reached.
+            with _activation_checkpoint(clinic, waiting_pid, ready):
+                future = pool.submit(retry)
+                assert ready.wait(timeout=15)
+                with transaction(clinic.migration, clinic.tenant) as observer:
+                    wait_for_postgres_lock(observer, waiting_pid[0], holder_pid)
+        replay = future.result(timeout=30)
+    assert replay == original
+    assert original["schedule_revision"] == 2
+    with transaction(clinic.migration, clinic.tenant) as connection:
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.clinic_policy_versions "
+                    "WHERE organization_id=:tenant AND kind='SCHEDULE'"
+                ),
+                {"tenant": clinic.tenant},
+            )
+            == 2
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.idempotency_receipts "
+                    "WHERE organization_id=:tenant AND operation='settings.schedule.activate' "
+                    "AND idempotency_key=:key"
+                ),
+                {"tenant": clinic.tenant, "key": key},
+            )
+            == 1
+        )
+
+
+def test_schema_identical_activation_rechecks_receipt_after_schedule_lock(
     patient_backend,
 ):
     clinic = patient_backend
     actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         preview = _stage(connection, actor, _config())
     key = str(uuid4())
-    started = Event()
-    waiting_pid = []
+    started, waiting_pid = Event(), []
 
     def retry():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        with transaction(clinic.migration, clinic.tenant) as connection:
             waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             started.set()
             return _activate(connection, actor, preview, key=key)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        with transaction(clinic.runtime, clinic.tenant) as holder:
+        with transaction(clinic.migration, clinic.tenant) as holder:
             original = _activate(holder, actor, preview, key=key)
             holder_pid = holder.scalar(text("SELECT pg_backend_pid()"))
             future = pool.submit(retry)
             assert started.wait(timeout=15)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
+            with transaction(clinic.migration, clinic.tenant) as observer:
                 blocked_sql = _blocked_query(observer, waiting_pid[0], holder_pid)
             assert blocked_sql.startswith("SELECT 1 FROM public.clinic_policy_heads ")
             assert " FOR UPDATE" in blocked_sql
         replay = future.result(timeout=30)
     assert replay == original
     assert original["schedule_revision"] == 2
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
                 text(
@@ -283,7 +383,7 @@ def test_direct_identical_activation_rechecks_receipt_after_schedule_lock(
         ("POST", "/preview", "settings.schedule.preview"),
     ],
 )
-def test_direct_schedule_stage_preview_receipt_insert_collision_recovers_signed(
+def test_schema_schedule_stage_preview_receipt_insert_collision_recovers_signed(
     patient_backend, method, suffix, operation
 ):
     clinic = patient_backend
@@ -320,7 +420,8 @@ def test_direct_schedule_stage_preview_receipt_insert_collision_recovers_signed(
 
     def stage():
         try:
-            with transaction(clinic.runtime, clinic.tenant) as connection:
+            # Bypass request serialization only to exercise the receipt UNIQUE invariant.
+            with transaction(clinic.migration, clinic.tenant) as connection:
                 projection = _stage(
                     connection, actor, config, key=key, operation=operation
                 )
@@ -338,8 +439,8 @@ def test_direct_schedule_stage_preview_receipt_insert_collision_recovers_signed(
             assert status == 200, result
             return "replayed", result["data"]
 
-    event.listen(clinic.runtime, "after_cursor_execute", hold_winner_insert)
-    event.listen(clinic.runtime, "before_cursor_execute", observe_loser_insert)
+    event.listen(clinic.migration, "after_cursor_execute", hold_winner_insert)
+    event.listen(clinic.migration, "before_cursor_execute", observe_loser_insert)
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
             winner_future = pool.submit(stage)
@@ -347,7 +448,7 @@ def test_direct_schedule_stage_preview_receipt_insert_collision_recovers_signed(
                 assert inserted.wait(timeout=15)
                 loser_future = pool.submit(stage)
                 assert loser_insert_started.wait(timeout=15)
-                with transaction(clinic.runtime, clinic.tenant) as observer:
+                with transaction(clinic.migration, clinic.tenant) as observer:
                     wait_for_postgres_lock(observer, loser_pid[0], winner_pid[0])
             finally:
                 release_winner.set()
@@ -355,12 +456,12 @@ def test_direct_schedule_stage_preview_receipt_insert_collision_recovers_signed(
             loser = loser_future.result(timeout=30)
     finally:
         release_winner.set()
-        event.remove(clinic.runtime, "before_cursor_execute", observe_loser_insert)
-        event.remove(clinic.runtime, "after_cursor_execute", hold_winner_insert)
+        event.remove(clinic.migration, "before_cursor_execute", observe_loser_insert)
+        event.remove(clinic.migration, "after_cursor_execute", hold_winner_insert)
 
     assert winner[0] == "written" and loser[0] == "replayed"
     assert loser[1] == winner[1]
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert (
             connection.scalar(
                 text(
@@ -404,7 +505,8 @@ def _setup(runtime, tenant, owner):
         assert (
             connection.scalar(
                 text("""
-            SELECT count(*) FROM public.appointments WHERE service_date = :day
+            SELECT count(*) FROM public.appointments
+            WHERE organization_id = current_setting('app.organization_id')::uuid AND service_date = :day
         """),
                 {"day": SERVICE_DAY},
             )
@@ -418,20 +520,23 @@ def _read_final(runtime, tenant):
         return (
             connection.scalar(
                 text("""
-                SELECT revision FROM public.clinic_policy_heads WHERE kind = 'SCHEDULE'
+                SELECT revision FROM public.clinic_policy_heads
+                WHERE organization_id = current_setting('app.organization_id')::uuid AND kind = 'SCHEDULE'
             """)
             ),
             date_rules(load_current_schedule(connection, tenant), SERVICE_DAY).eligible,
             connection.execute(
                 text("""
                 SELECT id, status, booking_mode, starts_at, ends_at
-                FROM public.appointments WHERE service_date = :day
+                FROM public.appointments
+                WHERE organization_id = current_setting('app.organization_id')::uuid AND service_date = :day
             """),
                 {"day": SERVICE_DAY},
             ).all(),
             connection.scalar(
                 text("""
-                SELECT count(*) FROM public.clinic_policy_versions WHERE kind = 'SCHEDULE'
+                SELECT count(*) FROM public.clinic_policy_versions
+                WHERE organization_id = current_setting('app.organization_id')::uuid AND kind = 'SCHEDULE'
             """)
             ),
         )
@@ -568,6 +673,7 @@ def test_activation_first_closes_absent_date_before_stale_booking_can_commit(
             connection.scalar(
                 text("""
             SELECT count(*) FROM public.appointment_price_snapshots
+            WHERE organization_id = current_setting('app.organization_id')::uuid
         """)
             )
             == 0
@@ -576,6 +682,7 @@ def test_activation_first_closes_absent_date_before_stale_booking_can_commit(
             connection.scalar(
                 text("""
             SELECT count(*) FROM public.appointment_history
+            WHERE organization_id = current_setting('app.organization_id')::uuid
         """)
             )
             == 0

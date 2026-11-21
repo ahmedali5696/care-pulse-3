@@ -402,9 +402,14 @@ def test_tenant_bounded_day_lane_phone_and_event_query_plans(appointment_storage
         # Inspect representative usable index access paths even with tiny data.
         connection.execute(text("SET LOCAL enable_seqscan=off"))
         for name, statement in queries.items():
+            if name == "completion_cancellation_events":
+                # Tiny fixtures can favor a tenant-only bitmap index plus sort.
+                connection.execute(text("SET LOCAL enable_sort=off"))
             plan = connection.scalar(
                 text(f"EXPLAIN (FORMAT JSON, COSTS FALSE) {statement}"), params
             )
+            if name == "completion_cancellation_events":
+                connection.execute(text("SET LOCAL enable_sort=on"))
             assert plan and "Plan" in plan[0]
             print(f"D-11 T109 {name} EXPLAIN: {json.dumps(plan[0], sort_keys=True)}")
             if name == "appointments_day_status_lane":

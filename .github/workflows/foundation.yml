@@ -28,6 +28,15 @@ on:
           - authorization-lock
           - booking-races
           - followup-races
+          - f01-cleanup
+          - f01-followup-lock
+          - f01-visit-lock
+          - f01-followup-context
+          - f01-pricing
+          - f01-pricing-races
+          - compat-us1
+          - compat-us2
+          - compat-us3
 
 # Cancel superseded PR/push checks and duplicate manual runs of the same SHA/mode.
 # Keep manual runs for different commits and spike modes independent.
@@ -40,8 +49,8 @@ permissions:
 
 jobs:
   inputs-and-build:
-    name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'diagnostic-static-checks' || 'inputs-and-build' }}
-    if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' }}
+    name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && !startsWith(inputs.postgres_diagnostic, 'compat-') && 'diagnostic-static-checks' || 'inputs-and-build' }}
+    if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' || startsWith(inputs.postgres_diagnostic, 'compat-') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -136,6 +145,12 @@ jobs:
           {
             echo "CP_DB_PASSWORD_FILE=$RUNNER_TEMP/foundation-ci-private/postgres-password"
             echo "CP_RUNTIME_DB_PASSWORD_FILE=$RUNNER_TEMP/foundation-ci-private/runtime-db-password"
+            echo "CP_WEB_DB_PASSWORD_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/web-db-password"
+            echo "CP_API_DB_PASSWORD_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/api-db-password"
+            echo "CP_WORKER_DB_PASSWORD_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/worker-db-password"
+            echo "CP_GATE_DB_PASSWORD_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/gate-db-password"
+            echo "CP_DB_IDENTITY_KEY_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/db-identity-key"
+            echo "CP_DB_IDENTITY_KEY_ID=synthetic-db-ci-v1"
             echo "CP_AUTH_DB_PASSWORD_SOURCE_FILE=$RUNNER_TEMP/foundation-ci-private/auth-db-password"
             echo "CP_MIGRATION_SECRET_FILE=$RUNNER_TEMP/foundation-ci-private/migration-password"
             echo "CP_OPERATOR_SECRET_FILE=$RUNNER_TEMP/foundation-ci-private/operator-password"
@@ -160,7 +175,6 @@ jobs:
             echo "CP_DB_HOST=db"
             echo "CP_DB_PORT=5432"
             echo "CP_DB_NAME=carepulse"
-            echo "CP_DB_USER=carepulse_runtime"
             echo "CP_INTERNAL_API_URL=http://api:8000"
             echo "CP_SIGNING_KEY_ID=synthetic-ci-v1"
             echo "CP_RECOVERY_FINGERPRINT_KEY_VERSION=synthetic-ci-v1"
@@ -227,12 +241,32 @@ jobs:
           & pwsh -NoProfile -File ops/check.ps1 integration
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Mandatory source 0040 to candidate 0046 compatibility, recovery and preserved-data acceptance
+        if: ${{ (!inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full') && !inputs.t133_terminal && !inputs.b04_spike }}
+        shell: pwsh
+        env:
+          CP_COMPAT_DIAGNOSTIC: compat-full
+        run: |
+          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
+          & pwsh -NoProfile -File ops/check.ps1 compat-full
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Focused disposable PostgreSQL diagnostics and scoped cleanup
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && !startsWith(inputs.postgres_diagnostic, 'compat-') }}
         shell: pwsh
         env:
           CP_POSTGRES_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
         run: |
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
           & pwsh -NoProfile -File ops/check.ps1 integration-diagnostic
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Compatibility diagnostics (PRE-W3-COMPAT) and scoped cleanup
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && startsWith(inputs.postgres_diagnostic, 'compat-') }}
+        shell: pwsh
+        env:
+          CP_COMPAT_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
+        run: |
+          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
+          & pwsh -NoProfile -File ops/check.ps1 compat-diagnostic
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

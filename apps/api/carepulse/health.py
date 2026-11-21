@@ -8,11 +8,12 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from carepulse.compat.admission import is_compat_enabled, probe_compat_readiness
 from carepulse.config import ConfigError, Consumer, load_config
 from carepulse.db import create_db_engine, transaction
 
 PROBE_DEADLINE_SECONDS = 4
-COMPATIBLE_REVISION = "0040_t173_numeric_money"
+COMPATIBLE_REVISION = "0046_f01_audit_integrity"
 router = APIRouter()
 
 
@@ -34,6 +35,8 @@ def probe_readiness(consumer: Consumer) -> bool:
 def _database_ready(consumer: Consumer) -> bool:
     engine = create_db_engine(load_config(consumer))
     try:
+        if is_compat_enabled():
+            return probe_compat_readiness(engine, consumer)
         with transaction(engine) as connection:
             connection.execute(text("SET LOCAL statement_timeout = 2000"))
             revisions = connection.scalars(

@@ -27,9 +27,9 @@ from carepulse.visits.eligibility_contracts import (
 )
 from postgres_locks import wait_for_postgres_lock
 from pydantic import ValidationError
+from runtime_identity_fixture import db_proof_headers
 from sqlalchemy import event, text
 from test_appointment_persistence import _activate_clinic
-from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_booking import booking_effects, booking_request
 from test_database import admin as admin  # noqa: PLC0414
@@ -42,12 +42,22 @@ from test_followup_persistence import (
 from test_followup_persistence import (
     _source as _legacy_source,
 )
-from test_followups import doctor_decision, followup_body, terminal_claim
+from test_followups import (
+    doctor_decision,
+    followup_body,
+    signed_command_transaction,
+    terminal_claim,
+    upgrade_replay_clinic,
+)
 from test_followups import followup_clinic as followup_clinic  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
-from test_pricing import _patch, pricing_request
+from test_pricing import (
+    _fresh_receptionist_session,
+    _owner_changes_manager,
+    _patch,
+    pricing_request,
+)
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
-from test_visit_persistence import _receptionist
 
 
 def _actor(tenant, staff, role="DOCTOR_OWNER", *, manager=False):
@@ -62,7 +72,7 @@ def _staff_context(connection, staff):
 
 
 def _source(clinic):
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         return _v2_source(connection, clinic.tenant, UUID(clinic.owner.staff_id))
 
 
@@ -125,7 +135,7 @@ def _confirmed(clinic, source):
     )
     assert status == 201, reply
     saved = reply["data"]
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         claim = connection.scalar(
             text("""
                 SELECT id FROM public.followup_claims
@@ -177,8 +187,8 @@ def test_signed_source_detail_controls_decision_with_active_claim(followup_clini
     confirmed = _confirmed(clinic, source)
     detail_path = f"/v1/appointments/{source['appointment']}"
     decision_path = f"/v1/visits/{source['visit']}"
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        frozen = _frozen_claim(connection, confirmed["claim"])
+    with transaction(clinic.migration, clinic.tenant) as connection:
+        frozen = _frozen_claim(connection, confirmed["claim"], clinic.tenant)
     before = booking_effects(clinic)
 
     def read(actor, kind, role, revision, can_revise, deadline=None):
@@ -270,7 +280,7 @@ def test_signed_source_detail_controls_decision_with_active_claim(followup_clini
             {"tenant": clinic.other},
         )
         foreign_doctor = _activate_clinic(connection, clinic.other, operator)
-    with transaction(clinic.runtime, clinic.other) as connection:
+    with transaction(clinic.migration, clinic.other) as connection:
         foreign = _v2_source(connection, clinic.other, foreign_doctor)
     for actor in (reception, doctor):
         for hidden in (foreign["appointment"], uuid4()):
@@ -280,8 +290,8 @@ def test_signed_source_detail_controls_decision_with_active_claim(followup_clini
             assert status == 404, result
             assert "data" not in result
     assert booking_effects(clinic) == before
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        assert _frozen_claim(connection, confirmed["claim"]) == frozen
+    with transaction(clinic.migration, clinic.tenant) as connection:
+        assert _frozen_claim(connection, confirmed["claim"], clinic.tenant) == frozen
 
 
 def test_receptionist_extension_flag_tracks_doctor_deadline_and_effective_claim(
@@ -503,6 +513,7 @@ def _signed_visit_request(
             ),
         )
     )
+    headers.extend(db_proof_headers(envelope))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -532,7 +543,7 @@ def _signed_visit_request(
 
 
 def _effects(clinic, visit, operation):
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         _staff_context(connection, UUID(clinic.owner.staff_id))
         return connection.execute(
             text("""
@@ -582,15 +593,18 @@ def test_signed_same_key_distinct_visits_conflict_without_second_decision(
         next(result for status, result in results if status == 403)["error"]["code"]
         == "FORBIDDEN"
     )
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         _staff_context(connection, UUID(clinic.owner.staff_id))
         assert (
             connection.scalar(
                 text(
                     "SELECT count(*) FROM public.followup_source_decision_events "
-                    "WHERE source_visit_id=ANY(:visits)"
+                    "WHERE organization_id=:tenant AND source_visit_id=ANY(:visits)"
                 ),
-                {"visits": [source["visit"] for source in sources]},
+                {
+                    "tenant": clinic.tenant,
+                    "visits": [source["visit"] for source in sources],
+                },
             )
             == 1
         )
@@ -598,9 +612,9 @@ def test_signed_same_key_distinct_visits_conflict_without_second_decision(
             connection.scalar(
                 text(
                     "SELECT count(*) FROM public.idempotency_receipts "
-                    "WHERE operation='visits.followup_decision' AND idempotency_key=:key"
+                    "WHERE organization_id=:tenant AND operation='visits.followup_decision' AND idempotency_key=:key"
                 ),
-                {"key": key},
+                {"tenant": clinic.tenant, "key": key},
             )
             == 1
         )
@@ -777,7 +791,7 @@ def test_signed_unicode_blank_followup_reason_denies_without_evidence(
     ) == (status, accepted)
 
 
-def _frozen_claim(connection, claim):
+def _frozen_claim(connection, claim, tenant):
     return connection.execute(
         text("""
         SELECT c.state, c.revision, c.approved_deadline, c.policy_snapshot,
@@ -788,28 +802,35 @@ def _frozen_claim(connection, claim):
           ON (p.organization_id,p.appointment_id)=(c.organization_id,c.appointment_id)
         JOIN public.appointments a
           ON (a.organization_id,a.id)=(c.organization_id,c.appointment_id)
-        WHERE c.id=:claim
+        WHERE c.organization_id=:tenant AND c.id=:claim
     """),
-        {"claim": claim},
+        {"tenant": tenant, "claim": claim},
     ).one()
 
 
 @pytest.mark.parametrize("kind", ["DEFAULT", "OPTED_OUT", "DEADLINE"])
 def test_doctor_decision_appends_actual_operational_evidence_without_clinical_change(
-    appointment_storage, kind
+    patient_backend, kind
 ):
-    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
-    with transaction(runtime, tenant) as connection:
-        source = _v2_source(connection, tenant, doctor)
+    clinic = patient_backend
+    tenant, doctor, migration = (
+        clinic.tenant,
+        UUID(clinic.owner.staff_id),
+        clinic.migration,
+    )
+    source = _source(clinic)
     command = _decision(
         kind,
         deadline=source["day"] + timedelta(days=14) if kind == "DEADLINE" else None,
         reason="Synthetic Doctor restriction" if kind != "DEFAULT" else None,
     )
-    with transaction(runtime, tenant) as connection:
-        _staff_context(connection, doctor)
+    with signed_command_transaction(clinic, command, visit=source["visit"]) as (
+        connection,
+        actor,
+        key,
+    ):
         projection, revision = record_followup_decision(
-            connection, _actor(tenant, doctor), source["visit"], command, str(uuid4())
+            connection, actor, source["visit"], command, key
         )
         assert (projection["revision"], revision, projection["visit_revision"]) == (
             1,
@@ -819,6 +840,8 @@ def test_doctor_decision_appends_actual_operational_evidence_without_clinical_ch
         assert projection["followup_decision"] == command.followup_decision.model_dump(
             mode="json", exclude_none=True
         )
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+    with migration.connect() as connection:
         assert connection.execute(
             text(
                 "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
@@ -834,8 +857,6 @@ def test_doctor_decision_appends_actual_operational_evidence_without_clinical_ch
             )
             == 0
         )
-        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
-    with migration.connect() as connection:
         event = connection.execute(
             text("""
             SELECT e.source_revision, e.actor_staff_id, e.actor_role,
@@ -861,45 +882,46 @@ def test_doctor_decision_appends_actual_operational_evidence_without_clinical_ch
 
 @pytest.mark.parametrize("manager", [False, True])
 def test_receptionist_can_amend_own_decision_with_authorship_preserved(
-    appointment_storage, manager
+    patient_backend, manager
 ):
-    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
-    staff = _receptionist(migration, tenant)
+    clinic = patient_backend
+    tenant, migration = clinic.tenant, clinic.migration
+    staff = UUID(clinic.receptionist.staff_id)
+    identity = clinic.receptionist
     if manager:
-        with migration.begin() as connection:
-            connection.execute(
-                text(
-                    "UPDATE public.staff_accounts SET operational_manager=true, security_revision=security_revision+1 WHERE id=:staff"
-                ),
-                {"staff": staff},
-            )
-    with transaction(runtime, tenant) as connection:
-        source = _v2_source(connection, tenant, doctor)
-    actor = _actor(tenant, staff, "RECEPTIONIST", manager=manager)
-    with transaction(runtime, tenant) as connection:
-        _staff_context(connection, staff)
+        _owner_changes_manager(clinic, True, 0)
+        identity = _fresh_receptionist_session(clinic, 1)
+    source = _source(clinic)
+    command = _decision(
+        "DEADLINE",
+        deadline=source["day"] + timedelta(days=12),
+        reason="Receptionist operational decision",
+    )
+    with signed_command_transaction(
+        clinic, command, visit=source["visit"], actor=identity
+    ) as (connection, actor, key):
         first, _ = record_followup_decision(
             connection,
             actor,
             source["visit"],
-            _decision(
-                "DEADLINE",
-                deadline=source["day"] + timedelta(days=12),
-                reason="Receptionist operational decision",
-            ),
-            str(uuid4()),
+            command,
+            key,
         )
+    command = _decision("DEFAULT", 1)
+    with signed_command_transaction(
+        clinic, command, visit=source["visit"], actor=identity
+    ) as (connection, actor, key):
         second, _ = record_followup_decision(
-            connection, actor, source["visit"], _decision("DEFAULT", 1), str(uuid4())
+            connection, actor, source["visit"], command, key
         )
         assert (first["revision"], second["revision"]) == (1, 2)
+    with migration.connect() as connection:
         assert connection.execute(
             text(
                 "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
             ),
             {"visit": source["visit"]},
         ).one() == (0, None)
-    with migration.connect() as connection:
         events = connection.execute(
             text("""
             SELECT source_revision, actor_staff_id, actor_role, before_decision, decision
@@ -918,36 +940,40 @@ def test_receptionist_can_amend_own_decision_with_authorship_preserved(
 
 @pytest.mark.parametrize("restriction", ["OPTED_OUT", "DEADLINE"])
 def test_receptionist_cannot_replace_actual_doctor_restriction(
-    appointment_storage, restriction
+    patient_backend, restriction
 ):
-    runtime, migration, (tenant, _), (doctor, _) = appointment_storage
-    staff = _receptionist(migration, tenant)
-    with transaction(runtime, tenant) as connection:
-        source = _v2_source(connection, tenant, doctor)
-    with transaction(runtime, tenant) as connection:
-        _staff_context(connection, doctor)
+    clinic = patient_backend
+    source = _source(clinic)
+    command = _decision(
+        restriction,
+        deadline=source["day"] + timedelta(days=3)
+        if restriction == "DEADLINE"
+        else None,
+        reason="Doctor clinical restriction",
+    )
+    with signed_command_transaction(clinic, command, visit=source["visit"]) as (
+        connection,
+        actor,
+        key,
+    ):
         record_followup_decision(
             connection,
-            _actor(tenant, doctor),
+            actor,
             source["visit"],
-            _decision(
-                restriction,
-                deadline=source["day"] + timedelta(days=3)
-                if restriction == "DEADLINE"
-                else None,
-                reason="Doctor clinical restriction",
-            ),
-            str(uuid4()),
+            command,
+            key,
         )
-    with transaction(runtime, tenant) as connection:
-        _staff_context(connection, staff)
+    command = _decision("DEFAULT", 1)
+    with signed_command_transaction(
+        clinic, command, visit=source["visit"], actor=clinic.receptionist
+    ) as (connection, actor, key):
         with pytest.raises(ContractError) as denied:
             record_followup_decision(
                 connection,
-                _actor(tenant, staff, "RECEPTIONIST"),
+                actor,
                 source["visit"],
-                _decision("DEFAULT", 1),
-                str(uuid4()),
+                command,
+                key,
             )
         assert denied.value.status_code == 403
         assert (
@@ -973,11 +999,11 @@ def test_receptionist_cannot_replace_actual_doctor_restriction(
     ],
 )
 def test_denied_decision_keeps_clinical_operational_and_receipt_evidence_empty(
-    appointment_storage, case, status, code
+    patient_backend, case, status, code
 ):
-    runtime, _, (tenant, _), (doctor, _) = appointment_storage
-    with transaction(runtime, tenant) as connection:
-        source = _v2_source(connection, tenant, doctor)
+    clinic = patient_backend
+    tenant = clinic.tenant
+    source = _source(clinic)
     command = _decision(
         "DEADLINE",
         revision=int(case == "stale_source"),
@@ -987,33 +1013,38 @@ def test_denied_decision_keeps_clinical_operational_and_receipt_evidence_empty(
         + timedelta(days=-1 if case == "before_completion" else 8),
         reason="Synthetic operational decision",
     )
-    with transaction(runtime, tenant) as connection:
-        _staff_context(connection, doctor)
-        if case == "disabled":
+    if case == "disabled":
+        with clinic.migration.begin() as connection:
             connection.execute(
                 text(
                     "UPDATE public.staff_accounts SET enabled=false, security_revision=security_revision+1 WHERE id=:staff"
                 ),
-                {"staff": doctor},
+                {"staff": UUID(clinic.receptionist.staff_id)},
             )
-        with pytest.raises(ContractError) as denied, connection.begin_nested():
-            record_followup_decision(
-                connection,
-                _actor(
-                    tenant, doctor, "OPERATOR" if case == "operator" else "DOCTOR_OWNER"
-                ),
-                source["visit"],
-                command,
-                str(uuid4()),
-            )
-        assert (denied.value.status_code, denied.value.code) == (status, code)
-        if case == "disabled":
-            connection.execute(
-                text(
-                    "UPDATE public.staff_accounts SET enabled=true, security_revision=security_revision+1 WHERE id=:staff"
-                ),
-                {"staff": doctor},
-            )
+    with (
+        pytest.raises(ContractError) as denied,
+        signed_command_transaction(
+            clinic,
+            command,
+            visit=source["visit"],
+            actor=clinic.receptionist if case == "disabled" else clinic.owner,
+        ) as (
+            connection,
+            actor,
+            key,
+        ),
+    ):
+        record_followup_decision(
+            connection,
+            replace(actor, role="OPERATOR", _legacy_bulk_reschedule=False)
+            if case == "operator"
+            else actor,
+            source["visit"],
+            command,
+            key,
+        )
+    assert (denied.value.status_code, denied.value.code) == (status, code)
+    with transaction(clinic.migration, tenant) as connection:
         assert connection.execute(
             text(
                 "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
@@ -1227,7 +1258,7 @@ def test_signed_followup_retry_waits_for_organization_lock_then_replays(
             assert release_original.wait(timeout=30)
 
     def observe_signed_retry(connection, _cursor, statement, _params, _context, _many):
-        if receipt_inserted.is_set() and "public.lock_active_organization" in statement:
+        if receipt_inserted.is_set() and "public.f01_activate()" in statement:
             retry_pid.append(connection.connection.driver_connection.info.backend_pid)
             retry_started.set()
 
@@ -1303,7 +1334,7 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
 
     def observe_sql(connection, cursor, statement, parameters, context, executemany):
         marker = (
-            "SELECT public.lock_active_organization"
+            "SELECT public.f01_activate()"
             if revoke_first
             else "FROM public.idempotency_receipts AS r"
         )
@@ -1353,7 +1384,7 @@ def test_signed_decision_receipt_replay_serializes_with_staff_revocation(
                         )
                         in_flight = pool.submit(retry)
                         waiter_pid = runtime_pid.get(timeout=10)
-                        with clinic.runtime.connect() as observer:
+                        with clinic.migration.connect() as observer:
                             wait_for_postgres_lock(observer, waiter_pid, holder_pid)
                     finally:
                         tx.commit()
@@ -1436,7 +1467,7 @@ def test_signed_committed_v1_replays_exact_original_digest_including_null_distin
         "revision": 0,
     }
     digest = sha256(visit_id.bytes + normalize_typed_body(command)).hexdigest()
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         _staff_context(connection, UUID(clinic.owner.staff_id))
         insert_tenant_receipt(
             connection,
@@ -1476,7 +1507,7 @@ def test_signed_committed_v1_replays_exact_original_digest_including_null_distin
         )
         assert hidden_status == 404, hidden
         assert "data" not in hidden
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         stored = connection.execute(
             text("""
             SELECT request_digest, result_projection, result_revision
@@ -1489,8 +1520,8 @@ def test_signed_committed_v1_replays_exact_original_digest_including_null_distin
     assert _effects(clinic, visit_id, "visits.followup_decision") == (0, 0, 0, 0, 1)
 
 
-def test_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_checks(
-    patient_backend, admin, empty_database, monkeypatch
+def test_f01_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_checks(
+    patient_backend, admin, empty_database
 ):
     # Local import avoids the historical migration test's fixture-helper import cycle.
     from test_followup_migration import _historical_extension, _predecessor
@@ -1519,7 +1550,10 @@ def test_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_chec
                     "doctor": doctor,
                 },
             )
-        with transaction(runtime, tenant) as connection:
+        with transaction(migration, tenant) as connection:
+            assert (
+                connection.scalar(text("SELECT session_user")) == "carepulse_migration"
+            )
             source = _legacy_source(connection, tenant, doctor)
             claim = _claim(connection, tenant, source)
             key = str(uuid4())
@@ -1559,7 +1593,13 @@ def test_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_chec
             owner=actor,
             config=patient_backend.config,
         )
-        monkeypatch.setattr(app.state, "db_engine", runtime)
+        upgrade_replay_clinic(clinic, patient_backend, admin)
+        with clinic.runtime.connect() as connection:
+            assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+        with migration.connect() as connection:
+            assert (
+                connection.execute(receipt_sql, receipt_args).one() == original_receipt
+            )
         path = f"/v1/visits/{source['visit']}/extend-followup"
         before = _effects(clinic, source["visit"], "visits.extend_followup")
         assert _signed_visit_request(
@@ -1630,6 +1670,13 @@ def test_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_chec
             )
         assert _effects(clinic, source["visit"], "visits.extend_followup") == before
     finally:
+        app.state.db_engine, app.state.gate_engine = (
+            patient_backend.runtime,
+            patient_backend.gate,
+        )
+        if "clinic" in locals() and hasattr(clinic, "gate"):
+            clinic.runtime.dispose()
+            clinic.gate.dispose()
         runtime.dispose()
         migration.dispose()
 
@@ -1680,7 +1727,7 @@ def test_invalid_saved_v2_decision_receipt_denies_before_digest_conflict(
             "kind": "OPTED_OUT",
             "reason": {"clinical_notes": "private"},
         }
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         _staff_context(connection, UUID(clinic.owner.staff_id))
         insert_tenant_receipt(
             connection,
@@ -1773,7 +1820,7 @@ def test_saved_v2_extension_receipt_must_match_immutable_authorization_event(
     else:
         altered["claim_revision"] = ["private clinical details"]
     key = str(uuid4())
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         _staff_context(connection, UUID(clinic.owner.staff_id))
         insert_tenant_receipt(
             connection,
@@ -1829,7 +1876,7 @@ def test_receptionist_cannot_recover_legacy_doctor_reason_from_saved_receipt(
     payload = command.model_dump(mode="json", exclude_unset=True)
     digest = sha256(visit_id.bytes + normalize_typed_body(command)).hexdigest()
     receptionist = UUID(clinic.receptionist.staff_id)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         _staff_context(connection, receptionist)
         insert_tenant_receipt(
             connection,
@@ -1869,26 +1916,35 @@ def test_post_confirmation_doctor_restriction_leaves_original_entitlement_frozen
     source = _source(clinic)
     confirmed = _confirmed(clinic, source)
     command = _decision("OPTED_OUT", reason="Doctor later restriction")
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
     key = str(uuid4())
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _staff_context(connection, actor.staff_id)
-        frozen = _frozen_claim(connection, confirmed["claim"])
+    with transaction(clinic.migration, clinic.tenant) as connection:
+        frozen = _frozen_claim(connection, confirmed["claim"], clinic.tenant)
+    with signed_command_transaction(
+        clinic, command, visit=source["visit"], key=key
+    ) as (connection, actor, _):
         original = record_followup_decision(
             connection, actor, source["visit"], command, key
         )
         assert original[1] == 1
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _staff_context(connection, actor.staff_id)
+    with signed_command_transaction(
+        clinic, command, visit=source["visit"], key=key
+    ) as (connection, actor, _):
         assert (
             record_followup_decision(connection, actor, source["visit"], command, key)
             == original
         )
-        with pytest.raises(ReceiptConflict):
-            record_followup_decision(
-                connection, actor, source["visit"], _decision("DEFAULT", 1), key
-            )
-        assert _frozen_claim(connection, confirmed["claim"]) == frozen
+    changed = _decision("DEFAULT", 1)
+    with (
+        signed_command_transaction(clinic, changed, visit=source["visit"], key=key) as (
+            connection,
+            actor,
+            _,
+        ),
+        pytest.raises(ReceiptConflict),
+    ):
+        record_followup_decision(connection, actor, source["visit"], changed, key)
+    with transaction(clinic.migration, clinic.tenant) as connection:
+        assert _frozen_claim(connection, confirmed["claim"], clinic.tenant) == frozen
 
 
 def test_confirmed_extension_appends_authorization_without_clinical_or_price_change(
@@ -1898,38 +1954,47 @@ def test_confirmed_extension_appends_authorization_without_clinical_or_price_cha
     source = _source(clinic)
     confirmed = _confirmed(clinic, source)
     command = _extension(source, confirmed["id"])
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
     key = str(uuid4())
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _staff_context(connection, actor.staff_id)
-        frozen = _frozen_claim(connection, confirmed["claim"])
+    with transaction(clinic.migration, clinic.tenant) as connection:
+        frozen = _frozen_claim(connection, confirmed["claim"], clinic.tenant)
+    with signed_command_transaction(
+        clinic, command, visit=source["visit"], key=key
+    ) as (connection, actor, _):
         original = extend_followup(connection, actor, source["visit"], command, key)
         assert original[1] == original[0]["revision"] == 1
         assert (original[0]["claim_revision"], original[0]["visit_revision"]) == (1, 0)
-        assert _frozen_claim(connection, confirmed["claim"]) == frozen
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+    with transaction(clinic.migration, clinic.tenant) as connection:
+        assert _frozen_claim(connection, confirmed["claim"], clinic.tenant) == frozen
         assert connection.execute(
             text(
                 "SELECT clinical_revision, followup_decision FROM public.visits WHERE id=:visit"
             ),
             {"visit": source["visit"]},
         ).one() == (0, None)
-        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _staff_context(connection, actor.staff_id)
+    with signed_command_transaction(
+        clinic, command, visit=source["visit"], key=key
+    ) as (connection, actor, _):
         assert (
             extend_followup(connection, actor, source["visit"], command, key)
             == original
         )
+    command = _extension(source, confirmed["id"], authorization_revision=1)
+    with signed_command_transaction(clinic, command, visit=source["visit"]) as (
+        connection,
+        actor,
+        next_key,
+    ):
         repeated = extend_followup(
             connection,
             actor,
             source["visit"],
-            _extension(source, confirmed["id"], authorization_revision=1),
-            str(uuid4()),
+            command,
+            next_key,
         )
         assert repeated[1] == 2
-        assert _frozen_claim(connection, confirmed["claim"]) == frozen
     with clinic.migration.connect() as connection:
+        assert _frozen_claim(connection, confirmed["claim"], clinic.tenant) == frozen
         events = connection.execute(
             text("""
             SELECT e.authorization_revision, e.kind, e.prior_deadline,
@@ -2002,19 +2067,26 @@ def test_denied_extension_preserves_claim_and_has_no_new_authorization_evidence(
         appointment_revision=2 if case == "stale_appointment" else 0,
         deadline=source["day"] + timedelta(days=6) if case == "shorten" else None,
     )
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _staff_context(connection, UUID(clinic.owner.staff_id))
-        frozen = _frozen_claim(connection, confirmed["claim"])
-        with pytest.raises(ContractError) as denied:
-            extend_followup(
-                connection,
-                _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
-                source["visit"],
-                command,
-                str(uuid4()),
-            )
-        assert (denied.value.status_code, denied.value.code) == (status, code)
-        assert _frozen_claim(connection, confirmed["claim"]) == frozen
+    with transaction(clinic.migration, clinic.tenant) as connection:
+        frozen = _frozen_claim(connection, confirmed["claim"], clinic.tenant)
+    with (
+        pytest.raises(ContractError) as denied,
+        signed_command_transaction(clinic, command, visit=source["visit"]) as (
+            connection,
+            actor,
+            key,
+        ),
+    ):
+        extend_followup(
+            connection,
+            actor,
+            source["visit"],
+            command,
+            key,
+        )
+    assert (denied.value.status_code, denied.value.code) == (status, code)
+    with transaction(clinic.migration, clinic.tenant) as connection:
+        assert _frozen_claim(connection, confirmed["claim"], clinic.tenant) == frozen
         assert (
             connection.scalar(
                 text("""

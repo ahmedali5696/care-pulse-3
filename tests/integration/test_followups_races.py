@@ -11,9 +11,10 @@ from carepulse.appointments.book import book_appointment
 from carepulse.appointments.booking_contracts import BookAppointment
 from carepulse.db import transaction
 from carepulse.identity.contracts import ContractError
+from carepulse.policies.pricing_contracts import PricingPatch
+from carepulse.policies.pricing_service import update_pricing
 from carepulse.policies.schedule_service import load_current_schedule
 from carepulse.policies.slots import candidates_for_date
-from carepulse.policies.versions import append_version
 from carepulse.visits.eligibility import extend_followup, record_followup_decision
 from carepulse.visits.eligibility_contracts import (
     ExtendFollowupV2,
@@ -26,11 +27,11 @@ from test_booking import booking_body, booking_effects
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_booking_races import _concurrent
 from test_followup_persistence import _v2_source
-from test_followups import terminal_claim
+from test_followups import signed_command_transaction, terminal_claim
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _patch, pricing_request
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
-from test_schedule import _actor, _config, _publish
+from test_schedule import _actor, _config, publish_signed_schedule
 
 
 @pytest.fixture
@@ -44,18 +45,14 @@ def followup_clinic(booking_clinic):
         key=str(uuid4()),
     )
     assert status == 200, reply
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(
-            connection,
-            _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
-            _config(mode="OPEN", working_weekdays=list(range(1, 8))),
-            revision=2,
-        )
+    publish_signed_schedule(
+        clinic, _config(mode="OPEN", working_weekdays=list(range(1, 8))), revision=2
+    )
     return clinic
 
 
 def _source_for(clinic):
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         return _v2_source(connection, clinic.tenant, UUID(clinic.owner.staff_id))
 
 
@@ -82,10 +79,9 @@ def _command(source, day_offset=2, **changes):
 
 
 def _attempt(clinic, command):
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with signed_command_transaction(clinic, command) as (connection, actor, key):
         _doctor_context(connection, actor.staff_id)
-        return book_appointment(connection, actor, command, str(uuid4()))
+        return book_appointment(connection, actor, command, key)
 
 
 def _doctor_context(connection, staff):
@@ -112,7 +108,7 @@ def _decision(kind, revision, *, reason=None):
 
 
 def _claim_count(clinic, source):
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         return connection.scalar(
             text("""
                 SELECT count(*) FROM public.followup_claims
@@ -152,14 +148,19 @@ def test_doctor_edit_first_makes_reviewed_source_stale_without_booking_writes(
     next_decision = {"kind": "OPTED_OUT", "reason": "Corrected recommendation"}
     expected_revision = 0
     if acknowledged_fallback:
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        prior = _decision("OPTED_OUT", 0, reason="Prior opt-out")
+        with signed_command_transaction(clinic, prior, visit=source["visit"]) as (
+            connection,
+            actor,
+            key,
+        ):
             _doctor_context(connection, UUID(clinic.owner.staff_id))
             record_followup_decision(
                 connection,
-                _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
+                actor,
                 source["visit"],
-                _decision("OPTED_OUT", 0, reason="Prior opt-out"),
-                str(uuid4()),
+                prior,
+                key,
             )
         requested = _command(
             source,
@@ -181,29 +182,29 @@ def test_doctor_edit_first_makes_reviewed_source_stale_without_booking_writes(
     actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
 
     def edit():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            edit_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+        command = _decision(
+            next_decision["kind"], expected_revision, reason=next_decision.get("reason")
+        )
+        with signed_command_transaction(
+            clinic, command, visit=source["visit"], pid=edit_pid
+        ) as (connection, actor, key):
             _doctor_context(connection, actor.staff_id)
             record_followup_decision(
                 connection,
                 actor,
                 source["visit"],
-                _decision(
-                    next_decision["kind"],
-                    expected_revision,
-                    reason=next_decision.get("reason"),
-                ),
-                str(uuid4()),
+                command,
+                key,
             )
             changed.set()
             assert permit_commit.wait(timeout=20)
 
     def book():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            booking_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            booking_started.set()
+        with signed_command_transaction(
+            clinic, requested, pid=booking_pid, started=booking_started
+        ) as (connection, actor, key):
             _doctor_context(connection, actor.staff_id)
-            return book_appointment(connection, actor, requested, str(uuid4()))
+            return book_appointment(connection, actor, requested, key)
 
     before = booking_effects(clinic)
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -212,7 +213,7 @@ def test_doctor_edit_first_makes_reviewed_source_stale_without_booking_writes(
         booking = pool.submit(book)
         try:
             assert booking_started.wait(timeout=15)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
+            with transaction(clinic.migration, clinic.tenant) as observer:
                 wait_for_postgres_lock(observer, booking_pid[0], edit_pid[0])
         finally:
             permit_commit.set()
@@ -233,28 +234,32 @@ def test_confirmation_first_freezes_claim_before_doctor_opt_out(followup_clinic)
     confirmation_pid = []
     edit_pid = []
     edit_started = Event()
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
 
     def confirm():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            confirmation_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+        command = _command(source)
+        with signed_command_transaction(clinic, command, pid=confirmation_pid) as (
+            connection,
+            actor,
+            key,
+        ):
             _doctor_context(connection, actor.staff_id)
-            result = book_appointment(connection, actor, _command(source), str(uuid4()))
+            result = book_appointment(connection, actor, command, key)
             booked.set()
             assert commit_booking.wait(timeout=20)
             return result
 
     def update_decision():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            edit_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            edit_started.set()
+        command = _decision("OPTED_OUT", 0, reason="Later assessment")
+        with signed_command_transaction(
+            clinic, command, visit=source["visit"], pid=edit_pid, started=edit_started
+        ) as (connection, actor, key):
             _doctor_context(connection, actor.staff_id)
             return record_followup_decision(
                 connection,
                 actor,
                 source["visit"],
-                _decision("OPTED_OUT", 0, reason="Later assessment"),
-                str(uuid4()),
+                command,
+                key,
             )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -263,7 +268,7 @@ def test_confirmation_first_freezes_claim_before_doctor_opt_out(followup_clinic)
         edited = pool.submit(update_decision)
         try:
             assert edit_started.wait(timeout=15)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
+            with transaction(clinic.migration, clinic.tenant) as observer:
                 wait_for_postgres_lock(observer, edit_pid[0], confirmation_pid[0])
         finally:
             commit_booking.set()
@@ -272,7 +277,7 @@ def test_confirmation_first_freezes_claim_before_doctor_opt_out(followup_clinic)
 
     assert saved["service_type"] == "FOLLOW_UP"
     assert _claim_count(clinic, source) == 1
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert connection.scalar(
             text("""
                 SELECT approved_deadline FROM public.followup_claims
@@ -296,7 +301,7 @@ def test_release_or_consume_races_fresh_claim_without_double_use(
     replacement_pid = []
 
     if terminal == "Completed":
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        with transaction(clinic.migration, clinic.tenant) as connection:
             _doctor_context(connection, UUID(clinic.owner.staff_id))
             _admit_saved(
                 connection,
@@ -327,16 +332,16 @@ def test_release_or_consume_races_fresh_claim_without_double_use(
             assert finish.wait(timeout=20)
 
     def book_replacement():
-        actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            replacement_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            replacement_started.set()
+        command = _command(source, 3)
+        with signed_command_transaction(
+            clinic, command, pid=replacement_pid, started=replacement_started
+        ) as (connection, actor, key):
             _doctor_context(connection, actor.staff_id)
             return book_appointment(
                 connection,
                 actor,
-                _command(source, 3),
-                str(uuid4()),
+                command,
+                key,
             )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -345,7 +350,7 @@ def test_release_or_consume_races_fresh_claim_without_double_use(
         replacement = pool.submit(book_replacement)
         try:
             assert replacement_started.wait(timeout=15)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
+            with transaction(clinic.migration, clinic.tenant) as observer:
                 wait_for_postgres_lock(
                     observer,
                     replacement_pid[0],
@@ -379,10 +384,14 @@ def test_claim_confirmation_first_blocks_terminal_until_booking_commits(
     actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
 
     def book():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            booking_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+        command = _command(source)
+        with signed_command_transaction(clinic, command, pid=booking_pid) as (
+            connection,
+            actor,
+            key,
+        ):
             _doctor_context(connection, actor.staff_id)
-            saved = book_appointment(connection, actor, _command(source), str(uuid4()))
+            saved = book_appointment(connection, actor, command, key)
             pending_booking.append(saved)
             confirmed.set()
             assert release_booking.wait(timeout=20)
@@ -482,30 +491,32 @@ def test_doctor_extension_and_new_claim_compete_for_same_source(followup_clinic)
     booking_pid = []
 
     def doctor_extend():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            extension_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+        with signed_command_transaction(
+            clinic, extension, visit=source["visit"], pid=extension_pid
+        ) as (connection, actor, key):
             _doctor_context(connection, UUID(clinic.owner.staff_id))
             result = extend_followup(
                 connection,
-                _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
+                actor,
                 source["visit"],
                 extension,
-                str(uuid4()),
+                key,
             )
             extension_written.set()
             assert release_extension.wait(timeout=20)
             return result
 
     def booking_attempt():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            booking_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            booking_started.set()
+        command = _command(source, 3)
+        with signed_command_transaction(
+            clinic, command, pid=booking_pid, started=booking_started
+        ) as (connection, actor, key):
             _doctor_context(connection, UUID(clinic.owner.staff_id))
             return book_appointment(
                 connection,
-                _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
-                _command(source, 3),
-                str(uuid4()),
+                actor,
+                command,
+                key,
             )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -514,7 +525,7 @@ def test_doctor_extension_and_new_claim_compete_for_same_source(followup_clinic)
         competing = pool.submit(booking_attempt)
         try:
             assert booking_started.wait(timeout=15)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
+            with transaction(clinic.migration, clinic.tenant) as observer:
                 wait_for_postgres_lock(observer, booking_pid[0], extension_pid[0])
         finally:
             release_extension.set()
@@ -571,16 +582,20 @@ def test_extension_locks_source_and_target_by_uuid_before_claim(
     extension_pid = []
 
     def extend():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            extension_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            started.set()
+        with signed_command_transaction(
+            clinic,
+            extension,
+            visit=source["visit"],
+            pid=extension_pid,
+            started=started,
+        ) as (connection, actor, key):
             _doctor_context(connection, UUID(clinic.owner.staff_id))
             return extend_followup(
                 connection,
-                _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
+                actor,
                 source["visit"],
                 extension,
-                str(uuid4()),
+                key,
             )
 
     lock_row = text("""
@@ -607,9 +622,9 @@ def test_extension_locks_source_and_target_by_uuid_before_claim(
                 first_pid = first_holder.scalar(text("SELECT pg_backend_pid()"))
                 competing = pool.submit(extend)
                 assert started.wait(timeout=15)
-                with transaction(clinic.runtime, clinic.tenant) as observer:
+                with transaction(clinic.migration, clinic.tenant) as observer:
                     wait_for_postgres_lock(observer, extension_pid[0], first_pid)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
+            with transaction(clinic.migration, clinic.tenant) as observer:
                 wait_for_postgres_lock(observer, extension_pid[0], second_pid)
             with clinic.migration.connect() as observer:
                 assert (
@@ -654,19 +669,20 @@ def test_source_lock_is_acquired_after_day_counter_on_confirmation(followup_clin
     source = _source_for(clinic)
     before = booking_effects(clinic)
     command = _command(source)
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
     observed = Event()
     pid = []
 
     def book():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            observed.set()
+        with signed_command_transaction(clinic, command, pid=pid, started=observed) as (
+            connection,
+            actor,
+            key,
+        ):
             _doctor_context(connection, actor.staff_id)
-            return book_appointment(connection, actor, command, str(uuid4()))
+            return book_appointment(connection, actor, command, key)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        with transaction(clinic.runtime, clinic.tenant) as holder:
+        with transaction(clinic.migration, clinic.tenant) as holder:
             held = holder.scalar(
                 text("""
                     SELECT id FROM public.appointments
@@ -680,7 +696,7 @@ def test_source_lock_is_acquired_after_day_counter_on_confirmation(followup_clin
             assert observed.wait(timeout=15)
             if future.done():
                 future.result(timeout=0)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
+            with transaction(clinic.migration, clinic.tenant) as observer:
                 wait_for_postgres_lock(observer, pid[0], holder_pid)
             # A blocked booking has not made any committed number/claim/receipt.
             assert booking_effects(clinic) == before
@@ -696,20 +712,18 @@ def test_timed_followup_rescans_capacity_after_waiting_for_day_allocator(
     sources = [_source_for(clinic), _source_for(clinic)]
     day = max(source["day"] for source in sources) + timedelta(days=2)
     weekday = day.isoweekday()
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(
-            connection,
-            actor,
-            _config(
-                mode="EXACT_TIME",
-                working_weekdays=[weekday],
-                weekly_work_periods=[
-                    {"weekday": weekday, "starts_at": "09:00", "ends_at": "12:00"}
-                ],
-            ),
-            revision=3,
-        )
+    publish_signed_schedule(
+        clinic,
+        _config(
+            mode="EXACT_TIME",
+            working_weekdays=[weekday],
+            weekly_work_periods=[
+                {"weekday": weekday, "starts_at": "09:00", "ends_at": "12:00"}
+            ],
+        ),
+        revision=3,
+    )
+    with transaction(clinic.migration, clinic.tenant) as connection:
         slot = candidates_for_date(
             load_current_schedule(connection, clinic.tenant), day
         )[0]
@@ -731,20 +745,23 @@ def test_timed_followup_rescans_capacity_after_waiting_for_day_allocator(
     second_pid = []
 
     def first_booking():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            first_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+        with signed_command_transaction(clinic, commands[0], pid=first_pid) as (
+            connection,
+            actor,
+            key,
+        ):
             _doctor_context(connection, actor.staff_id)
-            saved = book_appointment(connection, actor, commands[0], str(uuid4()))
+            saved = book_appointment(connection, actor, commands[0], key)
             first_confirmed.set()
             assert allow_first_commit.wait(timeout=20)
             return saved
 
     def competing_booking():
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            second_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            second_started.set()
+        with signed_command_transaction(
+            clinic, commands[1], pid=second_pid, started=second_started
+        ) as (connection, actor, key):
             _doctor_context(connection, actor.staff_id)
-            return book_appointment(connection, actor, commands[1], str(uuid4()))
+            return book_appointment(connection, actor, commands[1], key)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(first_booking)
@@ -752,7 +769,7 @@ def test_timed_followup_rescans_capacity_after_waiting_for_day_allocator(
         second = pool.submit(competing_booking)
         try:
             assert second_started.wait(timeout=15)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
+            with transaction(clinic.migration, clinic.tenant) as observer:
                 wait_for_postgres_lock(observer, second_pid[0], first_pid[0])
             assert booking_effects(clinic) == before
         finally:
@@ -787,7 +804,6 @@ def test_followup_policy_publication_serializes_with_preferential_booking(
     clinic = followup_clinic
     source = _source_for(clinic)
     command = _command(source)
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
     before = booking_effects(clinic)
     holder_ready = Event()
     waiter_started = Event()
@@ -805,31 +821,36 @@ def test_followup_policy_publication_serializes_with_preferential_booking(
     """)
 
     def publish(hold):
-        with transaction(clinic.runtime, clinic.tenant) as connection:
-            _doctor_context(connection, actor.staff_id)
-            publication_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            if not hold:
-                waiter_started.set()
-            revision = append_version(
-                connection,
-                clinic.tenant,
-                "FOLLOWUP",
-                {"completion_day_zero": True, "last_day_inclusive": 10},
-                1,
-                actor_staff_id=str(actor.staff_id),
+        publication = PricingPatch.model_validate(
+            _patch(
+                expected_price_revision=3,
+                expected_followup_revision=1,
+                followup_last_day_inclusive=10,
             )
+        )
+        with signed_command_transaction(
+            clinic,
+            publication,
+            pid=publication_pid,
+            started=None if hold else waiter_started,
+        ) as (connection, actor, key):
+            _doctor_context(connection, actor.staff_id)
+            revision = update_pricing(connection, actor, publication, key)[
+                "followup_revision"
+            ]
             if hold:
                 holder_ready.set()
                 assert release_holder.wait(timeout=20)
             return revision
 
     def book(hold):
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        with signed_command_transaction(
+            clinic, command, pid=booking_pid, started=None if hold else waiter_started
+        ) as (connection, actor, key):
             _doctor_context(connection, actor.staff_id)
-            booking_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             if not hold:
                 waiter_started.set()
-            saved = book_appointment(connection, actor, command, str(uuid4()))
+            saved = book_appointment(connection, actor, command, key)
             frozen = connection.execute(
                 frozen_query,
                 {"tenant": clinic.tenant, "appointment": UUID(saved["id"])},
@@ -845,7 +866,7 @@ def test_followup_policy_publication_serializes_with_preferential_booking(
             assert holder_ready.wait(timeout=15)
             waiter = pool.submit(book if policy_first else publish, False)
             assert waiter_started.wait(timeout=15)
-            with transaction(clinic.runtime, clinic.tenant) as observer:
+            with transaction(clinic.migration, clinic.tenant) as observer:
                 wait_for_postgres_lock(
                     observer,
                     booking_pid[0] if policy_first else publication_pid[0],
@@ -867,7 +888,7 @@ def test_followup_policy_publication_serializes_with_preferential_booking(
             assert frozen.approved_deadline == source["day"] + timedelta(days=7)
             assert frozen.policy_snapshot["policy_revision"] == 1
 
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with transaction(clinic.migration, clinic.tenant) as connection:
         assert connection.execute(
             text("""
                 SELECT current_version, revision FROM public.clinic_policy_heads

@@ -8,9 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
-from carepulse.db import transaction
 from carepulse.identity.authorization import bootstrap_owner_organization
 from carepulse.identity.contracts import ContractError, success_response
+from carepulse.identity.runtime_identity import bound_transaction
 
 router = APIRouter()
 
@@ -33,7 +33,7 @@ def activate_first_owner(body: OwnerActivation, request: Request):
     if not re.fullmatch(r"[A-Za-z0-9_-]{43}", body.proof):
         raise ContractError(422)
     clinic = bootstrap_owner_organization(envelope)
-    with transaction(request.app.state.db_engine, clinic) as connection:
+    with bound_transaction(request.app.state.db_engine, envelope) as connection:
         try:
             activation = (
                 connection.execute(

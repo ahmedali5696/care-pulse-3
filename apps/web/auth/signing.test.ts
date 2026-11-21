@@ -57,6 +57,7 @@ for (const vector of fixture.vectors) {
       securityRevision: Number(fields[11]), timestamp: Number(fields[12]), nonce: fields[13],
       purpose: fields[14], idempotencyKey: fields[15], keyId: fields[1],
       serviceKey: fixture.test_only_key,
+      dbIdentityKeyId: "synthetic-db-v1", dbIdentityKey: Buffer.alloc(32, 65),
     });
 
     assert.equal(canonicalPath(vector.raw_path), fields[4]);
@@ -81,6 +82,9 @@ for (const vector of fixture.vectors) {
     }
     assert.equal(signed.headers.get("X-CarePulse-Signature"), vector.signature);
     assert.equal(signed.headers.get("X-CarePulse-Service-Key"), fixture.test_only_key);
+    assert.equal(signed.headers.get("X-CarePulse-Db-Key-Id"), "synthetic-db-v1");
+    assert.equal(signed.headers.get("X-CarePulse-Db-Proof"), createHmac("sha256", Buffer.alloc(32, 65))
+      .update(Buffer.concat([Buffer.from("carepulse-db-context-v1\0synthetic-db-v1\0"), canonicalBytes])).digest("hex"));
     assert.equal(signed.headers.has("Cookie"), false);
     assert.equal(signed.headers.has("Authorization"), false);
   });

@@ -10,6 +10,14 @@ from uuid import UUID
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
+from carepulse.compat.admission import (
+    CompatAdmissionError,
+    CompatRuntimeConfig,
+    acquire_invocation_permit,
+    is_compat_enabled,
+    record_attempt_disposition,
+    release_invocation_permit,
+)
 from carepulse.config import ConfigError, load_config
 from carepulse.notifications.evidence import (
     ClaimedJob,
@@ -55,11 +63,16 @@ def _settings() -> SenderSettings:
     )
 
 
-def _tenant(connection, organization_id: UUID) -> None:
+def _tenant(connection, organization_id: UUID, attempt_id: str | None = None) -> None:
     connection.execute(
         text("SELECT set_config('app.organization_id', :tenant, true)"),
         {"tenant": str(organization_id)},
     )
+    if attempt_id is not None:
+        connection.execute(
+            text("SELECT set_config('app.compat_attempt_id', :attempt, true)"),
+            {"attempt": attempt_id},
+        )
 
 
 def _material_payload(connection, claim: ClaimedJob) -> tuple[bytes, float] | None:
@@ -115,7 +128,8 @@ def _material_payload(connection, claim: ClaimedJob) -> tuple[bytes, float] | No
     return encoded, float(committed["remaining"])
 
 
-def _node_call(input_bytes: bytes | None, timeout: float) -> bool:
+def _node_call(input_bytes: bytes | None, timeout: float) -> str:
+    """Invoke Node transport and distinguish SENT, NOT_SENT, and AMBIGUOUS (T035)."""
     command = [_NODE, _ADAPTER]
     if input_bytes is None:
         command.append("--check")
@@ -127,32 +141,85 @@ def _node_call(input_bytes: bytes | None, timeout: float) -> bool:
             timeout=timeout,
             check=False,
         )
-        return completed.returncode == 0 and completed.stdout == b"SENT\n"
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+        if completed.returncode == 0 and completed.stdout == b"SENT\n":
+            return "SENT"
+        if b"NOT_SENT" in completed.stderr or (
+            input_bytes is None and completed.returncode != 0
+        ):
+            return "NOT_SENT"
+        return "AMBIGUOUS"
+    except subprocess.TimeoutExpired:
+        return "AMBIGUOUS"
+    except OSError:
+        return "NOT_SENT"
 
 
 def send_one_job(
     organization_id: UUID, job_id: UUID | None, settings: SenderSettings
 ) -> str:
     """Commit claim before Node; finish only if D-09 still owns the generation."""
-    if not _node_call(None, settings.timeout_seconds):
+    if _node_call(None, settings.timeout_seconds) != "SENT":
         raise ConfigError("Sender key or transport configuration unavailable")
     engine = create_engine(settings.connection_url, hide_parameters=True)
+    permit = None
+    permit_conn = None
+    final_disposition = "UNKNOWN"
+    claimed_job_id: str | None = str(job_id) if job_id else None
+    claimed_lease_gen: int | None = None
     try:
+        if is_compat_enabled():
+            compat_cfg = CompatRuntimeConfig.from_env("sender")
+            assert compat_cfg is not None
+            permit, permit_conn = acquire_invocation_permit(
+                engine,
+                config=compat_cfg,
+                expected_login="carepulse_sender",
+                invocation_class="sender_claim",
+                correlation_id=str(job_id) if job_id else f"org:{organization_id}",
+                record_attempt=True,
+            )
         with engine.begin() as connection:
-            _tenant(connection, organization_id)
+            _tenant(connection, organization_id, permit.attempt_id if permit else None)
             claim = claim_delivery_job(connection, settings.policy, job_id)
+            if claim is not None and permit is not None:
+                connection.execute(
+                    text("""
+                        SELECT compat_control.record_own_attempt(
+                            :aid, :tid, :epoch, :generation, 'sender',
+                            'sender_claim', :job, :lease, 'PENDING'
+                        )
+                    """),
+                    {
+                        "aid": permit.attempt_id,
+                        "tid": permit.target_id,
+                        "epoch": permit.owner_epoch,
+                        "generation": permit.generation,
+                        "job": str(claim.id),
+                        "lease": claim.generation,
+                    },
+                )
         if claim is None:
+            final_disposition = "NOT_SENT"
             return "NOT_DUE"
+        claimed_job_id = str(claim.id)
+        claimed_lease_gen = claim.generation
         with engine.begin() as connection:
             _tenant(connection, organization_id)
             material = _material_payload(connection, claim)
         if material is None:
+            final_disposition = "NOT_SENT"
             return "STALE"
         payload, seconds_remaining = material
         deadline = min(float(settings.timeout_seconds), seconds_remaining - 0.5)
-        sent = deadline > 0 and _node_call(payload, deadline)
+        transport_status = (
+            _node_call(payload, deadline) if deadline > 0 else "AMBIGUOUS"
+        )
+        if transport_status == "AMBIGUOUS":
+            # Never auto-retry, discard material, or count ambiguous ack as settled (T035).
+            final_disposition = "UNKNOWN"
+            return "AMBIGUOUS"
+        sent = transport_status == "SENT"
+        outcome = None
         with engine.begin() as connection:
             _tenant(connection, organization_id)
             attempts = connection.scalar(
@@ -171,12 +238,50 @@ def send_one_job(
                 outcome = JobOutcome(
                     "READY", not_before=retry_at, detail="RETRY_SCHEDULED"
                 )
-            return (
-                outcome.state
-                if finish_delivery_job(connection, claim, outcome)
-                else "STALE"
-            )
+            updated = finish_delivery_job(connection, claim, outcome)
+        if not updated:
+            if not sent:
+                final_disposition = "NOT_SENT"  # Transport was definitely absent.
+            return "STALE"
+        # Independent readback using only the sender's column-scoped SELECT grants.
+        # An acknowledged finish does not prove the transaction committed.
+        with engine.begin() as observer:
+            _tenant(observer, organization_id)
+            row = observer.execute(
+                text("""
+                    SELECT state, claim_generation, claim_owner, not_before
+                    FROM public.delivery_jobs
+                    WHERE id = :job AND organization_id = :tenant
+                """),
+                {"job": claim.id, "tenant": organization_id},
+            ).one_or_none()
+        if (
+            row
+            and row.claim_generation == claim.generation
+            and row.claim_owner is None
+            and row.state == outcome.state
+            and (outcome.state != "READY" or row.not_before == outcome.not_before)
+        ):
+            final_disposition = "SENT" if sent else "NOT_SENT"
+        return outcome.state
+    except Exception:
+        if claimed_lease_gen is not None:
+            final_disposition = "UNKNOWN"
+        raise
     finally:
+        if permit is not None and permit_conn is not None:
+            try:
+                record_attempt_disposition(
+                    permit_conn,
+                    permit,
+                    invocation_class="sender_claim",
+                    disposition=final_disposition,  # type: ignore[arg-type]
+                    correlation_id=claimed_job_id,
+                    lease_generation=claimed_lease_gen,
+                )
+            except CompatAdmissionError:
+                pass
+            release_invocation_permit(permit_conn, permit)
         engine.dispose()
 
 
@@ -190,7 +295,15 @@ def main() -> int:
     try:
         print(send_one_job(args.organization_id, args.job_id, _settings()))
         return 0
-    except (ConfigError, SQLAlchemyError, OSError, ValueError, TypeError, KeyError):
+    except (
+        CompatAdmissionError,
+        ConfigError,
+        SQLAlchemyError,
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+    ):
         print("Delivery unavailable")
         return 1
 

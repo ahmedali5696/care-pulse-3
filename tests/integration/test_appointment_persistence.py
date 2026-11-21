@@ -1,16 +1,21 @@
 """D-05 Appointment and frozen-money persistence on disposable PostgreSQL."""
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 from carepulse.appointments.persistence import AppointmentDraft, persist_appointment
 from carepulse.appointments.snapshots import validate_price_snapshot
+from carepulse.config import _load_policy
 from carepulse.db import transaction
 from carepulse.identity.authorization import AuthorizedStaff
 from carepulse.identity.receipts import TenantReceiptQuery
+from carepulse.identity.signing import PROTOCOL_VERSION, CanonicalEnvelope
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
@@ -381,7 +386,13 @@ def _admit_saved(
                 },
             )
         current = status
-    if completion_writer:
+    if completion_writer and connection.scalar(
+        text("SELECT to_regprocedure('public.f01_org()') IS NOT NULL")
+    ):
+        _seed_current_completion(
+            connection, tenant, appointment, doctor, actor=actor, role=role
+        )
+    elif completion_writer:
         connection.execute(
             text("""
                 SELECT * FROM public.complete_examined_visit(
@@ -389,6 +400,81 @@ def _admit_saved(
             """),
             {"tenant": tenant, "appointment": appointment},
         ).one()
+
+
+def _seed_current_completion(
+    connection, tenant, appointment, doctor, *, actor=None, role="DOCTOR_OWNER"
+):
+    """Migration-only history fixture; never invoke the protected T133 writer."""
+    assert connection.scalar(text("SELECT session_user")) == "carepulse_migration"
+    actor = actor or doctor
+    visit = connection.scalar(
+        text("SELECT id FROM public.visits WHERE appointment_id=:appointment"),
+        {"appointment": appointment},
+    )
+    fields = {
+        "tenant": tenant,
+        "appointment": appointment,
+        "visit": visit,
+        "doctor": doctor,
+        "actor": actor,
+        "role": role,
+        "history": uuid4(),
+        "audit": uuid4(),
+        "attestation": uuid4(),
+    }
+    connection.execute(
+        text(
+            "UPDATE public.appointments SET status='Completed', revision=3 WHERE organization_id=:tenant AND id=:appointment"
+        ),
+        fields,
+    )
+    fields["at"] = connection.scalar(
+        text("""
+            INSERT INTO public.appointment_history
+                (id, organization_id, appointment_id, appointment_revision,
+                 action, old_status, new_status, old_service_date, new_service_date,
+                 old_number, new_number, actor_staff_id, actor_role,
+                 reason, price_snapshot_appointment_id)
+            SELECT :history, organization_id, id, 3, 'STATUS',
+                   'In Examination', 'Completed', service_date, service_date,
+                   current_number, current_number, :actor, :role,
+                   'Examination completed', id
+            FROM public.appointments WHERE organization_id=:tenant AND id=:appointment
+            RETURNING occurred_at
+        """),
+        fields,
+    )
+    connection.execute(
+        text("""
+            INSERT INTO public.sensitive_audit
+                (id, organization_id, actor_staff_id, actor_role, action, reason,
+                 correlation_id, before_state, after_state, occurred_at)
+            VALUES (:audit, :tenant, :actor, :role,
+                    'VISIT_EXAMINATION_COMPLETED', 'Examination completion',
+                    CAST(:attestation AS text),
+                    jsonb_build_object('appointment_id', CAST(:appointment AS uuid),
+                        'visit_id', CAST(:visit AS uuid),
+                        'appointment_revision', 2, 'status', 'In Examination'),
+                    jsonb_build_object('appointment_id', CAST(:appointment AS uuid),
+                        'visit_id', CAST(:visit AS uuid),
+                        'appointment_revision', 3, 'status', 'Completed',
+                        'examination_occurred', true), :at)
+        """),
+        fields,
+    )
+    connection.execute(
+        text("""
+            INSERT INTO public.completion_attestations
+                (id, organization_id, appointment_id, visit_id,
+                 completion_history_revision, examination_occurred,
+                 actor_staff_id, actor_role, completed_at, sensitive_audit_id)
+            VALUES (:attestation, :tenant, :appointment, :visit, 3, true,
+                    :actor, :role, :at, :audit)
+        """),
+        fields,
+    )
+    return visit
 
 
 def _persist_with_status(connection, tenant, patient, doctor, status, **changes):
@@ -467,13 +553,14 @@ def _activate_clinic(connection, tenant, operator_id):
 
 @pytest.fixture
 def appointment_storage(role_engine, tenant_factory):
+    """Current-head schema verification; supported API authority is separate."""
     operator_id, create_tenant = tenant_factory
     tenants = (
         create_tenant("Synthetic D-05 clinic A"),
         create_tenant("Synthetic D-05 clinic B"),
     )
     migration = role_engine("carepulse_migration")
-    runtime = role_engine("carepulse_runtime")
+    runtime = role_engine("carepulse_migration")
     try:
         with migration.begin() as connection:
             doctors = tuple(
@@ -483,6 +570,92 @@ def appointment_storage(role_engine, tenant_factory):
     finally:
         migration.dispose()
         runtime.dispose()
+
+
+@pytest.fixture
+def appointment_api(appointment_storage, role_engine):
+    _, migration, tenants, doctors = appointment_storage
+    runtime = role_engine("carepulse_api")
+    gate = role_engine("carepulse_gate")
+    actors = {}
+    with migration.begin() as connection:
+        for tenant, doctor in zip(tenants, doctors, strict=True):
+            session = f"synthetic-schema-{uuid4()}"
+            connection.execute(
+                text("""
+                    INSERT INTO public."session"
+                        (id, "userId", token, "expiresAt", "createdAt", "updatedAt",
+                         "securityRevision", "absoluteDeadline", "lastActivity")
+                    SELECT :session, auth_user_id, :token, now()+interval '1 hour',
+                           now(), now(), security_revision, now()+interval '1 hour', now()
+                    FROM public.staff_accounts WHERE id=:doctor
+                """),
+                {"session": session, "token": str(uuid4()), "doctor": doctor},
+            )
+            actors[tenant] = CanonicalEnvelope(
+                PROTOCOL_VERSION,
+                "v1",
+                "web",
+                "GET",
+                "/v1/patients",
+                "",
+                sha256(b"").hexdigest(),
+                str(tenant),
+                str(doctor),
+                session,
+                "DOCTOR_OWNER",
+                "0",
+                str(int(datetime.now(UTC).timestamp() * 1000)),
+                f"synthetic_{uuid4().hex}",
+                "PATIENT_REGISTRY",
+                "",
+            )
+    try:
+        yield SimpleNamespace(
+            runtime=runtime,
+            gate=gate,
+            migration=migration,
+            actors=actors,
+            tenant=tenants[0],
+            other=tenants[1],
+            staff=doctors[0],
+            owner=actors[tenants[0]],
+            config=SimpleNamespace(policy=_load_policy()),
+        )
+    finally:
+        runtime.dispose()
+        gate.dispose()
+
+
+def _api_actor(clinic, tenant, staff):
+    """Issue a real native session for an additional synthetic staff actor."""
+    session = f"synthetic-schema-{uuid4()}"
+    with clinic.migration.begin() as connection:
+        role, revision = connection.execute(
+            text("""
+                INSERT INTO public."session"
+                    (id, "userId", token, "expiresAt", "createdAt", "updatedAt",
+                     "securityRevision", "absoluteDeadline", "lastActivity")
+                SELECT :session, auth_user_id, :token, now()+interval '1 hour',
+                       now(), now(), security_revision, now()+interval '1 hour', now()
+                FROM public.staff_accounts WHERE organization_id=:tenant AND id=:staff
+                RETURNING (SELECT role FROM public.staff_accounts WHERE id=:staff),
+                          "securityRevision"
+            """),
+            {
+                "session": session,
+                "token": str(uuid4()),
+                "tenant": tenant,
+                "staff": staff,
+            },
+        ).one()
+    return replace(
+        clinic.actors[tenant],
+        staff_id=str(staff),
+        session_id=session,
+        role=role,
+        security_revision=str(revision),
+    )
 
 
 @pytest.mark.parametrize(
@@ -560,8 +733,9 @@ def test_counted_statuses_prevent_second_same_patient_day(appointment_storage, c
             connection.scalar(
                 text("""
                 SELECT last_number FROM public.appointment_day_counters
-                WHERE service_date = DATE '2026-10-27'
-            """)
+                WHERE organization_id=:tenant AND service_date = DATE '2026-10-27'
+            """),
+                {"tenant": tenant},
             )
             == first["number"]
         )
@@ -624,8 +798,9 @@ def test_terminal_cancel_or_no_show_allows_new_id_and_retains_old_number(
         assert connection.scalars(
             text("""
                 SELECT number FROM public.appointment_number_assignments
-                WHERE service_date = DATE '2026-10-27' ORDER BY number
-            """)
+                WHERE organization_id=:tenant AND service_date = DATE '2026-10-27' ORDER BY number
+            """),
+            {"tenant": tenant},
         ).all() == [1, 2]
 
 
@@ -726,7 +901,7 @@ def test_confirmed_decimal_rounding_and_discounted_emergency_persist(
 
 
 def test_appointment_rls_and_operator_cannot_read_clinical_records(
-    appointment_storage, role_engine
+    appointment_storage, appointment_api, role_engine
 ):
     runtime, _, (tenant, other), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
@@ -735,7 +910,13 @@ def test_appointment_rls_and_operator_cannot_read_clinical_records(
             _draft(_patient(connection, tenant), doctor),
             _query(tenant, doctor),
         )
-    with transaction(runtime, tenant) as connection:
+    with signed_test_transaction(
+        appointment_api,
+        appointment_api.actors[tenant],
+        method="GET",
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, _):
         assert connection.scalar(text("SELECT count(*) FROM public.appointments")) == 1
         assert (
             connection.scalar(
@@ -743,8 +924,24 @@ def test_appointment_rls_and_operator_cannot_read_clinical_records(
             )
             == 1
         )
+    with signed_test_transaction(
+        appointment_api,
+        appointment_api.actors[other],
+        method="GET",
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, _):
+        assert (
+            connection.execute(text("SELECT id FROM public.appointments")).all() == []
+        )
+        assert (
+            connection.execute(
+                text("SELECT appointment_id FROM public.appointment_history")
+            ).all()
+            == []
+        )
     for scope in (other, None):
-        with transaction(runtime, scope) as connection:
+        with transaction(appointment_api.runtime, scope) as connection:
             assert (
                 connection.execute(text("SELECT id FROM public.appointments")).all()
                 == []
@@ -796,6 +993,7 @@ def test_bare_status_update_without_matching_history_cannot_commit(
 
 def test_terminal_records_and_frozen_snapshot_number_history_are_immutable(
     appointment_storage,
+    appointment_api,
 ):
     runtime, migration, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
@@ -811,6 +1009,13 @@ def test_terminal_records_and_frozen_snapshot_number_history_are_immutable(
                 {"id": created["id"]},
             )
         assert update_denied.value.orig.sqlstate == "23514"
+    with signed_test_transaction(
+        appointment_api,
+        appointment_api.actors[tenant],
+        method="GET",
+        path=f"/v1/appointments/{created['id']}",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, _):
         with pytest.raises(DBAPIError) as delete_denied, connection.begin_nested():
             connection.execute(
                 text("DELETE FROM public.appointments WHERE id = :id"),

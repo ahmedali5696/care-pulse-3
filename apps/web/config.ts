@@ -261,7 +261,7 @@ export function loadWebConfig() {
     host: hostname("CP_DB_HOST"),
     port: port("CP_DB_PORT"),
     name: required("CP_DB_NAME"),
-    user: required("CP_DB_USER"),
+    user: choice("CP_DB_USER", ["carepulse_web"]),
     password: secretFile("CP_DB_PASSWORD_FILE"),
   };
   const authDatabase = {
@@ -269,12 +269,17 @@ export function loadWebConfig() {
     user: choice("CP_AUTH_DB_USER", ["carepulse_auth"]),
     password: secretFile("CP_AUTH_DB_PASSWORD_FILE"),
   };
-  if (database.user === authDatabase.user || database.password === authDatabase.password) {
+  if (database.password === authDatabase.password) {
     invalid("CP_AUTH_DB_PASSWORD_FILE");
   }
   const apiUrl = privateHttpUrl("CP_INTERNAL_API_URL");
   const serviceKey = secretFile("CP_SERVICE_KEY_FILE");
   const signingKeyIdValue = signingKeyId();
+  const dbIdentityKeyId = required("CP_DB_IDENTITY_KEY_ID");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(dbIdentityKeyId)) invalid("CP_DB_IDENTITY_KEY_ID");
+  const dbIdentityHex = secretFile("CP_DB_IDENTITY_KEY_FILE");
+  if (!/^[0-9a-f]{64}$/.test(dbIdentityHex) || dbIdentityHex === serviceKey) invalid("CP_DB_IDENTITY_KEY_FILE");
+  const dbIdentityKey = Buffer.from(dbIdentityHex, "hex");
   const authSecret = secretFile("CP_AUTH_SECRET_FILE");
   const { mailEnabled, smtp } = loadMailSettings();
   // Non-mail processes remain valid without a delivery key; issuance checks mailEnabled.
@@ -283,7 +288,7 @@ export function loadWebConfig() {
   const deliveryPublicKey = mailEnabled ? readProtectedFile("CP_DELIVERY_PUBLIC_KEY_FILE", 8192) : null;
   choice("CP_SCAN_ENABLED", ["false"]);
 
-  return { environment, policy, database, authDatabase, apiUrl, serviceKey, signingKeyId: signingKeyIdValue, authSecret, deliveryKeyId, deliveryPublicKey, mailEnabled, smtp };
+  return { environment, policy, database, authDatabase, apiUrl, serviceKey, signingKeyId: signingKeyIdValue, dbIdentityKeyId, dbIdentityKey, authSecret, deliveryKeyId, deliveryPublicKey, mailEnabled, smtp };
 }
 
 // Fingerprints are bound to a configured secret version for the entire retry lifecycle.

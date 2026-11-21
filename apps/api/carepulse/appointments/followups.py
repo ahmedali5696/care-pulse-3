@@ -58,7 +58,7 @@ def _locked_source(connection: Connection, tenant: UUID, source_visit_id: UUID):
         connection.execute(
             text("""
             SELECT id, appointment_id, patient_id, doctor_staff_id,
-                   clinical_revision, followup_decision
+                   clinical_revision
             FROM public.visits
             WHERE organization_id=:tenant AND id=:source_visit FOR UPDATE
         """),

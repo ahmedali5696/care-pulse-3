@@ -47,11 +47,6 @@ def _owner(connection: Connection, tenant: UUID, staff_id: UUID, user_id: str):
     )
     if owner is None:
         raise ContractError(403)
-    # Only the verified recovery Owner can inspect linked revocation audit evidence.
-    connection.execute(
-        text("SELECT set_config('app.staff_id', :staff, true)"),
-        {"staff": str(staff_id)},
-    )
     return owner
 
 

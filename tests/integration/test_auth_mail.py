@@ -10,7 +10,6 @@ from uuid import UUID, uuid4
 
 import psycopg
 import pytest
-from test_database import REVISION
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -258,4 +257,4 @@ def test_denied_routes_preserve_current_persistence_boundary():
         }
         assert connection.execute(
             "SELECT version_num FROM public.alembic_version"
-        ).fetchall() == [(REVISION,)]
+        ).fetchall() == [("0046_f01_audit_integrity",)]

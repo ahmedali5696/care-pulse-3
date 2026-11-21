@@ -57,12 +57,15 @@ export type SignedRequest = {
   idempotencyKey?: string;
   keyId: string;
   serviceKey: string;
+  dbIdentityKeyId: string;
+  dbIdentityKey: Uint8Array;
   timestamp?: number;
   nonce?: string;
 };
 
 export function signRequest(request: SignedRequest) {
-  if (!TOKEN.test(request.keyId) || !/^[A-Z]{1,16}$/.test(request.method)) {
+  if (!TOKEN.test(request.keyId) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(request.dbIdentityKeyId) ||
+      request.dbIdentityKey.byteLength !== 32 || !/^[A-Z]{1,16}$/.test(request.method)) {
     throw new Error("Invalid request signing input");
   }
   const path = canonicalPath(request.rawPath);
@@ -80,8 +83,13 @@ export function signRequest(request: SignedRequest) {
       fields.some((field) => field.length > 4096 || /[\x00-\x1f\x7f-\x9f\uD800-\uDFFF]/.test(field))) {
     throw new Error("Invalid request signing input");
   }
+  const canonical = JSON.stringify(fields);
   const signature = createHmac("sha256", request.serviceKey)
-    .update(JSON.stringify(fields), "utf8").digest("hex");
+    .update(canonical, "utf8").digest("hex");
+  const dbProof = createHmac("sha256", request.dbIdentityKey)
+    .update("carepulse-db-context-v1\0", "utf8")
+    .update(request.dbIdentityKeyId + "\0", "utf8")
+    .update(canonical, "utf8").digest("hex");
   const headerNames = ["protocol-version", "key-id", "service", "organization-id", "staff-id",
     "session-id", "role", "security-revision", "timestamp", "nonce", "purpose", "idempotency-key"];
   const headers = new Headers();
@@ -91,5 +99,7 @@ export function signRequest(request: SignedRequest) {
   }
   headers.set("X-CarePulse-Signature", signature);
   headers.set("X-CarePulse-Service-Key", request.serviceKey);
+  headers.set("X-CarePulse-Db-Key-Id", request.dbIdentityKeyId);
+  headers.set("X-CarePulse-Db-Proof", dbProof);
   return { path, query, headers, signature, fields };
 }

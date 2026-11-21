@@ -31,10 +31,8 @@ def _counted_intervals(
         Interval(row.starts_at.astimezone(UTC), row.ends_at.astimezone(UTC))
         for row in connection.execute(
             text("""
-                SELECT starts_at, ends_at FROM public.appointments
-                WHERE organization_id = :tenant AND service_date = :service_date
-                  AND booking_mode = 'EXACT_TIME'
-                  AND status IN ('Booked','Waiting','In Examination','Completed')
+                SELECT starts_at, ends_at
+                FROM public.f01_counted_appointment_intervals(:tenant, :service_date)
             """),
             {"tenant": tenant, "service_date": service_date},
         )

@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('inputs', 'python-quality', 'unit', 'web', 'imports', 'integration', 'integration-diagnostic')]
+    [ValidateSet('inputs', 'python-quality', 'unit', 'web', 'imports', 'integration', 'integration-diagnostic', 'compat-diagnostic', 'compat-full')]
     [string]$Check
 )
 
@@ -68,9 +68,11 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'c8d43656f391254f8ff9c6dcb8c57d93c890643db649d05ae98584426e1ba01f',
+    '.github/workflows/foundation.yml': '528ccd4f64bebbde8b9f439a18e43a10185cfeeee3e806f8c8348d67017a603b',
+    'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
+    'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
     'apps/api/Dockerfile': '8465e11d5b90d94704ec63072180f10c56dcf4becf471da84258ea21de5208c8',
-    'apps/web/Dockerfile': '933af52609f2a4eb638d048605ec555e2a3443cb25b3ba5d64d5a36ec585f02a',
+    'apps/web/Dockerfile': 'f4c68d5acdb939573661e8d79b1e08c901fa54cf87993464942eedab8f8df93b',
 }
 for filename, approved in approved_bootstrap_files.items():
     canonical = Path(filename).read_bytes().replace(b'\r\n', b'\n')
@@ -249,6 +251,12 @@ if [ "$1" = integration-diagnostic ]; then
     authorization-lock) focused_target='tests/integration/test_request_boundary.py::test_suspension_serializes_with_protected_mutation' ;;
     booking-races) focused_target='tests/integration/test_booking_races.py' ;;
     followup-races) focused_target='tests/integration/test_followups_races.py' ;;
+    f01-cleanup) focused_target='tests/integration/test_f01_runtime_identity.py::test_session_cleanup_requires_committed_matching_revocation[committed]' ;;
+    f01-followup-lock) focused_target='tests/integration/test_followup_persistence.py::test_v2_creation_exception_cannot_authorize_same_date_interval_change' ;;
+    f01-visit-lock) focused_target='tests/integration/test_visit_persistence.py::test_invalid_admission_shell_rejected_without_a_visit[forged_actor]' ;;
+    f01-followup-context) focused_target='tests/integration/test_followup_persistence.py::test_v2_writer_rejects_invalid_context_without_evidence[missing]' ;;
+    f01-pricing) focused_target='tests/integration/test_pricing.py' ;;
+    f01-pricing-races) focused_target='tests/integration/test_pricing_races.py' ;;
     *) echo 'FAIL unapproved PostgreSQL diagnostic selection'; exit 1 ;;
   esac
   printf 'Focused PostgreSQL diagnostic only: %s (SHA %s, project %s)\n' "$focused_target" "$GITHUB_SHA" "$CP_CI_PROJECT"
@@ -259,6 +267,18 @@ mkdir -m 0700 "$private"
 cleanup() {
   local code=$? cleanup_failed=0
   trap - EXIT
+  if [[ -n "${host_pid:-}" ]]; then
+    kill -TERM "$host_pid" 2>/dev/null || true
+    if ! wait "$host_pid"; then
+      echo 'FAIL independent compatibility host supervisor'; cleanup_failed=1
+    fi
+    host_pid=''
+  fi
+  if [[ -n "${host_pid:-}" ]]; then
+    kill -TERM "$host_pid" 2>/dev/null || true
+    wait "$host_pid" 2>/dev/null || true
+    host_pid=''
+  fi
   if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" && "$private" = "$RUNNER_TEMP/foundation-ci-private" && -d "$private" && -O "$private" && ! -L "$private" ]]; then
     if ! docker compose --profile mail --profile test --profile sender --profile operator down --remove-orphans --volumes; then
       echo 'FAIL scoped Compose cleanup'; cleanup_failed=1
@@ -277,7 +297,7 @@ cleanup() {
   exit "$code"
 }
 trap cleanup EXIT
-for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE"; do
+for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_API_DB_PASSWORD_SOURCE_FILE" "$CP_WEB_DB_PASSWORD_SOURCE_FILE" "$CP_WORKER_DB_PASSWORD_SOURCE_FILE" "$CP_GATE_DB_PASSWORD_SOURCE_FILE" "$CP_DB_IDENTITY_KEY_SOURCE_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE"; do
   test "$(dirname "$file")" = "$private"
   openssl rand -hex 32 > "$file"
   chmod 0444 "$file"
@@ -313,15 +333,25 @@ for attempt in $(seq 1 40); do
 done
 export CP_MIGRATION_PASSWORD="$(cat "$CP_MIGRATION_SECRET_FILE")"
 export CP_RUNTIME_PASSWORD="$(cat "$CP_RUNTIME_DB_PASSWORD_FILE")"
+export CP_API_DB_PASSWORD="$(cat "$CP_API_DB_PASSWORD_SOURCE_FILE")"
+export CP_WEB_DB_PASSWORD="$(cat "$CP_WEB_DB_PASSWORD_SOURCE_FILE")"
+export CP_WORKER_DB_PASSWORD="$(cat "$CP_WORKER_DB_PASSWORD_SOURCE_FILE")"
+export CP_GATE_DB_PASSWORD="$(cat "$CP_GATE_DB_PASSWORD_SOURCE_FILE")"
 export CP_AUTH_DB_PASSWORD="$(cat "$CP_AUTH_DB_PASSWORD_SOURCE_FILE")"
 export CP_OPERATOR_PASSWORD="$(cat "$CP_OPERATOR_SECRET_FILE")"
 export CP_SENDER_PASSWORD="$(cat "$CP_SENDER_DB_PASSWORD_SOURCE_FILE")"
-if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e CP_AUTH_DB_PASSWORD -e CP_OPERATOR_PASSWORD -e CP_SENDER_PASSWORD \
+if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e CP_AUTH_DB_PASSWORD -e CP_OPERATOR_PASSWORD -e CP_SENDER_PASSWORD -e CP_API_DB_PASSWORD -e CP_WEB_DB_PASSWORD -e CP_WORKER_DB_PASSWORD -e CP_GATE_DB_PASSWORD \
   db psql --no-psqlrc -v VERBOSITY=sqlstate -U carepulse_bootstrap -d carepulse < db/roles.sql > "$private/roles.log" 2>&1; then
   roles_error="$(sed -nE 's/^psql:[^:]+:([0-9]+): ERROR: +([A-Z0-9]{5}).*$/roles.sql:\1 SQLSTATE \2/p' "$private/roles.log" | head -n 1)"
   echo "FAIL controlled roles (${roles_error:-SQLSTATE unavailable}; credential-bearing diagnostics withheld)"; exit 1
 fi
-unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_AUTH_DB_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD
+unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_AUTH_DB_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD CP_API_DB_PASSWORD CP_WEB_DB_PASSWORD CP_WORKER_DB_PASSWORD CP_GATE_DB_PASSWORD
+identity_fixture_args=(
+  -e CP_DB_IDENTITY_KEY_ID
+  -v "$CP_DB_IDENTITY_KEY_SOURCE_FILE:/run/secrets/db_identity_key:ro"
+  -v "$CP_API_DB_PASSWORD_SOURCE_FILE:/run/secrets/api_db_password:ro"
+  -v "$CP_GATE_DB_PASSWORD_SOURCE_FILE:/run/secrets/gate_db_password:ro"
+)
 upgrade_head() {
   docker compose --profile test run --rm --no-deps \
     -e CP_DB_HOST=db -e CP_DB_PORT=5432 -e CP_DB_NAME=carepulse \
@@ -330,13 +360,30 @@ upgrade_head() {
     test python -m alembic -c alembic.ini upgrade head
 }
 
+# Synthetic-only custody setup. The ordinary runtime roles have no key-table
+# access. Provisioning is performed outside all application containers.
+seed_identity_policy() {
+  set +x
+  export CP_F01_SYNTHETIC_KEY="$(cat "$CP_DB_IDENTITY_KEY_SOURCE_FILE")"
+  export CP_F01_FRESHNESS="$(jq -er 'select(.profile == "synthetic") | .signed_request_freshness_seconds' tests/fixtures/foundation-policy.json)"
+  export CP_F01_SKEW="$(jq -er 'select(.profile == "synthetic") | .signed_request_max_skew_seconds' tests/fixtures/foundation-policy.json)"
+  export CP_F01_IDLE="$(jq -er 'select(.profile == "synthetic") | .session_idle_minutes' tests/fixtures/foundation-policy.json)"
+  docker compose exec -T -e CP_F01_SYNTHETIC_KEY -e CP_DB_IDENTITY_KEY_ID -e CP_F01_FRESHNESS -e CP_F01_SKEW -e CP_F01_IDLE \
+    db psql --no-psqlrc -v VERBOSITY=sqlstate -U carepulse_bootstrap -d carepulse < db/f01-synthetic-bootstrap.sql > "$private/f01-bootstrap.log" 2>&1 || {
+      unset CP_F01_SYNTHETIC_KEY CP_F01_FRESHNESS CP_F01_SKEW CP_F01_IDLE
+      echo 'FAIL F-01 synthetic identity provisioning'; return 1;
+    }
+  unset CP_F01_SYNTHETIC_KEY CP_F01_FRESHNESS CP_F01_SKEW CP_F01_IDLE
+}
+
 if [ -n "$focused_target" ]; then
   if ! upgrade_head > "$private/focused-migration.log" 2>&1; then
     echo 'FAIL focused PostgreSQL Alembic upgrade to head'; exit 1
   fi
   echo 'PASS focused PostgreSQL Alembic upgrade to head'
+  seed_identity_policy
   docker compose exec -T db postgres --version | grep -F '17.11'
-  docker compose --profile test run --rm --no-deps -T \
+  docker compose --profile test run --rm --no-deps -T "${identity_fixture_args[@]}" \
     -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
     -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
     -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -345,8 +392,240 @@ if [ -n "$focused_target" ]; then
   exit 0
 fi
 
+# Historical migration assertions use the accepted 0040 graph and a different
+# PostgreSQL cluster, never a re-enabled login in the current-head cluster.
+historical_nodes=(
+  'tests/integration/test_t133_migration.py::test_t133_populated_0032_upgrade_preserves_claim_and_new_exam'
+  'tests/integration/test_t133_migration.py::test_t133_failed_upgrade_0032_rolls_back_every_new_object'
+  'tests/integration/test_m1_migration.py'
+  'tests/integration/test_queue_migration.py'
+  'tests/integration/test_day_review_migration.py'
+  'tests/integration/test_schedule_migration.py'
+  'tests/integration/test_b10_writer_migration.py'
+  'tests/integration/test_visit_migration.py::test_version_and_fresh_upgrade_preserve_predecessor_records'
+  'tests/integration/test_visit_migration.py::test_existing_unbacked_admission_refuses_upgrade_atomically'
+  'tests/integration/test_visit_migration.py::test_failed_later_revision_rolls_back_and_keeps_d07'
+  'tests/integration/test_visit_migration.py::test_populated_0025_upgrade_preserves_legacy_clinical_history_and_receipts'
+  'tests/integration/test_visit_migration.py::test_failed_0026_upgrade_reverts_objects_and_predecessor_version'
+  'tests/integration/test_followup_migration.py::test_v2_populated_immediate_predecessor_preserves_legacy_evidence_and_denies_unattested_actions'
+  'tests/integration/test_followup_migration.py::test_v2_upgrade_replays_correction_ancestry_and_never_invents_doctor_default'
+  'tests/integration/test_followup_migration.py::test_v2_failed_populated_upgrade_rolls_back_and_repeat_upgrade_is_stable'
+  'tests/integration/test_followup_migration.py::test_v2_first_extension_uses_verified_legacy_deadline_without_rewriting_it'
+  'tests/integration/test_followup_migration.py::test_predecessor_data_and_security_survive_compatible_upgrade'
+  'tests/integration/test_followup_migration.py::test_incompatible_unpaired_predecessor_claim_refuses_atomically'
+  'tests/integration/test_followup_migration.py::test_fresh_and_failed_following_migration_keep_one_head'
+  'tests/integration/test_followup_migration.py::test_populated_0023_followup_evidence_survives_0024_and_new_claims_use_live_policy'
+  'tests/integration/test_pricing_migration.py::test_predecessor_legacy_numeric_null_snapshots_receipts_survive_upgrade'
+  'tests/integration/test_pricing_migration.py::test_fresh_install_and_repeated_upgrade_are_no_ops'
+  'tests/integration/test_pricing_migration.py::test_failed_following_revision_keeps_head_and_ddl_atomic'
+  'tests/integration/test_pricing_migration.py::test_t145_upgrade_preserves_historical_numeric_percentage_and_receipt'
+  'tests/integration/test_pricing_migration.py::test_t173_populated_0039_money_successor_and_atomic_failed_upgrade'
+  'tests/integration/test_policy_persistence.py::test_older_clinics_backfilled_and_new_clinics_triggered_in_both_orders'
+  'tests/integration/test_followup_persistence.py::test_v2_doctor_priority_blocks_receptionist_reset_exception_and_extension'
+  'tests/integration/test_followup_persistence.py::test_v2_declared_new_date_without_event_rolls_back_all_creation_evidence'
+  'tests/integration/test_followup_persistence.py::test_completed_new_examination_sources_create_active_claim'
+  'tests/integration/test_followup_persistence.py::test_nonqualifying_source_cannot_claim'
+  'tests/integration/test_followup_persistence.py::test_followup_target_must_match_source_tenant_patient_doctor'
+  'tests/integration/test_followup_persistence.py::test_one_active_source_across_different_service_dates'
+  'tests/integration/test_followup_persistence.py::test_claim_cannot_forge_frozen_authorization_evidence'
+  'tests/integration/test_followup_persistence.py::test_consumed_source_cannot_regain_active_or_second_consumed_claim'
+  'tests/integration/test_followup_persistence.py::test_released_prior_claim_cannot_become_second_consumption'
+  'tests/integration/test_followup_persistence.py::test_source_authorization_and_revision_required'
+  'tests/integration/test_followup_persistence.py::test_released_history_allows_fresh_eligibility_and_price_snapshot'
+  'tests/integration/test_followup_persistence.py::test_default_claim_uses_live_followup_window_and_rebook_freezes_new_policy'
+  'tests/integration/test_followup_persistence.py::test_zero_day_followup_policy_qualifies_and_confirms_only_completion_day'
+  'tests/integration/test_followup_persistence.py::test_integral_decimal_followup_policy_payload_is_accepted'
+  'tests/integration/test_followup_persistence.py::test_claim_and_preferential_appointment_must_both_exist_at_commit'
+  'tests/integration/test_followup_persistence.py::test_cancel_no_show_and_exceptional_admission_release_in_same_commit'
+  'tests/integration/test_followup_persistence.py::test_completed_followup_consumes_once_and_retains_immutable_history'
+  'tests/integration/test_followup_persistence.py::test_injected_failure_after_appointment_write_rolls_back_both_sides'
+  'tests/integration/test_followup_persistence.py::test_unpaired_terminal_transition_cannot_commit'
+  'tests/integration/test_followup_persistence.py::test_tenant_rls_no_context_operator_denied_and_narrow_runtime_grants'
+  'tests/integration/test_followup_races.py::test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger[release]'
+  'tests/integration/test_followup_races.py::test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger[consume]'
+  'tests/integration/test_followup_races.py::test_v2_extension_first_remains_historical_after_later_restriction_or_terminal[release]'
+  'tests/integration/test_followup_races.py::test_v2_extension_first_remains_historical_after_later_restriction_or_terminal[consume]'
+  'tests/integration/test_followup_races.py::test_v2_claim_waits_for_release_and_cannot_reuse_consumed_source'
+  'tests/integration/test_followup_races.py::test_two_simultaneous_claims_leave_one_active_and_no_orphan_appointment'
+  'tests/integration/test_followup_races.py::test_terminal_first_holds_claim_until_release_or_permanent_consumption'
+  'tests/integration/test_followup_races.py::test_claim_attempt_first_respects_later_terminal_outcome'
+  'tests/integration/test_followup_races.py::test_claim_first_staged_booking_contends_with_terminal_before_commit'
+  'tests/integration/test_followup_races.py::test_extension_and_competing_claim_serialize_without_new_reservation'
+  'tests/integration/test_followup_races.py::test_extension_rejects_unrelated_clinical_audit_evidence'
+  'tests/integration/test_followup_races.py::test_deadline_day_is_inclusive_but_next_day_loses_parallel_race'
+  # Pre-cutover writer contracts: the current API has no permitted Wave 3 writer path.
+  'tests/integration/test_visit_persistence.py::test_new_completion_attests_actual_staff_and_history_without_clinical_revision'
+  'tests/integration/test_visit_persistence.py::test_completion_rejects_invalid_assertion_actor_scope_and_revision'
+  'tests/integration/test_visit_persistence.py::test_completion_duplicate_and_direct_evidence_forgery_are_denied'
+  'tests/integration/test_visit_revisions.py::test_receptionist_completion_preserves_independent_doctor_corrections'
+  'tests/integration/test_visit_revisions.py::test_terminal_doctor_correction_keeps_status_and_actual_revision'
+  'tests/integration/test_visit_revisions.py::test_unauthorized_or_unjustified_correction_denied'
+  'tests/integration/test_visit_revisions.py::test_disabled_doctor_cannot_edit_clinical_content'
+  'tests/integration/test_visit_migration.py::test_competing_completions_consume_one_visit_revision'
+  'tests/integration/test_visit_migration.py::test_concurrent_clinical_correction_and_completion_preserve_both_evidence'
+  'tests/integration/test_day_review_persistence.py::test_all_six_states_and_retained_visit_survive_cairo_midnight_and_day_close'
+  'tests/integration/test_day_review_persistence.py::test_review_amendments_append_history_and_stale_revision_cannot_overwrite'
+  'tests/integration/test_day_review_persistence.py::test_verified_receptionist_can_record_initial_day_reviews_but_cannot_amend'
+  'tests/integration/test_day_review_persistence.py::test_day_reviews_enforce_tenant_actor_context_and_operator_denial'
+  'tests/integration/test_day_review_races.py::test_direct_waiting_transition_serializes_with_final_close'
+  'tests/integration/test_day_review_races.py::test_first_queue_day_insert_waits_on_final_close_barrier_in_both_orders'
+  'tests/integration/test_day_review_races.py::test_direct_active_queue_entry_update_uses_same_barrier'
+  'tests/integration/test_day_review_races.py::test_direct_active_entry_insert_waits_for_barrier_before_rejecting_booked_source'
+  'tests/integration/test_followup_races.py::test_current_head_doctor_clinical_correction_and_extension_preserve_independent_revisions'
+  'tests/integration/test_followups_races.py::test_release_or_consume_races_fresh_claim_without_double_use'
+  'tests/integration/test_followups_races.py::test_claim_confirmation_first_blocks_terminal_until_booking_commits'
+  'tests/integration/test_queue_capacity.py::test_scoped_confirmation_consumes_once_in_rolled_back_sql_simulation'
+  'tests/integration/test_queue_capacity.py::test_one_shared_doctor_control_across_lane_and_original_date'
+  'tests/integration/test_queue_capacity.py::test_doctor_scoped_confirmation_validates_revision_and_one_use_transition'
+  'tests/integration/test_queue_capacity.py::test_non_doctor_cannot_revoke_scoped_approval'
+  'tests/integration/test_queue_races.py::test_shared_doctor_control_blocks_alternate_lane_and_original_date'
+  'tests/integration/test_queue_races.py::test_cross_date_cross_lane_provisional_admission_serializes_then_rolls_back'
+  'tests/integration/test_queue_races.py::test_provisional_confirmation_is_one_use_and_invisible_until_rollback'
+  'tests/integration/test_followups.py::test_pre0029_preferential_v1_receipt_survives_upgrade_and_signed_replay'
+  'tests/integration/test_followup_decisions.py::test_signed_pre0029_v1_extension_receipt_survives_upgrade_and_authority_checks'
+  'tests/integration/test_followup_migration.py::test_retained_active_unattested_claim_conflicts_at_current_head'
+)
+historical_deselect=()
+ordinary_core_migration_files=(tests/integration/test_t133_migration.py tests/integration/test_m1_migration.py)
+ordinary_queue_migration_files=(tests/integration/test_queue_migration.py)
+ordinary_schedule_migration_files=(tests/integration/test_schedule_migration.py)
+ordinary_b10_migration_files=(tests/integration/test_b10_writer_migration.py)
+ordinary_day_review_migration_files=(tests/integration/test_day_review_migration.py)
+run_historical_migrations() (
+  set -euo pipefail
+  test "${CP_T133_MODE:-false}" = false
+  test -z "${CP_T133_SHA:-}"
+  local historical_sha=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
+  local historical_head=0040_t173_numeric_money
+  local historical_project="carepulse-ci-${GITHUB_RUN_ID}-0${GITHUB_RUN_ATTEMPT}"
+  local historical_dir="$private/historical"
+  local historical_root="$historical_dir/source"
+  local test_image="$COMPOSE_PROJECT_NAME-test"
+  [[ "$historical_project" =~ ^carepulse-ci-[0-9]+-[0-9]+$ ]]
+  test "$historical_project" != "$COMPOSE_PROJECT_NAME"
+  test ! -e "$historical_dir"
+  mkdir -m 0700 "$historical_dir" "$historical_root"
+  # Checkout is shallow; the public origin is fetched by immutable object ID only.
+  if ! git cat-file -e "$historical_sha^{commit}" 2>/dev/null; then
+    GIT_TERMINAL_PROMPT=0 git fetch --no-tags --depth=1 origin "$historical_sha"
+  fi
+  test "$(git rev-parse "$historical_sha^{commit}")" = "$historical_sha"
+  local -a historical_graph_files
+  mapfile -t historical_graph_files < <(git ls-tree -r --name-only "$historical_sha" -- db/migrations)
+  test "${#historical_graph_files[@]}" -gt 40
+  git diff --exit-code "$historical_sha" -- "${historical_graph_files[@]}"
+  git archive "$historical_sha" -- alembic.ini pyproject.toml db apps/api/carepulse apps/worker tests/integration tests/fixtures | tar -x -C "$historical_root"
+  mkdir "$historical_root/private-files"
+  chmod -R a+rX "$historical_root"
+  test "$(docker image inspect --format '{{.Id}}' "$test_image")" != ""
+  printf 'services:\n  test:\n    image: %s\n' "$test_image" > "$historical_dir/compose-override.yaml"
+  # Never share the active cluster's credentials, volumes or network.
+  export CP_DB_PASSWORD_FILE="$historical_dir/postgres-password"
+  export CP_RUNTIME_DB_PASSWORD_FILE="$historical_dir/runtime-password"
+  export CP_MIGRATION_SECRET_FILE="$historical_dir/migration-password"
+  export CP_AUTH_DB_PASSWORD_SOURCE_FILE="$historical_dir/auth-password"
+  export CP_OPERATOR_SECRET_FILE="$historical_dir/operator-password"
+  export CP_OPERATOR_DB_PASSWORD_SOURCE_FILE="$CP_OPERATOR_SECRET_FILE"
+  export CP_SENDER_DB_PASSWORD_SOURCE_FILE="$historical_dir/sender-password"
+  for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE"; do
+    openssl rand -hex 32 > "$file"
+    chmod 0444 "$file"
+  done
+  historical_compose() {
+    docker compose -p "$historical_project" -f "$PWD/compose.yaml" -f "$historical_dir/compose-override.yaml" "$@"
+  }
+  historical_compose --profile test config --format json > "$historical_dir/compose.json"
+  chmod 0444 "$historical_dir/compose.json"
+  jq -e --arg project "$historical_project" '
+    .name == $project and .services.db.environment.POSTGRES_DB == "carepulse" and
+    (.services.db.ports // [] | length == 0) and
+    .volumes.db_data.name == ($project + "_db_data") and
+    .networks.database.name == ($project + "_database") and .networks.database.internal == true
+  ' "$historical_dir/compose.json" > /dev/null
+  test -z "$(docker ps -aq --filter "label=com.docker.compose.project=$historical_project")"
+  test -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$historical_project")"
+  test -z "$(docker network ls -q --filter "label=com.docker.compose.project=$historical_project")"
+  historical_cleanup() {
+    local code=$?
+    trap - EXIT
+    if ! historical_compose --profile test down --remove-orphans --volumes; then
+      echo 'FAIL historical Compose cleanup'; code=1
+    fi
+    exit "$code"
+  }
+  trap historical_cleanup EXIT
+  historical_compose up -d --no-build db
+  for attempt in $(seq 1 40); do
+    if historical_compose exec -T db pg_isready -h 127.0.0.1 -U carepulse_bootstrap -d carepulse > /dev/null 2>&1; then break; fi
+    if [ "$attempt" = 40 ]; then echo 'FAIL historical database startup'; exit 1; fi
+    sleep 2
+  done
+  export CP_MIGRATION_PASSWORD="$(cat "$CP_MIGRATION_SECRET_FILE")"
+  export CP_RUNTIME_PASSWORD="$(cat "$CP_RUNTIME_DB_PASSWORD_FILE")"
+  export CP_AUTH_DB_PASSWORD="$(cat "$CP_AUTH_DB_PASSWORD_SOURCE_FILE")"
+  export CP_OPERATOR_PASSWORD="$(cat "$CP_OPERATOR_SECRET_FILE")"
+  export CP_SENDER_PASSWORD="$(cat "$CP_SENDER_DB_PASSWORD_SOURCE_FILE")"
+  if ! historical_compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e CP_AUTH_DB_PASSWORD -e CP_OPERATOR_PASSWORD -e CP_SENDER_PASSWORD \
+    db psql --no-psqlrc -v VERBOSITY=sqlstate -U carepulse_bootstrap -d carepulse < "$historical_root/db/roles.sql" > "$historical_dir/roles.log" 2>&1; then
+    echo 'FAIL historical controlled roles (credential-bearing diagnostics withheld)'; exit 1
+  fi
+  unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_AUTH_DB_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD
+  local -a historical_test_args=(
+    --profile test run --rm --no-deps -T
+    -e CP_CI_PROJECT="$historical_project" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json
+    -v "$historical_root:/srv:ro"
+    -v "$historical_dir/compose.json:/tmp/foundation-compose.json:ro"
+    -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro"
+    -v "$CP_AUTH_DB_PASSWORD_SOURCE_FILE:/run/secrets/auth_db_password:ro"
+    -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro"
+    -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro"
+    -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro"
+  )
+  test "$(historical_compose "${historical_test_args[@]}" test python -m alembic -c alembic.ini heads)" = "$historical_head (head)"
+  historical_compose "${historical_test_args[@]}" \
+    -e CP_DB_HOST=db -e CP_DB_PORT=5432 -e CP_DB_NAME=carepulse \
+    -e CP_MIGRATION_PASSWORD_FILE=/run/secrets/migration_password \
+    test python -m alembic -c alembic.ini upgrade "$historical_head"
+  test "$(historical_compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = "$historical_head"
+  echo "Historical migration evidence: $historical_sha ($historical_head), cluster $historical_project"
+  historical_compose "${historical_test_args[@]}" test python -m pytest -q -ra --tb=short -p no:cacheprovider "${historical_nodes[@]}" | tee "$historical_dir/tests.log"
+  if grep -Eq '[0-9]+ skipped|no tests ran' "$historical_dir/tests.log"; then
+    echo 'FAIL mandatory historical migration evidence skipped'; exit 1
+  fi
+)
+# Keep experimental/protected invocation and its original selection untouched.
+if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ] && [ "${CP_B04_SPIKE:-false}" = false ]; then
+  for node in "${historical_nodes[@]}"; do
+    if [[ "$node" = *::* ]]; then historical_deselect+=("--deselect=$node"); fi
+  done
+  ordinary_core_migration_files=(tests/integration/test_t133_migration.py)
+  ordinary_queue_migration_files=()
+  ordinary_schedule_migration_files=()
+  ordinary_b10_migration_files=()
+  ordinary_day_review_migration_files=()
+fi
+
 upgrade_head
-docker compose --profile test run --rm --no-deps \
+seed_identity_policy
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
+  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+  -v "$CP_WEB_DB_PASSWORD_SOURCE_FILE:/run/secrets/web_db_password:ro" \
+  -v "$CP_WORKER_DB_PASSWORD_SOURCE_FILE:/run/secrets/worker_db_password:ro" \
+  -v "$CP_AUTH_DB_PASSWORD_SOURCE_FILE:/run/secrets/auth_db_password:ro" \
+  -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
+  -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  -v "$CP_DB_PASSWORD_FILE:/run/secrets/postgres_password:ro" \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_f01_runtime_identity.py tests/integration/test_f01_audit_integrity.py tests/integration/test_f01_grants_migration.py | tee "$private/f01-runtime-identity.log"
+if grep -Eq '[0-9]+ skipped|no tests ran' "$private/f01-runtime-identity.log"; then
+  echo 'FAIL mandatory F-01 runtime identity evidence skipped'; exit 1
+fi
+if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ] && [ "${CP_B04_SPIKE:-false}" = false ]; then
+  run_historical_migrations
+fi
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -354,47 +633,47 @@ docker compose --profile test run --rm --no-deps \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_patient_persistence.py tests/integration/test_policy_persistence.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py tests/integration/test_appointment_persistence.py tests/integration/test_appointment_races.py tests/integration/test_visit_persistence.py tests/integration/test_visit_revisions.py tests/integration/test_visit_migration.py tests/integration/test_followup_persistence.py tests/integration/test_followup_races.py tests/integration/test_followup_migration.py tests/integration/test_t133_migration.py tests/integration/test_m1_migration.py | tee "$private/d08-core.log"
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider "${historical_deselect[@]}" tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_patient_persistence.py tests/integration/test_policy_persistence.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py tests/integration/test_appointment_persistence.py tests/integration/test_appointment_races.py tests/integration/test_visit_persistence.py tests/integration/test_visit_revisions.py tests/integration/test_visit_migration.py tests/integration/test_followup_persistence.py tests/integration/test_followup_races.py tests/integration/test_followup_migration.py "${ordinary_core_migration_files[@]}" | tee "$private/d08-core.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d08-core.log"; then
   echo 'FAIL mandatory D-08 persistence evidence skipped'; exit 1
 fi
 # Independent D-06 suite must remain executable without D-07/Visit imports.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
-  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider \
+  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider "${historical_deselect[@]}" \
   tests/integration/test_queue_persistence.py tests/integration/test_queue_capacity.py \
-  tests/integration/test_queue_races.py tests/integration/test_queue_migration.py | tee "$private/d06-queue.log"
+  tests/integration/test_queue_races.py "${ordinary_queue_migration_files[@]}" | tee "$private/d06-queue.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d06-queue.log"; then
   echo 'FAIL mandatory D-06 real-PostgreSQL evidence skipped'; exit 1
 fi
 # All B-06 suites run against disposable PostgreSQL; no silent skip counts.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider "${historical_deselect[@]}" \
   tests/integration/test_pricing.py tests/integration/test_pricing_races.py tests/integration/test_pricing_migration.py | tee "$private/b06-pricing.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b06-pricing.log"; then
   echo 'FAIL mandatory B-06 pricing evidence skipped'; exit 1
 fi
 # B-07 tests must run against disposable PostgreSQL, including preview races and migration.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider \
-  tests/integration/test_schedule.py tests/integration/test_schedule_races.py tests/integration/test_schedule_migration.py | tee "$private/b07-schedule.log"
+  tests/integration/test_schedule.py tests/integration/test_schedule_races.py "${ordinary_schedule_migration_files[@]}" | tee "$private/b07-schedule.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b07-schedule.log"; then
   echo 'FAIL mandatory B-07 schedule evidence skipped'; exit 1
 fi
 # B-08 tests exercise the real PostgreSQL booking-day lock and capacity races.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -405,7 +684,7 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b08-slots.log"; then
   echo 'FAIL mandatory B-08 slot evidence skipped'; exit 1
 fi
 # B-09 confirms atomic Booked-only creation and real-PostgreSQL races.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -416,34 +695,34 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b09-booking.log"; then
   echo 'FAIL mandatory B-09 booking evidence skipped'; exit 1
 fi
 # B-10 confirms Doctor decisions, exact extensions, bookings and denial/race evidence.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider \
+  test python -m pytest -q -ra --tb=short -p no:cacheprovider "${historical_deselect[@]}" \
   tests/integration/test_followups.py tests/integration/test_followups_denial.py \
   tests/integration/test_followup_decisions.py tests/integration/test_followups_races.py \
-  tests/integration/test_b10_writer_migration.py | tee "$private/b10-followups.log"
+  "${ordinary_b10_migration_files[@]}" | tee "$private/b10-followups.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b10-followups.log"; then
   echo 'FAIL mandatory B-10 follow-up evidence skipped'; exit 1
 fi
 # D-11 remains mandatory, but runs after the T145-owned pricing/booking/follow-up
 # suites so an unrelated fail-fast plan assertion cannot mask their evidence.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
-  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider \
+  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider "${historical_deselect[@]}" \
   tests/integration/test_day_review_persistence.py tests/integration/test_report_query_plans.py \
-  tests/integration/test_day_review_races.py tests/integration/test_day_review_migration.py | tee "$private/d11-day-review.log"
+  tests/integration/test_day_review_races.py "${ordinary_day_review_migration_files[@]}" | tee "$private/d11-day-review.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d11-day-review.log"; then
   echo 'FAIL mandatory D-11 real-PostgreSQL evidence skipped'; exit 1
 fi
 # B-05 backend proof has no BFF/invitation prerequisite and cannot silently skip.
-docker compose --profile test run --rm --no-deps \
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
@@ -460,7 +739,7 @@ for attempt in $(seq 1 40); do
   sleep 2
 done
 echo 'PASS runner-host web http://127.0.0.1:3000/'
-docker compose exec -T web node --experimental-strip-types --input-type=module <<'NODE'
+timeout 60s docker compose exec -T web node --experimental-strip-types --input-type=module <<'NODE'
 import { getSchema } from 'better-auth/db';
 import { getMigrations } from 'better-auth/db/migration';
 import { betterAuth } from 'better-auth';
@@ -594,7 +873,7 @@ docker compose exec -T web node -e 'fetch("http://api:8000/__foundation_network_
 docker compose --profile test run --rm --no-deps -e CI=true \
   -v "$GITHUB_WORKSPACE/tests:/srv/tests:ro" api python -m pytest -q -ra -p no:cacheprovider tests/integration/test_secrets.py
 : > "$private/denials.log"
-for key in CP_POLICY_FILE CP_DB_PASSWORD_FILE CP_AUTH_DB_PASSWORD_FILE CP_SERVICE_KEY_FILE CP_AUTH_SECRET_FILE; do
+for key in CP_POLICY_FILE CP_DB_PASSWORD_FILE CP_AUTH_DB_PASSWORD_FILE CP_SERVICE_KEY_FILE CP_AUTH_SECRET_FILE CP_DB_IDENTITY_KEY_FILE; do
   set +e
   timeout 15s docker compose run --rm --no-deps -e "$key=/run/secrets/missing" web > "$private/web-denial.log" 2>&1
   code=$?
@@ -617,10 +896,10 @@ for key in CP_POLICY_FILE CP_DB_PASSWORD_FILE CP_FILE_ENCRYPTION_KEY_FILE; do
   fi
   echo "PASS worker protected startup denies missing $key"
 done
-cat "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" \
+cat "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_API_DB_PASSWORD_SOURCE_FILE" "$CP_WEB_DB_PASSWORD_SOURCE_FILE" "$CP_WORKER_DB_PASSWORD_SOURCE_FILE" "$CP_GATE_DB_PASSWORD_SOURCE_FILE" "$CP_DB_IDENTITY_KEY_SOURCE_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" \
   "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" > "$private/canaries"
 chmod 0444 "$private/canaries"
-awk 'length($0) != 64 || $0 !~ /^[0-9a-f]+$/ { invalid=1 } END { if (NR != 10 || invalid) exit 1 }' "$private/canaries"
+awk 'length($0) != 64 || $0 !~ /^[0-9a-f]+$/ || seen[$0]++ { invalid=1 } END { if (NR != 15 || invalid) exit 1 }' "$private/canaries"
 if git grep -I -q -f "$private/canaries" -- apps tests ops compose.yaml; then
   echo 'FAIL synthetic key in tracked source'; exit 1
 else
@@ -718,7 +997,7 @@ docker compose --profile test run --rm --no-deps \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_SERVICE_KEY_SOURCE_FILE:/run/secrets/service_key:ro" \
   test python -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_auth_mail.py
-if ! docker compose --profile test run --rm --no-deps \
+if ! docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" \
   -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
@@ -754,6 +1033,7 @@ if ! docker compose --profile sender run --rm --no-deps -T --entrypoint python \
   -v "$PWD/tests:/srv/tests:ro" \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
   -v "$CP_DB_PASSWORD_FILE:/run/secrets/postgres_password:ro" \
+  -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   sender -m pytest -q -ra --tb=short -p no:cacheprovider \
   tests/integration/test_recovery.py; then
   docker compose logs --no-color web 2>&1 | grep -aE 'B04_SYNTHETIC_ISSUE' || true
@@ -882,6 +1162,289 @@ fi
 '@
             & bash -e -c $integration -- $Check
             if ($LASTEXITCODE -ne 0) { throw "Integration failed (exit $LASTEXITCODE)" }
+        }
+        { $_ -in @('compat-diagnostic', 'compat-full') } {
+            if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Linux' -or $PSVersionTable.PSVersion.Major -lt 7) {
+                throw 'Compatibility verification requires Docker-capable Linux CI and PowerShell 7; no local Docker probe performed'
+            }
+            if ($env:CP_CI_PROJECT -notmatch '^carepulse-ci-[0-9]+-[0-9]+$' -or $env:COMPOSE_PROJECT_NAME -ne $env:CP_CI_PROJECT) {
+                throw 'Explicit matching disposable CI project required'
+            }
+            $compatScript = @'
+set -euo pipefail
+umask 077
+if [[ "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false || -n "${CP_T133_SHA:-}" ]]; then
+  echo 'FAIL compat runner cannot combine with experimental or protected modes'; exit 1
+fi
+if [[ "$1" = compat-diagnostic ]]; then
+  if [[ "${GITHUB_EVENT_NAME:-}" != workflow_dispatch ]]; then
+    echo 'FAIL compat diagnostics require a manual dispatch'; exit 1
+  fi
+  mode="${CP_COMPAT_DIAGNOSTIC:-}"
+  case "$mode" in
+    compat-us1|compat-us2|compat-us3) ;;
+    *) echo "FAIL unknown compat diagnostic mode: $mode"; exit 1 ;;
+  esac
+elif [[ "$1" = compat-full && "${CP_COMPAT_DIAGNOSTIC:-}" = compat-full ]]; then
+  mode=compat-full
+else
+  echo 'FAIL invalid ordinary compatibility selection'; exit 1
+fi
+private="$RUNNER_TEMP/foundation-ci-private"
+test ! -e "$private"
+mkdir -m 0700 "$private"
+if [[ "$mode" = compat-full ]]; then
+  mkdir -m 1777 "$private/compat-results"
+fi
+source_dir="$RUNNER_TEMP/compat-source-0040"
+rm -rf -- "$source_dir"
+cleanup() {
+  local code=$? cleanup_failed=0
+  trap - EXIT
+  if [[ -n "${host_pid:-}" ]]; then
+    kill -TERM "$host_pid" 2>/dev/null || true
+    if ! wait "$host_pid"; then
+      echo 'FAIL independent compatibility host supervisor'; cleanup_failed=1
+    fi
+    host_pid=''
+  fi
+  if [[ "$COMPOSE_PROJECT_NAME" =~ ^carepulse-ci-[0-9]+-[0-9]+$ && "$COMPOSE_PROJECT_NAME" = "$CP_CI_PROJECT" && "$private" = "$RUNNER_TEMP/foundation-ci-private" && -d "$private" && -O "$private" && ! -L "$private" ]]; then
+    if ! docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer down --remove-orphans --volumes; then
+      echo 'FAIL scoped compat Compose cleanup'; cleanup_failed=1
+    fi
+    if ! rm -rf -- "$private" "$source_dir" || test -e "$private"; then
+      echo 'FAIL synthetic compat secret/source cleanup'; cleanup_failed=1
+    fi
+    if [ "$cleanup_failed" = 1 ]; then
+      code=1
+    else
+      echo 'PASS scoped compat Compose volume and synthetic secret cleanup'
+    fi
+  else
+    echo 'FAIL unsafe compat cleanup project'; code=1
+  fi
+  exit "$code"
+}
+trap cleanup EXIT
+
+source_sha='6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7'
+if ! git cat-file -e "${source_sha}^{commit}" 2>/dev/null; then
+  git fetch --no-tags --depth=1 origin "$source_sha"
+fi
+git cat-file -e "${source_sha}^{commit}"
+mkdir -m 0755 "$source_dir"
+git archive "$source_sha" | tar -x -C "$source_dir"
+echo "Verified immutable source commit $source_sha in $source_dir"
+export CP_SOURCE_CONTEXT="$source_dir"
+export CP_COMPAT_ADAPTERS_DIR="$PWD/ops/compat"
+export CP_COMPAT_MANIFEST_DIR="$private/manifests"
+mkdir -m 0755 "$CP_COMPAT_MANIFEST_DIR"
+
+export CP_SOURCE_RUNTIME_DB_PASSWORD_FILE="$private/source-runtime-db-password"
+export CP_SOURCE_AUTH_DB_PASSWORD_FILE="$private/source-auth-db-password"
+export CP_SOURCE_SENDER_DB_PASSWORD_FILE="$private/source-sender-db-password"
+export CP_SOURCE_SERVICE_KEY_FILE="$private/source-service-key"
+export CP_SOURCE_AUTH_SECRET_FILE="$private/source-auth-secret"
+export CP_SOURCE_FILE_ENCRYPTION_KEY_FILE="$private/source-file-key"
+export CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE="$private/source-delivery-private-key"
+export CP_SOURCE_DELIVERY_PUBLIC_KEY_FILE="$private/source-delivery-public-key"
+
+for file in "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_API_DB_PASSWORD_SOURCE_FILE" "$CP_WEB_DB_PASSWORD_SOURCE_FILE" "$CP_WORKER_DB_PASSWORD_SOURCE_FILE" "$CP_GATE_DB_PASSWORD_SOURCE_FILE" "$CP_DB_IDENTITY_KEY_SOURCE_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" "$CP_SOURCE_RUNTIME_DB_PASSWORD_FILE" "$CP_SOURCE_AUTH_DB_PASSWORD_FILE" "$CP_SOURCE_SENDER_DB_PASSWORD_FILE" "$CP_SOURCE_SERVICE_KEY_FILE" "$CP_SOURCE_AUTH_SECRET_FILE" "$CP_SOURCE_FILE_ENCRYPTION_KEY_FILE"; do
+  test "$(dirname "$file")" = "$private"
+  openssl rand -hex 32 > "$file"
+  chmod 0444 "$file"
+done
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" > /dev/null 2>&1
+openssl pkey -in "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" -pubout -out "$CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE" > /dev/null 2>&1
+chmod 0444 "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" "$CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE" > /dev/null 2>&1
+openssl pkey -in "$CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE" -pubout -out "$CP_SOURCE_DELIVERY_PUBLIC_KEY_FILE" > /dev/null 2>&1
+chmod 0444 "$CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE" "$CP_SOURCE_DELIVERY_PUBLIC_KEY_FILE"
+! cmp -s "$CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE" "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE"
+
+docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer config --quiet
+docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer config --format json > "$private/compose.compat.json"
+chmod 0444 "$private/compose.compat.json"
+docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer build --pull
+docker compose -f compose.compat.yaml --profile mail up -d --no-build db mail
+for attempt in $(seq 1 40); do
+  if docker compose -f compose.compat.yaml exec -T db pg_isready -h 127.0.0.1 -U carepulse_bootstrap -d carepulse > /dev/null 2>&1; then break; fi
+  if [ "$attempt" = 40 ]; then echo 'FAIL disposable compat database startup'; exit 1; fi
+  sleep 2
+done
+
+for svc in source-api source-web source-worker source-sender candidate-api candidate-web candidate-worker candidate-sender; do
+  img_tag="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["services"][sys.argv[2]]["image"])' "$private/compose.compat.json" "$svc")"
+  img="$(docker image inspect --format '{{.Id}}' "$img_tag")"
+  [[ "$img" == sha256:* ]] || { echo "FAIL missing built compat image for $svc"; exit 1; }
+  echo "COMPAT_IMAGE $svc=$img"
+done
+sha256sum ops/compat/source-web.cjs ops/compat/source-api.py ops/compat/source-jobs.py apps/api/carepulse/compat/admission.py apps/web/compat/admission.ts
+
+assert_full_compat_count() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+group, expected, filename = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+root = ET.parse(filename).getroot()
+suites = [root] if root.tag == 'testsuite' else list(root)
+if len(suites) != 1 or suites[0].tag != 'testsuite':
+    raise SystemExit(f'FAIL {group}: missing or ambiguous JUnit test suite')
+suite = suites[0]
+stats = {key: int(suite.attrib[key]) for key in ('tests', 'failures', 'errors', 'skipped')}
+if stats != {'tests': expected, 'failures': 0, 'errors': 0, 'skipped': 0}:
+    raise SystemExit(f'FAIL {group}: expected {expected} tests, zero failures/skips; got {stats}')
+print(f'PASS {group}: {expected} mandatory Python tests, zero skips')
+PY
+}
+run_compat_observer() {
+  local group="$1" expected="$2"
+  shift 2
+  local ipc_args=()
+  if [[ "$group" = compat-us1-source-web-runtime ]]; then
+    test -n "${CP_SOURCE_WEB_DB_IP:-}"
+    ipc_args=(-e CP_SOURCE_WEB_DB_IP)
+  fi
+  if [[ "$group" = compat-us2 ]]; then
+    ipc_args=(-e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -e CP_COMPAT_T051_REPLY_DIR=/tmp/compat-host-replies -v "$private/handshake:/tmp/compat-host:rw" -v "$private/host-replies:/tmp/compat-host-replies:ro")
+  fi
+  if [[ "$mode" = compat-full ]]; then
+    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/compat-results:/tmp/compat-results:rw" "${ipc_args[@]}" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "--junitxml=/tmp/compat-results/$group.xml" "$@"
+    assert_full_compat_count "$group" "$expected" "$private/compat-results/$group.xml"
+  else
+    timeout 120s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" "${ipc_args[@]}" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=25 --tb=short -p no:cacheprovider "$@"
+  fi
+}
+if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
+    required_suites=(tests/unit/test_compat_admission.py tests/integration/test_compat_matrix.py tests/integration/test_compat_entry_denials.py tests/integration/test_compat_source_privileges.py)
+    for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
+    run_compat_observer compat-us1 25 "${required_suites[@]}"
+    docker compose -f compose.compat.yaml --profile candidate run --rm --no-deps -T --entrypoint node candidate-web --no-warnings --experimental-strip-types --test --test-reporter=tap auth/compat.test.ts | tee "$private/compat-us1-web.log"
+    test -f tests/unit/source-web.test.cjs || { echo 'FAIL missing source Web privilege regression'; exit 1; }
+    docker compose -f compose.compat.yaml --profile source run --rm --no-deps -T --entrypoint node -e CP_SOURCE_WEB_ADAPTER_PATH=/run/compat-adapters/source-web.cjs -v "$PWD/tests/unit/source-web.test.cjs:/tmp/source-web.test.cjs:ro" source-web --test --test-reporter=tap /tmp/source-web.test.cjs | tee "$private/compat-us1-source-web.log"
+    # Hosted immutable-source Web: genuine Node preload, Next HTTP and both real 0040 logins.
+    docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T observer python -c 'from tests.integration.test_compat_source_web_runtime import prepare_source_web_http_lab; prepare_source_web_http_lab()'
+    docker compose -f compose.compat.yaml --profile source --profile candidate up -d --no-build --no-deps source-api source-web candidate-web
+    docker compose -f compose.compat.yaml --profile source run -d --no-deps --name "${CP_CI_PROJECT}-source-peer" -e CP_COMPAT_EXPECTED_API_PEER=http://candidate-api:8000 source-web
+    source_web_id="$(docker compose -f compose.compat.yaml --profile source ps -q source-web)"
+    if [[ -z "$source_web_id" ]]; then
+      echo 'FAIL immutable source Web stopped during HTTP test startup'
+      docker compose -f compose.compat.yaml --profile source --profile candidate ps -a source-api source-web candidate-web
+      docker compose -f compose.compat.yaml --profile source logs --no-color --tail 30 source-web
+      exit 1
+    fi
+    echo 'PASS immutable source Web process running before HTTP test'
+    source_web_host_pid="$(docker inspect --format '{{.State.Pid}}' "$source_web_id")"
+    export CP_SOURCE_WEB_DB_IP="$(docker inspect "$source_web_id" | python3 -c 'import json,sys; nets=json.load(sys.stdin)[0]["NetworkSettings"]["Networks"]; ips=[n["IPAddress"] for k,n in nets.items() if k.endswith("_compat_db")]; assert len(ips)==1; print(ips[0])')"
+    test -n "$CP_SOURCE_WEB_DB_IP"
+    run_compat_observer compat-us1-source-web-runtime 1 tests/integration/test_compat_source_web_runtime.py
+    test "$(docker inspect --format '{{.State.Pid}}' "$source_web_id")" = "$source_web_host_pid"
+    docker compose -f compose.compat.yaml --profile source --profile candidate stop source-api source-web candidate-web
+    docker rm -f "${CP_CI_PROJECT}-source-peer" >/dev/null
+    if [[ "$mode" = compat-full ]]; then
+      for result in '# tests 9' '# pass 9' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
+        grep -Fxq "$result" "$private/compat-us1-web.log" || { echo "FAIL mandatory compat Web test count: $result"; exit 1; }
+      done
+      echo 'PASS compat-us1-web: 9 mandatory Web tests, zero skips'
+      for result in '# tests 2' '# pass 2' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
+        grep -Fxq "$result" "$private/compat-us1-source-web.log" || { echo "FAIL mandatory source Web test count: $result"; exit 1; }
+      done
+      echo 'PASS compat-us1-source-web: 2 mandatory source image tests, zero skips'
+    fi
+fi
+# The independent Docker/PG supervisor attests every stopped-consumer proof
+# for US2 drain/migration and US3 recovery; observer never receives Docker.
+if [[ "$mode" = compat-us2 || "$mode" = compat-us3 || "$mode" = compat-full ]]; then
+    python3 - "$private/compose.compat.json" "$private/observed.json" "$GITHUB_SHA" <<'PY'
+import json, re, subprocess, sys
+
+config_path, output_path, sha = sys.argv[1:]
+assert re.fullmatch(r'[0-9a-f]{40}', sha)
+services = json.load(open(config_path, encoding='utf-8'))['services']
+observed = {'candidate_sha': sha, 'services': {}}
+for generation in ('source', 'candidate'):
+    for service in ('api', 'web', 'worker', 'sender'):
+        name = f'{generation}-{service}'
+        spec = services[name]
+        image = json.loads(subprocess.check_output(
+            ['docker', 'image', 'inspect', spec['image']], text=True))[0]
+        image_id = image['Id']
+        assert re.fullmatch(r'sha256:[0-9a-f]{64}', image_id)
+        entry = spec.get('entrypoint')
+        command = spec.get('command')
+        if entry is None:
+            entry = image['Config'].get('Entrypoint') or []
+        if command is None:
+            command = image['Config'].get('Cmd') or []
+        assert isinstance(entry, list) and isinstance(command, list)
+        volumes = spec.get('volumes', [])
+        observed['services'][name] = {
+            'image_id': image_id,
+            'entry': entry + command,
+            'adapter_readonly': any(v.get('target') == '/run/compat-adapters'
+                                    and v.get('read_only') is True for v in volumes),
+            'api_peer': spec.get('environment', {}).get('CP_COMPAT_EXPECTED_API_PEER', ''),
+            'smtp_peer': spec.get('environment', {}).get('CP_SMTP_HOST', ''),
+            'db_name': spec.get('environment', {}).get('CP_DB_NAME', ''),
+            'target_id': spec.get('environment', {}).get('CP_COMPAT_TARGET_ID', ''),
+            'secrets': sorted(s.get('source', '') if isinstance(s, dict) else s
+                              for s in spec.get('secrets', [])),
+        }
+with open(output_path, 'w', encoding='utf-8') as stream:
+    json.dump(observed, stream, sort_keys=True)
+PY
+    chmod 0444 "$private/observed.json"
+    mkdir -m 1777 "$private/handshake"
+    mkdir -m 0755 "$private/host-replies"
+    python3 -u ops/compat/ci_host.py "$private/handshake" "$private/observed.json" "$private/host-replies" > "$private/ci-host.log" 2>&1 &
+    host_pid=$!
+fi
+if [[ "$mode" = compat-us2 || "$mode" = compat-full ]]; then
+    required_suites=(tests/integration/test_compat_drain.py tests/integration/test_compat_delivery.py tests/integration/test_compat_upgrade.py)
+    for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
+    run_compat_observer compat-us2 8 "${required_suites[@]}"
+    if [[ "$mode" = compat-us2 ]]; then
+      kill -TERM "$host_pid" 2>/dev/null || true
+      if ! wait "$host_pid"; then
+        echo 'FAIL independent compatibility host supervisor'
+        cat "$private/ci-host.log"
+        exit 1
+      fi
+      host_pid=''
+    fi
+fi
+if [[ "$mode" = compat-us3 || "$mode" = compat-full ]]; then
+    required_suites=(tests/integration/test_compat_recovery_source.py tests/integration/test_compat_recovery_intermediate.py tests/integration/test_compat_recovery_target.py tests/integration/test_compat_preservation.py)
+    for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
+    set +e
+    if [[ "$mode" = compat-full ]]; then
+      timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -e CP_COMPAT_T051_REPLY_DIR=/tmp/compat-host-replies -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" -v "$private/handshake:/tmp/compat-host:rw" -v "$private/host-replies:/tmp/compat-host-replies:ro" -v "$private/compat-results:/tmp/compat-results:rw" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=35 --tb=short -p no:cacheprovider --junitxml=/tmp/compat-results/compat-us3.xml "${required_suites[@]}"
+      test_code=$?
+    else
+      timeout 300s docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T -e CP_COMPAT_COMPOSE_CONFIG_PATH=/tmp/compat-compose.json -e CP_COMPAT_T051_IPC_DIR=/tmp/compat-host -e CP_COMPAT_T051_REPLY_DIR=/tmp/compat-host-replies -v "$private/compose.compat.json:/tmp/compat-compose.json:ro" -v "$private/observed.json:/tmp/compat-observed.json:ro" -v "$private/handshake:/tmp/compat-host:rw" -v "$private/host-replies:/tmp/compat-host-replies:ro" observer python -u -m pytest -v -s -ra -o faulthandler_timeout=35 --tb=short -p no:cacheprovider "${required_suites[@]}"
+      test_code=$?
+    fi
+    kill -TERM "$host_pid" 2>/dev/null || true
+    wait "$host_pid"
+    host_code=$?
+    host_pid=''
+    set -e
+    if [[ "$test_code" -ne 0 || "$host_code" -ne 0 ]]; then
+      echo 'FAIL real compatibility scenario or bounded host supervisor'
+      test "$host_code" -eq 0 || cat "$private/ci-host.log"
+      exit 1
+    fi
+    if [[ "$mode" = compat-full ]]; then
+      assert_full_compat_count compat-us3 10 "$private/compat-results/compat-us3.xml"
+    fi
+fi
+if [[ "$mode" = compat-full ]]; then
+  echo 'PASS mandatory compatibility: 44 Python cases (US1 26, US2 8, US3 10), 11 Web cases, zero skips'
+fi
+'@
+            & bash -e -c $compatScript -- $Check
+            if ($LASTEXITCODE -ne 0) { throw "Compatibility verification failed (exit $LASTEXITCODE)" }
         }
     }
 } catch {

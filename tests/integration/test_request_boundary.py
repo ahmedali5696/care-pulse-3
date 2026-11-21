@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from carepulse.appointments.persistence import persist_appointment
 from carepulse.config import ServiceConfig, _load_policy
 from carepulse.db import transaction
 from carepulse.identity.authorization import protected_transaction
@@ -40,11 +41,13 @@ from carepulse.identity.signing import (
 from carepulse.notifications.evidence import append_outbox
 from postgres_locks import wait_for_postgres_lock
 from pydantic import BaseModel, ConfigDict
+from runtime_identity_fixture import db_proof_headers, registered_test_request
 from sqlalchemy import text
+from test_appointment_persistence import _draft, _patient, _query
 
 _SECRET = "synthetic-B-01-key"
-_PATH = "/v1/__synthetic_t023_internal__"
-_PURPOSE = "synthetic.test"
+_PATH = "/v1/patients"
+_PURPOSE = "PATIENT_REGISTRY"
 
 
 class SyntheticRequest(BaseModel):
@@ -63,7 +66,8 @@ def boundary_data(role_engine, tenant_factory, monkeypatch):
     active = create_tenant("Synthetic B-01 active")
     other = create_tenant("Synthetic B-01 provisioning")
     migration = role_engine("carepulse_migration")
-    runtime = role_engine("carepulse_runtime")
+    runtime = role_engine("carepulse_api")
+    gate = role_engine("carepulse_gate")
     staff_id = uuid4()
     native_user = f"synthetic-b01-{uuid4()}"
     session_id = f"synthetic-b01-session-{uuid4()}"
@@ -133,7 +137,7 @@ def boundary_data(role_engine, tenant_factory, monkeypatch):
         db_host="db",
         db_port=5432,
         db_name="carepulse",
-        db_user="carepulse_runtime",
+        db_user="carepulse_api",
         db_password="synthetic-never-used",
         file_encryption_key="synthetic-never-used",
         service_key=_SECRET,
@@ -143,6 +147,9 @@ def boundary_data(role_engine, tenant_factory, monkeypatch):
         mail=None,
         scan=None,
     )
+    from carepulse.main import app
+
+    monkeypatch.setattr(app.state, "gate_engine", gate, raising=False)
     try:
         yield SimpleNamespace(
             tenant=active,
@@ -152,21 +159,36 @@ def boundary_data(role_engine, tenant_factory, monkeypatch):
             native_user=native_user,
             migration=migration,
             runtime=runtime,
+            gate=gate,
             config=config,
         )
     finally:
         runtime.dispose()
+        gate.dispose()
         migration.dispose()
 
 
-def _signed(data, *, tenant=None, session=None, nonce=None, key=None, value="first"):
-    body = json.dumps({"value": value}, separators=(",", ":")).encode()
+def _signed(
+    data,
+    *,
+    tenant=None,
+    session=None,
+    nonce=None,
+    key=None,
+    value="first",
+    command=None,
+    path=_PATH,
+    purpose=_PURPOSE,
+):
+    body = json.dumps(
+        {"value": value} if command is None else command, separators=(",", ":")
+    ).encode()
     identity = CanonicalEnvelope(
         PROTOCOL_VERSION,
         "v1",
         "web",
         "POST",
-        _PATH,
+        path,
         "",
         raw_body_sha256(body),
         str(tenant or data.tenant),
@@ -176,7 +198,7 @@ def _signed(data, *, tenant=None, session=None, nonce=None, key=None, value="fir
         "0",
         str(int(datetime.now(UTC).timestamp() * 1000)),
         nonce or f"synthetic_{uuid4().hex}",
-        _PURPOSE,
+        purpose,
         key or f"synthetic-{uuid4()}",
     )
     field_names = (
@@ -222,6 +244,7 @@ def _signed(data, *, tenant=None, session=None, nonce=None, key=None, value="fir
             ),
         ]
     )
+    headers.extend(db_proof_headers(identity))
     return identity, body, headers
 
 
@@ -236,7 +259,11 @@ def _dispatch(data, payload, handle):
         "query_string": b"",
         "headers": headers,
         "app": SimpleNamespace(
-            state=SimpleNamespace(service_config=data.config, db_engine=data.runtime)
+            state=SimpleNamespace(
+                service_config=data.config,
+                db_engine=data.runtime,
+                gate_engine=data.gate,
+            )
         ),
     }
 
@@ -258,9 +285,13 @@ def _dispatch(data, payload, handle):
         messages.append(message)
 
     asyncio.run(
-        ClosedServiceBoundary(app, routes={("POST", _PATH): _PURPOSE})(
-            scope, receive, send
-        )
+        ClosedServiceBoundary(
+            app,
+            routes={
+                ("POST", _PATH): _PURPOSE,
+                ("POST", "/v1/appointments"): "APPOINTMENT_BOOKING",
+            },
+        )(scope, receive, send)
     )
     return messages[0]["status"], json.loads(messages[1]["body"])
 
@@ -270,14 +301,8 @@ def _read_own(data, identity, _body):
         data.runtime, identity, data.config.policy.session_idle_minutes
     ) as (connection, actor):
         assert actor.organization_id == data.tenant
-        assert connection.scalar(text("SELECT current_setting('app.staff_id')")) == str(
-            data.staff
-        )
-        return {
-            "tenant": str(
-                connection.scalar(text("SELECT current_setting('app.organization_id')"))
-            )
-        }
+        assert connection.scalar(text("SELECT public.f01_staff()")) == str(data.staff)
+        return {"tenant": str(connection.scalar(text("SELECT public.f01_org()")))}
 
 
 def test_valid_native_session_and_provisioning_or_forged_session_denied(boundary_data):
@@ -391,34 +416,54 @@ def test_parallel_same_nonce_has_single_committed_winner(boundary_data):
 
 def test_nonce_replay_survives_rolled_back_business_transaction(boundary_data):
     data = boundary_data
-    payload = _signed(data)
+    # The historical synthetic event is not a permitted F-01 patient operation.
+    # Seed a real appointment; the rollback under test uses only the API login.
+    with transaction(data.migration, data.tenant) as connection:
+        patient = _patient(connection, data.tenant)
+        appointment = persist_appointment(
+            connection, _draft(patient, data.staff), _query(data.tenant, data.staff)
+        )["id"]
+    payload = _signed(
+        data,
+        command={"patient_id": str(patient)},
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+    )
 
     def failed(identity, _body):
         with protected_transaction(
             data.runtime, identity, data.config.policy.session_idle_minutes
         ) as (connection, actor):
-            append_outbox(
+            event_id = append_outbox(
                 connection,
                 {
                     "organization_id": actor.organization_id,
-                    "event_type": "SYNTHETIC_T023_ROLLBACK",
-                    "aggregate_type": "synthetic",
-                    "aggregate_id": str(uuid4()),
-                    "payload": {},
+                    "event_type": "APPOINTMENT_BOOKED",
+                    "aggregate_type": "APPOINTMENT",
+                    "aggregate_id": appointment,
+                    "payload": {"appointment_id": appointment},
                 },
+            )
+            assert (
+                connection.scalar(
+                    text("SELECT count(*) FROM public.outbox_events WHERE id=:id"),
+                    {"id": event_id},
+                )
+                == 1
             )
             raise ContractError(409)
 
     assert _dispatch(data, payload, failed)[0] == 409
     assert _dispatch(data, payload, failed)[0] == 401
-    with transaction(data.runtime, data.tenant) as connection:
+    with data.migration.begin() as connection:
         assert (
             connection.scalar(
                 text("""
             SELECT count(*) FROM public.outbox_events
-            WHERE organization_id=:tenant AND event_type='SYNTHETIC_T023_ROLLBACK'
+            WHERE organization_id=:tenant AND event_type='APPOINTMENT_BOOKED'
+              AND aggregate_id=:appointment
         """),
-                {"tenant": data.tenant},
+                {"tenant": data.tenant, "appointment": appointment},
             )
             == 0
         )
@@ -435,7 +480,7 @@ def test_receipt_retry_changed_body_and_revoked_cache(boundary_data):
         ) as (connection, actor):
             query = TenantReceiptQuery(
                 actor=actor,
-                operation=_PURPOSE,
+                operation="patients.create",
                 idempotency_key=identity.idempotency_key,
                 request_digest=digest,
             )
@@ -447,7 +492,7 @@ def test_receipt_retry_changed_body_and_revoked_cache(boundary_data):
                 connection,
                 Receipt(
                     actor.staff_id,
-                    _PURPOSE,
+                    "patients.create",
                     identity.idempotency_key,
                     digest,
                     result,
@@ -480,10 +525,13 @@ def test_suspension_serializes_with_protected_mutation(boundary_data):
     waiter_pid = []
 
     def operation():
-        identity, _, _ = _signed(data)
-        with protected_transaction(
-            data.runtime, identity, data.config.policy.session_idle_minutes
-        ) as (connection, _):
+        identity, body, _ = _signed(data)
+        with (
+            registered_test_request(data, identity, body),
+            protected_transaction(
+                data.runtime, identity, data.config.policy.session_idle_minutes
+            ) as (connection, _),
+        ):
             holder_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             entered.set()
             assert release.wait(timeout=10)
@@ -515,8 +563,9 @@ def test_suspension_serializes_with_protected_mutation(boundary_data):
             release.set()
         assert first.result(timeout=10) == "authorized_committed"
         assert second.result(timeout=10) == "suspended_committed"
-    identity, _, _ = _signed(data)
+    identity, body, _ = _signed(data)
     with (
+        registered_test_request(data, identity, body),
         pytest.raises(ContractError),
         protected_transaction(
             data.runtime, identity, data.config.policy.session_idle_minutes

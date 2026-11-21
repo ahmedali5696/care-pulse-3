@@ -5,17 +5,85 @@ from uuid import UUID, uuid4
 
 import pytest
 from carepulse.db import transaction
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import (
+    _api_actor,
     _patient,
     _persist_with_status,
 )
+from test_appointment_persistence import appointment_api as appointment_api  # noqa: PLC0414
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_identity_persistence import _staff, _user
+from test_visit_persistence import _receptionist
 
 DAY = date(2026, 10, 27)
 NEXT_DAY = date(2026, 10, 28)
+
+
+@pytest.mark.parametrize("role", ["DOCTOR_OWNER", "RECEPTIONIST"])
+def test_f01_signed_staff_cannot_read_or_write_day_reviews(
+    appointment_storage, appointment_api, role_engine, role
+):
+    _, migration, (tenant, other), (doctor, _) = appointment_storage
+    staff = doctor if role == "DOCTOR_OWNER" else _receptionist(migration, tenant)
+    identity = (
+        appointment_api.actors[tenant]
+        if staff == doctor
+        else _api_actor(appointment_api, tenant, staff)
+    )
+    with signed_test_transaction(
+        appointment_api,
+        identity,
+        method="GET",
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, actor):
+        assert actor.staff_id == staff
+        assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+        for organization in (tenant, other):
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                _review(connection, organization, DAY, 0, "REVIEWED", "Unsupported")
+            assert denied.value.orig.sqlstate == "42501"
+        for table in ("day_reviews", "day_review_history"):
+            for statement in (
+                f"SELECT * FROM public.{table}",
+                f"INSERT INTO public.{table} (id) VALUES (:id)",
+                f"UPDATE public.{table} SET notes='Forged' WHERE id=:id",
+                f"DELETE FROM public.{table} WHERE id=:id",
+            ):
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    connection.execute(text(statement), {"id": uuid4()})
+                assert denied.value.orig.sqlstate == "42501"
+    operator = role_engine("carepulse_operator")
+    try:
+        with operator.connect() as connection:
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(text("SELECT * FROM public.day_review_history"))
+            assert denied.value.orig.sqlstate == "42501"
+    finally:
+        operator.dispose()
+    with migration.connect() as connection:
+        for table in ("day_reviews", "day_review_history"):
+            assert (
+                connection.scalar(
+                    text(
+                        f"SELECT count(*) FROM public.{table} WHERE organization_id IN (:tenant,:other)"
+                    ),
+                    {"tenant": tenant, "other": other},
+                )
+                == 0
+            )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.sensitive_audit WHERE organization_id IN (:tenant,:other) AND action='DAY_REVIEW_RECORDED'"
+                ),
+                {"tenant": tenant, "other": other},
+            )
+            == 0
+        )
 
 
 def _review(connection, tenant, service_date, expected_revision, disposition, notes):
@@ -346,6 +414,7 @@ def test_verified_receptionist_can_record_initial_day_reviews_but_cannot_amend(
 
 def test_day_reviews_enforce_tenant_actor_context_and_operator_denial(
     appointment_storage,
+    appointment_api,
     role_engine,
 ):
     runtime, migration, (tenant, other), (doctor, other_doctor) = appointment_storage
@@ -359,7 +428,13 @@ def test_day_reviews_enforce_tenant_actor_context_and_operator_denial(
         with pytest.raises(DBAPIError) as foreign_staff, connection.begin_nested():
             _review(connection, tenant, DAY, 1, "FINAL_CLOSED", "Foreign staff")
         assert foreign_staff.value.orig.sqlstate == "42501"
-        _as_actor(connection, doctor)
+    with signed_test_transaction(
+        appointment_api,
+        appointment_api.actors[tenant],
+        method="GET",
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, _):
         with pytest.raises(DBAPIError) as write_denied, connection.begin_nested():
             connection.execute(
                 text("""
@@ -370,21 +445,58 @@ def test_day_reviews_enforce_tenant_actor_context_and_operator_denial(
             )
         assert write_denied.value.orig.sqlstate == "42501"
     with transaction(runtime, other) as connection:
-        assert connection.scalar(text("SELECT count(*) FROM public.day_reviews")) == 0
         assert (
-            connection.scalar(text("SELECT count(*) FROM public.day_review_history"))
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.day_reviews WHERE organization_id=:tenant"
+                ),
+                {"tenant": other},
+            )
+            == 0
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.day_review_history WHERE organization_id=:tenant"
+                ),
+                {"tenant": other},
+            )
             == 0
         )
         _as_actor(connection, other_doctor)
         _review(connection, other, DAY, 0, "REVIEWED", "Tenant B")
-        assert connection.scalar(text("SELECT count(*) FROM public.day_reviews")) == 1
-    with runtime.connect() as connection:
-        assert connection.scalar(text("SELECT count(*) FROM public.day_reviews")) == 0
         assert (
-            connection.scalar(text("SELECT count(*) FROM public.day_review_history"))
-            == 0
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.day_reviews WHERE organization_id=:tenant"
+                ),
+                {"tenant": other},
+            )
+            == 1
         )
-        with pytest.raises(DBAPIError) as no_actor:
+    for organization in (tenant, other):
+        with signed_test_transaction(
+            appointment_api,
+            appointment_api.actors[organization],
+            method="GET",
+            path="/v1/appointments",
+            purpose="APPOINTMENT_BOOKING",
+        ) as (connection, _):
+            for table in ("day_reviews", "day_review_history"):
+                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                    connection.execute(text(f"SELECT * FROM public.{table}"))
+                assert denied.value.orig.sqlstate == "42501"
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                _review(
+                    connection, organization, NEXT_DAY, 0, "REVIEWED", "Unsupported"
+                )
+            assert denied.value.orig.sqlstate == "42501"
+    with appointment_api.runtime.connect() as connection:
+        for table in ("day_reviews", "day_review_history"):
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(text(f"SELECT * FROM public.{table}"))
+            assert denied.value.orig.sqlstate == "42501"
+        with pytest.raises(DBAPIError) as no_actor, connection.begin_nested():
             _review(connection, tenant, NEXT_DAY, 0, "REVIEWED", "Missing session")
         assert no_actor.value.orig.sqlstate == "42501"
     operator = role_engine("carepulse_operator")

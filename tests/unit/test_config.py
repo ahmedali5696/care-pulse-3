@@ -50,12 +50,16 @@ SECRET_CANARIES = {
     "CP_DB_PASSWORD_FILE": "synthetic-credential-db-password-123456",
     "CP_FILE_ENCRYPTION_KEY_FILE": "synthetic-credential-file-encryption-123456",
     "CP_SERVICE_KEY_FILE": "synthetic-credential-service-key-123456",
+    "CP_GATE_DB_PASSWORD_FILE": "synthetic-credential-gate-password-123456",
 }
 
 
 @pytest.fixture
 def policy_path(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, synthetic_delivery_key: bytes
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    synthetic_delivery_key: bytes,
+    request: pytest.FixtureRequest,
 ) -> Path:
     # Start independently of the developer's actual application environment.
     for name in tuple(os.environ):
@@ -63,6 +67,9 @@ def policy_path(
             monkeypatch.delenv(name)
     policy_file = tmp_path / "policy.json"
     policy_file.write_bytes(POLICY_FIXTURE.read_bytes())
+    consumer = getattr(getattr(request.node, "callspec", None), "params", {}).get(
+        "consumer", "api"
+    )
     settings = {
         "CP_ENV": "test",
         "CP_SYNTHETIC_TEST_PROFILE": "true",
@@ -70,7 +77,7 @@ def policy_path(
         "CP_DB_HOST": "db",
         "CP_DB_PORT": "5432",
         "CP_DB_NAME": "carepulse_test",
-        "CP_DB_USER": "carepulse_runtime",
+        "CP_DB_USER": f"carepulse_{consumer}",
         "CP_SIGNING_KEY_ID": "synthetic-ci-v1",
         "CP_DELIVERY_KEY_ID": "synthetic-test-delivery-v1",
         "CP_DELIVERY_PUBLIC_KEY_FILE": str(tmp_path / "delivery-public.pem"),
@@ -115,7 +122,12 @@ def test_complete_synthetic_profile(
 
     assert config.environment == environment
     assert config.db_host == "db" and config.db_port == 5432
-    assert config.db_name == "carepulse_test" and config.db_user == "carepulse_runtime"
+    assert (
+        config.db_name == "carepulse_test" and config.db_user == f"carepulse_{consumer}"
+    )
+    assert config.gate_db_password == (
+        SECRET_CANARIES["CP_GATE_DB_PASSWORD_FILE"] if consumer == "api" else None
+    )
     assert config.db_password == SECRET_CANARIES["CP_DB_PASSWORD_FILE"]
     assert config.file_encryption_key == SECRET_CANARIES["CP_FILE_ENCRYPTION_KEY_FILE"]
     assert config.service_key == (
@@ -148,6 +160,7 @@ def test_complete_synthetic_profile(
     [(consumer, name) for consumer in ("api", "worker") for name in SHARED_ENV]
     + [
         ("api", "CP_SERVICE_KEY_FILE"),
+        ("api", "CP_GATE_DB_PASSWORD_FILE"),
         ("api", "CP_SIGNING_KEY_ID"),
         ("api", "CP_DELIVERY_KEY_ID"),
         ("api", "CP_DELIVERY_PUBLIC_KEY_FILE"),
@@ -370,12 +383,14 @@ def test_invalid_json_is_rejected_without_echoing_content(
 
 def test_scanner_is_mandatory_when_api_policy_requires_it(
     policy_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     policy = json.loads(policy_path.read_text(encoding="utf-8"))
     policy["file_policy"]["scanner_required"] = True
     replace_policy(policy_path, policy)
     with pytest.raises(ConfigError, match="scanner"):
         load_config("api")
+    monkeypatch.setenv("CP_DB_USER", "carepulse_worker")
     assert load_config("worker").scan is None
 
 
@@ -441,7 +456,9 @@ def test_worker_does_not_consume_api_service_key(
     policy_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("CP_SERVICE_KEY_FILE")
+    monkeypatch.setenv("CP_DB_USER", "carepulse_worker")
     assert load_config("worker").service_key is None
+    monkeypatch.setenv("CP_DB_USER", "carepulse_api")
     with pytest.raises(ConfigError, match="CP_SERVICE_KEY_FILE"):
         load_config("api")
 
@@ -455,7 +472,22 @@ def test_api_rejects_invalid_signing_key_id(policy_path, monkeypatch, key_id):
 
 def test_worker_does_not_need_bff_signing_key_id(policy_path, monkeypatch):
     monkeypatch.delenv("CP_SIGNING_KEY_ID")
+    monkeypatch.delenv("CP_GATE_DB_PASSWORD_FILE")
+    monkeypatch.setenv("CP_DB_USER", "carepulse_worker")
     assert load_config("worker").signing_key_id is None
+
+
+@pytest.mark.parametrize("consumer", ["api", "worker"])
+def test_service_rejects_wrong_database_role(policy_path, monkeypatch, consumer):
+    monkeypatch.setenv("CP_DB_USER", "carepulse_runtime")
+    with pytest.raises(ConfigError, match="CP_DB_USER"):
+        load_config(consumer)
+
+
+def test_api_rejects_reused_gate_password(policy_path, monkeypatch):
+    monkeypatch.setenv("CP_GATE_DB_PASSWORD_FILE", os.environ["CP_DB_PASSWORD_FILE"])
+    with pytest.raises(ConfigError, match="CP_GATE_DB_PASSWORD_FILE"):
+        load_config("api")
 
 
 @pytest.mark.parametrize("consumer", ["api", "worker"])

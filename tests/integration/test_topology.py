@@ -104,7 +104,8 @@ def test_resolved_compose_topology() -> None:
         "test": {"postgres_password", "active_policy"},
         "web": {
             "active_policy",
-            "runtime_db_password",
+            "web_db_password",
+            "db_identity_key",
             "auth_db_password",
             "service_key",
             "auth_secret",
@@ -112,12 +113,13 @@ def test_resolved_compose_topology() -> None:
         },
         "api": {
             "active_policy",
-            "runtime_db_password",
+            "api_db_password",
+            "gate_db_password",
             "service_key",
             "file_encryption_key",
             "delivery_public_key",
         },
-        "worker": {"active_policy", "runtime_db_password", "file_encryption_key"},
+        "worker": {"active_policy", "worker_db_password", "file_encryption_key"},
         "sender": {"active_policy", "sender_db_password", "delivery_private_key"},
         "operator": {
             "active_policy",
@@ -143,6 +145,8 @@ def test_resolved_compose_topology() -> None:
         }
 
     assert services["sender"]["environment"]["CP_DB_USER"] == "carepulse_sender"
+    for service in ("web", "api", "worker"):
+        assert services[service]["environment"]["CP_DB_USER"] == f"carepulse_{service}"
     assert services["web"]["environment"]["CP_AUTH_DB_USER"] == "carepulse_auth"
     assert (
         services["web"]["environment"]["CP_AUTH_DB_PASSWORD_FILE"]

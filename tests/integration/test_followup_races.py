@@ -2,6 +2,7 @@
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import timedelta
 from threading import Barrier, Event
 from time import monotonic, sleep
@@ -13,15 +14,20 @@ from carepulse.db import transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _admit_saved, _draft, _query
+from test_appointment_persistence import appointment_api as appointment_api  # noqa: PLC0414
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
+from test_booking_races import _activation_checkpoint
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
 from test_followup_persistence import (
     _claim,
+    _current_v2_command,
     _insert_claim,
     _outcome,
     _provenance,
+    _signed_v2_command,
+    _signed_v2_transaction,
     _source,
     _v2_booking,
     _v2_command,
@@ -47,15 +53,16 @@ def _wait_for_pg_blocker(observer, pid):
 @pytest.mark.parametrize(
     "correction_first", [True, False], ids=["clinical-first", "extension-first"]
 )
-def test_current_head_doctor_clinical_correction_and_extension_preserve_independent_revisions(
-    appointment_storage, correction_first
+def test_f01_doctor_clinical_correction_and_signed_extension_preserve_independent_revisions(
+    appointment_storage, appointment_api, correction_first
 ):
     runtime, migration, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
         source = _v2_source(connection, tenant, doctor)
-        claim = _v2_command(
-            connection, "create_followup_claim", source, **_v2_booking(source)
-        )
+    claim = _signed_v2_command(
+        appointment_api, "create_followup_claim", source, **_v2_booking(source)
+    )
+    with transaction(runtime, tenant) as connection:
         record = _v2_record(connection, claim)
         frozen = connection.execute(
             text("""
@@ -76,10 +83,8 @@ def test_current_head_doctor_clinical_correction_and_extension_preserve_independ
     def correct(connection):
         connection.execute(text("SET LOCAL lock_timeout = '5s'"))
         connection.execute(text("SET LOCAL statement_timeout = '15s'"))
-        connection.execute(
-            text("SELECT set_config('app.staff_id', :doctor, true)"),
-            {"doctor": str(doctor)},
-        )
+        # No clinical API exists in F-01; maintenance exercises the real guard
+        # and revision lock against the supported signed extension writer.
         connection.execute(
             text(
                 "SELECT set_config('app.clinical_reason', 'Synthetic correction race', true)"
@@ -96,7 +101,7 @@ def test_current_head_doctor_clinical_correction_and_extension_preserve_independ
         ).rowcount
 
     def extend(connection):
-        return _v2_command(
+        return _current_v2_command(
             connection,
             "extend_followup_claim",
             source,
@@ -114,7 +119,14 @@ def test_current_head_doctor_clinical_correction_and_extension_preserve_independ
         )
 
     def hold_first():
-        with transaction(runtime, tenant) as connection:
+        context = (
+            transaction(migration, tenant)
+            if correction_first
+            else _signed_v2_transaction(
+                appointment_api, "extend_followup_claim", source, reference=claim
+            )
+        )
+        with context as connection:
             holder_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             outcome = correct(connection) if correction_first else extend(connection)
             held.set()
@@ -123,18 +135,35 @@ def test_current_head_doctor_clinical_correction_and_extension_preserve_independ
 
     def wait_second():
         assert held.wait(timeout=10)
-        with transaction(runtime, tenant) as connection:
-            waiter_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            started.set()
+        context = (
+            _signed_v2_transaction(
+                appointment_api, "extend_followup_claim", source, reference=claim
+            )
+            if correction_first
+            else transaction(migration, tenant)
+        )
+        with context as connection:
+            if not correction_first:
+                waiter_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+                started.set()
             return extend(connection) if correction_first else correct(connection)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         holder = pool.submit(hold_first)
-        waiter = pool.submit(wait_second)
         try:
-            assert started.wait(timeout=10)
-            with migration.connect() as observer:
-                assert holder_pid[0] in _wait_for_pg_blocker(observer, waiter_pid[0])
+            assert held.wait(timeout=10)
+            checkpoint = (
+                _activation_checkpoint(appointment_api, waiter_pid, started)
+                if correction_first
+                else nullcontext()
+            )
+            with checkpoint:
+                waiter = pool.submit(wait_second)
+                assert started.wait(timeout=10)
+                with migration.connect() as observer:
+                    assert holder_pid[0] in _wait_for_pg_blocker(
+                        observer, waiter_pid[0]
+                    )
         finally:
             release.set()
         assert holder.result(timeout=20) == 1
@@ -259,14 +288,28 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
         else "appointment_storage"
     )
     runtime, migration, (tenant, _), (doctor, _) = storage
+    clinic = (
+        request.getfixturevalue("appointment_api")
+        if first not in ("release", "consume")
+        else None
+    )
+    command = _current_v2_command if clinic else _v2_command
     with transaction(runtime, tenant) as connection:
         source = _v2_source(connection, tenant, doctor)
-        claim = _v2_command(
-            connection, "create_followup_claim", source, **_v2_booking(source)
+    if clinic:
+        claim = _signed_v2_command(
+            clinic, "create_followup_claim", source, **_v2_booking(source)
         )
+    else:
+        with transaction(runtime, tenant) as connection:
+            claim = _v2_command(
+                connection, "create_followup_claim", source, **_v2_booking(source)
+            )
+    with transaction(runtime, tenant) as connection:
         record = _v2_record(connection, claim)
     held, release, started = Event(), Event(), Event()
     waiting_pid = []
+    holder_pid = []
     expected = {
         "source_revision": 0,
         "clinical_revision": 0,
@@ -277,7 +320,7 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
     }
 
     def extension(connection):
-        return _v2_command(
+        return command(
             connection,
             "extend_followup_claim",
             source,
@@ -288,9 +331,25 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
         )
 
     def hold_first():
-        with transaction(runtime, tenant) as connection:
+        routine = (
+            "record_followup_source_decision"
+            if first in ("decision", "restriction")
+            else "extend_followup_claim"
+        )
+        context = (
+            _signed_v2_transaction(
+                clinic,
+                routine,
+                source,
+                reference=claim if first == "extension" else None,
+            )
+            if clinic
+            else transaction(runtime, tenant)
+        )
+        with context as connection:
+            holder_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
             if first in ("decision", "restriction"):
-                _v2_command(
+                command(
                     connection,
                     "record_followup_source_decision",
                     source,
@@ -315,11 +374,32 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
 
     def wait_second():
         assert held.wait(timeout=10)
-        with transaction(runtime, tenant) as connection:
-            waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            started.set()
+        routine = (
+            "record_followup_source_decision"
+            if first == "decision"
+            else "extend_followup_claim"
+        )
+        context = (
+            _signed_v2_transaction(
+                clinic,
+                routine,
+                source,
+                reference=claim if first != "decision" else None,
+            )
+            if clinic
+            else transaction(runtime, tenant)
+        )
+        checkpoint = (
+            _activation_checkpoint(clinic, waiting_pid, started)
+            if clinic
+            else nullcontext()
+        )
+        with checkpoint, context as connection:
+            if not clinic:
+                waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+                started.set()
             if first == "decision":
-                return _v2_command(
+                return command(
                     connection,
                     "record_followup_source_decision",
                     source,
@@ -333,7 +413,7 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
         try:
             assert started.wait(timeout=10)
             with migration.connect() as observer:
-                assert _wait_for_pg_blocker(observer, waiting_pid[0])
+                assert holder_pid[0] in _wait_for_pg_blocker(observer, waiting_pid[0])
         finally:
             release.set()
         holder.result(timeout=20)
@@ -368,18 +448,38 @@ def test_v2_extension_first_remains_historical_after_later_restriction_or_termin
         else "appointment_storage"
     )
     runtime, migration, (tenant, _), (doctor, _) = storage
+    clinic = (
+        request.getfixturevalue("appointment_api") if later == "restriction" else None
+    )
+    command = _current_v2_command if clinic else _v2_command
     with transaction(runtime, tenant) as connection:
         source = _v2_source(connection, tenant, doctor)
-        claim = _v2_command(
-            connection, "create_followup_claim", source, **_v2_booking(source)
+    if clinic:
+        claim = _signed_v2_command(
+            clinic, "create_followup_claim", source, **_v2_booking(source)
         )
+    else:
+        with transaction(runtime, tenant) as connection:
+            claim = _v2_command(
+                connection, "create_followup_claim", source, **_v2_booking(source)
+            )
+    with transaction(runtime, tenant) as connection:
         record = _v2_record(connection, claim)
     held, release, started = Event(), Event(), Event()
     waiting_pid = []
+    holder_pid = []
 
     def extend_first():
-        with transaction(runtime, tenant) as connection:
-            _v2_command(
+        context = (
+            _signed_v2_transaction(
+                clinic, "extend_followup_claim", source, reference=claim
+            )
+            if clinic
+            else transaction(runtime, tenant)
+        )
+        with context as connection:
+            holder_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            command(
                 connection,
                 "extend_followup_claim",
                 source,
@@ -400,13 +500,24 @@ def test_v2_extension_first_remains_historical_after_later_restriction_or_termin
 
     def follow_later():
         assert held.wait(timeout=10)
-        with transaction(runtime, tenant) as connection:
+        context = (
+            _signed_v2_transaction(clinic, "record_followup_source_decision", source)
+            if clinic
+            else transaction(runtime, tenant)
+        )
+        checkpoint = (
+            _activation_checkpoint(clinic, waiting_pid, started)
+            if clinic
+            else nullcontext()
+        )
+        with checkpoint, context as connection:
             connection.execute(text("SET LOCAL lock_timeout='5s'"))
             connection.execute(text("SET LOCAL statement_timeout='15s'"))
-            waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
-            started.set()
+            if not clinic:
+                waiting_pid.append(connection.scalar(text("SELECT pg_backend_pid()")))
+                started.set()
             if later == "restriction":
-                _v2_command(
+                command(
                     connection,
                     "record_followup_source_decision",
                     source,
@@ -428,7 +539,7 @@ def test_v2_extension_first_remains_historical_after_later_restriction_or_termin
         try:
             assert started.wait(timeout=10)
             with migration.connect() as observer:
-                assert _wait_for_pg_blocker(observer, waiting_pid[0])
+                assert holder_pid[0] in _wait_for_pg_blocker(observer, waiting_pid[0])
         finally:
             release.set()
         first.result(timeout=20)
@@ -1087,15 +1198,27 @@ def test_deadline_day_is_inclusive_but_next_day_loses_parallel_race(
 
 def test_t133_denied_terminal_write_cannot_unwind_existing_active_claim(
     appointment_storage,
+    appointment_api,
 ):
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
     with transaction(runtime, tenant) as connection:
         source = _v2_source(connection, tenant, doctor)
-        claim = _v2_command(
-            connection, "create_followup_claim", source, **_v2_booking(source)
-        )
-        target = _v2_record(connection, claim)["id"]
+    claim = _signed_v2_command(
+        appointment_api, "create_followup_claim", source, **_v2_booking(source)
+    )
     with transaction(runtime, tenant) as connection:
+        target = _v2_record(connection, claim)["id"]
+    with _signed_v2_transaction(
+        appointment_api, "create_followup_claim", source
+    ) as connection:
+        assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+        assert not connection.scalar(
+            text("""
+            SELECT has_function_privilege(current_user,
+                'public.transition_terminal_appointment(uuid,uuid,bigint,jsonb)',
+                'EXECUTE')
+        """)
+        )
         with pytest.raises(DBAPIError) as denied, connection.begin_nested():
             connection.execute(
                 text("""

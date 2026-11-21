@@ -12,7 +12,11 @@ from pydantic import (
     model_validator,
 )
 
-from carepulse.policies.pricing import parse_money, parse_percent
+from carepulse.policies.pricing import (
+    parse_money,
+    parse_percent,
+    validate_discount_reason,
+)
 
 Revision = Annotated[int, Field(strict=True, ge=0)]
 DiscountKind = Literal["NONE", "FIXED", "PERCENT"]
@@ -82,6 +86,7 @@ class DiscountInput(BaseModel):
         (parse_percent if self.discount_type == "PERCENT" else parse_money)(
             self.discount_value
         )
+        validate_discount_reason(self.discount_type, self.discount_reason)
         return self
 
 

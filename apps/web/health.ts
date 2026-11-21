@@ -2,6 +2,7 @@
 import { createConnection } from "node:net";
 import type { PoolClient } from "pg";
 import { loadWebConfig } from "./config";
+import { isCompatEnabled, verifyWebReadinessCompat } from "./compat/admission";
 import { runtimeDatabase } from "./db";
 
 const DEPENDENCY_TIMEOUT_MS = 1000;
@@ -17,7 +18,7 @@ async function databaseReady(config: WebConfig): Promise<boolean> {
       "SELECT version_num FROM public.alembic_version",
     );
     completed = true;
-    return revision.rows.length === 1 && revision.rows[0].version_num === "0040_t173_numeric_money";
+    return revision.rows.length === 1 && revision.rows[0].version_num === "0046_f01_audit_integrity";
   } catch {
     return false;
   } finally {
@@ -25,12 +26,14 @@ async function databaseReady(config: WebConfig): Promise<boolean> {
   }
 }
 
-async function apiLive(config: WebConfig): Promise<boolean> {
+async function apiAvailable(config: WebConfig, compatEnabled: boolean): Promise<boolean> {
   try {
-    const response = await fetch(`${config.apiUrl}/health/live`, {
-      cache: "no-store", signal: AbortSignal.timeout(DEPENDENCY_TIMEOUT_MS),
+    const response = await fetch(`${config.apiUrl}/health/${compatEnabled ? "ready" : "live"}`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(compatEnabled ? PROBE_DEADLINE_MS : DEPENDENCY_TIMEOUT_MS),
     });
-    return response.status === 200 && (await response.json()).status === "alive";
+    return response.status === 200 &&
+      (await response.json()).status === (compatEnabled ? "ready" : "alive");
   } catch {
     return false;
   }
@@ -60,8 +63,10 @@ export async function foundationReady(): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const config = loadWebConfig();
+    const compatEnabled = isCompatEnabled();
     const dependencies = Promise.all([
-      databaseReady(config), apiLive(config),
+      compatEnabled ? verifyWebReadinessCompat() : databaseReady(config),
+      apiAvailable(config, compatEnabled),
       config.smtp ? smtpReady(config.smtp) : Promise.resolve(true),
     ]).then((checks) => checks.every(Boolean));
     return await Promise.race([

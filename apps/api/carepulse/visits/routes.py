@@ -25,7 +25,7 @@ from carepulse.visits.eligibility_contracts import (
 router = APIRouter(prefix="/v1/visits")
 
 
-def _transaction(request: Request):
+def _transaction(request: Request, *, stage: str = "PRIMARY"):
     if request.query_params:
         raise ContractError(422)
     identity = request.scope.get("carepulse.identity")
@@ -35,6 +35,7 @@ def _transaction(request: Request):
         request.app.state.db_engine,
         identity,
         request.app.state.service_config.policy.session_idle_minutes,
+        stage=stage,
     )
 
 
@@ -106,7 +107,7 @@ def patch_followup_decision(
             )
             return success_response(projection, revision)
     except ReceiptConflict:
-        with _transaction(request) as (connection, actor):
+        with _transaction(request, stage="RECEIPT_RECOVERY") as (connection, actor):
             projection, revision = recover_followup_receipt(
                 connection, actor, visit_id, command, key, "visits.followup_decision"
             )
@@ -127,7 +128,7 @@ def post_followup_extension(
             )
             return success_response(projection, revision, status_code=201)
     except ReceiptConflict:
-        with _transaction(request) as (connection, actor):
+        with _transaction(request, stage="RECEIPT_RECOVERY") as (connection, actor):
             projection, revision = recover_followup_receipt(
                 connection, actor, visit_id, command, key, "visits.extend_followup"
             )

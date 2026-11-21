@@ -140,6 +140,22 @@ def test_forbidden_authority_and_unqualified_booking_intents_rejected(invalid_fi
         BookAppointment.model_validate({**_valid_command(), **invalid_fields})
 
 
+@pytest.mark.parametrize("reason", [None, " ", "bad\x00reason", "bad\ud800reason"])
+def test_discount_reason_is_validated_before_booking_transaction(reason):
+    body = _valid_command()
+    body["discount"] = {
+        "discount_type": "FIXED",
+        "discount_value": "5.00",
+        "discount_reason": reason,
+    }
+    with pytest.raises(ValidationError):
+        BookAppointment.model_validate(body)
+    body["discount"]["discount_reason"] = "  approved hardship  "
+    assert BookAppointment.model_validate(body).discount.discount_reason == (
+        "  approved hardship  "
+    )
+
+
 def test_untimed_and_complete_timed_intents_have_distinct_fields():
     open_booking = BookAppointment.model_validate(_valid_command())
     assert open_booking.starts_at is open_booking.ends_at is None

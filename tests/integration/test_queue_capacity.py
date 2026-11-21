@@ -6,10 +6,14 @@ from uuid import UUID, uuid4
 
 import pytest
 from carepulse.db import transaction
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
+from test_appointment_persistence import _api_actor
+from test_appointment_persistence import appointment_api as appointment_api  # noqa: PLC0414
 from test_appointment_persistence import appointment_storage as appointment_storage  # noqa: PLC0414
 from test_queue_persistence import DAY, _appointment, _arrive
+from test_visit_persistence import _receptionist
 
 
 def _policy_capacity(connection, tenant, *, capacity=2, paused=False):
@@ -116,7 +120,8 @@ def _consume(connection, tenant, confirmation, appointment):
     return connection.execute(
         text("""
             UPDATE public.doctor_admission_confirmations
-            SET state='CONSUMED', consuming_admission_revision=1
+            SET state='CONSUMED', consuming_admission_revision=1,
+                consumed_at=clock_timestamp()
             WHERE organization_id=:tenant AND id=:confirmation
               AND appointment_id=:appointment AND state='ISSUED'
         """),
@@ -448,8 +453,11 @@ def test_doctor_scoped_confirmation_validates_revision_and_one_use_transition(
         raise RuntimeError("rollback simulation")
 
 
-def test_non_doctor_cannot_revoke_scoped_approval(appointment_storage):
+def test_non_doctor_cannot_revoke_scoped_approval(appointment_storage, appointment_api):
     runtime, _, (tenant, _), (doctor, _) = appointment_storage
+    receptionist = _api_actor(
+        appointment_api, tenant, _receptionist(appointment_api.migration, tenant)
+    )
     with (
         pytest.raises(RuntimeError, match="rollback simulation"),
         transaction(runtime, tenant) as connection,
@@ -465,16 +473,76 @@ def test_non_doctor_cannot_revoke_scoped_approval(appointment_storage):
         _lock(connection, tenant, doctor)
         _simulated_exam(connection, tenant, doctor, first)
         approval = _issue(connection, tenant, doctor, second, "MAIN", DAY)
-        _doctor_context(connection, uuid4())
-        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
-            connection.execute(
-                text("""
+        with signed_test_transaction(
+            appointment_api,
+            receptionist,
+            method="GET",
+            path="/v1/appointments",
+            purpose="APPOINTMENT_BOOKING",
+        ) as (api, _):
+            with pytest.raises(DBAPIError) as denied, api.begin_nested():
+                api.execute(
+                    text("""
                         UPDATE public.doctor_admission_confirmations
                         SET state='REVOKED', revoked_by_staff_id=:doctor,
                             revoked_at=clock_timestamp(), revoke_reason='Forged revoke'
                         WHERE organization_id=:tenant AND id=:approval
                     """),
-                {"tenant": tenant, "doctor": doctor, "approval": approval},
-            )
-        assert denied.value.orig.sqlstate == "42501"
+                    {"tenant": tenant, "doctor": doctor, "approval": approval},
+                )
+            assert denied.value.orig.sqlstate == "42501"
         raise RuntimeError("rollback simulation")
+
+
+@pytest.mark.parametrize("role", ["DOCTOR_OWNER", "RECEPTIONIST"])
+def test_f01_signed_staff_cannot_admit_or_issue_queue_approval(
+    appointment_storage, appointment_api, role
+):
+    _, migration, (tenant, _), (doctor, _) = appointment_storage
+    staff = doctor if role == "DOCTOR_OWNER" else _receptionist(migration, tenant)
+    identity = (
+        appointment_api.actors[tenant]
+        if staff == doctor
+        else _api_actor(appointment_api, tenant, staff)
+    )
+    with transaction(migration, tenant) as connection:
+        first = _appointment(connection, tenant, doctor)
+        _arrive(connection, tenant, doctor, first)
+    with signed_test_transaction(
+        appointment_api,
+        identity,
+        method="GET",
+        path=f"/v1/appointments/{first['id']}",
+        purpose="APPOINTMENT_BOOKING",
+    ) as (connection, actor):
+        assert actor.staff_id == staff
+        assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            _lock(connection, tenant, doctor)
+        assert denied.value.orig.sqlstate == "42501"
+        for statement in (
+            "SELECT * FROM public.doctor_admission_confirmations",
+            "INSERT INTO public.doctor_admission_confirmations (id) VALUES (:id)",
+            "UPDATE public.doctor_admission_confirmations SET state='REVOKED' WHERE id=:id",
+            "UPDATE public.appointments SET status='In Examination' WHERE id=:id",
+        ):
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(text(statement), {"id": UUID(first["id"])})
+            assert denied.value.orig.sqlstate == "42501"
+    with migration.connect() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT status FROM public.appointments WHERE id=:id"),
+                {"id": UUID(first["id"])},
+            )
+            == "Waiting"
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.doctor_admission_confirmations WHERE organization_id=:tenant"
+                ),
+                {"tenant": tenant},
+            )
+            == 0
+        )

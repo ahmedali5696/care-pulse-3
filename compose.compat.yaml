@@ -1,0 +1,529 @@
+# Disposable dual-generation compatibility topology for PRE-W3-COMPAT.
+# Both generations are isolated by private networks, distinct secrets, and
+# separately mounted read-only predecessor adapters.
+
+services:
+  db:
+    image: postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27
+    environment:
+      POSTGRES_DB: carepulse
+      POSTGRES_USER: carepulse_bootstrap
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - compat_db_data:/var/lib/postgresql/data
+    networks:
+      - compat_db
+
+  mail:
+    image: axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387
+    profiles:
+      - mail
+    networks:
+      - compat_source_app
+      - compat_candidate_app
+
+  source-api:
+    image: ${CP_SOURCE_API_IMAGE:-carepulse-compat-source-api:0040}
+    build:
+      context: ${CP_SOURCE_CONTEXT:-.}
+      dockerfile: apps/api/Dockerfile
+      target: api
+    profiles:
+      - source
+    networks:
+      compat_source_app:
+        aliases:
+          - api
+      compat_db:
+    depends_on:
+      - db
+    volumes:
+      - ${CP_COMPAT_ADAPTERS_DIR:-./ops/compat}:/run/compat-adapters:ro
+      - ${CP_COMPAT_MANIFEST_DIR:-./ops/compat}:/run/compat-manifest:ro
+    environment:
+      PYTHONPATH: /run/compat-adapters:/srv/apps/api:/srv
+      CP_COMPAT_SERVICE: api
+      CP_COMPAT_GENERATION: source
+      CP_COMPAT_EXPECTED_HEAD: 0040_t173_numeric_money
+      CP_COMPAT_TARGET_ID: ${CP_COMPAT_TARGET_ID:-compat-target-1}
+      CP_COMPAT_MANIFEST_ID: ${CP_SOURCE_MANIFEST_ID:-source-0040}
+      CP_ENV: ${CP_ENV:-test}
+      CP_SYNTHETIC_TEST_PROFILE: ${CP_SYNTHETIC_TEST_PROFILE:-true}
+      CP_POLICY_FILE: /run/secrets/active_policy
+      CP_DB_HOST: db
+      CP_DB_PORT: "5432"
+      CP_DB_NAME: carepulse
+      CP_DB_USER: ${CP_SOURCE_API_DB_USER:-carepulse_runtime}
+      CP_DB_PASSWORD_FILE: /run/secrets/source_runtime_db_password
+      CP_SERVICE_KEY_FILE: /run/secrets/source_service_key
+      CP_SIGNING_KEY_ID: ${CP_SOURCE_SIGNING_KEY_ID:-synthetic-source-v1}
+      CP_DELIVERY_KEY_ID: ${CP_SOURCE_DELIVERY_KEY_ID:-synthetic-source-delivery-v1}
+      CP_DELIVERY_PUBLIC_KEY_FILE: /run/secrets/source_delivery_public_key
+      CP_FILE_ENCRYPTION_KEY_FILE: /run/secrets/source_file_encryption_key
+      CP_MAIL_ENABLED: "false"
+      CP_SCAN_ENABLED: "false"
+    secrets:
+      - active_policy
+      - source_runtime_db_password
+      - source_service_key
+      - source_delivery_public_key
+      - source_file_encryption_key
+    entrypoint: ["python", "/run/compat-adapters/source-api.py"]
+
+  source-web:
+    image: ${CP_SOURCE_WEB_IMAGE:-carepulse-compat-source-web:0040}
+    build:
+      context: ${CP_SOURCE_CONTEXT:-.}
+      dockerfile: apps/web/Dockerfile
+      target: runtime
+    profiles:
+      - source
+    networks:
+      - compat_source_app
+      - compat_db
+    depends_on:
+      - source-api
+    volumes:
+      - ${CP_COMPAT_ADAPTERS_DIR:-./ops/compat}:/run/compat-adapters:ro
+      - ${CP_COMPAT_MANIFEST_DIR:-./ops/compat}:/run/compat-manifest:ro
+    environment:
+      CP_COMPAT_SERVICE: web
+      CP_COMPAT_GENERATION: source
+      CP_COMPAT_EXPECTED_HEAD: 0040_t173_numeric_money
+      CP_COMPAT_TARGET_ID: ${CP_COMPAT_TARGET_ID:-compat-target-1}
+      CP_COMPAT_MANIFEST_ID: ${CP_SOURCE_MANIFEST_ID:-source-0040}
+      CP_ENV: ${CP_ENV:-test}
+      CP_SYNTHETIC_TEST_PROFILE: ${CP_SYNTHETIC_TEST_PROFILE:-true}
+      CP_POLICY_FILE: /run/secrets/active_policy
+      CP_DB_HOST: db
+      CP_DB_PORT: "5432"
+      CP_DB_NAME: carepulse
+      CP_DB_USER: ${CP_SOURCE_WEB_DB_USER:-carepulse_runtime}
+      CP_DB_PASSWORD_FILE: /run/secrets/source_runtime_db_password
+      CP_AUTH_DB_USER: carepulse_auth
+      CP_AUTH_DB_PASSWORD_FILE: /run/secrets/source_auth_db_password
+      CP_INTERNAL_API_URL: http://api:8000
+      CP_COMPAT_EXPECTED_API_PEER: http://api:8000
+      CP_SIGNING_KEY_ID: ${CP_SOURCE_SIGNING_KEY_ID:-synthetic-source-v1}
+      CP_SERVICE_KEY_FILE: /run/secrets/source_service_key
+      CP_AUTH_SECRET_FILE: /run/secrets/source_auth_secret
+      CP_MAIL_ENABLED: "false"
+      CP_SCAN_ENABLED: "false"
+    secrets:
+      - active_policy
+      - source_runtime_db_password
+      - source_auth_db_password
+      - source_service_key
+      - source_auth_secret
+    command: ["sh", "-c", "node --experimental-strip-types --input-type=module -e 'import(\"./config.ts\").then((m) => m.loadWebConfig())' && exec node --require /run/compat-adapters/source-web.cjs ingress.mjs"]
+
+  source-worker:
+    image: ${CP_SOURCE_WORKER_IMAGE:-carepulse-compat-source-worker:0040}
+    build:
+      context: ${CP_SOURCE_CONTEXT:-.}
+      dockerfile: apps/api/Dockerfile
+      target: worker
+    profiles:
+      - source
+    networks:
+      - compat_db
+    depends_on:
+      - db
+    volumes:
+      - ${CP_COMPAT_ADAPTERS_DIR:-./ops/compat}:/run/compat-adapters:ro
+      - ${CP_COMPAT_MANIFEST_DIR:-./ops/compat}:/run/compat-manifest:ro
+    environment:
+      PYTHONPATH: /run/compat-adapters:/srv/apps/api:/srv
+      CP_COMPAT_SERVICE: worker
+      CP_COMPAT_GENERATION: source
+      CP_COMPAT_EXPECTED_HEAD: 0040_t173_numeric_money
+      CP_COMPAT_TARGET_ID: ${CP_COMPAT_TARGET_ID:-compat-target-1}
+      CP_COMPAT_MANIFEST_ID: ${CP_SOURCE_MANIFEST_ID:-source-0040}
+      CP_ENV: ${CP_ENV:-test}
+      CP_SYNTHETIC_TEST_PROFILE: ${CP_SYNTHETIC_TEST_PROFILE:-true}
+      CP_POLICY_FILE: /run/secrets/active_policy
+      CP_DB_HOST: db
+      CP_DB_PORT: "5432"
+      CP_DB_NAME: carepulse
+      CP_DB_USER: ${CP_SOURCE_WORKER_DB_USER:-carepulse_runtime}
+      CP_DB_PASSWORD_FILE: /run/secrets/source_runtime_db_password
+      CP_FILE_ENCRYPTION_KEY_FILE: /run/secrets/source_file_encryption_key
+      CP_MAIL_ENABLED: "false"
+      CP_SCAN_ENABLED: "false"
+    secrets:
+      - active_policy
+      - source_runtime_db_password
+      - source_file_encryption_key
+    command: ["python", "/run/compat-adapters/source-jobs.py", "worker"]
+
+  source-sender:
+    image: ${CP_SOURCE_SENDER_IMAGE:-carepulse-compat-source-sender:0040}
+    build:
+      context: ${CP_SOURCE_CONTEXT:-.}
+      dockerfile: apps/api/Dockerfile
+      target: sender
+    profiles:
+      - source-sender
+    networks:
+      - compat_source_app
+      - compat_db
+    depends_on:
+      - db
+    volumes:
+      - ${CP_COMPAT_ADAPTERS_DIR:-./ops/compat}:/run/compat-adapters:ro
+      - ${CP_COMPAT_MANIFEST_DIR:-./ops/compat}:/run/compat-manifest:ro
+    environment:
+      PYTHONPATH: /run/compat-adapters:/srv/apps/api:/srv
+      CP_COMPAT_SERVICE: sender
+      CP_COMPAT_GENERATION: source
+      CP_COMPAT_EXPECTED_HEAD: 0040_t173_numeric_money
+      CP_COMPAT_TARGET_ID: ${CP_COMPAT_TARGET_ID:-compat-target-1}
+      CP_COMPAT_MANIFEST_ID: ${CP_SOURCE_MANIFEST_ID:-source-0040}
+      CP_ENV: ${CP_ENV:-test}
+      CP_SYNTHETIC_TEST_PROFILE: ${CP_SYNTHETIC_TEST_PROFILE:-true}
+      CP_POLICY_FILE: /run/secrets/active_policy
+      CP_DB_HOST: db
+      CP_DB_PORT: "5432"
+      CP_DB_NAME: carepulse
+      CP_DB_USER: carepulse_sender
+      CP_SENDER_DB_PASSWORD_FILE: /run/secrets/source_sender_db_password
+      CP_MAIL_ENABLED: "true"
+      CP_SCAN_ENABLED: "false"
+      CP_SMTP_HOST: mail
+      CP_SMTP_PORT: "1025"
+      CP_MAIL_BASE_URL: ${CP_MAIL_BASE_URL:-http://127.0.0.1:3000}
+      CP_DELIVERY_LEASE_SECONDS: ${CP_DELIVERY_LEASE_SECONDS:-30}
+      CP_DELIVERY_ATTEMPT_TIMEOUT_SECONDS: ${CP_DELIVERY_ATTEMPT_TIMEOUT_SECONDS:-5}
+      CP_DELIVERY_MAX_ATTEMPTS: ${CP_DELIVERY_MAX_ATTEMPTS:-3}
+      CP_DELIVERY_RETRY_SECONDS: ${CP_DELIVERY_RETRY_SECONDS:-2}
+      CP_DELIVERY_PRIVATE_KEY_FILE: /run/secrets/source_delivery_private_key
+      CP_DELIVERY_PRIVATE_KEY_FILES: ${CP_SOURCE_DELIVERY_KEY_ID:-synthetic-source-delivery-v1}=/run/secrets/source_delivery_private_key
+    secrets:
+      - active_policy
+      - source_sender_db_password
+      - source_delivery_private_key
+    entrypoint: ["python", "/run/compat-adapters/source-jobs.py", "sender"]
+    command: []
+
+  candidate-api:
+    image: ${CP_CANDIDATE_API_IMAGE:-carepulse-compat-candidate-api:0046}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: api
+    profiles:
+      - candidate
+    networks:
+      compat_candidate_app:
+        aliases:
+          - api
+      compat_db:
+    depends_on:
+      - db
+    environment:
+      CP_COMPAT_SERVICE: api
+      CP_COMPAT_GENERATION: candidate
+      CP_COMPAT_EXPECTED_HEAD: 0046_f01_audit_integrity
+      CP_COMPAT_TARGET_ID: ${CP_COMPAT_TARGET_ID:-compat-target-1}
+      CP_COMPAT_MANIFEST_ID: ${CP_CANDIDATE_MANIFEST_ID:-candidate-0046}
+      CP_ENV: ${CP_ENV:-test}
+      CP_SYNTHETIC_TEST_PROFILE: ${CP_SYNTHETIC_TEST_PROFILE:-true}
+      CP_POLICY_FILE: /run/secrets/active_policy
+      CP_DB_HOST: db
+      CP_DB_PORT: "5432"
+      CP_DB_NAME: carepulse
+      CP_DB_USER: carepulse_api
+      CP_DB_PASSWORD_FILE: /run/secrets/api_db_password
+      CP_GATE_DB_PASSWORD_FILE: /run/secrets/gate_db_password
+      CP_SERVICE_KEY_FILE: /run/secrets/service_key
+      CP_SIGNING_KEY_ID: ${CP_SIGNING_KEY_ID:-synthetic-ci-v1}
+      CP_DELIVERY_KEY_ID: ${CP_DELIVERY_KEY_ID:-synthetic-ci-delivery-v1}
+      CP_DELIVERY_PUBLIC_KEY_FILE: /run/secrets/delivery_public_key
+      CP_FILE_ENCRYPTION_KEY_FILE: /run/secrets/file_encryption_key
+      CP_MAIL_ENABLED: "false"
+      CP_SCAN_ENABLED: "false"
+    secrets:
+      - active_policy
+      - api_db_password
+      - gate_db_password
+      - service_key
+      - delivery_public_key
+      - file_encryption_key
+
+  candidate-web:
+    image: ${CP_CANDIDATE_WEB_IMAGE:-carepulse-compat-candidate-web:0046}
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      target: runtime
+    profiles:
+      - candidate
+    networks:
+      - compat_candidate_app
+      - compat_db
+    depends_on:
+      - candidate-api
+    environment:
+      CP_COMPAT_SERVICE: web
+      CP_COMPAT_GENERATION: candidate
+      CP_COMPAT_EXPECTED_HEAD: 0046_f01_audit_integrity
+      CP_COMPAT_TARGET_ID: ${CP_COMPAT_TARGET_ID:-compat-target-1}
+      CP_COMPAT_MANIFEST_ID: ${CP_CANDIDATE_MANIFEST_ID:-candidate-0046}
+      CP_ENV: ${CP_ENV:-test}
+      CP_SYNTHETIC_TEST_PROFILE: ${CP_SYNTHETIC_TEST_PROFILE:-true}
+      CP_POLICY_FILE: /run/secrets/active_policy
+      CP_DB_HOST: db
+      CP_DB_PORT: "5432"
+      CP_DB_NAME: carepulse
+      CP_DB_USER: carepulse_web
+      CP_DB_PASSWORD_FILE: /run/secrets/web_db_password
+      CP_AUTH_DB_USER: carepulse_auth
+      CP_AUTH_DB_PASSWORD_FILE: /run/secrets/auth_db_password
+      CP_INTERNAL_API_URL: http://api:8000
+      CP_COMPAT_EXPECTED_API_PEER: http://api:8000
+      CP_SIGNING_KEY_ID: ${CP_SIGNING_KEY_ID:-synthetic-ci-v1}
+      CP_DB_IDENTITY_KEY_ID: ${CP_DB_IDENTITY_KEY_ID:-synthetic-db-ci-v1}
+      CP_DB_IDENTITY_KEY_FILE: /run/secrets/db_identity_key
+      CP_DELIVERY_KEY_ID: ${CP_DELIVERY_KEY_ID:-synthetic-ci-delivery-v1}
+      CP_DELIVERY_PUBLIC_KEY_FILE: /run/secrets/delivery_public_key
+      CP_SERVICE_KEY_FILE: /run/secrets/service_key
+      CP_AUTH_SECRET_FILE: /run/secrets/auth_secret
+      CP_RECOVERY_FINGERPRINT_KEY_VERSION: ${CP_RECOVERY_FINGERPRINT_KEY_VERSION:-synthetic-ci-v1}
+      CP_MAIL_ENABLED: "false"
+      CP_SCAN_ENABLED: "false"
+    secrets:
+      - active_policy
+      - web_db_password
+      - db_identity_key
+      - auth_db_password
+      - service_key
+      - auth_secret
+      - delivery_public_key
+
+  candidate-worker:
+    image: ${CP_CANDIDATE_WORKER_IMAGE:-carepulse-compat-candidate-worker:0046}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: worker
+    profiles:
+      - candidate
+    networks:
+      - compat_db
+    depends_on:
+      - db
+    environment:
+      CP_COMPAT_SERVICE: worker
+      CP_COMPAT_GENERATION: candidate
+      CP_COMPAT_EXPECTED_HEAD: 0046_f01_audit_integrity
+      CP_COMPAT_TARGET_ID: ${CP_COMPAT_TARGET_ID:-compat-target-1}
+      CP_COMPAT_MANIFEST_ID: ${CP_CANDIDATE_MANIFEST_ID:-candidate-0046}
+      CP_ENV: ${CP_ENV:-test}
+      CP_SYNTHETIC_TEST_PROFILE: ${CP_SYNTHETIC_TEST_PROFILE:-true}
+      CP_POLICY_FILE: /run/secrets/active_policy
+      CP_DB_HOST: db
+      CP_DB_PORT: "5432"
+      CP_DB_NAME: carepulse
+      CP_DB_USER: carepulse_worker
+      CP_DB_PASSWORD_FILE: /run/secrets/worker_db_password
+      CP_FILE_ENCRYPTION_KEY_FILE: /run/secrets/file_encryption_key
+      CP_MAIL_ENABLED: "false"
+      CP_SCAN_ENABLED: "false"
+    secrets:
+      - active_policy
+      - worker_db_password
+      - file_encryption_key
+
+  candidate-sender:
+    image: ${CP_CANDIDATE_SENDER_IMAGE:-carepulse-compat-candidate-sender:0046}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: sender
+    profiles:
+      - candidate-sender
+    networks:
+      - compat_candidate_app
+      - compat_db
+    depends_on:
+      - db
+    environment:
+      CP_COMPAT_SERVICE: sender
+      CP_COMPAT_GENERATION: candidate
+      CP_COMPAT_EXPECTED_HEAD: 0046_f01_audit_integrity
+      CP_COMPAT_TARGET_ID: ${CP_COMPAT_TARGET_ID:-compat-target-1}
+      CP_COMPAT_MANIFEST_ID: ${CP_CANDIDATE_MANIFEST_ID:-candidate-0046}
+      CP_ENV: ${CP_ENV:-test}
+      CP_SYNTHETIC_TEST_PROFILE: ${CP_SYNTHETIC_TEST_PROFILE:-true}
+      CP_POLICY_FILE: /run/secrets/active_policy
+      CP_DB_HOST: db
+      CP_DB_PORT: "5432"
+      CP_DB_NAME: carepulse
+      CP_DB_USER: carepulse_sender
+      CP_SENDER_DB_PASSWORD_FILE: /run/secrets/sender_db_password
+      CP_MAIL_ENABLED: "true"
+      CP_SCAN_ENABLED: "false"
+      CP_SMTP_HOST: mail
+      CP_SMTP_PORT: "1025"
+      CP_MAIL_BASE_URL: ${CP_MAIL_BASE_URL:-http://127.0.0.1:3000}
+      CP_DELIVERY_LEASE_SECONDS: ${CP_DELIVERY_LEASE_SECONDS:-30}
+      CP_DELIVERY_ATTEMPT_TIMEOUT_SECONDS: ${CP_DELIVERY_ATTEMPT_TIMEOUT_SECONDS:-5}
+      CP_DELIVERY_MAX_ATTEMPTS: ${CP_DELIVERY_MAX_ATTEMPTS:-3}
+      CP_DELIVERY_RETRY_SECONDS: ${CP_DELIVERY_RETRY_SECONDS:-2}
+      CP_DELIVERY_PRIVATE_KEY_FILE: /run/secrets/delivery_private_key
+      CP_DELIVERY_PRIVATE_KEY_FILES: ${CP_DELIVERY_PRIVATE_KEY_FILES:-synthetic-ci-delivery-v1=/run/secrets/delivery_private_key}
+    secrets:
+      - active_policy
+      - sender_db_password
+      - delivery_private_key
+
+  controller:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: test
+    profiles:
+      - controller
+    networks:
+      - compat_db
+    depends_on:
+      - db
+    environment:
+      CP_ENV: ${CP_ENV:-test}
+      CP_SYNTHETIC_TEST_PROFILE: ${CP_SYNTHETIC_TEST_PROFILE:-true}
+      CP_POLICY_FILE: /run/secrets/active_policy
+      CP_DB_HOST: db
+      CP_DB_PORT: "5432"
+      CP_DB_NAME: carepulse
+      CP_MIGRATION_PASSWORD_FILE: /run/secrets/migration_password
+    secrets:
+      - active_policy
+      - migration_password
+      - postgres_password
+
+  observer:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: test
+    profiles:
+      - observer
+    networks:
+      - compat_db
+      - compat_source_app
+      - compat_candidate_app
+    depends_on:
+      - db
+    volumes:
+      - ${CP_SOURCE_CONTEXT:-.}/db:/run/source-db:ro
+    environment:
+      CI: "true"
+      CP_CI_PROJECT: ${CP_CI_PROJECT:-}
+      CP_ENV: ${CP_ENV:-test}
+      CP_SYNTHETIC_TEST_PROFILE: ${CP_SYNTHETIC_TEST_PROFILE:-true}
+      CP_POLICY_FILE: /run/secrets/active_policy
+      CP_DB_HOST: db
+      CP_DB_PORT: "5432"
+      CP_DB_NAME: carepulse
+      CP_DB_USER: carepulse_api
+      CP_DB_PASSWORD_FILE: /run/secrets/api_db_password
+      CP_GATE_DB_PASSWORD_FILE: /run/secrets/gate_db_password
+      CP_WEB_DB_PASSWORD_FILE: /run/secrets/web_db_password
+      CP_WORKER_DB_PASSWORD_FILE: /run/secrets/worker_db_password
+      CP_AUTH_DB_PASSWORD_FILE: /run/secrets/auth_db_password
+      CP_OPERATOR_DB_PASSWORD_FILE: /run/secrets/operator_db_password
+      CP_SENDER_DB_PASSWORD_FILE: /run/secrets/sender_db_password
+      CP_MIGRATION_PASSWORD_FILE: /run/secrets/migration_password
+      CP_RUNTIME_DB_PASSWORD_FILE: /run/secrets/source_runtime_db_password
+      CP_SERVICE_KEY_FILE: /run/secrets/service_key
+      CP_SOURCE_SERVICE_KEY_FILE: /run/secrets/source_service_key
+      CP_SIGNING_KEY_ID: ${CP_SIGNING_KEY_ID:-synthetic-ci-v1}
+      CP_DB_IDENTITY_KEY_ID: ${CP_DB_IDENTITY_KEY_ID:-synthetic-db-ci-v1}
+      CP_DB_IDENTITY_KEY_FILE: /run/secrets/db_identity_key
+      CP_DELIVERY_KEY_ID: ${CP_DELIVERY_KEY_ID:-synthetic-ci-delivery-v1}
+      CP_DELIVERY_PUBLIC_KEY_FILE: /run/secrets/delivery_public_key
+      CP_DELIVERY_PRIVATE_KEY_FILE: /run/secrets/delivery_private_key
+      CP_MAIL_ENABLED: "false"
+      CP_SCAN_ENABLED: "false"
+    secrets:
+      - active_policy
+      - postgres_password
+      - migration_password
+      - api_db_password
+      - gate_db_password
+      - web_db_password
+      - worker_db_password
+      - auth_db_password
+      - operator_db_password
+      - sender_db_password
+      - service_key
+      - db_identity_key
+      - delivery_public_key
+      - delivery_private_key
+      - source_runtime_db_password
+      - source_service_key
+      - source_auth_db_password
+      - source_sender_db_password
+
+networks:
+  compat_db:
+    internal: true
+  compat_source_app:
+    internal: true
+  compat_candidate_app:
+    internal: true
+
+volumes:
+  compat_db_data:
+
+secrets:
+  postgres_password:
+    file: ${CP_DB_PASSWORD_FILE:?Set disposable DB password file}
+  migration_password:
+    file: ${CP_MIGRATION_SECRET_FILE:?Set disposable migration secret file}
+  active_policy:
+    file: ${CP_ACTIVE_POLICY_SOURCE_FILE:?Set active policy fixture path}
+  api_db_password:
+    file: ${CP_API_DB_PASSWORD_SOURCE_FILE:?Set API DB password file}
+  gate_db_password:
+    file: ${CP_GATE_DB_PASSWORD_SOURCE_FILE:?Set gate DB password file}
+  web_db_password:
+    file: ${CP_WEB_DB_PASSWORD_SOURCE_FILE:?Set Web DB password file}
+  worker_db_password:
+    file: ${CP_WORKER_DB_PASSWORD_SOURCE_FILE:?Set worker DB password file}
+  auth_db_password:
+    file: ${CP_AUTH_DB_PASSWORD_SOURCE_FILE:?Set auth DB password file}
+  operator_db_password:
+    file: ${CP_OPERATOR_DB_PASSWORD_SOURCE_FILE:?Set operator DB password file}
+  sender_db_password:
+    file: ${CP_SENDER_DB_PASSWORD_SOURCE_FILE:?Set sender DB password file}
+  service_key:
+    file: ${CP_SERVICE_KEY_SOURCE_FILE:?Set service key file}
+  db_identity_key:
+    file: ${CP_DB_IDENTITY_KEY_SOURCE_FILE:?Set DB identity key file}
+  delivery_public_key:
+    file: ${CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE:?Set delivery public key file}
+  delivery_private_key:
+    file: ${CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE:?Set delivery private key file}
+  file_encryption_key:
+    file: ${CP_FILE_ENCRYPTION_KEY_SOURCE_FILE:?Set file encryption key file}
+  auth_secret:
+    file: ${CP_AUTH_SECRET_SOURCE_FILE:?Set auth secret file}
+  source_runtime_db_password:
+    file: ${CP_SOURCE_RUNTIME_DB_PASSWORD_FILE:-${CP_RUNTIME_DB_PASSWORD_FILE:?Set source runtime DB password file}}
+  source_auth_db_password:
+    file: ${CP_SOURCE_AUTH_DB_PASSWORD_FILE:-${CP_AUTH_DB_PASSWORD_SOURCE_FILE:?Set source auth DB password file}}
+  source_sender_db_password:
+    file: ${CP_SOURCE_SENDER_DB_PASSWORD_FILE:-${CP_SENDER_DB_PASSWORD_SOURCE_FILE:?Set source sender DB password file}}
+  source_service_key:
+    file: ${CP_SOURCE_SERVICE_KEY_FILE:-${CP_SERVICE_KEY_SOURCE_FILE:?Set source service key file}}
+  source_auth_secret:
+    file: ${CP_SOURCE_AUTH_SECRET_FILE:-${CP_AUTH_SECRET_SOURCE_FILE:?Set source auth secret file}}
+  source_file_encryption_key:
+    file: ${CP_SOURCE_FILE_ENCRYPTION_KEY_FILE:-${CP_FILE_ENCRYPTION_KEY_SOURCE_FILE:?Set source file encryption key file}}
+  source_delivery_private_key:
+    file: ${CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE:?Set separate source delivery private key file}
+  source_delivery_public_key:
+    file: ${CP_SOURCE_DELIVERY_PUBLIC_KEY_FILE:?Set separate source delivery public key file}

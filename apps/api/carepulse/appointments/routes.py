@@ -35,7 +35,7 @@ from carepulse.identity.receipts import (
 router = APIRouter(prefix="/v1/appointments")
 
 
-def _transaction(request: Request):
+def _transaction(request: Request, *, stage: str = "PRIMARY"):
     if request.method != "GET" and request.query_params:
         raise ContractError(422)
     identity = request.scope.get("carepulse.identity")
@@ -45,6 +45,7 @@ def _transaction(request: Request):
         request.app.state.db_engine,
         identity,
         request.app.state.service_config.policy.session_idle_minutes,
+        stage=stage,
     )
 
 
@@ -91,7 +92,7 @@ def create_appointment(
             )
     except ReceiptConflict:
         # The losing write has rolled back; check live grants and resource visibility anew.
-        with _transaction(request) as (connection, actor):
+        with _transaction(request, stage="RECEIPT_RECOVERY") as (connection, actor):
             query = TenantReceiptQuery(
                 actor, "appointments.book", key, normalized_request_digest(command)
             )

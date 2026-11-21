@@ -246,10 +246,40 @@ def _end_unusable_job(connection: Connection, job_id: UUID, state: str) -> None:
     )
 
 
+def _has_unknown_compat_attempt(
+    connection: Connection, job_id: UUID | None, org_id: UUID | None = None
+) -> bool:
+    """Fail closed on unknown sender work through the sender-only control reader."""
+    if not connection.scalar(
+        text("SELECT to_regnamespace('compat_control') IS NOT NULL")
+    ):
+        return False
+    tenant = connection.scalar(
+        text("SELECT NULLIF(current_setting('app.organization_id', true), '')")
+    )
+    if not tenant or (org_id is not None and str(org_id) != tenant):
+        raise RuntimeError("Compatibility sender requires its current tenant context")
+    return bool(
+        connection.scalar(
+            text("""
+                SELECT compat_control.has_unknown_sender_attempt(
+                    :job, COALESCE(:org, NULLIF(current_setting('app.organization_id', true), ''))
+                )
+            """),
+            {
+                "job": str(job_id) if job_id is not None else None,
+                "org": str(org_id) if org_id is not None else None,
+            },
+        )
+    )
+
+
 def claim_delivery_job(
     connection: Connection, policy: ClaimPolicy, job_id: UUID | None = None
 ) -> ClaimedJob | None:
     """Lock one due job; DB time and the persisted generation decide ownership."""
+    if _has_unknown_compat_attempt(connection, job_id):
+        return None
     job = (
         connection.execute(
             text("""
@@ -269,6 +299,11 @@ def claim_delivery_job(
         .one_or_none()
     )
     if job is None:
+        return None
+    # A tenant-wide poll has no job ID until this row is selected. Recheck
+    # the actual candidate before any claim/reclaim, including a prior
+    # ambiguous attempt correlated only by this job's ID.
+    if _has_unknown_compat_attempt(connection, job["id"], job["organization_id"]):
         return None
     now = _database_time(connection)
     if not _proof_usable(connection, job, now):

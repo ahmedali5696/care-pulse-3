@@ -1,4 +1,5 @@
 import { loadWebConfig } from "../config.ts";
+import { isCompatEnabled, loadCompatWebConfig } from "../compat/admission.ts";
 import { currentActor } from "./session.ts";
 import { failure, validMutation } from "./http.ts";
 import { canonicalPath, signRequest } from "./signing.ts";
@@ -40,6 +41,17 @@ export async function boundedBody(request: Request): Promise<Uint8Array | null> 
 export async function forwardPrivate(request: Request, route: ApprovedRoute): Promise<Response> {
   if (request.method !== route.method || !route.path.startsWith("/v1/")) return failure(403);
   if (request.method !== "GET" && !validMutation(request)) return failure(403);
+  if (isCompatEnabled()) {
+    try {
+      const compatCfg = loadCompatWebConfig();
+      if (!compatCfg) return failure(503);
+      if (request.headers.has("x-carepulse-generation")) return failure(403);
+      const webCfg = loadWebConfig();
+      if (webCfg.apiUrl !== compatCfg.expectedApiPeer) return failure(503);
+    } catch {
+      return failure(503);
+    }
+  }
   let actor;
   try { actor = await currentActor(request); } catch { return failure(503); }
   if (!actor) return failure(401);
@@ -57,6 +69,7 @@ export async function forwardPrivate(request: Request, route: ApprovedRoute): Pr
       sessionId: actor.sessionId, role: actor.role,
       securityRevision: actor.securityRevision, purpose: route.purpose,
       idempotencyKey, keyId: config.signingKeyId, serviceKey: config.serviceKey,
+      dbIdentityKeyId: config.dbIdentityKeyId, dbIdentityKey: config.dbIdentityKey,
     });
     const headers = signed.headers;
     const contentType = request.headers.get("content-type");

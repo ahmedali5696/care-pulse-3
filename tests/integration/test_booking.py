@@ -14,12 +14,12 @@ from zoneinfo import ZoneInfo
 import pytest
 from carepulse.appointments.book import book_appointment
 from carepulse.appointments.booking_contracts import BookAppointment
-from carepulse.db import transaction
 from carepulse.identity.signing import canonical_payload, canonical_query
 from carepulse.main import app
 from carepulse.policies.schedule_service import load_current_schedule
 from carepulse.policies.slots import candidates_for_date
 from carepulse.policies.versions import append_version
+from runtime_identity_fixture import db_proof_headers, signed_test_transaction
 from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from test_appointment_persistence import _patient, _persist_with_status
@@ -27,7 +27,7 @@ from test_patients import create_patient
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _patch, pricing_request
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
-from test_schedule import SERVICE_DAY, _actor, _config, _publish
+from test_schedule import SERVICE_DAY, _config, publish_signed_schedule
 
 
 def booking_request(
@@ -91,6 +91,7 @@ def booking_request(
             .encode(),
         ),
     ]
+    headers.extend(db_proof_headers(signed))
     if declared_length is not None:
         headers.append((b"content-length", str(declared_length).encode()))
     scope = {
@@ -140,12 +141,7 @@ def booking_clinic(patient_backend):
         key=str(uuid4()),
     )
     assert status == 200, response
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(
-            connection,
-            _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
-            _config(mode="OPEN"),
-        )
+    publish_signed_schedule(clinic, _config(mode="OPEN"))
     return clinic
 
 
@@ -194,7 +190,7 @@ def booking_effects(clinic):
 
 
 def new_patient(clinic):
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.begin() as connection:
         return _patient(connection, clinic.tenant)
 
 
@@ -240,7 +236,7 @@ def test_signed_numeric_max_quote_booking_snapshot_and_receipt(booking_clinic, c
     assert saved["data"]["base_egp"] == base
     assert saved["data"]["net_egp"] == quote["net_egp"]
     assert saved["data"]["discount_value"] == percentage
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.connect() as connection:
         persisted = connection.execute(
             text("""
                 SELECT base_egp, net_egp, creation_standard_base_egp,
@@ -266,7 +262,7 @@ def test_signed_booking_rejects_historical_unrepresentable_price_atomically(
 ):
     clinic = booking_clinic
     oversized = "1" + "0" * 131_072 + ".00"
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.begin() as connection:
         append_version(
             connection,
             clinic.tenant,
@@ -429,7 +425,7 @@ def test_signed_open_booking_commits_frozen_ledger_and_readback(booking_clinic, 
     assert saved["starts_at"] is saved["ends_at"] is None
     assert len(saved["history"]) == 1 and saved["history"][0]["action"] == "CREATED"
     assert booking_effects(clinic) == (1, 1, 1, 1, 1, 1, 1, 1)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.connect() as connection:
         assert connection.execute(
             text("""
             SELECT a.id, a.current_number, n.number, s.net_egp, s.discount_value,
@@ -495,7 +491,7 @@ def test_signed_booking_roundtrips_16384_digit_percentage_and_receipt(booking_cl
     before = booking_effects(clinic)
     assert booking_request(clinic, clinic.owner, body=body, key=key) == (201, first)
     assert booking_effects(clinic) == before
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.connect() as connection:
         numeric_value, text_value, net = connection.execute(
             text("""
                 SELECT discount_value, discount_percent_text, net_egp
@@ -597,7 +593,7 @@ def test_counted_patient_day_guard_preserves_terminal_old_number(
 ):
     clinic = booking_clinic
     patient = new_patient(clinic)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.begin() as connection:
         previous = _persist_with_status(
             connection,
             clinic.tenant,
@@ -614,7 +610,7 @@ def test_counted_patient_day_guard_preserves_terminal_old_number(
     if allowed:
         assert result["data"]["id"] != previous["id"]
         assert result["data"]["number"] == previous["number"] + 1
-        with transaction(clinic.runtime, clinic.tenant) as connection:
+        with clinic.migration.connect() as connection:
             assert (
                 connection.scalar(
                     text("SELECT current_number FROM public.appointments WHERE id=:id"),
@@ -663,7 +659,7 @@ def test_invalid_booking_denies_without_partial_ledger(
 def test_archived_patient_and_foreign_patient_cannot_create(booking_clinic):
     clinic = booking_clinic
     archived = new_patient(clinic)
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.begin() as connection:
         connection.execute(
             text("""
             UPDATE public.patients SET archived = true,
@@ -721,13 +717,8 @@ def test_no_booking_horizon_but_current_rules_still_apply(
             {"weekday": weekday, "starts_at": "09:00", "ends_at": "12:00"}
             for weekday in range(1, 8)
         ]
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(
-            connection,
-            _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
-            proposal,
-            revision=2,
-        )
+    publish_signed_schedule(clinic, proposal, revision=2)
+    with clinic.migration.connect() as connection:
         interval = (
             candidates_for_date(load_current_schedule(connection, clinic.tenant), day)[
                 0
@@ -776,13 +767,8 @@ def test_signed_booking_rejects_normalized_offset_and_truncated_instant(
             {"weekday": weekday, "starts_at": "09:00", "ends_at": "12:00"}
         ],
     )
-    with transaction(clinic.runtime, clinic.tenant) as connection:
-        _publish(
-            connection,
-            _actor(clinic.tenant, UUID(clinic.owner.staff_id)),
-            config,
-            revision=2,
-        )
+    publish_signed_schedule(clinic, config, revision=2)
+    with clinic.migration.connect() as connection:
         slot = candidates_for_date(
             load_current_schedule(connection, clinic.tenant), day
         )[0]
@@ -875,7 +861,7 @@ def test_receipt_survives_repricing_and_archive_but_not_changed_body_or_revocati
         )[0]
         == 200
     )
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.begin() as connection:
         connection.execute(
             text(
                 "UPDATE public.patients SET archived = true, lifecycle_revision = 1 WHERE id=:id"
@@ -902,8 +888,15 @@ def test_lost_response_after_commit_reconciles_by_original_key(booking_clinic):
     clinic = booking_clinic
     patient = new_patient(clinic)
     body, key = booking_body(patient), str(uuid4())
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with signed_test_transaction(
+        clinic,
+        clinic.owner,
+        method="POST",
+        path="/v1/appointments",
+        purpose="APPOINTMENT_BOOKING",
+        body=body,
+        key=key,
+    ) as (connection, actor):
         book_appointment(connection, actor, BookAppointment.model_validate(body), key)
     before = booking_effects(clinic)
     status, resolved = booking_request(clinic, clinic.owner, body=body, key=key)
@@ -917,7 +910,7 @@ def test_paused_doctor_and_disabled_walkin_do_not_block_ordinary_booking(
     booking_clinic,
 ):
     clinic = booking_clinic
-    with transaction(clinic.runtime, clinic.tenant) as connection:
+    with clinic.migration.begin() as connection:
         append_version(
             connection,
             clinic.tenant,
@@ -955,6 +948,7 @@ def assert_tenant_context_cleared(connection, backend_pid, *, terminated=False):
     else:
         assert current_pid == backend_pid
     assert organization_id in ("", None)
+    assert connection.scalar(text("SELECT public.f01_org()")) is None
 
 
 @pytest.mark.parametrize("blocked_table", BOOKING_WRITE_STAGES)
@@ -965,21 +959,27 @@ def test_postgres_lock_timeout_rolls_back_all_booking_writes_and_reuses_unassign
     clinic = booking_clinic
     patient = new_patient(clinic)
     command = BookAppointment.model_validate(booking_body(patient))
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
     key = str(uuid4())
     before = booking_effects(clinic)
     with clinic.migration.begin() as holder:
         holder.execute(text(f"LOCK TABLE public.{blocked_table} IN SHARE MODE"))
+        with (
+            pytest.raises(DBAPIError) as blocked,
+            signed_test_transaction(
+                clinic,
+                clinic.owner,
+                method="POST",
+                path="/v1/appointments",
+                purpose="APPOINTMENT_BOOKING",
+                body=booking_body(patient),
+                key=key,
+            ) as (connection, actor),
+        ):
+            backend_pid = connection.scalar(text("SELECT pg_backend_pid()"))
+            connection.execute(text("SET LOCAL lock_timeout = '300ms'"))
+            book_appointment(connection, actor, command, key)
+        assert blocked.value.orig.sqlstate == "55P03"
         with clinic.runtime.connect() as connection:
-            with pytest.raises(DBAPIError) as blocked, connection.begin():
-                connection.execute(
-                    text("SELECT set_config('app.organization_id', :tenant, true)"),
-                    {"tenant": str(clinic.tenant)},
-                )
-                backend_pid = connection.scalar(text("SELECT pg_backend_pid()"))
-                connection.execute(text("SET LOCAL lock_timeout = '300ms'"))
-                book_appointment(connection, actor, command, key)
-            assert blocked.value.orig.sqlstate == "55P03"
             assert_tenant_context_cleared(connection, backend_pid)
     assert booking_effects(clinic) == before
     status, saved = booking_request(
@@ -997,33 +997,37 @@ def test_real_sql_error_at_each_write_stage_rolls_back_every_booking_effect(
     clinic = booking_clinic
     patient = new_patient(clinic)
     command = BookAppointment.model_validate(booking_body(patient))
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
     key = str(uuid4())
     expected_sql = f"INSERT INTO public.{failed_table} "
     reached = []
     before = booking_effects(clinic)
 
+    with (
+        pytest.raises(DBAPIError) as failed,
+        signed_test_transaction(
+            clinic,
+            clinic.owner,
+            method="POST",
+            path="/v1/appointments",
+            purpose="APPOINTMENT_BOOKING",
+            body=booking_body(patient),
+            key=key,
+        ) as (connection, actor),
+    ):
+        backend_pid = connection.scalar(text("SELECT pg_backend_pid()"))
+
+        @event.listens_for(connection, "before_cursor_execute", retval=True)
+        def fail_sql_write(_connection, _cursor, statement, params, _context, _many):
+            if expected_sql in " ".join(statement.split()):
+                reached.append(failed_table)
+                return "SELECT 1 / 0", ()
+            return statement, params
+
+        book_appointment(connection, actor, command, key)
+
+    assert reached == [failed_table]
+    assert failed.value.orig.sqlstate == "22012"
     with clinic.runtime.connect() as connection:
-        with pytest.raises(DBAPIError) as failed, connection.begin():
-            connection.execute(
-                text("SELECT set_config('app.organization_id', :tenant, true)"),
-                {"tenant": str(clinic.tenant)},
-            )
-            backend_pid = connection.scalar(text("SELECT pg_backend_pid()"))
-
-            @event.listens_for(connection, "before_cursor_execute", retval=True)
-            def fail_sql_write(
-                _connection, _cursor, statement, params, _context, _many
-            ):
-                if expected_sql in " ".join(statement.split()):
-                    reached.append(failed_table)
-                    return "SELECT 1 / 0", ()
-                return statement, params
-
-            book_appointment(connection, actor, command, key)
-
-        assert reached == [failed_table]
-        assert failed.value.orig.sqlstate == "22012"
         assert_tenant_context_cleared(connection, backend_pid)
     assert booking_effects(clinic) == before
     status, recovered = booking_request(
@@ -1041,7 +1045,6 @@ def test_real_postgres_connection_loss_at_each_write_stage_rolls_back_receipt(
     clinic = booking_clinic
     patient = new_patient(clinic)
     command = BookAppointment.model_validate(booking_body(patient))
-    actor = _actor(clinic.tenant, UUID(clinic.owner.staff_id))
     key = str(uuid4())
     terminated = []
     before = booking_effects(clinic)
@@ -1049,7 +1052,15 @@ def test_real_postgres_connection_loss_at_each_write_stage_rolls_back_receipt(
 
     with (
         pytest.raises(DBAPIError) as failed,
-        transaction(clinic.runtime, clinic.tenant) as connection,
+        signed_test_transaction(
+            clinic,
+            clinic.owner,
+            method="POST",
+            path="/v1/appointments",
+            purpose="APPOINTMENT_BOOKING",
+            body=booking_body(patient),
+            key=key,
+        ) as (connection, actor),
     ):
         backend_pid = connection.scalar(text("SELECT pg_backend_pid()"))
 
