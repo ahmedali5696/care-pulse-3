@@ -35,6 +35,7 @@ function loadAdapter() {
       control_select: true, control_mutation: false,
       control_column_mutation: false, work_access: false,
       work_column_access: false, other_schema_access: false,
+      unapproved_public_relation_privilege: false,
       patient_read: user === "carepulse_runtime",
       appointment_write: user === "carepulse_runtime",
       auth_native_crud: user === "carepulse_auth",
@@ -132,6 +133,7 @@ test("source native-auth pool.query and promise checkouts fail closed on effecti
   assert.match(sqlChecks[0], /has_database_privilege/);
   assert.match(sqlChecks[0], /has_any_column_privilege/);
   assert.match(sqlChecks[0], /auth_unexpected_relation_access/);
+  assert.match(sqlChecks[0], /has_table_privilege\(current_user, c\.oid, 'TRUNCATE,REFERENCES,TRIGGER'\)/);
   assert.match(sqlChecks[0], /format\('public\.%I', native_table\), 'INSERT'/);
   assert.match(sqlChecks[0], /\('user'\), \('session'\), \('account'\), \('verification'\)/);
 
@@ -140,6 +142,16 @@ test("source native-auth pool.query and promise checkouts fail closed on effecti
   await assert.rejects(auth.query('INSERT INTO public."session" VALUES (...)'), /privilege mismatch/);
   assert.ok(!executed.includes('INSERT INTO public."session" VALUES (...)'));
   roles.carepulse_auth.auth_native_crud = true;
+
+  roles.carepulse_auth.unapproved_public_relation_privilege = true;
+  await assert.rejects(auth.query("TRUNCATE public.patients"), /privilege mismatch/);
+  assert.ok(!executed.includes("TRUNCATE public.patients"));
+  roles.carepulse_auth.unapproved_public_relation_privilege = false;
+
+  roles.carepulse_runtime.unapproved_public_relation_privilege = true;
+  await assert.rejects(runtime.connect(), /privilege mismatch/);
+  assert.ok(released.some((r) => r.user === "carepulse_runtime" && r.destroy));
+  roles.carepulse_runtime.unapproved_public_relation_privilege = false;
 
   roles.carepulse_auth.auth_unexpected_relation_access = true;
   await assert.rejects(auth.query("SELECT leaked_clinical_data"), /privilege mismatch/);

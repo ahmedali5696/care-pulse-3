@@ -36,6 +36,13 @@ def _source_adapter(filename: str):
     return module
 
 
+def _source_web_role_probe() -> str:
+    """Execute the source Web adapter's exact catalog query on real PostgreSQL."""
+    path = Path(__file__).resolve().parents[2] / "ops/compat/source-web.cjs"
+    content = path.read_text(encoding="utf-8")
+    return content.split("const ident = await client.query(", 1)[1].split(chr(96), 2)[1]
+
+
 def _response(guard, path: str) -> tuple[int, bytes]:
     messages = []
 
@@ -90,6 +97,11 @@ def test_0040_source_privileges_fail_closed_on_surviving_connections(
             with runtime_engine.connect() as surviving:
                 epoch = runtime_epoch(surviving)
                 assert job_epoch(surviving, "carepulse_runtime") == epoch
+                web_role = (
+                    surviving.execute(text(_source_web_role_probe())).mappings().one()
+                )
+                assert web_role["current_user"] == "carepulse_runtime"
+                assert web_role["unapproved_public_relation_privilege"] is False
                 assert surviving.execute(
                     text(
                         "SELECT has_table_privilege(current_user, 'public.patients', 'SELECT')"
@@ -170,6 +182,10 @@ def test_0040_source_privileges_fail_closed_on_surviving_connections(
                             'REVOKE DELETE ON public."account" FROM carepulse_runtime',
                         ),
                         (
+                            "GRANT TRUNCATE ON public.patients TO carepulse_runtime",
+                            "REVOKE TRUNCATE ON public.patients FROM carepulse_runtime",
+                        ),
+                        (
                             "ALTER ROLE carepulse_runtime CREATEDB",
                             "ALTER ROLE carepulse_runtime NOCREATEDB",
                         ),
@@ -193,6 +209,12 @@ def test_0040_source_privileges_fail_closed_on_surviving_connections(
                                 runtime_epoch(surviving)
                             with pytest.raises(RuntimeError, match="privilege"):
                                 job_epoch(surviving, "carepulse_runtime")
+                            if "GRANT TRUNCATE" in grant:
+                                assert (
+                                    surviving.execute(text(_source_web_role_probe()))
+                                    .mappings()
+                                    .one()["unapproved_public_relation_privilege"]
+                                )
                             with pytest.raises(PreflightError):
                                 run_source_preflight(observer, **preflight_args)
 
@@ -243,6 +265,12 @@ def test_0040_source_privileges_fail_closed_on_surviving_connections(
                         assert not auth.execute(
                             "SELECT has_table_privilege(current_user, 'public.patients', 'SELECT') AS ok"
                         ).fetchone()["ok"]
+                        assert (
+                            auth.execute(_source_web_role_probe()).fetchone()[
+                                "auth_native_crud"
+                            ]
+                            is True
+                        )
                         auth_drifts = (
                             (
                                 "GRANT SELECT ON public.patients TO carepulse_auth",
@@ -272,6 +300,13 @@ def test_0040_source_privileges_fail_closed_on_surviving_connections(
                                 )
                                 with pytest.raises(PreflightError):
                                     run_source_preflight(observer, **preflight_args)
+                                if 'REVOKE INSERT ON public."session"' in grant:
+                                    assert (
+                                        auth.execute(
+                                            _source_web_role_probe()
+                                        ).fetchone()["auth_native_crud"]
+                                        is False
+                                    )
                             finally:
                                 admin.execute(revoke)
                             assert run_source_preflight(
@@ -330,6 +365,14 @@ def test_0040_source_privileges_fail_closed_on_surviving_connections(
                         "REVOKE INSERT ON public.appointments FROM carepulse_sender",
                     ),
                     (
+                        "GRANT UPDATE (status) ON public.appointments TO carepulse_sender",
+                        "REVOKE UPDATE (status) ON public.appointments FROM carepulse_sender",
+                    ),
+                    (
+                        'GRANT SELECT(identifier) ON public."verification" TO carepulse_sender',
+                        'REVOKE SELECT(identifier) ON public."verification" FROM carepulse_sender',
+                    ),
+                    (
                         "GRANT UPDATE ON compat_control.target_control TO carepulse_sender",
                         "REVOKE UPDATE ON compat_control.target_control FROM carepulse_sender",
                     ),
@@ -359,6 +402,8 @@ def test_0040_source_privileges_fail_closed_on_surviving_connections(
                         admin.execute(grant)
                         with pytest.raises(RuntimeError, match="privilege"):
                             job_epoch(sender, "carepulse_sender")
+                        with pytest.raises(PreflightError):
+                            run_source_preflight(admin, **preflight_args)
                     finally:
                         sender.rollback()
                         admin.execute(revoke)

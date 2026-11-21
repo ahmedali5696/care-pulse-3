@@ -124,6 +124,12 @@ async function verifyClient(client, cfg, expectedRole) {
                 AND n.nspname NOT LIKE 'pg_%'
                 AND has_schema_privilege(current_user, n.oid, 'USAGE,CREATE')
             ) AS other_schema_access,
+            EXISTS (
+              SELECT 1 FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                AND has_table_privilege(current_user, c.oid, 'TRUNCATE,REFERENCES,TRIGGER')
+            ) AS unapproved_public_relation_privilege,
             has_table_privilege(current_user, 'public.patients', 'SELECT') AS patient_read,
             has_table_privilege(current_user, 'public.appointments', 'INSERT') AS appointment_write,
             (SELECT bool_and(
@@ -242,6 +248,7 @@ async function verifyClient(client, cfg, expectedRole) {
     !r.control_reader || !r.control_status_reader || !r.attempt_writer || r.sender_authority ||
     !r.control_select || r.control_mutation || r.control_column_mutation ||
     r.work_access || r.work_column_access || r.other_schema_access ||
+    r.unapproved_public_relation_privilege ||
     (expectedRole === 'carepulse_auth'
       ? r.patient_read || r.appointment_write || r.auth_unexpected_relation_access ||
         r.auth_widened_metadata ||

@@ -68,6 +68,11 @@ _SOURCE_ROLE_PROBE = """
                  AND (has_schema_privilege(current_user, n.oid, 'USAGE')
                       OR has_schema_privilege(current_user, n.oid, 'CREATE'))
            )
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relkind IN ('r','p')
+                 AND has_table_privilege(current_user, c.oid, 'TRUNCATE,REFERENCES,TRIGGER')
+           )
            AND CASE
                WHEN current_user = 'carepulse_runtime' THEN
                    has_table_privilege(current_user, 'public.patients', 'SELECT')
@@ -96,9 +101,22 @@ _SOURCE_ROLE_PROBE = """
                    AND has_column_privilege(current_user, 'public.delivery_jobs', 'claim_generation', 'SELECT')
                    AND has_table_privilege(current_user, 'public.delivery_jobs', 'UPDATE')
                    AND NOT has_table_privilege(current_user, 'public.delivery_jobs', 'INSERT')
-                   AND NOT has_column_privilege(current_user, 'public."verification"', 'value', 'SELECT')
-                   AND NOT has_column_privilege(
-                       current_user, 'public.protected_delivery_material', 'ciphertext_base64url', 'SELECT'
+                   AND has_column_privilege(current_user, 'public."verification"', 'id', 'SELECT')
+                   AND has_column_privilege(current_user, 'public."verification"', 'expiresAt', 'SELECT')
+                   AND has_column_privilege(current_user, 'public.protected_delivery_material', 'job_id', 'SELECT')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pg_attribute a
+                       WHERE a.attrelid = 'public."verification"'::regclass
+                         AND a.attnum > 0 AND NOT a.attisdropped
+                         AND a.attname NOT IN ('id', 'expiresAt')
+                         AND has_column_privilege(current_user, a.attrelid, a.attnum, 'SELECT')
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pg_attribute a
+                       WHERE a.attrelid = 'public.protected_delivery_material'::regclass
+                         AND a.attnum > 0 AND NOT a.attisdropped
+                         AND a.attname <> 'job_id'
+                         AND has_column_privilege(current_user, a.attrelid, a.attnum, 'SELECT')
                    )
                    AND NOT EXISTS (
                        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -127,10 +145,14 @@ _SOURCE_ROLE_PROBE = """
                              'clinical_audit', 'followup_claims', 'followup_source_state'
                          ) AND (
                              has_any_column_privilege(current_user, c.oid, 'SELECT')
+                             OR has_any_column_privilege(current_user, c.oid, 'INSERT')
+                             OR has_any_column_privilege(current_user, c.oid, 'UPDATE')
+                             OR has_any_column_privilege(current_user, c.oid, 'REFERENCES')
                              OR has_table_privilege(current_user, c.oid, 'INSERT')
                              OR has_table_privilege(current_user, c.oid, 'UPDATE')
                              OR has_table_privilege(current_user, c.oid, 'DELETE')
                              OR has_table_privilege(current_user, c.oid, 'TRUNCATE')
+                             OR has_table_privilege(current_user, c.oid, 'TRIGGER')
                          )
                    )
                ELSE FALSE

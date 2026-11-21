@@ -148,7 +148,7 @@ def _verify_source_effective_grants(conn: psycopg.Connection) -> None:
                        SELECT 1 FROM pg_namespace n
                        WHERE n.nspname NOT IN (
                            'public','compat_control','pg_catalog','information_schema'
-                       ) AND n.nspname NOT LIKE 'pg_%'
+                        ) AND n.nspname NOT LIKE 'pg_%%'
                        AND (
                            has_schema_privilege(%s, n.oid, 'USAGE')
                            OR has_schema_privilege(%s, n.oid, 'CREATE')
@@ -159,6 +159,17 @@ def _verify_source_effective_grants(conn: psycopg.Connection) -> None:
         ).fetchone()
         if row is None or row["safe"] is not True:
             raise PreflightError("Source login database, schema or control ACL drift")
+        if conn.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public' AND c.relkind IN ('r','p')
+                  AND has_table_privilege(%s, c.oid, 'TRUNCATE,REFERENCES,TRIGGER')
+            ) AS unsafe
+            """,
+            (role,),
+        ).fetchone()["unsafe"]:
+            raise PreflightError("Source login destructive public-table grant drift")
         can_record = conn.execute(
             """
             SELECT has_function_privilege(
@@ -214,6 +225,9 @@ def _verify_source_effective_grants(conn: psycopg.Connection) -> None:
                     WHERE n.nspname = 'public' AND c.relname = ANY(%s)
                       AND (
                           has_any_column_privilege(%s, c.oid, 'SELECT')
+                          OR has_any_column_privilege(%s, c.oid, 'INSERT')
+                          OR has_any_column_privilege(%s, c.oid, 'UPDATE')
+                          OR has_any_column_privilege(%s, c.oid, 'REFERENCES')
                           OR has_table_privilege(%s, c.oid, 'INSERT')
                           OR has_table_privilege(%s, c.oid, 'UPDATE')
                           OR has_table_privilege(%s, c.oid, 'DELETE')
@@ -221,7 +235,7 @@ def _verify_source_effective_grants(conn: psycopg.Connection) -> None:
                       )
                 ) AS unexpected
                 """,
-                (_SOURCE_CLINICAL_TABLES, *((role,) * 5)),
+                (_SOURCE_CLINICAL_TABLES, *((role,) * 8)),
             ).fetchone()["unexpected"]
             if extra_clinical:
                 raise PreflightError("Source login clinical ACL drift")
@@ -264,12 +278,17 @@ def _verify_source_effective_grants(conn: psycopg.Connection) -> None:
     for role, col, permission in (
         ("carepulse_sender", "claim_generation", True),
         ("carepulse_sender", "id", True),
-        ("carepulse_sender", "ciphertext_base64url", False),
+        ("carepulse_sender", "job_id", True),
+        ("carepulse_sender", "expiresAt", True),
     ):
         relation = (
             "public.protected_delivery_material"
-            if col == "ciphertext_base64url"
-            else "public.delivery_jobs"
+            if col == "job_id"
+            else (
+                'public."verification"'
+                if col == "expiresAt"
+                else "public.delivery_jobs"
+            )
         )
         actual = conn.execute(
             "SELECT has_column_privilege(%s, %s, %s, 'SELECT') AS permitted",
@@ -277,6 +296,23 @@ def _verify_source_effective_grants(conn: psycopg.Connection) -> None:
         ).fetchone()["permitted"]
         if actual is not permission:
             raise PreflightError("Source sender column privilege drift")
+    for relation, allowed in (
+        ('public."verification"', ("id", "expiresAt")),
+        ("public.protected_delivery_material", ("job_id",)),
+    ):
+        row = conn.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped
+                  AND a.attname <> ALL(%s::text[])
+                  AND has_column_privilege('carepulse_sender', a.attrelid, a.attnum, 'SELECT')
+            ) AS excess
+            """,
+            (relation, list(allowed)),
+        ).fetchone()
+        if row is None or row["excess"]:
+            raise PreflightError("Source sender unexpected column grant")
 
 
 def verify_populated_source_basis(

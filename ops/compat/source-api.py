@@ -73,6 +73,11 @@ _SOURCE_ROLE_PROBE = """
                  AND (has_schema_privilege(current_user, n.oid, 'USAGE')
                       OR has_schema_privilege(current_user, n.oid, 'CREATE'))
            )
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relkind IN ('r','p')
+                 AND has_table_privilege(current_user, c.oid, 'TRUNCATE,REFERENCES,TRIGGER')
+           )
            AND has_table_privilege(current_user, 'public.patients', 'SELECT')
            AND has_table_privilege(current_user, 'public.appointments', 'INSERT')
            AND has_table_privilege(current_user, 'public.delivery_jobs', 'UPDATE')
