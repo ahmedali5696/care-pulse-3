@@ -1326,7 +1326,7 @@ if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
     # Hosted immutable-source Web: genuine Node preload, Next HTTP and both real 0040 logins.
     docker compose -f compose.compat.yaml --profile observer run --rm --no-deps -T observer python -c 'from tests.integration.test_compat_source_web_runtime import prepare_source_web_http_lab; prepare_source_web_http_lab()'
     docker compose -f compose.compat.yaml --profile source --profile candidate up -d --no-build --no-deps source-api source-web candidate-web
-    docker compose -f compose.compat.yaml --profile source run -d --no-build --no-deps --name "${CP_CI_PROJECT}-source-peer" -e CP_COMPAT_EXPECTED_API_PEER=http://candidate-api:8000 source-web
+    docker compose -f compose.compat.yaml --profile source run -d --no-deps --name "${CP_CI_PROJECT}-source-peer" -e CP_COMPAT_EXPECTED_API_PEER=http://candidate-api:8000 source-web
     source_web_id="$(docker compose -f compose.compat.yaml --profile source ps -q source-web)"
     test -n "$source_web_id"
     source_web_host_pid="$(docker inspect --format '{{.State.Pid}}' "$source_web_id")"

@@ -313,8 +313,13 @@ def test_original_source_web_http_rechecks_live_native_and_runtime_privileges() 
         assert _effects(admin) == original
         assert _session_digest(admin) == previous_session
         assert _web_attempts(admin) == admitted_web_attempts
+        role_counts = {row["usename"]: row["sessions"] for row in roles}
         print(
-            "SOURCE_WEB_HTTP 0040/SOURCE_OPEN login=200 session=200 runtime/auth=real-pg drift/phase/head/peer=503 live=200 effects=unchanged"
+            "SOURCE_WEB_HTTP 0040/SOURCE_OPEN login=200 session=200 "
+            f"runtime_sessions={role_counts['carepulse_runtime']} "
+            f"auth_sessions={role_counts['carepulse_auth']} "
+            f"protected_effect_counts={original} delta=0 "
+            "ACL/phase/head/peer_denied=503 live=200 candidate_fenced=503"
         )
     finally:
         admin.close()
