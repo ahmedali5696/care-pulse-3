@@ -37,7 +37,7 @@ Phase 0, 2026-11-22. Source baseline `79d6a2775d8b20a27b8df3e6ca4a64415c8eb8ec`.
 ### Configuration and later delivery remain bounded
 
 - **Decision:** Confirmation TTL is configured, persisted on issue and checked at consumption; absent/invalid policy denies issuing/using confirmations. Only labeled synthetic fixture values are chosen during authorized testing. Commit minimal operational events now; B-23/B-24 deliver/filter realtime/push and B-25 owns scheduling/retries.
-- **Rationale:** Spec clarification and master §2 already defer production numerical approval. Ordinary one-capacity admission needs no extra-case confirmation. B-16 owns Doctor In Examination cancellation review events, B-17 Doctor Booked/Waiting cancellation, B-18 Doctor individual reschedule. Source reasons/clinical narrative are excluded from operational delivery.
+- **Rationale:** Spec clarification and master §2 already defer production numerical approval. Ordinary one-capacity admission needs no extra-case confirmation. BR-019's approved Doctor-origin cancellation/rescheduling rule applies through B-16 In Examination cancellation, B-17 Booked/Waiting cancellation, B-18 individual reschedule and B-19 bulk reschedule (one minimal event per successfully moved Appointment, atomic/no duplicates). Doctor manual No-show emits no Receptionist-review event; its normal audit/status still applies. Doctor-authored source reasons and clinical narrative are excluded from operational delivery.
 - **Alternatives considered:** Fixed TTL, new settings control, production defaults, automatic midnight carry, network calls during a transaction or implementing a scheduler now would invent policy or transfer ownership.
 
 ### Bind receipt identity to the complete command target
@@ -51,6 +51,14 @@ Phase 0, 2026-11-22. Source baseline `79d6a2775d8b20a27b8df3e6ca4a64415c8eb8ec`.
 - **Decision:** Authorized staff may create initial review/close. Any existing-review revision update, including amendment/reopen or later close, remains Owner-only. Original same-key recovery reads the committed result rather than making another amendment.
 - **Rationale:** PRD BR-049 separates management amendment from initial review; BR-036 does not delegate it. `0027_d11_day_review.py:440–449` already restricts existing-review updates to DOCTOR_OWNER.
 - **Alternatives considered:** Treating amendment as a universal staff action broadens established permissions without authority.
+
+### Apply the 2026-11-22 Product Owner checklist approvals
+
+- **CHK007 / B-18 and B-19:** An already-Waiting Routine appointment cannot undergo same-service-day rescheduling in either Open or Exact-Time, including interval-only changes; B-13 `ManualRoutinePlacement` owns within-day Routine ordering. Valid cross-day Waiting→Booked requires new attendance; independently eligible Booked and permitted same-day Urgent reschedules keep their existing behavior. B-19 preview excludes/denies Waiting items targeted to their original date and does not add a bulk grant.
+- **CHK009 / B-20:** Derive overdue exactly as `Appointment.service_date < current IANA Africa/Cairo date`; a same-day elapsed Exact-Time slot does not qualify. Manual Booked No-show needs current actual-actor authorization, verified absence, reason and atomic check-in exclusion; the separately configured automatic selected-day cutoff is not gated by this manual predicate.
+- **CHK037 / B-20 with B-25:** Resolve the selected service-day B-07 cutoff HH:MM under IANA Africa/Cairo: repeated local instant uses the **later** occurrence (`fold=1`), a nonexistent local time advances to the **first valid instant after the gap**, and the result is compared against authoritative UTC time. Guard each Booked→No-show with atomic claim/evidence/receipt updates and replay/concurrent-run deduplication; retain retryability for still-eligible rows after interrupted or partially committed runs. B-20 owns selection/transition; B-25 invokes/schedules/retries. No new scheduler, daily one-shot lockout, settings field or fixed UTC offset.
+
+**Approval provenance:** These three decisions were explicitly approved by the Product Owner in the current conversation on **2026-11-22**. They close the former product-decision clarification gap only; they do not modify approved PRD/Domain/System authorities, prove executable behavior or replace independent review.
 
 ## Upstream prerequisite register
 
@@ -75,4 +83,4 @@ Master §8 applies **before affected implementation**: when the exact consumed u
 - Live GitHub search on 2026-11-22 confirmed #24/#25/#26/#28 OPEN. #26 retains independent Security/Clinical and PO risk disposition. Master §12 records later evidence addressing #28's historical synthetic findings; open status alone does not invalidate that evidence or require repetition.
 - #2/#4/#5/#13/#18 and SECURITY-POLICY-NUMERICS / OPEN-OPS-01/02/03 / OPEN-FILES-01 retain master §§12/14 production owners/triggers/closure criteria. #13's wider historical upgrade obligation is distinct from mandatory preservation proof for any new immediate-predecessor migration. Custody, production TTL, legal basis and release approval are not Phase 0 unknowns or planning blockers.
 
-No unresolved design clarification remains. Executable prerequisites remain explicitly unverified; use [quickstart](quickstart.md) under separate authorization.
+Pre-tasks review CHK007, CHK009 and CHK037 have explicit **2026-11-22 Product Owner approval** and are now incorporated consistently for reviewer evaluation; only the independent reviewer accepts checklist markers. Executable prerequisites remain separately unverified; use [quickstart](quickstart.md) under separate authorization.

@@ -48,7 +48,7 @@ Authority order: [PRD](../../docs/CarePulse_PRD_v1_APPROVED.md) → [Domain Mode
 | V — focused scope/worktree safety | PASS: initial worktree clean | PASS: feature planning artifacts only; no upstream/task/code/Issue changes |
 | Approval/production boundaries | PASS: authorized synthetic policy variance | PASS: production TTL/numerics/legal/custody remain separate; no release claim |
 
-These are documentary planning gates, not executable Security/Clinical approval. No unresolved product clarification or Constitution violation remains. Unverified prerequisites below are implementation/enablement gates, not questions to answer by inventing requirements.
+These are documentary planning gates, not executable Security/Clinical approval. The Product Owner explicitly approved **CHK007 Option B, CHK009 Option A and CHK037 conservative Cairo DST/recovery policy in this conversation on 2026-11-22**; their scope is recorded in [spec.md](spec.md#checklist-resolution--product-owner-approval-2026-11-22) and the B-18/B-20 contracts. Their former PO-decision blockers are resolved for requirements review, subject to independent reviewer checkbox acceptance. No Constitution violation is identified. Unverified executable prerequisites below remain separate implementation/enablement gates.
 
 ## Ownership, dependencies and delivery order
 
@@ -63,9 +63,9 @@ Dependencies are copied from the spec and master §8; no edge is added. Work sta
 | B-13 | B-12/15, D-04/06 | Routine placement/future policy; placement versus B-15 admission proof owned here |
 | B-16 | B-15, D-07/08, B-10 | Doctor clinical work/corrections; actual-examination completion; In Examination exceptional cancel |
 | B-17 | B-10–12/15 | Booked/Waiting cancel; typed-confirmed new-ID Routine→Urgent replacement; rollback/races |
-| B-18 | B-07–10/12/17 | Same-ID reschedule; frozen evidence/price; distinct B-10 extension and Doctor precedence |
-| B-19 | B-18, D-06 | All-staff same-original-day eligible Routine preview/atomic move; no separate grant |
-| B-20 | B-12, B-15–18, D-11 | Booked-only cutoff/manual No-show, dated review/close; B-25 owns invocation/retries |
+| B-18 | B-07–10/12/17 | Same-ID reschedule; forbid same-day Routine Waiting in Open/Exact-Time (B-13 placement handles queue order); retain cross-day Waiting→Booked, Booked and same-day Urgent permissions; frozen evidence/price; distinct B-10 extension and Doctor precedence |
+| B-19 | B-18, D-06 | All-staff same-original-day eligible Routine preview/atomic move; inherited same-day Waiting denial and explicit exclusion; no separate grant |
+| B-20 | B-12, B-15–18, D-11 | Strict Cairo prior-date manual overdue; separate selected-day cutoff at IANA fold=1/gap-first-valid instant; atomic Booked-only/retryable duplicate-safe transitions, dated review/close; B-25 owns invocation/retries |
 
 W3-M1 covers check-in/intake/lanes/admission and applicable queue-policy proof; W3-M2 covers Visit/individual/bulk/reconciliation. B-12 is independent of B-11; B-15 is independent of B-13. Ordering does not permit another Wave or transfer ownership.
 
