@@ -73,34 +73,40 @@ jobs:
           echo "$RUNNER_TEMP/pwsh" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/pwsh/pwsh" -NoProfile -Command 'if ($PSVersionTable.PSVersion.ToString() -ne "7.6.7") { exit 1 }'
 
-      - name: Build exact CPython 3.13.16 from verified official source
+      # Official prebuilt CPython for ubuntu-24.04 x64; the pinned action
+      # resolves the exact patch version, never a floating 3.13 release.
+      - name: Set up exact prebuilt CPython 3.13.16 and lockfile-keyed pip cache
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13.16'
+          architecture: x64
+          check-latest: false
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Verify prebuilt CPython and create disposable environment
         shell: bash
         run: |
           set -euo pipefail
-          # Exclude the unrelated hosted Microsoft apt feed, which may return 403.
-          for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-            if [ -f "$source" ] && grep -Fq 'packages.microsoft.com/ubuntu/24.04/prod' "$source"; then
-              sudo mv "$source" "$source.carepulse-ci-disabled"
-            fi
-          done
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev uuid-dev
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/Python-3.13.16.tar.xz" https://www.python.org/ftp/python/3.13.16/Python-3.13.16.tar.xz
-          echo "f4b1bfb3c79b5bb11b8d228a12504163b4c0dab4d679828d8f5f26b6cb6ab35d  $RUNNER_TEMP/Python-3.13.16.tar.xz" | sha256sum -c -
-          mkdir -p "$RUNNER_TEMP/python-src"
-          tar -xJf "$RUNNER_TEMP/Python-3.13.16.tar.xz" -C "$RUNNER_TEMP/python-src" --strip-components=1
-          cd "$RUNNER_TEMP/python-src"
-          ./configure --prefix="$RUNNER_TEMP/python-3.13.16" --with-ensurepip=install > "$RUNNER_TEMP/python-configure.log" 2>&1
-          make -j 4 > "$RUNNER_TEMP/python-make.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/python-make.log"; exit 1; }
-          make install > "$RUNNER_TEMP/python-install.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/python-install.log"; exit 1; }
-          "$RUNNER_TEMP/python-3.13.16/bin/python3.13" -m venv "$RUNNER_TEMP/foundation-venv"
+          python - <<'PY'
+          import platform
+          import sys
+          import sysconfig
+
+          assert sys.implementation.name == "cpython"
+          assert sys.version_info[:3] == (3, 13, 16)
+          assert platform.machine() == "x86_64"
+          assert not sysconfig.get_config_var("Py_GIL_DISABLED")
+          print("PASS exact standard-GIL CPython 3.13.16 x64")
+          PY
+          python -m venv "$RUNNER_TEMP/foundation-venv"
 
       - name: Secure installer bootstrap and frozen dependencies
         shell: bash
         run: |
           set -euo pipefail
           PY="$RUNNER_TEMP/foundation-venv/bin/python"
-          "$PY" -m pip install --no-cache-dir "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+          "$PY" -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
           "$PY" -c 'import pip, sys; assert pip.__version__ == "26.2.2"; assert sys.version_info[:3] == (3, 13, 16)'
           "$PY" -m pip install --require-hashes --only-binary=:all: -r requirements.lock
           echo "$RUNNER_TEMP/foundation-venv/bin" >> "$GITHUB_PATH"
@@ -111,6 +117,14 @@ jobs:
           test "$(node --version)" = v24.22.1
           npm install --global --ignore-scripts --no-audit --no-fund pnpm@10.34.7
           echo "$RUNNER_TEMP/node-v24.22.1-linux-x64/bin" >> "$GITHUB_PATH"
+
+      # Cache the content-addressed store, never node_modules or an installed environment.
+      # Frozen pnpm install and approved-lock fingerprint checks remain mandatory.
+      - name: Cache pnpm store for exact approved lock
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/pnpm/store
+          key: foundation-ubuntu24-x64-node24.22.1-pnpm10.34.7-${{ hashFiles('pnpm-lock.yaml') }}
 
       - name: Common pinned inputs, quality, unit, imports and web gates
         shell: pwsh
@@ -195,28 +209,47 @@ jobs:
           tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"
           chmod +x "$RUNNER_TEMP/pwsh/pwsh"
           echo "$RUNNER_TEMP/pwsh" >> "$GITHUB_PATH"
-          for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-            if [ -f "$source" ] && grep -Fq 'packages.microsoft.com/ubuntu/24.04/prod' "$source"; then
-              sudo mv "$source" "$source.carepulse-ci-disabled"
-            fi
-          done
-          sudo install -m 0755 -d /etc/apt/keyrings
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
-          sudo chmod a+r /etc/apt/keyrings/docker.gpg
-          echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable' | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y --allow-downgrades \
-            docker-ce=5:29.9.2-1~ubuntu.24.04~noble \
-            docker-ce-cli=5:29.9.2-1~ubuntu.24.04~noble \
-            containerd.io=2.4.2-3~ubuntu.24.04~noble \
-            docker-compose-plugin=5.6.1-1~ubuntu.24.04~noble \
-            docker-buildx-plugin=0.38.1-1~ubuntu.24.04~noble
-          sudo systemctl restart docker
+          # Only reuse a hosted installation if every approved package and
+          # daemon/plugin version matches. Otherwise retain the pinned install.
+          if [ "$(dpkg-query -W -f='${Version}' docker-ce 2>/dev/null || true)" = '5:29.9.2-1~ubuntu.24.04~noble' ] &&
+             [ "$(dpkg-query -W -f='${Version}' docker-ce-cli 2>/dev/null || true)" = '5:29.9.2-1~ubuntu.24.04~noble' ] &&
+             [ "$(dpkg-query -W -f='${Version}' containerd.io 2>/dev/null || true)" = '2.4.2-3~ubuntu.24.04~noble' ] &&
+             [ "$(dpkg-query -W -f='${Version}' docker-compose-plugin 2>/dev/null || true)" = '5.6.1-1~ubuntu.24.04~noble' ] &&
+             [ "$(dpkg-query -W -f='${Version}' docker-buildx-plugin 2>/dev/null || true)" = '0.38.1-1~ubuntu.24.04~noble' ] &&
+             [ "$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)" = 29.9.2 ] &&
+             [ "$(docker version --format '{{.Client.Version}}' 2>/dev/null || true)" = 29.9.2 ] &&
+             [ "$(docker compose version --short 2>/dev/null || true)" = 5.6.1 ] &&
+             docker buildx version 2>/dev/null | grep -Fq 'v0.38.1'; then
+            echo 'PASS preinstalled approved Docker Engine and plugins'
+          else
+            echo 'Installing approved Docker Engine and plugins'
+            for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+              if [ -f "$source" ] && grep -Fq 'packages.microsoft.com/ubuntu/24.04/prod' "$source"; then
+                sudo mv "$source" "$source.carepulse-ci-disabled"
+              fi
+            done
+            sudo install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+            sudo chmod a+r /etc/apt/keyrings/docker.gpg
+            echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable' | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            sudo apt-get update -qq
+            sudo apt-get install -y --allow-downgrades \
+              docker-ce=5:29.9.2-1~ubuntu.24.04~noble \
+              docker-ce-cli=5:29.9.2-1~ubuntu.24.04~noble \
+              containerd.io=2.4.2-3~ubuntu.24.04~noble \
+              docker-compose-plugin=5.6.1-1~ubuntu.24.04~noble \
+              docker-buildx-plugin=0.38.1-1~ubuntu.24.04~noble
+            sudo systemctl restart docker
+          fi
           test "$(docker version --format '{{.Server.Version}}')" = 29.9.2
           test "$(docker version --format '{{.Client.Version}}')" = 29.9.2
           test "$(docker compose version --short)" = 5.6.1
           docker buildx version | grep -F 'v0.38.1'
           test "$(dpkg-query -W -f='${Version}' containerd.io)" = '2.4.2-3~ubuntu.24.04~noble'
+          test "$(dpkg-query -W -f='${Version}' docker-ce)" = '5:29.9.2-1~ubuntu.24.04~noble'
+          test "$(dpkg-query -W -f='${Version}' docker-ce-cli)" = '5:29.9.2-1~ubuntu.24.04~noble'
+          test "$(dpkg-query -W -f='${Version}' docker-compose-plugin)" = '5.6.1-1~ubuntu.24.04~noble'
+          test "$(dpkg-query -W -f='${Version}' docker-buildx-plugin)" = '0.38.1-1~ubuntu.24.04~noble'
 
       - name: Install pinned Playwright browser on disposable runner
         if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' }}
