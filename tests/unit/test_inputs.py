@@ -228,13 +228,18 @@ def test_peer_validation_cannot_be_disabled(checkout):
         ),
         (
             ".github/workflows/foundation.yml",
-            "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0",
-            "actions/setup-python@" + "0" * 40,
+            "d6f5f504043400592e9dcf368ba262c64d998608646cc22281b5a75beecbc872",
+            "0" * 64,
         ),
         (
             ".github/workflows/foundation.yml",
-            "cache-dependency-path: requirements.lock",
-            "cache-dependency-path: requirements.in",
+            "releases/download/3.13.16-36805956071/python-3.13.16-linux-24.04-x64.tar.gz",
+            "releases/download/3.13.16-latest/python-3.13.16-linux-24.04-x64.tar.gz",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "foundation-ubuntu24-x64-python3.13.16-pip26.2.2-${{ hashFiles('requirements.lock') }}",
+            "foundation-python-unkeyed",
         ),
         (
             ".github/workflows/foundation.yml",
@@ -295,14 +300,30 @@ def test_ci_tool_and_installer_drift_is_rejected_before_install(
     assert filename + " executable input drift" in completed.stdout + completed.stderr
 
 
-def test_ci_archive_must_be_verified_before_extraction(checkout):
+@pytest.mark.parametrize(
+    ("hash_line", "extract_line"),
+    [
+        (
+            (
+                'echo "6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431'
+                '  $RUNNER_TEMP/pwsh.tar.gz" | sha256sum -c -'
+            ),
+            'tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"',
+        ),
+        (
+            (
+                'echo "d6f5f504043400592e9dcf368ba262c64d998608646cc22281b5a75beecbc872'
+                '  $archive" | sha256sum -c -'
+            ),
+            'tar -xzf "$archive" -C "$RUNNER_TEMP/python-3.13.16"',
+        ),
+    ],
+)
+def test_ci_archive_must_be_verified_before_extraction(
+    checkout, hash_line, extract_line
+):
     workflow = checkout / ".github/workflows/foundation.yml"
     content = workflow.read_text()
-    hash_line = (
-        'echo "6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431'
-        '  $RUNNER_TEMP/pwsh.tar.gz" | sha256sum -c -'
-    )
-    extract_line = 'tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"'
     assert hash_line in content and extract_line in content
     workflow.write_text(
         content.replace(hash_line, "ARCHIVE_HASH_PLACEHOLDER", 1)
@@ -341,6 +362,11 @@ def test_commented_checkout_pin_cannot_hide_unapproved_action(checkout):
             ".github/workflows/foundation.yml",
             'tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"',
             'command curl -fsSL -o "$RUNNER_TEMP/pwsh.tar.gz" https://example.invalid/bad',
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            'tar -xzf "$archive" -C "$RUNNER_TEMP/python-3.13.16"',
+            'bash "$RUNNER_TEMP/python-3.13.16/setup.sh"',
         ),
         (
             ".github/workflows/foundation.yml",

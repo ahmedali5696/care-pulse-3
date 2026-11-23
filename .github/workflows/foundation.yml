@@ -73,22 +73,20 @@ jobs:
           echo "$RUNNER_TEMP/pwsh" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/pwsh/pwsh" -NoProfile -Command 'if ($PSVersionTable.PSVersion.ToString() -ne "7.6.7") { exit 1 }'
 
-      # Official prebuilt CPython for ubuntu-24.04 x64; the pinned action
-      # resolves the exact patch version, never a floating 3.13 release.
-      - name: Set up exact prebuilt CPython 3.13.16 and lockfile-keyed pip cache
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: '3.13.16'
-          architecture: x64
-          check-latest: false
-          cache: pip
-          cache-dependency-path: requirements.lock
-
-      - name: Verify prebuilt CPython and create disposable environment
+      # The release archive contains all Python bootstrap bytes, including
+      # ensurepip. Do not execute its setup.sh (which upgrades pip unpinned).
+      - name: Install SHA-256 verified prebuilt CPython 3.13.16
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
+          archive="$RUNNER_TEMP/python-3.13.16-linux-24.04-x64.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" https://github.com/actions/python-versions/releases/download/3.13.16-36805956071/python-3.13.16-linux-24.04-x64.tar.gz
+          echo "d6f5f504043400592e9dcf368ba262c64d998608646cc22281b5a75beecbc872  $archive" | sha256sum -c -
+          sha256sum "$archive"
+          mkdir -p "$RUNNER_TEMP/python-3.13.16"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/python-3.13.16"
+          PYTHON="$RUNNER_TEMP/python-3.13.16/bin/python3.13"
+          "$PYTHON" - <<'PY'
           import platform
           import sys
           import sysconfig
@@ -99,7 +97,14 @@ jobs:
           assert not sysconfig.get_config_var("Py_GIL_DISABLED")
           print("PASS exact standard-GIL CPython 3.13.16 x64")
           PY
-          python -m venv "$RUNNER_TEMP/foundation-venv"
+          "$PYTHON" -m venv "$RUNNER_TEMP/foundation-venv"
+
+      # Cached wheels still pass pip's required SHA-256 checks on installation.
+      - name: Cache pip downloads for exact approved lock
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: foundation-ubuntu24-x64-python3.13.16-pip26.2.2-${{ hashFiles('requirements.lock') }}
 
       - name: Secure installer bootstrap and frozen dependencies
         shell: bash
