@@ -27,6 +27,7 @@ from carepulse.policies.pricing_routes import router as pricing_router
 from carepulse.policies.schedule_routes import router as schedule_router
 from carepulse.policies.slots_routes import router as slots_router
 from carepulse.provisioning.routes import router as provisioning_router
+from carepulse.queue.routes import router as queue_router
 from carepulse.visits.routes import router as visit_router
 
 
@@ -59,6 +60,7 @@ app.include_router(visit_router)
 app.include_router(pricing_router)
 app.include_router(schedule_router)
 app.include_router(slots_router)
+app.include_router(queue_router)
 app.add_exception_handler(ContractError, contract_exception_handler)
 app.add_exception_handler(
     RequestValidationError, lambda _request, _error: error_response(422)
@@ -108,8 +110,16 @@ app.add_middleware(
         ("POST", "/v1/settings/schedule/preview"): "SETTINGS_SCHEDULE",
         ("POST", "/v1/settings/schedule/activate"): "SETTINGS_SCHEDULE",
         ("GET", "/v1/slots"): "SLOTS",
+        ("GET", "/v1/queue"): "QUEUE_READ",
     },
     route_patterns=(
+        (
+            "POST",
+            compile(
+                r"/v1/appointments/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/check-in"
+            ),
+            "QUEUE_CHECK_IN",
+        ),
         (
             "PATCH",
             compile(r"/v1/visits/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"),

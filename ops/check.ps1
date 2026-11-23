@@ -125,6 +125,7 @@ expected_paths = {
     '/v1/settings/pricing', '/v1/settings/schedule',
     '/v1/settings/schedule/preview', '/v1/settings/schedule/activate',
     '/v1/slots', '/v1/appointments', '/v1/appointments/{appointment_id}',
+    '/v1/appointments/{appointment_id}/check-in', '/v1/queue',
     '/v1/visits/{visit_id}', '/v1/visits/{visit_id}/extend-followup',
 }
 assert set(app.openapi()['paths']) == expected_paths
@@ -149,12 +150,14 @@ assert boundary.kwargs['routes'] == {
     ('POST', '/v1/settings/schedule/preview'): 'SETTINGS_SCHEDULE',
     ('POST', '/v1/settings/schedule/activate'): 'SETTINGS_SCHEDULE',
     ('GET', '/v1/slots'): 'SLOTS',
+    ('GET', '/v1/queue'): 'QUEUE_READ',
 }
 uuid = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
 assert {(method, pattern.pattern, purpose) for method, pattern, purpose in boundary.kwargs['route_patterns']} == {
     ('GET', f'/v1/staff/receptionists/{uuid}', 'STAFF_MANAGEMENT'),
     ('GET', f'/v1/patients/{uuid}', 'PATIENT_REGISTRY'),
     ('GET', f'/v1/appointments/{uuid}', 'APPOINTMENT_BOOKING'),
+    ('POST', f'/v1/appointments/{uuid}/check-in', 'QUEUE_CHECK_IN'),
     ('PATCH', f'/v1/visits/{uuid}', 'VISIT_FOLLOWUP'),
     ('POST', f'/v1/visits/{uuid}/extend-followup', 'VISIT_FOLLOWUP'),
     ('PATCH', f'/v1/patients/{uuid}', 'PATIENT_REGISTRY'),
@@ -237,6 +240,9 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             }
             foreach ($suite in @('tests/integration/test_day_review_persistence.py', 'tests/integration/test_report_query_plans.py', 'tests/integration/test_day_review_races.py', 'tests/integration/test_day_review_migration.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required D-11 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_w3_receipt_boundary.py', 'tests/integration/test_w3_checkin.py', 'tests/integration/test_w3_checkin_races.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-12 verification: $suite" }
             }
             # Linux CI retains the accepted Bash probes; PowerShell checks their exit immediately.
             $integration = @'

@@ -9,6 +9,14 @@ type RouteContext = { params: Promise<{ path?: string[] }> };
 
 async function delegate(request: Request, context: RouteContext): Promise<Response> {
   const segments = (await context.params).path ?? [];
+  if (segments.length === 2 && UUID.test(segments[0]) && segments[1] === "check-in") {
+    if (request.method !== "POST") return failure(403);
+    return forwardPrivate(request, {
+      path: `/v1/appointments/${segments[0]}/check-in`,
+      purpose: "QUEUE_CHECK_IN",
+      method: request.method,
+    });
+  }
   const allowed = segments.length === 0 ? ["GET", "POST"] :
     segments.length === 1 && UUID.test(segments[0]) ? ["GET"] : [];
   if (!allowed.includes(request.method)) return failure(403);

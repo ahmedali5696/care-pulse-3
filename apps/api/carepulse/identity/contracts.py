@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -129,6 +130,51 @@ def normalize_typed_body(body: BaseModel) -> bytes:
 
 def normalized_request_digest(body: BaseModel) -> str:
     return hashlib.sha256(normalize_typed_body(body)).hexdigest()
+
+
+def _canonical_target_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_target_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_target_value(item) for item in value]
+    raise ValueError("Unsupported command target value")
+
+
+def normalized_command_digest(
+    operation: str,
+    body: BaseModel,
+    *,
+    target: Mapping[str, Any] | None = None,
+) -> str:
+    """Target-aware canonical command digest binding operation, target, and typed body."""
+    if not isinstance(operation, str) or not operation.strip():
+        raise ValueError("Command operation is required")
+    body_payload = json.loads(normalize_typed_body(body).decode("utf-8"))
+    target_payload = _canonical_target_value(target) if target is not None else {}
+    try:
+        canonical = json.dumps(
+            {
+                "operation": operation,
+                "target": target_payload,
+                "body": body_payload,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except UnicodeEncodeError as invalid:
+        raise ContractError(422) from invalid
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def require_matching_revision(expected_revision: int, current_revision: int) -> None:

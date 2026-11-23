@@ -2,6 +2,7 @@
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID, uuid4
@@ -162,7 +163,7 @@ def lookup_tenant_receipt(
     return (
         connection.execute(
             text("""
-            SELECT r.request_digest, r.result_projection, r.result_revision
+            SELECT r.id, r.request_digest, r.result_projection, r.result_revision
             FROM public.idempotency_receipts AS r
             JOIN public.staff_accounts AS s
               ON (s.organization_id, s.id) = (r.organization_id, r.staff_id)
@@ -237,6 +238,63 @@ def require_committed_tenant_receipt(
 ) -> tuple[dict[str, Any], int]:
     """Receipt-only recovery after a rolled-back competing transaction."""
     stored = resolve_tenant_receipt(connection, query)
+    if stored is None:
+        from carepulse.identity.contracts import ContractError
+
+        raise ContractError(409, "IDEMPOTENCY_CONFLICT")
+    return stored
+
+
+def resolve_safe_tenant_receipt(
+    connection: Connection,
+    query: TenantReceiptQuery,
+    *,
+    check_target_visible: Callable[[], None],
+    validate_projection: Callable[[dict[str, Any], int], bool],
+) -> tuple[dict[str, Any], int] | None:
+    """Check target visibility before disclosing key conflicts or cached projections.
+
+    Caller must already hold live tenant/staff/session authorization in this transaction.
+    """
+    stored = lookup_tenant_receipt(
+        connection,
+        query.actor.organization_id,
+        query.actor.staff_id,
+        query.operation,
+        query.idempotency_key,
+    )
+    if stored is None:
+        return None
+    check_target_visible()
+    assert_same_request(stored["request_digest"], query.request_digest)
+    projection = stored["result_projection"]
+    revision = stored["result_revision"]
+    if (
+        not isinstance(projection, dict)
+        or type(revision) is not int
+        or revision < 0
+        or not validate_projection(projection, revision)
+    ):
+        from carepulse.identity.contracts import ContractError
+
+        raise ContractError(409)
+    return projection, revision
+
+
+def require_safe_committed_tenant_receipt(
+    connection: Connection,
+    query: TenantReceiptQuery,
+    *,
+    check_target_visible: Callable[[], None],
+    validate_projection: Callable[[dict[str, Any], int], bool],
+) -> tuple[dict[str, Any], int]:
+    """Receipt-only recovery with visibility and projection guards."""
+    stored = resolve_safe_tenant_receipt(
+        connection,
+        query,
+        check_target_visible=check_target_visible,
+        validate_projection=validate_projection,
+    )
     if stored is None:
         from carepulse.identity.contracts import ContractError
 

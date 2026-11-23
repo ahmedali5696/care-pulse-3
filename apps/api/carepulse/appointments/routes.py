@@ -31,15 +31,19 @@ from carepulse.identity.receipts import (
     TenantReceiptQuery,
     lookup_tenant_receipt,
 )
+from carepulse.queue.checkin import check_in_appointment, recover_committed_checkin
+from carepulse.queue.contracts import CheckInAppointment
 
 router = APIRouter(prefix="/v1/appointments")
 
 
-def _transaction(request: Request, *, stage: str = "PRIMARY"):
+def _transaction(
+    request: Request, *, purpose: str = "APPOINTMENT_BOOKING", stage: str = "PRIMARY"
+):
     if request.method != "GET" and request.query_params:
         raise ContractError(422)
     identity = request.scope.get("carepulse.identity")
-    if identity is None or identity.purpose != "APPOINTMENT_BOOKING":
+    if identity is None or identity.purpose != purpose:
         raise ContractError(403)
     return protected_transaction(
         request.app.state.db_engine,
@@ -148,3 +152,40 @@ def get_appointment(appointment_id: UUID, request: Request):
         if control is not None:
             projection["decision_control"] = control
         return success_response(projection, projection["revision"])
+
+
+async def _checkin_body(request: Request) -> CheckInAppointment:
+    try:
+        body = json.loads(
+            await request.body(),
+            object_pairs_hook=_unique_json_pairs,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+        )
+        return CheckInAppointment.model_validate(body)
+    except (ValueError, UnicodeError, ValidationError, RecursionError) as invalid:
+        raise ContractError(422) from invalid
+
+
+@router.post("/{appointment_id}/check-in")
+def post_appointment_checkin(
+    appointment_id: UUID,
+    request: Request,
+    command: Annotated[CheckInAppointment, Depends(_checkin_body)],
+):
+    key = request.scope["carepulse.identity"].idempotency_key
+    if not key:
+        raise ContractError(422)
+    try:
+        with _transaction(request, purpose="QUEUE_CHECK_IN") as (connection, actor):
+            projection, revision = check_in_appointment(
+                connection, actor, appointment_id, command, key
+            )
+            return success_response(projection, revision)
+    except ReceiptConflict:
+        with _transaction(
+            request, purpose="QUEUE_CHECK_IN", stage="RECEIPT_RECOVERY"
+        ) as (connection, actor):
+            projection, revision = recover_committed_checkin(
+                connection, actor, appointment_id, command, key
+            )
+            return success_response(projection, revision)
