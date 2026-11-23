@@ -346,7 +346,7 @@ def test_commented_checkout_pin_cannot_hide_unapproved_action(checkout):
     workflow = checkout / ".github/workflows/foundation.yml"
     content = workflow.read_text()
     approved = "- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-    assert content.count(approved) == 2
+    assert content.count(approved) == 3
     workflow.write_text(
         content.replace(approved, "- uses : actions/checkout@main", 1)
         + "\n# "
@@ -358,6 +358,37 @@ def test_commented_checkout_pin_cannot_hide_unapproved_action(checkout):
     assert ".github/workflows/foundation.yml executable input drift" in (
         completed.stdout + completed.stderr
     )
+
+
+def test_node24_artifacts_are_immutable_and_integrity_errors_are_fatal():
+    workflow = (ROOT / ".github/workflows/foundation.yml").read_text()
+    assert (
+        "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9" in workflow
+    )
+    assert (
+        "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333" in workflow
+    )
+    for required in (
+        "archive: true",
+        "overwrite: false",
+        "include-hidden-files: false",
+        "if-no-files-found: error",
+        "merge-multiple: false",
+        "digest-mismatch: error",
+        "if: ${{ always() }}",
+        "|| 'Full Foundation acceptance'",
+    ):
+        assert required in workflow
+    for forbidden in (
+        "continue-on-error:",
+        "ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION",
+        "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24",
+        "retention-days: 1",
+        "pull_request_target:",
+        "workflow_run:",
+        "artifact@v",
+    ):
+        assert forbidden not in workflow
 
 
 @pytest.mark.parametrize(

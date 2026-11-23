@@ -49,16 +49,36 @@ permissions:
 
 jobs:
   inputs-and-build:
-    name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && !startsWith(inputs.postgres_diagnostic, 'compat-') && 'diagnostic-static-checks' || 'inputs-and-build' }}
-    if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' || startsWith(inputs.postgres_diagnostic, 'compat-') }}
+    name: inputs-and-build
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    outputs:
+      mode: ${{ steps.request.outputs.mode }}
+      matrix: ${{ steps.request.outputs.matrix }}
+      candidate_sha: ${{ steps.request.outputs.candidate_sha }}
+      run_id: ${{ steps.request.outputs.run_id }}
+      attempt: ${{ steps.request.outputs.attempt }}
+      repository: ${{ steps.request.outputs.repository }}
+      workflow: ${{ steps.request.outputs.workflow }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Validate and normalize Foundation request
+        id: request
+        shell: bash
+        env:
+          INPUT_POSTGRES_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
+          INPUT_B04_SPIKE: ${{ inputs.b04_spike }}
+          INPUT_T133_TERMINAL: ${{ inputs.t133_terminal }}
+          INPUT_T133_SHA: ${{ inputs.t133_sha }}
+        run: |
+          set -euo pipefail
+          python3 -m ops.foundation_acceptance validate-request
+
       - name: Verify runner and install pinned PowerShell 7
+        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -76,6 +96,7 @@ jobs:
       # The release archive contains all Python bootstrap bytes, including
       # ensurepip. Do not execute its setup.sh (which upgrades pip unpinned).
       - name: Install SHA-256 verified prebuilt CPython 3.13.16
+        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -104,12 +125,14 @@ jobs:
 
       # Cached wheels still pass pip's required SHA-256 checks on installation.
       - name: Cache pip downloads for exact approved lock
+        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pip
           key: foundation-ubuntu24-x64-python3.13.16-pip26.2.2-${{ hashFiles('requirements.lock') }}
 
       - name: Secure installer bootstrap and frozen dependencies
+        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -129,12 +152,14 @@ jobs:
       # Cache the content-addressed store, never node_modules or an installed environment.
       # Frozen pnpm install and approved-lock fingerprint checks remain mandatory.
       - name: Cache pnpm store for exact approved lock
+        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/pnpm/store
           key: foundation-ubuntu24-x64-node24.22.1-pnpm10.34.7-${{ hashFiles('pnpm-lock.yaml') }}
 
       - name: Common pinned inputs, quality, unit, imports and web gates
+        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' }}
         shell: pwsh
         run: |
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
@@ -144,21 +169,42 @@ jobs:
           }
 
   compose-integration:
-    name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'postgres-diagnostic' || 'compose-integration' }}
+    name: ${{ matrix.lane == 'standard' && format('{0} integration', needs.inputs-and-build.outputs.mode) || format('Full Foundation {0}', matrix.lane) }}
     needs: inputs-and-build
-    if: ${{ !cancelled() && (needs.inputs-and-build.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && needs.inputs-and-build.result == 'skipped')) }}
+    if: ${{ needs.inputs-and-build.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJSON(needs.inputs-and-build.outputs.matrix) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
       CP_B04_SPIKE: ${{ inputs.b04_spike || false }}
       CP_T133_MODE: ${{ inputs.t133_terminal || false }}
       CP_T133_SHA: ${{ inputs.t133_sha || '' }}
-      COMPOSE_PROJECT_NAME: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
-      CP_CI_PROJECT: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CP_FOUNDATION_LANE: ${{ matrix.lane }}
+      CP_FOUNDATION_MODE: ${{ needs.inputs-and-build.outputs.mode }}
+      CP_FOUNDATION_RECEIPT_PATH: ${{ github.workspace }}/foundation-full-receipt.json
+      COMPOSE_PROJECT_NAME: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.lane == 'ordinary' && '1' || matrix.lane == 'historical' && '2' || '3') }}
+      CP_CI_PROJECT: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.lane == 'ordinary' && '1' || matrix.lane == 'historical' && '2' || '3') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Verify normalized lane and exact tested SHA
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ needs.inputs-and-build.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$CANDIDATE_SHA" = "$GITHUB_SHA"
+          case "$CP_FOUNDATION_MODE:$CP_FOUNDATION_LANE" in
+            full:ordinary|full:historical|full:compat|postgres-diagnostic:standard|compat-diagnostic:standard|b04-spike:standard|t133:standard) ;;
+            *) echo 'FAIL invalid normalized mode/lane combination'; exit 1 ;;
+          esac
+          test "$CP_CI_PROJECT" = "$COMPOSE_PROJECT_NAME"
 
       - name: Set runner-scoped synthetic secret paths and environment
         shell: bash
@@ -260,7 +306,7 @@ jobs:
           test "$(dpkg-query -W -f='${Version}' docker-buildx-plugin)" = '0.38.1-1~ubuntu.24.04~noble'
 
       - name: Install pinned Playwright browser on disposable runner
-        if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' }}
+        if: ${{ matrix.lane == 'ordinary' || (matrix.lane == 'standard' && (needs.inputs-and-build.outputs.mode == 'b04-spike' || needs.inputs-and-build.outputs.mode == 't133')) }}
         shell: bash
         run: |
           set -euo pipefail
@@ -275,7 +321,7 @@ jobs:
           pnpm --filter @carepulse/web exec playwright install --with-deps chromium
 
       - name: Disposable PostgreSQL, signed Patient API, invited-role acceptance and scoped cleanup
-        if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' }}
+        if: ${{ matrix.lane == 'ordinary' || matrix.lane == 'historical' || (matrix.lane == 'standard' && (needs.inputs-and-build.outputs.mode == 'b04-spike' || needs.inputs-and-build.outputs.mode == 't133')) }}
         shell: pwsh
         run: |
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
@@ -283,7 +329,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Mandatory source 0040 to candidate 0046 compatibility, recovery and preserved-data acceptance
-        if: ${{ (!inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full') && !inputs.t133_terminal && !inputs.b04_spike }}
+        if: ${{ matrix.lane == 'compat' }}
         shell: pwsh
         env:
           CP_COMPAT_DIAGNOSTIC: compat-full
@@ -293,7 +339,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Focused disposable PostgreSQL diagnostics and scoped cleanup
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && !startsWith(inputs.postgres_diagnostic, 'compat-') }}
+        if: ${{ matrix.lane == 'standard' && needs.inputs-and-build.outputs.mode == 'postgres-diagnostic' }}
         shell: pwsh
         env:
           CP_POSTGRES_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
@@ -303,7 +349,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Compatibility diagnostics (PRE-W3-COMPAT) and scoped cleanup
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && startsWith(inputs.postgres_diagnostic, 'compat-') }}
+        if: ${{ matrix.lane == 'standard' && needs.inputs-and-build.outputs.mode == 'compat-diagnostic' }}
         shell: pwsh
         env:
           CP_COMPAT_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
@@ -311,3 +357,70 @@ jobs:
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
           & pwsh -NoProfile -File ops/check.ps1 compat-diagnostic
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload post-cleanup Full Foundation lane receipt
+        if: ${{ matrix.lane != 'standard' && success() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, Node.js 24
+        with:
+          name: foundation-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.lane }}
+          path: foundation-full-receipt.json
+          archive: true
+          overwrite: false
+          include-hidden-files: false
+          if-no-files-found: error
+
+  full-foundation-acceptance:
+    name: ${{ needs.inputs-and-build.outputs.mode != '' && needs.inputs-and-build.outputs.mode != 'full' && format('{0} result (NOT Full Foundation acceptance)', needs.inputs-and-build.outputs.mode) || 'Full Foundation acceptance' }}
+    if: ${{ always() }}
+    needs: [inputs-and-build, compose-integration]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      NORMALIZED_MODE: ${{ needs.inputs-and-build.outputs.mode }}
+      CANDIDATE_SHA: ${{ needs.inputs-and-build.outputs.candidate_sha }}
+      COMMON_RUN_ID: ${{ needs.inputs-and-build.outputs.run_id }}
+      COMMON_ATTEMPT: ${{ needs.inputs-and-build.outputs.attempt }}
+      COMMON_REPOSITORY: ${{ needs.inputs-and-build.outputs.repository }}
+      COMMON_WORKFLOW: ${{ needs.inputs-and-build.outputs.workflow }}
+      INPUT_RESULT: ${{ needs.inputs-and-build.result }}
+      LANES_RESULT: ${{ needs.compose-integration.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reject missing mode, failed dependencies and stale common results
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$INPUT_RESULT" = success
+          test "$LANES_RESULT" = success
+          test "$CANDIDATE_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$COMMON_RUN_ID" = "$GITHUB_RUN_ID"
+          test "$COMMON_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+          test "$COMMON_REPOSITORY" = "$GITHUB_REPOSITORY"
+          test "$COMMON_WORKFLOW" = "$GITHUB_WORKFLOW_REF"
+          case "$NORMALIZED_MODE" in
+            full) ;;
+            postgres-diagnostic|compat-diagnostic|b04-spike|t133)
+              echo "NON_FULL_RESULT mode=$NORMALIZED_MODE sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT"
+              exit 0 ;;
+            *) echo 'FAIL invalid or missing normalized mode'; exit 1 ;;
+          esac
+
+      - name: Retrieve this attempt's three mandatory receipts with strict digest verification
+        if: ${{ env.NORMALIZED_MODE == 'full' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, Node.js 24
+        with:
+          pattern: foundation-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-*
+          path: foundation-evidence
+          merge-multiple: false
+          digest-mismatch: error
+
+      - name: Validate all Full Foundation receipts and issue final acceptance
+        if: ${{ env.NORMALIZED_MODE == 'full' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m ops.foundation_acceptance aggregate foundation-evidence
