@@ -228,8 +228,18 @@ def test_peer_validation_cannot_be_disabled(checkout):
         ),
         (
             ".github/workflows/foundation.yml",
-            "f4b1bfb3c79b5bb11b8d228a12504163b4c0dab4d679828d8f5f26b6cb6ab35d",
-            "0" * 64,
+            "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0",
+            "actions/setup-python@" + "0" * 40,
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "cache-dependency-path: requirements.lock",
+            "cache-dependency-path: requirements.in",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "foundation-ubuntu24-x64-node24.22.1-pnpm10.34.7-${{ hashFiles('pnpm-lock.yaml') }}",
+            "foundation-pnpm-unkeyed",
         ),
         (
             ".github/workflows/foundation.yml",
