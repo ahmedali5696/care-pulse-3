@@ -68,7 +68,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': '138470bb649f1dee11dfd332b9c77390b119b832f1144458089c42edf601b5bb',
+    '.github/workflows/foundation.yml': '5fe7b8f8f58cfa69663ff4dae0f8696962936a616ebf5324fe16eba2bcaba0a6',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
     'apps/api/Dockerfile': '8465e11d5b90d94704ec63072180f10c56dcf4becf471da84258ea21de5208c8',
@@ -243,6 +243,20 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
 set -euo pipefail
 umask 077
 focused_target=
+profile_lane="${CP_PROFILE_LANE:-}"
+if [ "$profile_lane" = off ]; then profile_lane=''; fi
+if [ -n "$profile_lane" ]; then
+  if [[ "${GITHUB_EVENT_NAME:-}" != workflow_dispatch || "${GITHUB_REF:-}" != refs/heads/feature/foundation-parallel-profile-20261123 || "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false || -n "${CP_T133_SHA:-}" ]]; then
+    echo 'FAIL profiling is restricted to one named manual experiment'; exit 1
+  fi
+  case "$profile_lane" in ordinary|historical) ;; *) echo 'FAIL unrecognized profiling lane'; exit 1 ;; esac
+fi
+profile_stamp() {
+  if [ -n "$profile_lane" ]; then
+    printf 'PROFILE_PHASE lane=%s phase=%s seconds=%s status=%s sha=%s\n' "$profile_lane" "$1" "$2" "$3" "$GITHUB_SHA"
+  fi
+}
+profile_cold_start=$SECONDS
 if [ "$1" = integration-diagnostic ]; then
   if [[ "${GITHUB_EVENT_NAME:-}" != workflow_dispatch || "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false || -n "${CP_T133_SHA:-}" ]]; then
     echo 'FAIL focused diagnostics require a manual dispatch without experimental modes'; exit 1
@@ -290,6 +304,8 @@ cleanup() {
       code=1
     elif [ -n "$focused_target" ]; then
       echo 'PASS scoped PostgreSQL volume and synthetic secret cleanup'
+    elif [ -n "$profile_lane" ]; then
+      echo 'PASS scoped profiling PostgreSQL volume and synthetic secret cleanup'
     fi
   else
     echo 'FAIL unsafe cleanup project'; code=1
@@ -308,6 +324,7 @@ chmod 0444 "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" "$CP_DELIVERY_PUBLIC_KEY_SOURC
 docker compose --profile mail --profile scan --profile test --profile sender --profile operator config --quiet
 docker compose --profile mail --profile scan --profile test --profile sender --profile operator config --format json > "$private/compose.json"
 chmod 0444 "$private/compose.json"
+profile_pull_start=$SECONDS
 for image in \
   'node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205' \
   'python:3.13.16-slim-bookworm@sha256:73aa5faee130c60da030e105ec971ccf57473fbd22ce73bd6fc9ba99a40b838d' \
@@ -323,11 +340,15 @@ do
   test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = linux/amd64
   docker image inspect --format '{{json .RepoDigests}} {{.Id}} {{.Os}}/{{.Architecture}}' "$image"
 done
-if [ -n "$focused_target" ]; then
+profile_stamp docker-pulls "$((SECONDS-profile_pull_start))" PASS
+profile_build_start=$SECONDS
+if [ -n "$focused_target" ] || [ "$profile_lane" = historical ]; then
   docker compose --profile test build --pull test
 else
   docker compose --profile test --profile sender --profile operator build --pull
 fi
+profile_stamp docker-build "$((SECONDS-profile_build_start))" PASS
+profile_db_start=$SECONDS
 docker compose up -d --no-build db
 for attempt in $(seq 1 40); do
   # TCP readiness excludes the temporary Unix-socket-only bootstrap server.
@@ -350,6 +371,8 @@ if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e C
   echo "FAIL controlled roles (${roles_error:-SQLSTATE unavailable}; credential-bearing diagnostics withheld)"; exit 1
 fi
 unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_AUTH_DB_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD CP_API_DB_PASSWORD CP_WEB_DB_PASSWORD CP_WORKER_DB_PASSWORD CP_GATE_DB_PASSWORD
+profile_stamp postgres-start-and-roles "$((SECONDS-profile_db_start))" PASS
+profile_stamp cold-preparation "$((SECONDS-profile_cold_start))" PASS
 identity_fixture_args=(
   -e CP_DB_IDENTITY_KEY_ID
   -v "$CP_DB_IDENTITY_KEY_SOURCE_FILE:/run/secrets/db_identity_key:ro"
@@ -522,6 +545,9 @@ run_historical_migrations() (
   mkdir "$historical_root/private-files"
   chmod -R a+rX "$historical_root"
   test "$(docker image inspect --format '{{.Id}}' "$test_image")" != ""
+  if [ "$profile_lane" = historical ]; then
+    echo "PROFILE_CANDIDATE sha=$GITHUB_SHA image=$(docker image inspect --format '{{.Id}}' "$test_image") source=$historical_sha"
+  fi
   printf 'services:\n  test:\n    image: %s\n' "$test_image" > "$historical_dir/compose-override.yaml"
   # Never share the active cluster's credentials, volumes or network.
   export CP_DB_PASSWORD_FILE="$historical_dir/postgres-password"
@@ -551,12 +577,15 @@ run_historical_migrations() (
   test -z "$(docker network ls -q --filter "label=com.docker.compose.project=$historical_project")"
   historical_cleanup() {
     local code=$?
+    local cleanup_start=$SECONDS
     trap - EXIT
     if ! historical_compose --profile test down --remove-orphans --volumes; then
       echo 'FAIL historical Compose cleanup'; code=1
     fi
+    profile_stamp historical-postgresql-cleanup "$((SECONDS-cleanup_start))" "$(if [ "$code" -eq 0 ]; then echo PASS; else echo FAIL; fi)"
     exit "$code"
   }
+  local historical_cleanup_start=$SECONDS
   trap historical_cleanup EXIT
   historical_compose up -d --no-build db
   for attempt in $(seq 1 40); do
@@ -596,7 +625,17 @@ run_historical_migrations() (
   if grep -Eq '[0-9]+ skipped|no tests ran' "$historical_dir/tests.log"; then
     echo 'FAIL mandatory historical migration evidence skipped'; exit 1
   fi
+  if [ "$profile_lane" = historical ] && ! grep -Eq '(^|[[:space:]])163 passed in ' "$historical_dir/tests.log"; then
+    echo 'FAIL profiling historical inventory differs from verified Full Foundation 163 cases'; exit 1
+  fi
+  profile_stamp historical-postgresql-lifecycle "$((SECONDS-historical_cleanup_start))" PASS
 )
+if [ "$profile_lane" = historical ]; then
+  profile_historical_start=$SECONDS
+  run_historical_migrations
+  profile_stamp historical-evidence "$((SECONDS-profile_historical_start))" PASS
+  exit 0
+fi
 # Keep experimental/protected invocation and its original selection untouched.
 if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ] && [ "${CP_B04_SPIKE:-false}" = false ]; then
   for node in "${historical_nodes[@]}"; do
@@ -609,6 +648,7 @@ if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ] && [ "${CP_
   ordinary_day_review_migration_files=()
 fi
 
+profile_ordinary_start=$SECONDS
 upgrade_head
 seed_identity_policy
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
@@ -626,7 +666,7 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/f01-runtime-identity.log"; then
   echo 'FAIL mandatory F-01 runtime identity evidence skipped'; exit 1
 fi
-if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ] && [ "${CP_B04_SPIKE:-false}" = false ]; then
+if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ] && [ "${CP_B04_SPIKE:-false}" = false ] && [ "$profile_lane" != ordinary ]; then
   run_historical_migrations
 fi
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
@@ -1146,6 +1186,7 @@ fi
 if [ "${CP_T133_MODE:-false}" = true ]; then
   bash ops/t133-ci.sh "$private"
 fi
+profile_stamp ordinary-integration "$((SECONDS-profile_ordinary_start))" PASS
 {
   echo '### Wave 0 and Wave 1 D-01/D-02 foundation checks'
   echo "- Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT}, SHA ${GITHUB_SHA})"
@@ -1194,6 +1235,17 @@ elif [[ "$1" = compat-full && "${CP_COMPAT_DIAGNOSTIC:-}" = compat-full ]]; then
 else
   echo 'FAIL invalid ordinary compatibility selection'; exit 1
 fi
+if [ -n "${CP_PROFILE_LANE:-}" ] && [ "${CP_PROFILE_LANE:-}" != off ]; then
+  if [[ "${CP_PROFILE_LANE}" != compat || "${GITHUB_EVENT_NAME:-}" != workflow_dispatch || "${GITHUB_REF:-}" != refs/heads/feature/foundation-parallel-profile-20261123 || "$mode" != compat-full ]]; then
+    echo 'FAIL unapproved profiling compatibility invocation'; exit 1
+  fi
+fi
+profile_stamp() {
+  if [ "${CP_PROFILE_LANE:-}" = compat ]; then
+    printf 'PROFILE_PHASE lane=compat phase=%s seconds=%s status=%s sha=%s\n' "$1" "$2" "$3" "$GITHUB_SHA"
+  fi
+}
+profile_cold_start=$SECONDS
 private="$RUNNER_TEMP/foundation-ci-private"
 test ! -e "$private"
 mkdir -m 0700 "$private"
@@ -1204,6 +1256,7 @@ source_dir="$RUNNER_TEMP/compat-source-0040"
 rm -rf -- "$source_dir"
 cleanup() {
   local code=$? cleanup_failed=0
+  local cleanup_start=$SECONDS
   trap - EXIT
   if [[ -n "${host_pid:-}" ]]; then
     kill -TERM "$host_pid" 2>/dev/null || true
@@ -1224,6 +1277,7 @@ cleanup() {
     else
       echo 'PASS scoped compat Compose volume and synthetic secret cleanup'
     fi
+    profile_stamp compat-cleanup "$((SECONDS-cleanup_start))" "$(if [ "$code" -eq 0 ]; then echo PASS; else echo FAIL; fi)"
   else
     echo 'FAIL unsafe compat cleanup project'; code=1
   fi
@@ -1269,7 +1323,9 @@ chmod 0444 "$CP_SOURCE_DELIVERY_PRIVATE_KEY_FILE" "$CP_SOURCE_DELIVERY_PUBLIC_KE
 docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer config --quiet
 docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer config --format json > "$private/compose.compat.json"
 chmod 0444 "$private/compose.compat.json"
+profile_compat_build_start=$SECONDS
 docker compose -f compose.compat.yaml --profile mail --profile source --profile source-sender --profile candidate --profile candidate-sender --profile controller --profile observer build --pull
+profile_stamp compat-image-build "$((SECONDS-profile_compat_build_start))" PASS
 docker compose -f compose.compat.yaml --profile mail up -d --no-build db mail
 for attempt in $(seq 1 40); do
   if docker compose -f compose.compat.yaml exec -T db pg_isready -h 127.0.0.1 -U carepulse_bootstrap -d carepulse > /dev/null 2>&1; then break; fi
@@ -1283,6 +1339,7 @@ for svc in source-api source-web source-worker source-sender candidate-api candi
   [[ "$img" == sha256:* ]] || { echo "FAIL missing built compat image for $svc"; exit 1; }
   echo "COMPAT_IMAGE $svc=$img"
 done
+profile_stamp compat-cold-preparation "$((SECONDS-profile_cold_start))" PASS
 sha256sum ops/compat/source-web.cjs ops/compat/source-api.py ops/compat/source-jobs.py apps/api/carepulse/compat/admission.py apps/web/compat/admission.ts
 
 assert_full_compat_count() {
@@ -1321,6 +1378,7 @@ run_compat_observer() {
   fi
 }
 if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
+    profile_us1_start=$SECONDS
     required_suites=(tests/unit/test_compat_admission.py tests/integration/test_compat_matrix.py tests/integration/test_compat_entry_denials.py tests/integration/test_compat_source_privileges.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
     run_compat_observer compat-us1 25 "${required_suites[@]}"
@@ -1356,6 +1414,7 @@ if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
       done
       echo 'PASS compat-us1-source-web: 2 mandatory source image tests, zero skips'
     fi
+    profile_stamp compat-us1 "$((SECONDS-profile_us1_start))" PASS
 fi
 # The independent Docker/PG supervisor attests every stopped-consumer proof
 # for US2 drain/migration and US3 recovery; observer never receives Docker.
@@ -1405,6 +1464,7 @@ PY
     host_pid=$!
 fi
 if [[ "$mode" = compat-us2 || "$mode" = compat-full ]]; then
+    profile_us2_start=$SECONDS
     required_suites=(tests/integration/test_compat_drain.py tests/integration/test_compat_delivery.py tests/integration/test_compat_upgrade.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
     run_compat_observer compat-us2 8 "${required_suites[@]}"
@@ -1417,8 +1477,10 @@ if [[ "$mode" = compat-us2 || "$mode" = compat-full ]]; then
       fi
       host_pid=''
     fi
+    profile_stamp compat-us2 "$((SECONDS-profile_us2_start))" PASS
 fi
 if [[ "$mode" = compat-us3 || "$mode" = compat-full ]]; then
+    profile_us3_start=$SECONDS
     required_suites=(tests/integration/test_compat_recovery_source.py tests/integration/test_compat_recovery_intermediate.py tests/integration/test_compat_recovery_target.py tests/integration/test_compat_preservation.py)
     for f in "${required_suites[@]}"; do test -f "$f" || { echo "FAIL missing $f"; exit 1; }; done
     set +e
@@ -1442,6 +1504,7 @@ if [[ "$mode" = compat-us3 || "$mode" = compat-full ]]; then
     if [[ "$mode" = compat-full ]]; then
       assert_full_compat_count compat-us3 10 "$private/compat-results/compat-us3.xml"
     fi
+    profile_stamp compat-us3 "$((SECONDS-profile_us3_start))" PASS
 fi
 if [[ "$mode" = compat-full ]]; then
   echo 'PASS mandatory compatibility: 44 Python cases (US1 26, US2 8, US3 10), 11 Web cases, zero skips'

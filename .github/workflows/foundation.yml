@@ -1,5 +1,5 @@
-name: Foundation
-run-name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'Foundation PostgreSQL diagnostic' || '' }}
+name: Foundation Parallel Profiling Experiment (NOT ACCEPTANCE)
+run-name: ${{ github.ref == 'refs/heads/feature/foundation-parallel-profile-20261123' && 'PROFILING EXPERIMENT ONLY — NOT FOUNDATION ACCEPTANCE' || (inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'Foundation PostgreSQL diagnostic' || '') }}
 
 on:
   push:
@@ -144,21 +144,41 @@ jobs:
           }
 
   compose-integration:
-    name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'postgres-diagnostic' || 'compose-integration' }}
+    name: ${{ github.ref == 'refs/heads/feature/foundation-parallel-profile-20261123' && format('PROFILE ONLY — {0}', matrix.lane) || (inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'postgres-diagnostic' || 'compose-integration') }}
     needs: inputs-and-build
-    if: ${{ !cancelled() && (needs.inputs-and-build.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && needs.inputs-and-build.result == 'skipped')) }}
+    if: ${{ !cancelled() && (needs.inputs-and-build.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && needs.inputs-and-build.result == 'skipped')) && (github.ref != 'refs/heads/feature/foundation-parallel-profile-20261123' || (github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic == 'full' && !inputs.b04_spike && !inputs.t133_terminal && inputs.t133_sha == '')) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ github.ref == 'refs/heads/feature/foundation-parallel-profile-20261123' && fromJSON('["ordinary","historical","compat"]') || fromJSON('["standard"]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
       CP_B04_SPIKE: ${{ inputs.b04_spike || false }}
       CP_T133_MODE: ${{ inputs.t133_terminal || false }}
       CP_T133_SHA: ${{ inputs.t133_sha || '' }}
-      COMPOSE_PROJECT_NAME: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
-      CP_CI_PROJECT: carepulse-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CP_PROFILE_LANE: ${{ matrix.lane == 'standard' && 'off' || matrix.lane }}
+      COMPOSE_PROJECT_NAME: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.lane == 'ordinary' && '1' || matrix.lane == 'historical' && '2' || '3') }}
+      CP_CI_PROJECT: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.lane == 'ordinary' && '1' || matrix.lane == 'historical' && '2' || '3') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Verify exact experiment runner, branch, and candidate SHA
+        if: ${{ matrix.lane != 'standard' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/feature/foundation-parallel-profile-20261123
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$CP_PROFILE_LANE" = ordinary -o "$CP_PROFILE_LANE" = historical -o "$CP_PROFILE_LANE" = compat
+          test "$CP_B04_SPIKE" = false
+          test "$CP_T133_MODE" = false
+          test -z "$CP_T133_SHA"
+          test "$CP_CI_PROJECT" = "$COMPOSE_PROJECT_NAME"
+          echo "PROFILE_PHASE lane=$CP_PROFILE_LANE phase=runner-identity seconds=0 status=PASS sha=$GITHUB_SHA"
 
       - name: Set runner-scoped synthetic secret paths and environment
         shell: bash
@@ -260,7 +280,7 @@ jobs:
           test "$(dpkg-query -W -f='${Version}' docker-buildx-plugin)" = '0.38.1-1~ubuntu.24.04~noble'
 
       - name: Install pinned Playwright browser on disposable runner
-        if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' }}
+        if: ${{ (!inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full') && (matrix.lane == 'standard' || matrix.lane == 'ordinary') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -275,7 +295,7 @@ jobs:
           pnpm --filter @carepulse/web exec playwright install --with-deps chromium
 
       - name: Disposable PostgreSQL, signed Patient API, invited-role acceptance and scoped cleanup
-        if: ${{ !inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full' }}
+        if: ${{ (!inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full') && (matrix.lane == 'standard' || matrix.lane == 'ordinary' || matrix.lane == 'historical') }}
         shell: pwsh
         run: |
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
@@ -283,7 +303,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Mandatory source 0040 to candidate 0046 compatibility, recovery and preserved-data acceptance
-        if: ${{ (!inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full') && !inputs.t133_terminal && !inputs.b04_spike }}
+        if: ${{ (!inputs.postgres_diagnostic || inputs.postgres_diagnostic == 'full') && !inputs.t133_terminal && !inputs.b04_spike && (matrix.lane == 'standard' || matrix.lane == 'compat') }}
         shell: pwsh
         env:
           CP_COMPAT_DIAGNOSTIC: compat-full
@@ -293,7 +313,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Focused disposable PostgreSQL diagnostics and scoped cleanup
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && !startsWith(inputs.postgres_diagnostic, 'compat-') }}
+        if: ${{ matrix.lane == 'standard' && github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && !startsWith(inputs.postgres_diagnostic, 'compat-') }}
         shell: pwsh
         env:
           CP_POSTGRES_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
@@ -303,7 +323,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Compatibility diagnostics (PRE-W3-COMPAT) and scoped cleanup
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && startsWith(inputs.postgres_diagnostic, 'compat-') }}
+        if: ${{ matrix.lane == 'standard' && github.event_name == 'workflow_dispatch' && inputs.postgres_diagnostic && startsWith(inputs.postgres_diagnostic, 'compat-') }}
         shell: pwsh
         env:
           CP_COMPAT_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
@@ -311,3 +331,64 @@ jobs:
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
           & pwsh -NoProfile -File ops/check.ps1 compat-diagnostic
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Emitted only after a successful lane command, including its scoped cleanup.
+      # No arbitrary output/logs/secrets are uploaded, only a fixed synthetic receipt.
+      - name: Seal non-acceptance profiling lane evidence
+        if: ${{ matrix.lane != 'standard' && success() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          lane = os.environ['CP_PROFILE_LANE']
+          sha = os.environ['GITHUB_SHA']
+          assert lane in ('ordinary', 'historical', 'compat')
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == sha
+          proof = {
+              'schema': 1, 'kind': 'PROFILING_ONLY_NOT_ACCEPTANCE',
+              'lane': lane, 'sha': sha, 'run_id': os.environ['GITHUB_RUN_ID'],
+              'attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'status': 'PASS',
+              'coverage': {'ordinary': 'current-head-excluding-extracted-historical',
+                           'historical': 'immutable-0040-selected-nodes-on-isolated-postgres',
+                           'compat': 'full-US1-US2-US3-six-successors-zero-skips'}[lane],
+              'cleanup': 'completed-by-checked-shell-trap',
+          }
+          pathlib.Path('profile-proof.json').write_text(json.dumps(proof, sort_keys=True))
+          print(f'PROFILE_PROOF lane={lane} sha={sha} status=PASS')
+          PY
+
+      - name: Publish sanitized profiling receipt only
+        if: ${{ matrix.lane != 'standard' && success() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: foundation-profile-${{ matrix.lane }}-${{ github.sha }}
+          path: profile-proof.json
+          if-no-files-found: error
+          retention-days: 1
+
+  profile-aggregate:
+    name: PROFILE ONLY — fail-closed aggregate (NOT acceptance)
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/feature/foundation-parallel-profile-20261123' }}
+    needs: [inputs-and-build, compose-integration]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1, experimental aggregator only
+        with:
+          persist-credentials: false
+
+      - name: Retrieve all three mandatory execution receipts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: foundation-profile-*-${{ github.sha }}
+          path: profile-proofs
+
+      - name: Verify complete lane outcomes, candidate SHA and scoped cleanup
+        shell: bash
+        env:
+          INPUT_RESULT: ${{ needs.inputs-and-build.result }}
+          LANES_RESULT: ${{ needs.compose-integration.result }}
+        run: |
+          set -euo pipefail
+          python3 ops/profile_aggregate.py profile-proofs
