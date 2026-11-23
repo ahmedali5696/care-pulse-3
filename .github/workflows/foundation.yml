@@ -85,6 +85,9 @@ jobs:
           sha256sum "$archive"
           mkdir -p "$RUNNER_TEMP/python-3.13.16"
           tar -xzf "$archive" -C "$RUNNER_TEMP/python-3.13.16"
+          # The prebuilt ELF resolves libpython from the verified archive's lib/.
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/python-3.13.16/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
           PYTHON="$RUNNER_TEMP/python-3.13.16/bin/python3.13"
           "$PYTHON" - <<'PY'
           import platform

@@ -243,6 +243,11 @@ def test_peer_validation_cannot_be_disabled(checkout):
         ),
         (
             ".github/workflows/foundation.yml",
+            'export LD_LIBRARY_PATH="$RUNNER_TEMP/python-3.13.16/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
+            'export LD_LIBRARY_PATH="/tmp/unverified"',
+        ),
+        (
+            ".github/workflows/foundation.yml",
             "foundation-ubuntu24-x64-node24.22.1-pnpm10.34.7-${{ hashFiles('pnpm-lock.yaml') }}",
             "foundation-pnpm-unkeyed",
         ),
