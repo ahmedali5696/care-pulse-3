@@ -556,42 +556,19 @@ def check_in_appointment(
         raise ContractError(409)
     require_matching_revision(command.expected_appointment_revision, int(appt.revision))
 
-    new_appt_revision = int(appt.revision) + 1
-    connection.execute(
-        text("""
-            UPDATE public.appointments
-            SET status = 'Waiting',
-                revision = :new_revision
-            WHERE organization_id = :tenant AND id = :appointment_id
-        """),
-        {
-            "tenant": actor.organization_id,
-            "appointment_id": appointment_id,
-            "new_revision": new_appt_revision,
-        },
-    )
-    connection.execute(
-        text("""
-            INSERT INTO public.appointment_history
-                (id, organization_id, appointment_id, appointment_revision, action,
-                 old_status, new_status, old_service_date, new_service_date,
-                 old_number, new_number, actor_staff_id, actor_role,
-                 price_snapshot_appointment_id, reason)
-            VALUES (:id, :tenant, :appointment_id, :appointment_revision, 'CHECKED_IN',
-                    'Booked', 'Waiting', :service_date, :service_date,
-                    :number, :number, :actor_staff_id, :actor_role,
-                    :appointment_id, NULL)
-        """),
-        {
-            "id": uuid4(),
-            "tenant": actor.organization_id,
-            "appointment_id": appointment_id,
-            "appointment_revision": new_appt_revision,
-            "service_date": appt.service_date,
-            "number": int(appt.current_number),
-            "actor_staff_id": actor.staff_id,
-            "actor_role": actor.role,
-        },
+    new_appt_revision = int(
+        connection.scalar(
+            text("""
+                SELECT public.f01_check_in_appointment(
+                    :tenant, :appointment_id, :expected_revision
+                )
+            """),
+            {
+                "tenant": actor.organization_id,
+                "appointment_id": appointment_id,
+                "expected_revision": int(appt.revision),
+            },
+        )
     )
 
     routine_rank: int | None = None

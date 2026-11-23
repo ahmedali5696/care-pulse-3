@@ -92,8 +92,59 @@ def upgrade() -> None:
     """)
 
     # 2) Least-privilege column/table grants for B-12 check-in and dated queue read.
+    # Retain zero direct UPDATE(status, revision) grant on public.appointments for carepulse_api;
+    # the F-01 scoped SECURITY DEFINER writer below enforces Booked->Waiting check-in only.
     op.execute("""
-        GRANT UPDATE (status, revision) ON public.appointments TO carepulse_api;
+        CREATE FUNCTION public.f01_check_in_appointment(
+            p_tenant uuid, p_appointment_id uuid, p_expected_revision bigint)
+        RETURNS bigint
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+        DECLARE
+            ctx record;
+            appt public.appointments%ROWTYPE;
+            new_rev bigint;
+        BEGIN
+            IF session_user <> 'carepulse_api' THEN
+                RAISE EXCEPTION 'Check-in writer scope denied' USING ERRCODE = '42501';
+            END IF;
+            SELECT * INTO ctx FROM public.f01_context();
+            IF NOT FOUND OR NOT COALESCE(
+                ctx.purpose = 'QUEUE_CHECK_IN'
+                AND ctx.method = 'POST'
+                AND ctx.stage = 'PRIMARY'
+                AND ctx.organization_id = p_tenant::text
+                AND ctx.target_id = p_appointment_id
+                AND ctx.role IN ('DOCTOR_OWNER', 'RECEPTIONIST')
+                AND ctx.staff_id IS NOT NULL,
+                false
+            ) THEN
+                RAISE EXCEPTION 'Check-in writer scope denied' USING ERRCODE = '42501';
+            END IF;
+            SELECT * INTO appt FROM public.appointments
+            WHERE organization_id = p_tenant AND id = p_appointment_id
+            FOR UPDATE;
+            IF NOT FOUND OR appt.status <> 'Booked' OR appt.revision <> p_expected_revision THEN
+                RAISE EXCEPTION 'Check-in precondition failed' USING ERRCODE = '23514';
+            END IF;
+            new_rev := appt.revision + 1;
+            UPDATE public.appointments
+            SET status = 'Waiting', revision = new_rev
+            WHERE organization_id = p_tenant AND id = p_appointment_id;
+            INSERT INTO public.appointment_history
+                (id, organization_id, appointment_id, appointment_revision, action,
+                 old_status, new_status, old_service_date, new_service_date,
+                 old_number, new_number, actor_staff_id, actor_role,
+                 price_snapshot_appointment_id, reason)
+            VALUES (gen_random_uuid(), p_tenant, p_appointment_id, new_rev, 'CHECKED_IN',
+                    'Booked', 'Waiting', appt.service_date, appt.service_date,
+                    appt.current_number, appt.current_number, ctx.staff_id::uuid, ctx.role,
+                    p_appointment_id, NULL);
+            RETURN new_rev;
+        END $$;
+        REVOKE ALL ON FUNCTION public.f01_check_in_appointment(uuid, uuid, bigint) FROM PUBLIC;
+        GRANT EXECUTE ON FUNCTION public.f01_check_in_appointment(uuid, uuid, bigint)
+            TO carepulse_api;
+
         GRANT SELECT, INSERT ON public.queue_days TO carepulse_api;
         GRANT UPDATE (revision, arrival_counter) ON public.queue_days TO carepulse_api;
         GRANT SELECT ON public.queue_entries TO carepulse_api;
@@ -373,13 +424,7 @@ def upgrade() -> None:
                           AND c.target_id IS NOT NULL AND appointments.id = c.target_id)
                   )
             ))
-            WITH CHECK (EXISTS (
-                SELECT 1 FROM public.f01_context() c
-                WHERE c.organization_id = appointments.organization_id::text AND c.stage = 'PRIMARY'
-                  AND c.purpose = 'QUEUE_CHECK_IN' AND c.method = 'POST'
-                  AND c.target_id IS NOT NULL AND appointments.id = c.target_id
-                  AND appointments.status = 'Waiting'
-            ));
+            WITH CHECK (false);
 
         DROP POLICY f01_api_insert ON public.appointment_history;
         CREATE POLICY f01_api_insert ON public.appointment_history FOR INSERT TO carepulse_api

@@ -3089,12 +3089,16 @@ def test_d08_adds_no_lifecycle_or_fixture_api_routes():
         if hasattr(route, "path")
         for method in getattr(route, "methods", set())
     }
+    authorized_w3_appointment_routes = {
+        ("POST", "/v1/appointments/{appointment_id}/check-in"),
+    }
     assert ("POST", "/v1/appointments") in route_set
     assert not any(
         path.startswith(("/v1/followups", "/v1/followup-claims", "/v1/fixtures"))
         or (
             path.startswith("/v1/appointments/")
             and method in ("PATCH", "POST", "DELETE")
+            and (method, path) not in authorized_w3_appointment_routes
         )
         for method, path in route_set
     )
