@@ -1,6 +1,8 @@
 """B-12 real authenticated browser-to-BFF-to-API-to-PostgreSQL acceptance."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from threading import Barrier
 from uuid import UUID, uuid4
 
 from test_booking import booking_body
@@ -149,6 +151,28 @@ def test_invited_browser_checkin_replay_and_tenant_session_isolation(invited_pat
     )
     _denied(browser_request(receptionist, path), 403, "FORBIDDEN")
     _denied(
+        browser_request(None, path, method="POST", body=command, key=key),
+        401,
+        "UNAUTHENTICATED",
+    )
+    _denied(
+        browser_request(receptionist, path, method="POST", body=command),
+        422,
+        "INVALID_INPUT",
+    )
+    for stale_field in ("expected_appointment_revision", "expected_queue_day_revision"):
+        _denied(
+            browser_request(
+                receptionist,
+                path,
+                method="POST",
+                body={**command, stale_field: 1},
+                key=str(uuid4()),
+            ),
+            409,
+            "STALE_REVISION",
+        )
+    _denied(
         browser_request(foreign, path, method="POST", body=command, key=key),
         404,
         "NOT_FOUND",
@@ -156,9 +180,16 @@ def test_invited_browser_checkin_replay_and_tenant_session_isolation(invited_pat
     assert _domain_state(sessions.clinic) == before
     assert _domain_state(foreign_tenant) == foreign_before
 
-    status, checked = browser_request(
-        receptionist, path, method="POST", body=command, key=key
-    )
+    start = Barrier(2)
+
+    def submit():
+        start.wait(timeout=15)
+        return browser_request(receptionist, path, method="POST", body=command, key=key)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = pool.submit(submit), pool.submit(submit)
+        status, checked = first.result(timeout=30)
+        assert second.result(timeout=30) == (status, checked)
     assert status == 200, checked
     entry = checked["data"]
     assert checked["revision"] == 1
@@ -357,6 +388,31 @@ def test_invited_browser_checkin_replay_and_tenant_session_isolation(invited_pat
     assert _domain_state(sessions.clinic) == after
     assert _domain_state(foreign_tenant) == foreign_before
 
+    # Same visible tenant, different target, identical signed body and key.
+    status, other_patient = browser_request(
+        receptionist,
+        method="POST",
+        body={**PATIENT, "name_parts": ["Synthetic", "B12", "Other"]},
+        key=str(uuid4()),
+    )
+    assert status == 201, other_patient
+    status, other_booking = browser_request(
+        receptionist,
+        "/api/appointments",
+        method="POST",
+        body=booking_body(other_patient["data"]["id"]),
+        key=str(uuid4()),
+    )
+    assert status == 201, other_booking
+    other_path = f"/api/appointments/{other_booking['data']['id']}/check-in"
+    after_other_booking = _domain_state(sessions.clinic)
+    _denied(
+        browser_request(receptionist, other_path, method="POST", body=command, key=key),
+        409,
+        "IDEMPOTENCY_CONFLICT",
+    )
+    assert _domain_state(sessions.clinic) == after_other_booking
+
     assert browser_request(receptionist, "/api/auth/logout", method="POST")[0] == 200
     _denied(
         browser_request(receptionist, path, method="POST", body=command, key=key),
@@ -364,5 +420,5 @@ def test_invited_browser_checkin_replay_and_tenant_session_isolation(invited_pat
         "UNAUTHENTICATED",
     )
     _denied(browser_request(receptionist, queue_path), 401, "UNAUTHENTICATED")
-    assert _domain_state(sessions.clinic) == after
+    assert _domain_state(sessions.clinic) == after_other_booking
     assert _domain_state(foreign_tenant) == foreign_before

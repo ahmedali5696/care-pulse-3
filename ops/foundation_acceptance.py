@@ -351,7 +351,7 @@ def _publish_acceptance(env: dict[str, str]) -> None:
         f"- Event/ref: `{context['event']}` / `{context['ref']}`",
         f"- Repository/workflow: `{context['repository']}` / `{context['workflow']}`",
         f"- Run/attempt: `{context['run_id']}` / `{context['attempt']}`",
-        "- Ordinary (0047, including B-12), historical (163 at 0040), compatibility (44 Python + 11 Web, 0040 to 0046): verified",
+        f"- Ordinary ({ORDINARY_SCHEMA}, including B-12), historical (163 at 0040), compatibility (44 Python + 11 Web, 0040 to 0046): verified",
         "- Three current-attempt receipts, zero mandatory skips, scoped cleanup, artifact digests: verified",
     ]
     if context["pr"] is not None:
