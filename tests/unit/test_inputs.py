@@ -29,6 +29,7 @@ def checkout(tmp_path):
         "compose.yaml",
         "compose.compat.yaml",
         ".github/workflows/foundation.yml",
+        ".github/workflows/fast-feedback.yml",
         "tests/integration/test_auth_mail.py",
         "tests/integration/test_tenant_isolation.py",
         "tests/integration/test_identity_persistence.py",
@@ -169,6 +170,20 @@ def test_runtime_version_mismatch_is_rejected(checkout):
     assert "Unapproved Node version" in completed.stdout + completed.stderr
 
 
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"])
+def test_fast_feedback_fingerprint_accepts_canonical_line_endings(
+    checkout, line_ending
+):
+    workflow = checkout / ".github/workflows/fast-feedback.yml"
+    canonical = workflow.read_bytes().replace(b"\r\n", b"\n")
+    workflow.write_bytes(canonical.replace(b"\n", line_ending))
+    env = _native_stub(checkout, "node", "echo v0.0.0\nexit 0\n")
+    completed = _check(checkout, env=env)
+    assert completed.returncode != 0
+    # Reaching the Node guard proves the workflow fingerprint passed without installing.
+    assert "Unapproved Node version" in completed.stdout + completed.stderr
+
+
 def test_native_failure_becomes_runner_failure(checkout):
     env = _native_stub(checkout, "python", "exit 23\n")
     completed = _check(checkout, "unit", env)
@@ -270,6 +285,51 @@ def test_peer_validation_cannot_be_disabled(checkout):
             ".github/workflows/foundation.yml",
             "#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70",
             "",
+        ),
+        (
+            ".github/workflows/fast-feedback.yml",
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "actions/checkout@main",
+        ),
+        (
+            ".github/workflows/fast-feedback.yml",
+            "releases/download/v7.6.7/powershell-7.6.7-linux-x64.tar.gz",
+            "releases/download/v7.6.8/powershell-7.6.8-linux-x64.tar.gz",
+        ),
+        (
+            ".github/workflows/fast-feedback.yml",
+            "d6f5f504043400592e9dcf368ba262c64d998608646cc22281b5a75beecbc872",
+            "0" * 64,
+        ),
+        (
+            ".github/workflows/fast-feedback.yml",
+            "#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70",
+            "",
+        ),
+        (
+            ".github/workflows/fast-feedback.yml",
+            "node-v24.22.1-linux-x64.tar.xz",
+            "node-v24.22.2-linux-x64.tar.xz",
+        ),
+        (
+            ".github/workflows/fast-feedback.yml",
+            "pnpm@10.34.7",
+            "pnpm@latest",
+        ),
+        (
+            ".github/workflows/fast-feedback.yml",
+            "foundation-ubuntu24-x64-python3.13.16-pip26.2.2-${{ hashFiles('requirements.lock') }}",
+            "foundation-python-unkeyed",
+        ),
+        (
+            ".github/workflows/fast-feedback.yml",
+            "foundation-ubuntu24-x64-node24.22.1-pnpm10.34.7-${{ hashFiles('pnpm-lock.yaml') }}",
+            "foundation-pnpm-unkeyed",
+        ),
+        (
+            ".github/workflows/fast-feedback.yml",
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "if ($LASTEXITCODE -ne 0) { exit 0 }",
         ),
         (
             "apps/api/Dockerfile",

@@ -109,6 +109,7 @@ require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
     '.github/workflows/foundation.yml': '9a0f2dba53b47e4dca7b2b094e2b3c85bce3c86e80180e823ce5f8ef46dabe56',
+    '.github/workflows/fast-feedback.yml': '814f40f9f2a09d6337e5d4e14f1d4851e88301e64c1f28d5e538d3549dccce8b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
     'apps/api/Dockerfile': '8465e11d5b90d94704ec63072180f10c56dcf4becf471da84258ea21de5208c8',

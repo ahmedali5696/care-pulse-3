@@ -1,0 +1,121 @@
+name: Fast Feedback
+
+on:
+  push:
+    branches:
+      - '**'
+      - '!development'
+      - '!main'
+  workflow_dispatch:
+
+concurrency:
+  group: fast-feedback-${{ github.event_name }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.sha || 'branch' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fast-feedback:
+    name: Fast Feedback
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify exact checkout SHA and label advisory evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          {
+            echo '### Fast Feedback (advisory; NOT Full Foundation acceptance)'
+            printf 'Checkout SHA: `%s`\n\nEvent: `%s`\n\nRef: `%s`\n\nRun: `%s` / attempt `%s`\n' "$GITHUB_SHA" "$GITHUB_EVENT_NAME" "$GITHUB_REF" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify runner and install pinned PowerShell 7
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$ImageOS" = ubuntu24
+          echo "Runner: $ImageOS $ImageVersion, $(uname -sm), SHA $GITHUB_SHA"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/pwsh.tar.gz" https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-linux-x64.tar.gz
+          echo "6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431  $RUNNER_TEMP/pwsh.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/pwsh"
+          tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"
+          chmod +x "$RUNNER_TEMP/pwsh/pwsh"
+          echo "$RUNNER_TEMP/pwsh" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/pwsh/pwsh" -NoProfile -Command 'if ($PSVersionTable.PSVersion.ToString() -ne "7.6.7") { exit 1 }'
+
+      # The release archive contains all Python bootstrap bytes, including
+      # ensurepip. Do not execute its setup.sh (which upgrades pip unpinned).
+      - name: Install SHA-256 verified prebuilt CPython 3.13.16
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/python-3.13.16-linux-24.04-x64.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" https://github.com/actions/python-versions/releases/download/3.13.16-36805956071/python-3.13.16-linux-24.04-x64.tar.gz
+          echo "d6f5f504043400592e9dcf368ba262c64d998608646cc22281b5a75beecbc872  $archive" | sha256sum -c -
+          sha256sum "$archive"
+          mkdir -p "$RUNNER_TEMP/python-3.13.16"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/python-3.13.16"
+          # The prebuilt ELF resolves libpython from the verified archive's lib/.
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/python-3.13.16/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          PYTHON="$RUNNER_TEMP/python-3.13.16/bin/python3.13"
+          "$PYTHON" - <<'PY'
+          import platform
+          import sys
+          import sysconfig
+
+          assert sys.implementation.name == "cpython"
+          assert sys.version_info[:3] == (3, 13, 16)
+          assert platform.machine() == "x86_64"
+          assert not sysconfig.get_config_var("Py_GIL_DISABLED")
+          print("PASS exact standard-GIL CPython 3.13.16 x64")
+          PY
+          "$PYTHON" -m venv "$RUNNER_TEMP/foundation-venv"
+
+      # Cached wheels still pass pip's required SHA-256 checks on installation.
+      - name: Cache pip downloads for exact approved lock
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: foundation-ubuntu24-x64-python3.13.16-pip26.2.2-${{ hashFiles('requirements.lock') }}
+
+      - name: Secure installer bootstrap and frozen dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$RUNNER_TEMP/foundation-venv/bin/python"
+          "$PY" -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+          "$PY" -c 'import pip, sys; assert pip.__version__ == "26.2.2"; assert sys.version_info[:3] == (3, 13, 16)'
+          "$PY" -m pip install --require-hashes --only-binary=:all: -r requirements.lock
+          echo "$RUNNER_TEMP/foundation-venv/bin" >> "$GITHUB_PATH"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/node.tar.xz" https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz
+          echo "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6  $RUNNER_TEMP/node.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/node.tar.xz" -C "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/node-v24.22.1-linux-x64/bin:$PATH"
+          test "$(node --version)" = v24.22.1
+          npm install --global --ignore-scripts --no-audit --no-fund pnpm@10.34.7
+          echo "$RUNNER_TEMP/node-v24.22.1-linux-x64/bin" >> "$GITHUB_PATH"
+
+      # Cache the content-addressed store, never node_modules or an installed environment.
+      # Frozen pnpm install and approved-lock fingerprint checks remain mandatory.
+      - name: Cache pnpm store for exact approved lock
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/pnpm/store
+          key: foundation-ubuntu24-x64-node24.22.1-pnpm10.34.7-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Common pinned inputs, quality, unit, imports and web gates
+        shell: pwsh
+        run: |
+          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
+          foreach ($check in @('inputs', 'python-quality', 'unit', 'imports', 'web')) {
+            & pwsh -NoProfile -File ops/check.ps1 $check
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
