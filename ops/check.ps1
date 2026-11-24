@@ -108,7 +108,8 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': '9a0f2dba53b47e4dca7b2b094e2b3c85bce3c86e80180e823ce5f8ef46dabe56',
+    # Exact isolated diagnostic workflow fingerprint; all other input pins remain unchanged.
+    '.github/workflows/foundation.yml': '1bd7eddf5b4050532884eb47461248a613226e959a064d5227cad4d9546b5303',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
     'apps/api/Dockerfile': '8465e11d5b90d94704ec63072180f10c56dcf4becf471da84258ea21de5208c8',
@@ -748,7 +749,40 @@ fi
 if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ] && [ "${CP_B04_SPIKE:-false}" = false ] && [ "$foundation_lane" != ordinary ]; then
   run_historical_migrations
 fi
-docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
+test "${GITHUB_EVENT_NAME:-}" = workflow_dispatch
+test "${GITHUB_REF:-}" = refs/heads/feature/foundation-d08-diagnostic-20261124
+test "${CP_FOUNDATION_MODE:-}" = b04-spike
+test "$foundation_lane" = standard
+test "${CP_B04_SPIKE:-false}" = true
+test "${CP_T133_MODE:-false}" = false
+test -z "${CP_T133_SHA:-}"
+echo 'D08-DIAG pre-special observation only; NOT Full Foundation or B-04 acceptance'
+(
+  for ((sample=1; sample<=18; sample++)); do
+    echo "D08-DIAG PG SNAPSHOT $sample $(date -u +%FT%TZ)"
+    if ! timeout 6s docker compose exec -T db psql --no-psqlrc -qAt -F '|' -v ON_ERROR_STOP=1 -v VERBOSITY=sqlstate -U carepulse_bootstrap -d carepulse <<'SQL'
+SET statement_timeout = '3s';
+SET default_transaction_read_only = on;
+SELECT 'ACTIVITY', pid, datid, usename, state, wait_event_type, wait_event,
+       pg_blocking_pids(pid), xact_start, backend_xid, backend_xmin
+FROM pg_stat_activity
+WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
+ORDER BY pid;
+SELECT 'LOCK', pid, locktype, mode, granted, database, relation,
+       transactionid, virtualxid, virtualtransaction
+FROM pg_locks
+WHERE pid IN (SELECT pid FROM pg_stat_activity
+              WHERE backend_type = 'client backend' AND pid <> pg_backend_pid())
+ORDER BY pid, granted, locktype, mode;
+SQL
+    then
+      echo 'D08-DIAG PG SNAPSHOT unavailable'
+    fi
+    sleep 10
+  done
+) &
+d08_observer_pid=$!
+if docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/foundation-results:/tmp/foundation-results:rw" \
   -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
@@ -757,7 +791,15 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
   -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
   -v "$CP_SENDER_DB_PASSWORD_SOURCE_FILE:/run/secrets/sender_password:ro" \
-  test python -m pytest -q -ra --tb=short -p no:cacheprovider --junitxml=/tmp/foundation-results/d08.xml "${historical_deselect[@]}" tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_patient_persistence.py tests/integration/test_policy_persistence.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py tests/integration/test_appointment_persistence.py tests/integration/test_appointment_races.py tests/integration/test_visit_persistence.py tests/integration/test_visit_revisions.py tests/integration/test_visit_migration.py tests/integration/test_followup_persistence.py tests/integration/test_followup_races.py tests/integration/test_followup_migration.py "${ordinary_core_migration_files[@]}" | tee "$private/d08-core.log"
+  test timeout --signal=TERM --kill-after=5s 150s python -u -m pytest -vv -rN --tb=no --show-capture=no --disable-warnings -o faulthandler_timeout=25 -p no:cacheprovider -p ops.d08_diagnostic --junitxml=/tmp/foundation-results/d08.xml "${historical_deselect[@]}" tests/integration/test_database.py tests/integration/test_tenant_isolation.py tests/integration/test_patient_persistence.py tests/integration/test_policy_persistence.py tests/integration/test_identity_persistence.py tests/integration/test_evidence_persistence.py tests/integration/test_request_boundary.py tests/integration/test_provisioning.py tests/integration/test_appointment_persistence.py tests/integration/test_appointment_races.py tests/integration/test_visit_persistence.py tests/integration/test_visit_revisions.py tests/integration/test_visit_migration.py tests/integration/test_followup_persistence.py tests/integration/test_followup_races.py tests/integration/test_followup_migration.py "${ordinary_core_migration_files[@]}" | tee "$private/d08-core.log"; then
+  d08_status=0
+else
+  d08_status=$?
+fi
+kill "$d08_observer_pid" 2>/dev/null || true
+wait "$d08_observer_pid" 2>/dev/null || true
+echo "D08-DIAG bounded observation finished, pytest/timeout status=$d08_status; intentionally failing diagnostic before special logic"
+exit 1
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d08-core.log"; then
   echo 'FAIL mandatory D-08 persistence evidence skipped'; exit 1
 fi

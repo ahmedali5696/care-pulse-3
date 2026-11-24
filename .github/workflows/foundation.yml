@@ -1,5 +1,5 @@
 name: Foundation
-run-name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'Foundation PostgreSQL diagnostic' || '' }}
+run-name: D-08 special-mode diagnostic ONLY (NOT Full Foundation acceptance)
 
 on:
   push:
@@ -51,7 +51,7 @@ jobs:
   inputs-and-build:
     name: inputs-and-build
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 15
     outputs:
       mode: ${{ steps.request.outputs.mode }}
       matrix: ${{ steps.request.outputs.matrix }}
@@ -75,6 +75,13 @@ jobs:
           INPUT_T133_SHA: ${{ inputs.t133_sha }}
         run: |
           set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/feature/foundation-d08-diagnostic-20261124
+          test "$INPUT_B04_SPIKE" = true
+          test "$INPUT_T133_TERMINAL" = false
+          test -z "$INPUT_T133_SHA"
+          test "$INPUT_POSTGRES_DIAGNOSTIC" = full
+          echo 'D-08 observation only: B-04 pre-special path; NOT acceptance'
           python3 -m ops.foundation_acceptance validate-request
 
       - name: Verify runner and install pinned PowerShell 7
@@ -177,7 +184,7 @@ jobs:
       matrix:
         lane: ${{ fromJSON(needs.inputs-and-build.outputs.matrix) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 15
     env:
       CP_B04_SPIKE: ${{ inputs.b04_spike || false }}
       CP_T133_MODE: ${{ inputs.t133_terminal || false }}
