@@ -8,6 +8,15 @@ Before declaring an authorized scope complete, report relevant open Issues and d
 
 Do not implement deferred work, modify approved decisions, or close Issues without verified evidence and appropriate authorization.
 
+## CI workflow selection
+
+- Use Fast Feedback for routine development checkpoints.
+- Require Full Foundation for integration acceptance at the exact tested SHA.
+- Never substitute Fast Feedback or diagnostic success for Full Foundation acceptance.
+- Rerun all Full Foundation jobs when required; never combine evidence from different attempts.
+- Verify mandatory tests actually execute with zero skips.
+- Follow docs/postgresql-ci.md for workflow selection, acceptance evidence, and diagnostic procedures.
+
 ## CI failure triage
 
 - Record the failing test or step, run, and exact SHA. Classify the failure as application, test, or environment, and establish the cause from logs, a reproduction, or observed transaction state before changing code.
