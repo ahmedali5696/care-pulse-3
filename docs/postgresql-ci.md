@@ -1,5 +1,17 @@
 # PostgreSQL CI diagnostics
 
+## Choosing Fast Feedback or Full Foundation
+
+**Fast Feedback** is advisory development feedback. It runs automatically on branch pushes except `development` and `main`, and can be dispatched manually with `gh workflow run fast-feedback.yml --ref <branch>` once the workflow exists on the default branch. Tags and pull request events do not trigger it; there are no path filters. Superseded pushes to the same branch cancel older Fast Feedback runs. Manual runs are grouped separately by ref and SHA; Foundation has its own concurrency namespace.
+
+The single `Fast Feedback` job verifies the checkout SHA and runs the same pinned common bootstrap and sequential `inputs`, `python-quality`, `unit`, `imports` and `web` checks as Foundation, including zero-skip unit validation. Only dependency downloads are cached; no installed environments, build outputs or test results are reused. The workflow has read-only repository permissions and does not run Compose, publish Full receipts or upload reports. Its summary identifies the actual checkout SHA, event/ref, run and attempt. A successful Fast Feedback run provides no PostgreSQL integration, migration, cleanup or Full acceptance evidence.
+
+Use Fast Feedback for routine feature checkpoints instead of optional manual Full runs. Foundation still runs its common checks independently and retains all existing triggers, lanes, diagnostics and B-04/T133 behavior. Use Full Foundation for integration acceptance at the exact candidate SHA; do not automatically dispatch another Full when an applicable complete run already exists. PR head, PR test-merge SHA and merged-development SHA are distinct acceptance identities even if their trees match. An existing complete run may be referenced only for its actual tested SHA while its evidence and provenance remain available; no automatic reuse, cross-SHA substitution, mixed-attempt receipts or proxy success checks.
+
+Branch protection is a separate, deferred administrative requirement. CI success alone does not enforce fail-closed merging. Under separate authorization, require PR-based changes and up-to-date branches on `development`, with the exact `Full Foundation acceptance` check bound to the verified `github-actions` app (ID `15368`), administrator enforcement without routine bypass, and force pushes/deletion disabled. Keep Fast Feedback optional; do not require generic common, lane or diagnostic check names. Verify missing, red and stale acceptance blocks merging and current eligible success permits it before claiming enforcement. Workflow fingerprints and CI changes still require trusted review; cancellation is incomplete evidence and never proves cleanup. Manual Fast Feedback dispatch must be verified after merge if the workflow is absent from the default branch during implementation review.
+
+## PostgreSQL diagnostics and acceptance
+
 Dispatch **Foundation** on the candidate branch with `postgres_diagnostic` set to one of these reviewed selections. For example, run `gh workflow run foundation.yml --ref <branch> -f postgres_diagnostic=authorization-lock`.
 
 | Selection | Test target |
