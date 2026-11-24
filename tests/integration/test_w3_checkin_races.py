@@ -69,7 +69,9 @@ def _archive(clinic, patient_id):
         )
 
 
-def _ordered_race(clinic, holder_transaction, waiter_transaction, denial=None):
+def _ordered_race(
+    clinic, holder_transaction, waiter_transaction, denial=None, *, checkpoint=None
+):
     """Hold the first command until PostgreSQL proves the second waits at F-01."""
     ready = Event()
     waiter_pid = []
@@ -97,6 +99,8 @@ def _ordered_race(clinic, holder_transaction, waiter_transaction, denial=None):
                 assert waiter_pid[0] != holder_pid
                 with clinic.migration.connect() as observer:
                     wait_for_postgres_lock(observer, waiter_pid[0], holder_pid)
+                    if checkpoint is not None:
+                        checkpoint(observer)
             finally:
                 event.remove(clinic.runtime, "before_cursor_execute", observe)
         if denial is not None:
@@ -318,9 +322,39 @@ def test_con41_archive_vs_existing_id_checkin_both_orders(
         SELECT to_jsonb(c) FROM public.followup_claims c
         WHERE organization_id=:t AND appointment_id=:a
     """)
+
+    # Snapshot the committed domain/evidence rows, including the completed source.
+    # The observer must see the same state while the winner is still uncommitted.
+    def state(conn):
+        return {
+            table: conn.scalar(
+                text(f"""
+                    SELECT jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r))
+                    FROM public.{table} r WHERE organization_id=:t
+                """),
+                params,
+            )
+            for table in (
+                "patients",
+                "appointments",
+                "appointment_day_counters",
+                "appointment_number_assignments",
+                "appointment_price_snapshots",
+                "appointment_history",
+                "queue_days",
+                "queue_entries",
+                "visits",
+                "followup_claims",
+                "sensitive_audit",
+                "outbox_events",
+                "idempotency_receipts",
+            )
+        }
+
     with clinic.migration.connect() as conn:
         claim_before = conn.execute(claim_sql, params).scalar_one()
         assert claim_before["state"] == "ACTIVE"
+        before = state(conn)
 
     command = CheckInAppointment(
         physical_presence_confirmed=True, expected_appointment_revision=0
@@ -333,11 +367,19 @@ def test_con41_archive_vs_existing_id_checkin_both_orders(
     def archive():
         return _archive(clinic, patient_id)
 
-    if archive_first:
-        archived, checked = _ordered_race(clinic, archive, checkin)
-    else:
-        checked, archived = _ordered_race(clinic, checkin, archive)
+    def checkpoint(observer):
+        assert state(observer) == before
 
+    if archive_first:
+        archived, checked = _ordered_race(
+            clinic, archive, checkin, checkpoint=checkpoint
+        )
+    else:
+        checked, archived = _ordered_race(
+            clinic, checkin, archive, checkpoint=checkpoint
+        )
+
+    assert archived["id"] == str(patient_id)
     assert archived["archived"] is True
     assert archived["lifecycle_revision"] == 1
     assert checked[0]["status"] == "Waiting" and checked[1] == 1
@@ -353,14 +395,28 @@ def test_con41_archive_vs_existing_id_checkin_both_orders(
         assert conn.execute(claim_sql, params).scalar_one() == claim_before
         assert conn.execute(
             text("""
-                SELECT actor_staff_id, actor_role, before_state->>'archived',
-                       after_state->>'archived', after_state->>'lifecycle_revision'
+                SELECT actor_staff_id, actor_role, before_state->>'patient_id',
+                       before_state->>'archived', before_state->>'lifecycle_revision',
+                       after_state->>'archived', after_state->>'lifecycle_revision',
+                       reason, occurred_at IS NOT NULL
                 FROM public.sensitive_audit
                 WHERE organization_id=:t AND action='patients.archive'
                       AND after_state->>'patient_id'=:patient
             """),
             params,
-        ).all() == [(UUID(clinic.owner.staff_id), "DOCTOR_OWNER", "false", "true", "1")]
+        ).all() == [
+            (
+                UUID(clinic.owner.staff_id),
+                "DOCTOR_OWNER",
+                str(patient_id),
+                "false",
+                "0",
+                "true",
+                "1",
+                "CON-41 synthetic archive",
+                True,
+            )
+        ]
         # B-05 archive is revision-guarded and audited; it has no receipt contract.
         assert (
             conn.scalar(
@@ -371,6 +427,44 @@ def test_con41_archive_vs_existing_id_checkin_both_orders(
             )
             == 0
         )
+        committed = state(conn)
+
+    for table in (
+        "appointment_day_counters",
+        "appointment_number_assignments",
+        "appointment_price_snapshots",
+        "followup_claims",
+        "visits",
+    ):
+        assert committed[table] == before[table]
+    for table, added in (
+        ("sensitive_audit", 2),
+        ("outbox_events", 1),
+        ("idempotency_receipts", 1),
+        ("queue_entries", 1),
+        ("appointment_history", 1),
+    ):
+        previous = before[table] or []
+        current = committed[table] or []
+        assert len(current) == len(previous) + added
+        assert all(row in current for row in previous)
+
+    # Denied fresh commands must leave both winners' immutable evidence intact.
+    with pytest.raises(ContractError) as denied, archive() as (_conn, execute):
+        execute()
+    assert denied.value.status_code == 409
+    assert denied.value.code == "STALE_REVISION"
+    with (
+        pytest.raises(ContractError) as denied,
+        _checkin(
+            clinic, clinic.receptionist, appointment_id, command, str(uuid4())
+        ) as (_conn, execute),
+    ):
+        execute()
+    assert denied.value.status_code == 409
+
+    with clinic.migration.connect() as conn:
+        assert state(conn) == committed
 
 
 def test_operation_scope_db_denials_for_queue_tables(booking_clinic) -> None:

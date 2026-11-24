@@ -803,9 +803,8 @@ def test_actual_late_depth_and_fifo(booking_clinic, depth, order, expected):
 def test_representative_production_queue_query_plan(booking_clinic):
     clinic = booking_clinic
     chosen = []
-    for index in range(75):
-        day = SERVICE_DAY if index < 25 else PRIOR_DAY
-        lane = "EMERGENCY" if index >= 50 else "MAIN"
+
+    def add_waiting(index, day, lane):
         appointment = _seed_booked(
             clinic,
             UUID(_new_patient(clinic, clinic.owner, f"Plan{index}")),
@@ -814,41 +813,7 @@ def test_representative_production_queue_query_plan(booking_clinic):
             lane=lane,
         )
         _check_in(clinic, appointment)
-        if index < 25:
-            chosen.append(appointment["id"])
-    with clinic.migration.begin() as conn:
-        conn.execute(
-            text("ANALYZE public.queue_entries, public.appointments, public.patients")
-        )
-    statement = []
-
-    def capture(_conn, _cursor, sql, params, _context, _executemany):
-        if "WITH ordered AS" in sql:
-            statement.append((sql, params))
-
-    query = QueueQuery(date=SERVICE_DAY, lane="MAIN", limit=10, offset=5)
-    with signed_test_transaction(
-        clinic,
-        clinic.receptionist,
-        method="GET",
-        path="/v1/queue",
-        purpose="QUEUE_READ",
-        query=canonical_query(urlencode(query.model_dump(mode="json"))),
-    ) as (conn, actor):
-        event.listen(conn, "before_cursor_execute", capture)
-        try:
-            data, _ = dated_queue_projection(conn, actor, query)
-        finally:
-            event.remove(conn, "before_cursor_execute", capture)
-        assert data["total_waiting"] == len(chosen)
-        assert [entry["appointment_id"] for entry in data["entries"]] == chosen[5:15]
-        assert len(statement) == 1
-        sql, params = statement[0]
-        plan = conn.exec_driver_sql(
-            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql, params
-        ).scalar_one()[0]["Plan"]
-    assert plan["Node Type"] == "Limit" and plan["Actual Rows"] == 10
-    assert "Shared Hit Blocks" in plan
+        return appointment["id"]
 
     def summary(node):
         return {
@@ -860,6 +825,9 @@ def test_representative_production_queue_query_plan(booking_clinic):
                     "Index Name",
                     "Actual Rows",
                     "Actual Loops",
+                    "Rows Removed by Filter",
+                    "Rows Removed by Join Filter",
+                    "Rows Removed by Index Recheck",
                     "Shared Hit Blocks",
                     "Shared Read Blocks",
                 )
@@ -868,4 +836,69 @@ def test_representative_production_queue_query_plan(booking_clinic):
             "Plans": [summary(child) for child in node.get("Plans", [])],
         }
 
-    print("B12_QUEUE_PLAN", json.dumps(summary(plan), sort_keys=True))
+    def observe(label):
+        with clinic.migration.begin() as conn:
+            conn.execute(
+                text(
+                    "ANALYZE public.queue_days, public.queue_entries, public.appointments, public.patients"
+                )
+            )
+        statements = {}
+
+        def capture(_conn, _cursor, sql, params, _context, _executemany):
+            if "WITH ordered AS" in sql:
+                statements["page"] = (sql, params)
+            elif "SELECT count(*)" in sql and "FROM public.queue_entries e" in sql:
+                statements["count"] = (sql, params)
+            elif "FROM public.queue_days q" in sql:
+                statements["day"] = (sql, params)
+
+        query = QueueQuery(date=SERVICE_DAY, lane="MAIN", limit=10, offset=5)
+        with signed_test_transaction(
+            clinic,
+            clinic.receptionist,
+            method="GET",
+            path="/v1/queue",
+            purpose="QUEUE_READ",
+            query=canonical_query(urlencode(query.model_dump(mode="json"))),
+        ) as (conn, actor):
+            event.listen(conn, "before_cursor_execute", capture)
+            try:
+                data, _ = dated_queue_projection(conn, actor, query)
+            finally:
+                event.remove(conn, "before_cursor_execute", capture)
+            assert data["total_waiting"] == len(chosen)
+            assert [entry["appointment_id"] for entry in data["entries"]] == chosen[
+                5:15
+            ]
+            assert [entry["position"] for entry in data["entries"]] == list(
+                range(6, 16)
+            )
+            assert statements.keys() == {"day", "count", "page"}
+            plans = {
+                name: conn.exec_driver_sql(
+                    "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql, params
+                ).scalar_one()[0]["Plan"]
+                for name, (sql, params) in statements.items()
+            }
+        assert plans["day"]["Actual Rows"] == plans["count"]["Actual Rows"] == 1
+        assert plans["page"]["Node Type"] == "Limit"
+        assert plans["page"]["Actual Rows"] == 10
+        assert all("Shared Hit Blocks" in plan for plan in plans.values())
+        # Compare actual scan work without forcing a planner or exposing predicates/IDs.
+        print(
+            "B12_QUEUE_PLAN",
+            label,
+            json.dumps(
+                {name: summary(plan) for name, plan in plans.items()}, sort_keys=True
+            ),
+        )
+
+    for index in range(25):
+        chosen.append(add_waiting(index, SERVICE_DAY, "MAIN"))
+    observe("selected-only")
+    for index in range(25, 50):
+        add_waiting(index, PRIOR_DAY, "MAIN")
+    for index in range(50, 75):
+        add_waiting(index, SERVICE_DAY, "EMERGENCY")
+    observe("other-day-and-lane")

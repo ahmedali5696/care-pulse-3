@@ -431,3 +431,124 @@ def test_checkin_signed_authority_and_transition_evidence(booking_clinic):
             with pytest.raises(DBAPIError) as denied, connection.begin_nested():
                 connection.scalar(writer, params)
             assert denied.value.orig.sqlstate == "42501"
+
+
+def test_checkin_requires_all_evidence_at_commit_and_rolls_back(
+    booking_clinic, monkeypatch
+):
+    clinic = booking_clinic
+    target = _seed_booked(
+        clinic,
+        UUID(_new_patient(clinic, clinic.owner, "Incomplete target")),
+        SERVICE_DAY,
+    )
+    peer = _seed_booked(
+        clinic, UUID(_new_patient(clinic, clinic.owner, "Incomplete peer")), SERVICE_DAY
+    )
+    day = _check_in(clinic, peer)
+    target_id = UUID(target["id"])
+    path = f"/v1/appointments/{target_id}/check-in"
+    body = {
+        "physical_presence_confirmed": True,
+        "expected_appointment_revision": 0,
+        "expected_queue_day_revision": day["queue_day_revision"],
+    }
+    command = CheckInAppointment.model_validate(body)
+    key = str(uuid4())
+
+    def snapshot():
+        with clinic.migration.connect() as connection:
+            return tuple(
+                connection.scalar(
+                    text(f"""
+                        SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t))
+                        FROM public.{table} t WHERE organization_id = :tenant
+                    """),
+                    {"tenant": clinic.tenant},
+                )
+                for table in (
+                    "appointments",
+                    "appointment_day_counters",
+                    "appointment_number_assignments",
+                    "appointment_price_snapshots",
+                    "appointment_history",
+                    "queue_days",
+                    "queue_entries",
+                    "visits",
+                    "sensitive_audit",
+                    "outbox_events",
+                    "idempotency_receipts",
+                )
+            )
+
+    before = snapshot()
+    for missing in ("append_sensitive_audit", "append_outbox", "insert_tenant_receipt"):
+        with monkeypatch.context() as patch:
+            patch.setattr(f"carepulse.queue.checkin.{missing}", lambda *_: None)
+            with (
+                pytest.raises(
+                    DBAPIError, match="Check-in commit evidence incomplete"
+                ) as denied,
+                signed_test_transaction(
+                    clinic,
+                    clinic.receptionist,
+                    method="POST",
+                    path=path,
+                    purpose="QUEUE_CHECK_IN",
+                    body=body,
+                    key=key,
+                ) as (connection, actor),
+            ):
+                projection, revision = check_in_appointment(
+                    connection, actor, target_id, command, key
+                )
+                assert revision == 1
+                assert projection["queue_day_revision"] == day["queue_day_revision"] + 1
+                assert projection["routine_rank"] == 1
+            assert denied.value.orig.sqlstate == "42501", missing
+        assert snapshot() == before, missing
+
+    # Even a fully evidenced transition must disappear if its transaction aborts.
+    with (
+        pytest.raises(RuntimeError, match="synthetic check-in rollback"),
+        signed_test_transaction(
+            clinic,
+            clinic.receptionist,
+            method="POST",
+            path=path,
+            purpose="QUEUE_CHECK_IN",
+            body=body,
+            key=key,
+        ) as (connection, actor),
+    ):
+        check_in_appointment(connection, actor, target_id, command, key)
+        raise RuntimeError("synthetic check-in rollback")
+    assert snapshot() == before
+
+    status, response = queue_request(
+        clinic,
+        clinic.receptionist,
+        method="POST",
+        path=path,
+        purpose="QUEUE_CHECK_IN",
+        body=body,
+        key=key,
+    )
+    assert status == 200, response
+    assert response["data"]["appointment_id"] == str(target_id)
+    assert response["data"]["appointment_revision"] == 1
+    assert response["data"]["queue_day_revision"] == day["queue_day_revision"] + 1
+    committed = snapshot()
+    assert committed != before
+    for old, new in zip(before[-3:], committed[-3:], strict=True):
+        assert len(new) == len(old) + 1
+    assert queue_request(
+        clinic,
+        clinic.receptionist,
+        method="POST",
+        path=path,
+        purpose="QUEUE_CHECK_IN",
+        body=body,
+        key=key,
+    ) == (status, response)
+    assert snapshot() == committed
