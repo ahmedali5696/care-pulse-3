@@ -204,7 +204,7 @@ def upgrade() -> None:
                                 || CASE WHEN checkin_body->'expected_queue_day_revision' IS NULL THEN ''
                                     ELSE ',"expected_queue_day_revision":'
                                         || COALESCE(req.checkin_queue_revision::text, 'null') END
-                                || ',"physical_presence_confirmed":true},"operation":"appointments.check_in","target":{"appointment_id":"'
+                                || ',"physical_presence_confirmed"\:true},"operation":"appointments.check_in","target":{"appointment_id":"'
                                 || req.target_id::text || '"}}', 'UTF8')), 'hex');
                         END IF;
                     ELSE
