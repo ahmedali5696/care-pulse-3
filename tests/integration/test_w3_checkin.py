@@ -10,14 +10,18 @@ from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 import pytest
+from carepulse.db import transaction
 from carepulse.identity.signing import canonical_payload, canonical_query
 from carepulse.main import app
 from carepulse.policies.versions import append_version
+from carepulse.queue.contracts import QueueQuery
+from carepulse.queue.queries import dated_queue_projection
 from runtime_identity_fixture import db_proof_headers, signed_test_transaction
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
+from test_appointment_persistence import _admit_saved
+from test_booking import booking_body, booking_request
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
-from test_booking import booking_request
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
 from test_database import empty_database as empty_database  # noqa: PLC0414
@@ -122,18 +126,15 @@ def queue_request(
     return start["status"], json.loads(raw.decode())
 
 
+def _new_patient(clinic, actor, name: str) -> str:
+    return create_patient(clinic, actor, name_parts=["Synthetic", "B12", name])["id"]
+
+
 def _book(clinic, actor, patient_id: str, service_date: date = SERVICE_DAY) -> dict:
     status, reply = booking_request(
         clinic,
         actor,
-        body={
-            "patient_id": patient_id,
-            "service_date": service_date.isoformat(),
-            "service_type": "NEW_EXAMINATION",
-            "expected_schedule_revision": 2,
-            "expected_price_revision": 2,
-            "expected_followup_revision": 1,
-        },
+        body=booking_body(patient_id, day=service_date),
         key=f"book-{uuid4().hex}",
     )
     assert status == 201, reply
@@ -152,7 +153,7 @@ def _seed_booked(
     appointment_id = uuid4()
     assignment_id = uuid4()
     doctor_id = UUID(clinic.owner.staff_id)
-    with clinic.migration.begin() as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         number = int(
             conn.scalar(
                 text("""
@@ -207,9 +208,10 @@ def _seed_booked(
             text("""
                 INSERT INTO public.appointment_price_snapshots
                     (organization_id, appointment_id, service_type, classification,
-                     base_egp, net_egp, is_free, pricing_version, creation_standard_base_egp)
+                     base_egp, net_egp, discount_type, discount_value, is_free,
+                     pricing_version, creation_standard_base_egp)
                 VALUES (:tenant, :id, 'NEW_EXAMINATION', :classification,
-                        :base, :base, false, 1, '100.00')
+                        :base, :base, 'NONE', 0, false, 2, '100.00')
             """),
             {
                 "tenant": clinic.tenant,
@@ -238,15 +240,20 @@ def _seed_booked(
                 "doctor": doctor_id,
             },
         )
-    return {"id": str(appointment_id), "number": number, "revision": 0}
+    return {
+        "id": str(appointment_id),
+        "number": number,
+        "revision": 0,
+        "service_date": service_date.isoformat(),
+    }
 
 
 def test_checkin_roles_archived_prebooking_replay_and_no_visit(booking_clinic) -> None:
     clinic = booking_clinic
-    p_doc = create_patient(clinic, clinic.owner, name="Doc Checkin")
-    p_rec = create_patient(clinic, clinic.owner, name="Rec Checkin")
-    p_mgr = create_patient(clinic, clinic.owner, name="Mgr Checkin")
-    p_arch = create_patient(clinic, clinic.owner, name="Archived Checkin")
+    p_doc = _new_patient(clinic, clinic.owner, "Doc Checkin")
+    p_rec = _new_patient(clinic, clinic.owner, "Rec Checkin")
+    p_mgr = _new_patient(clinic, clinic.owner, "Mgr Checkin")
+    p_arch = _new_patient(clinic, clinic.owner, "Archived Checkin")
 
     a_doc = _book(clinic, clinic.owner, p_doc)
     a_rec = _book(clinic, clinic.owner, p_rec)
@@ -318,8 +325,8 @@ def test_checkin_roles_archived_prebooking_replay_and_no_visit(booking_clinic) -
     assert r2["data"]["attested_by_staff_id"] == clinic.receptionist.staff_id
 
     # 3) Manager check-in.
-    _owner_changes_manager(clinic, True)
-    mgr = _fresh_receptionist_session(clinic)
+    _owner_changes_manager(clinic, True, 0)
+    mgr = _fresh_receptionist_session(clinic, 1)
     s3, r3 = queue_request(
         clinic,
         mgr,
@@ -346,7 +353,7 @@ def test_checkin_roles_archived_prebooking_replay_and_no_visit(booking_clinic) -
     assert r4["data"]["booking_number"] == a_arch["number"]
 
     # Negative: false presence denies with 422.
-    p_neg = create_patient(clinic, clinic.owner, name="No Presence")
+    p_neg = _new_patient(clinic, clinic.owner, "No Presence")
     a_neg = _book(clinic, clinic.owner, p_neg)
     s_neg, _ = queue_request(
         clinic,
@@ -402,7 +409,7 @@ def test_ordering_late_depth_urgent_emergency_and_old_day_isolation(
 ) -> None:
     clinic = booking_clinic
     # Set QUEUE policy with BOOKED_NUMBER and late_depth=1 effective on SERVICE_DAY.
-    with clinic.migration.begin() as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         append_version(
             conn,
             str(clinic.tenant),
@@ -413,14 +420,14 @@ def test_ordering_late_depth_urgent_emergency_and_old_day_isolation(
             today=PRIOR_DAY,
         )
 
-    p1 = UUID(create_patient(clinic, clinic.owner, name="P1"))
-    p2 = UUID(create_patient(clinic, clinic.owner, name="P2"))
-    p3 = UUID(create_patient(clinic, clinic.owner, name="P3"))
-    p4 = UUID(create_patient(clinic, clinic.owner, name="P4"))
-    p_urg = UUID(create_patient(clinic, clinic.owner, name="PUrg"))
-    p_emg1 = UUID(create_patient(clinic, clinic.owner, name="PEmg1"))
-    p_emg2 = UUID(create_patient(clinic, clinic.owner, name="PEmg2"))
-    p_prior = UUID(create_patient(clinic, clinic.owner, name="PPrior"))
+    p1 = UUID(_new_patient(clinic, clinic.owner, "P1"))
+    p2 = UUID(_new_patient(clinic, clinic.owner, "P2"))
+    p3 = UUID(_new_patient(clinic, clinic.owner, "P3"))
+    p4 = UUID(_new_patient(clinic, clinic.owner, "P4"))
+    p_urg = UUID(_new_patient(clinic, clinic.owner, "PUrg"))
+    p_emg1 = UUID(_new_patient(clinic, clinic.owner, "PEmg1"))
+    p_emg2 = UUID(_new_patient(clinic, clinic.owner, "PEmg2"))
+    p_prior = UUID(_new_patient(clinic, clinic.owner, "PPrior"))
 
     # Numbers 1, 2, 3, 4 on SERVICE_DAY (#1 and #3 remain unarrived Booked).
     _seed_booked(clinic, p1, SERVICE_DAY)
@@ -572,8 +579,8 @@ def test_ordering_late_depth_urgent_emergency_and_old_day_isolation(
 
 def test_fr019_capacity_visibility_and_query_plan(booking_clinic) -> None:
     clinic = booking_clinic
-    p_wait = UUID(create_patient(clinic, clinic.owner, name="Wait Patient"))
-    p_exam = UUID(create_patient(clinic, clinic.owner, name="Exam Patient"))
+    p_wait = UUID(_new_patient(clinic, clinic.owner, "Wait Patient"))
+    p_exam = UUID(_new_patient(clinic, clinic.owner, "Exam Patient"))
 
     a_wait = _seed_booked(clinic, p_wait, SERVICE_DAY)
     assert (
@@ -596,7 +603,7 @@ def test_fr019_capacity_visibility_and_query_plan(booking_clinic) -> None:
     a_exam = _seed_booked(
         clinic, p_exam, PRIOR_DAY, classification="EMERGENCY", lane="EMERGENCY"
     )
-    with clinic.migration.begin() as conn:
+    with transaction(clinic.migration, clinic.tenant) as conn:
         cap_v = append_version(
             conn,
             str(clinic.tenant),
@@ -621,14 +628,7 @@ def test_fr019_capacity_visibility_and_query_plan(booking_clinic) -> None:
             },
         )
         # Transition a_exam to In Examination on PRIOR_DAY EMERGENCY lane to prove cross-date/lane count.
-        conn.execute(
-            text("""
-                UPDATE public.appointments
-                SET status = 'In Examination', revision = 1
-                WHERE organization_id = :tenant AND id = :id
-            """),
-            {"tenant": clinic.tenant, "id": UUID(a_exam["id"])},
-        )
+        _admit_saved(conn, clinic.tenant, UUID(clinic.owner.staff_id), a_exam)
 
     # FR-019 positive: ordinary Receptionist sees configured shared capacity (3) AND active In Examination count (1).
     s_rec, rec_q = queue_request(
@@ -680,33 +680,190 @@ def test_fr019_capacity_visibility_and_query_plan(booking_clinic) -> None:
             {"tenant": clinic.tenant},
         )
 
-    # Representative PostgreSQL query plan inspection for bounded tenant/date/lane GET /queue projection.
-    with clinic.migration.begin() as conn:
-        plan_json = conn.scalar(
-            text("""
-                EXPLAIN (FORMAT JSON)
-                WITH ordered AS (
-                    SELECT e.id, e.appointment_id, e.routine_rank, e.arrival_sequence,
-                           ROW_NUMBER() OVER (
-                               ORDER BY
-                                   CASE WHEN e.lane = 'MAIN' AND a.classification = 'URGENT' THEN 0 ELSE 1 END ASC,
-                                   CASE WHEN e.lane = 'MAIN' AND a.classification = 'ROUTINE' THEN e.routine_rank ELSE e.arrival_sequence END ASC,
-                                   e.id ASC
-                           ) AS position
-                    FROM public.queue_entries e
-                    JOIN public.appointments a
-                      ON a.organization_id = e.organization_id AND a.id = e.appointment_id
-                    JOIN public.patients p
-                      ON p.organization_id = e.organization_id AND p.id = e.patient_id
-                    WHERE e.organization_id = :tenant
-                      AND e.service_date = :day
-                      AND e.lane = 'MAIN'
-                      AND e.disposition = 'ACTIVE'
-                      AND a.service_date = :day
-                      AND a.status = 'Waiting'
-                )
-                SELECT * FROM ordered ORDER BY position ASC LIMIT 50 OFFSET 0
-            """),
-            {"tenant": clinic.tenant, "day": SERVICE_DAY},
+    _owner_changes_manager(clinic, True, 0)
+    manager = _fresh_receptionist_session(clinic, 1)
+    for actor in (clinic.owner, manager):
+        status, payload = queue_request(
+            clinic,
+            actor,
+            method="GET",
+            path="/v1/queue",
+            purpose="QUEUE_READ",
+            query={"date": SERVICE_DAY.isoformat(), "lane": "MAIN"},
         )
-    assert isinstance(plan_json, list) and plan_json[0]["Plan"]["Node Type"] == "Limit"
+        assert status == 200 and payload["data"] == data
+    with (
+        signed_test_transaction(
+            clinic,
+            manager,
+            method="GET",
+            path="/v1/queue",
+            purpose="QUEUE_READ",
+            query=f"date={SERVICE_DAY.isoformat()}&lane=MAIN",
+        ) as (conn, _actor),
+        pytest.raises(DBAPIError),
+    ):
+        conn.execute(
+            text(
+                "UPDATE public.doctor_controls SET revision=revision+1 WHERE organization_id=:tenant"
+            ),
+            {"tenant": clinic.tenant},
+        )
+
+
+def _check_in(clinic, appointment):
+    status, payload = queue_request(
+        clinic,
+        clinic.owner,
+        method="POST",
+        path=f"/v1/appointments/{appointment['id']}/check-in",
+        purpose="QUEUE_CHECK_IN",
+        body={"physical_presence_confirmed": True, "expected_appointment_revision": 0},
+        key=str(uuid4()),
+    )
+    assert status == 200, payload
+    return payload["data"]
+
+
+@pytest.mark.parametrize(
+    "depth,order,expected",
+    [
+        (0, "BOOKED_NUMBER", [0, 2, 3, 4]),
+        (1, "BOOKED_NUMBER", [2, 0, 3, 4]),
+        (5, "BOOKED_NUMBER", [2, 3, 4, 0]),
+        (5, "ARRIVAL_FIFO", [4, 3, 2, 0]),
+    ],
+)
+def test_actual_late_depth_and_fifo(booking_clinic, depth, order, expected):
+    clinic = booking_clinic
+    with transaction(clinic.migration, clinic.tenant) as conn:
+        append_version(
+            conn,
+            str(clinic.tenant),
+            "QUEUE",
+            {"routine_order": order, "late_depth": depth},
+            1,
+            actor_staff_id=clinic.owner.staff_id,
+            today=PRIOR_DAY,
+        )
+    appointments = [
+        _book(clinic, clinic.owner, _new_patient(clinic, clinic.owner, f"Ordering{i}"))
+        for i in range(5)
+    ]
+    # Seed a genuine prior ordinary admission via D-06/D-07 fixtures, not a new B-15 API.
+    with transaction(clinic.migration, clinic.tenant) as conn:
+        _admit_saved(
+            conn,
+            clinic.tenant,
+            UUID(clinic.owner.staff_id),
+            appointments[1],
+            ordinary_routine_head=True,
+        )
+    for index in (4, 3, 2, 0):
+        _check_in(clinic, appointments[index])
+    status, payload = queue_request(
+        clinic,
+        clinic.owner,
+        method="GET",
+        path="/v1/queue",
+        purpose="QUEUE_READ",
+        query={"date": SERVICE_DAY.isoformat(), "lane": "MAIN"},
+    )
+    assert status == 200, payload
+    data = payload["data"]
+    assert data["routine_cursor"] == appointments[1]["number"]
+    assert data["routine_order"] == order and data["late_depth"] == depth
+    assert [entry["appointment_id"] for entry in data["entries"]] == [
+        appointments[i]["id"] for i in expected
+    ]
+    assert [entry["position"] for entry in data["entries"]] == [1, 2, 3, 4]
+    with transaction(clinic.migration, clinic.tenant) as conn:
+        assert (
+            conn.scalar(
+                text(
+                    "SELECT count(*) FROM public.visits WHERE organization_id=:tenant"
+                ),
+                {"tenant": clinic.tenant},
+            )
+            == 1
+        )
+        assert (
+            conn.scalar(
+                text(
+                    "SELECT count(*) FROM public.outbox_events WHERE organization_id=:tenant AND event_type='PATIENT_CHECKED_IN'"
+                ),
+                {"tenant": clinic.tenant},
+            )
+            == 4
+        )
+
+
+def test_representative_production_queue_query_plan(booking_clinic):
+    clinic = booking_clinic
+    chosen = []
+    for index in range(75):
+        day = SERVICE_DAY if index < 25 else PRIOR_DAY
+        lane = "EMERGENCY" if index >= 50 else "MAIN"
+        appointment = _seed_booked(
+            clinic,
+            UUID(_new_patient(clinic, clinic.owner, f"Plan{index}")),
+            day,
+            classification="EMERGENCY" if lane == "EMERGENCY" else "ROUTINE",
+            lane=lane,
+        )
+        _check_in(clinic, appointment)
+        if index < 25:
+            chosen.append(appointment["id"])
+    with clinic.migration.begin() as conn:
+        conn.execute(
+            text("ANALYZE public.queue_entries, public.appointments, public.patients")
+        )
+    statement = []
+
+    def capture(_conn, _cursor, sql, params, _context, _executemany):
+        if "WITH ordered AS" in sql:
+            statement.append((sql, params))
+
+    query = QueueQuery(date=SERVICE_DAY, lane="MAIN", limit=10, offset=5)
+    with signed_test_transaction(
+        clinic,
+        clinic.receptionist,
+        method="GET",
+        path="/v1/queue",
+        purpose="QUEUE_READ",
+        query=canonical_query(urlencode(query.model_dump(mode="json"))),
+    ) as (conn, actor):
+        event.listen(conn, "before_cursor_execute", capture)
+        try:
+            data, _ = dated_queue_projection(conn, actor, query)
+        finally:
+            event.remove(conn, "before_cursor_execute", capture)
+        assert data["total_waiting"] == len(chosen)
+        assert [entry["appointment_id"] for entry in data["entries"]] == chosen[5:15]
+        assert len(statement) == 1
+        sql, params = statement[0]
+        plan = conn.exec_driver_sql(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql, params
+        ).scalar_one()[0]["Plan"]
+    assert plan["Node Type"] == "Limit" and plan["Actual Rows"] == 10
+    assert "Shared Hit Blocks" in plan
+
+    def summary(node):
+        return {
+            **{
+                key: node[key]
+                for key in (
+                    "Node Type",
+                    "Relation Name",
+                    "Index Name",
+                    "Actual Rows",
+                    "Actual Loops",
+                    "Shared Hit Blocks",
+                    "Shared Read Blocks",
+                )
+                if key in node
+            },
+            "Plans": [summary(child) for child in node.get("Plans", [])],
+        }
+
+    print("B12_QUEUE_PLAN", json.dumps(summary(plan), sort_keys=True))

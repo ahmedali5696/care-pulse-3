@@ -27,6 +27,7 @@ from test_database import disposable_project as disposable_project  # noqa: PLC0
 from test_database import empty_database as empty_database  # noqa: PLC0414
 from test_evidence_persistence import _new_delivery
 from test_followup_persistence import _claim, _source
+from test_queue_persistence import _arrive
 
 PREVIOUS = "0041_f01_runtime_identity"
 REVISION = "0042_f01_effective_grants"
@@ -290,6 +291,12 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
                 """)
             )
             _new_delivery(connection, operator)
+            waiting = persist_appointment(
+                connection,
+                _draft(_patient(connection, tenant), doctor, status="Waiting"),
+                _query(tenant, doctor),
+            )
+            _arrive(connection, tenant, doctor, waiting)
         with migration.connect() as connection:
             retained = _historic_rows(connection)
             original_constraints = _constraints(connection, ("public",))
@@ -330,6 +337,14 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
         revisions = list(reversed(list(graph.iterate_revisions(head, baseline))))
         assert revisions[0].revision == PREVIOUS
         assert revisions[-1].revision == head
+        revision_order = [revision.revision for revision in revisions]
+        queue_grants_index = revision_order.index("0047_b12_queue_checkin_grants")
+        assert revision_order[queue_grants_index - 1 : queue_grants_index + 2] == [
+            "0046_f01_audit_integrity",
+            "0047_b12_queue_checkin_grants",
+            "0048_b12_queue_scope",
+        ]
+        assert any(row["disposition"] == "ACTIVE" for row in retained["queue_entries"])
         for revision in revisions:
             target = revision.revision
             with migration.connect() as connection:

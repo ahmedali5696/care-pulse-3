@@ -34,6 +34,11 @@ on:
           - f01-followup-context
           - f01-pricing
           - f01-pricing-races
+          - w3-checkin
+          - w3-checkin-races
+          - w3-receipt-boundary
+          - w3-queue-scope
+          - w3-migration
           - compat-us1
           - compat-us2
           - compat-us3

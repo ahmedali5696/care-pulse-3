@@ -25,6 +25,11 @@ Dispatch **Foundation** on the candidate branch with `postgres_diagnostic` set t
 | `f01-followup-context` | `test_followup_persistence.py::test_v2_writer_rejects_invalid_context_without_evidence[missing]` |
 | `f01-pricing` | `test_pricing.py` |
 | `f01-pricing-races` | `test_pricing_races.py` |
+| `w3-checkin` | `test_w3_checkin.py` |
+| `w3-checkin-races` | `test_w3_checkin_races.py` |
+| `w3-receipt-boundary` | `test_w3_receipt_boundary.py` |
+| `w3-queue-scope` | `test_w3_queue_scope.py` |
+| `w3-migration` | `test_f01_grants_migration.py` |
 
 The diagnostic check uses the same pinned PostgreSQL, migrations, disposable Compose project and synthetic secret lifecycle as Foundation. Use a separate dispatch for each independent database. Check the run's SHA and project ID, pytest counts, and volume and secret cleanup. The log reports the failing phase and test location, plus SQLSTATE or expected and observed blocker PIDs when available. It omits exception text, query text, parameters, test output, and parameter IDs.
 
@@ -32,7 +37,7 @@ For **Full Foundation acceptance**, dispatch with the default `full` selection a
 
 The unconditional **`Full Foundation acceptance`** job succeeds only after common checks, all three lanes, same-repository/workflow/tested SHA/run ID/attempt receipts and artifact digest verification succeed. Artifacts are restricted to sanitized post-cleanup receipts named `foundation-full-<run_id>-<attempt>-<sha>-<lane>`; no private test reports or secrets are uploaded. The final job verifies exactly one evidence file for each lane. A full acceptance marker printed in isolation is not accepted evidence: inspect the completed successful workflow run and the final gate's conclusion. Failed-jobs-only reruns cannot combine receipts from different attempts; rerun **all jobs** to acquire a complete fresh set. After artifact expiration, unavailable evidence cannot be reconstructed.
 
-On the Wave 3 branch, the ordinary lane must prove current head `0047_b12_queue_checkin_grants` and execute all three B-12 integration suites (`test_w3_receipt_boundary.py`, `test_w3_checkin.py`, `test_w3_checkin_races.py`) with separate mandatory zero-skip JUnit reports. The compatibility lane continues to prove the explicitly bounded 0040-to-0046 transition; it does not establish 0047 cutover compatibility. The historical selection and protected special modes remain unchanged.
+On the Wave 3 branch, the ordinary lane must prove current head `0048_b12_queue_scope` and execute all three B-12 integration suites (`test_w3_receipt_boundary.py`, `test_w3_checkin.py`, `test_w3_checkin_races.py`) plus the queue scope and authenticated BFF suites (`test_w3_queue_scope.py`, `test_w3_bff.py`) with separate mandatory zero-skip JUnit reports. The BFF suite runs after real web/API startup. The compatibility lane continues to prove the explicitly bounded 0040-to-0046 transition; it does not establish 0047/0048 cutover compatibility. The historical selection and protected special modes remain unchanged.
 
 PostgreSQL diagnostic selections retain lightweight execution and report `postgres-diagnostic result (NOT Full Foundation acceptance)`; the three compatibility diagnostics run their selected legacy checks and report `compat-diagnostic result (NOT Full Foundation acceptance)`. B-04 and protected T133 keep their single-runner behavior, common checks, guards and distinct non-acceptance job names. Invalid booleans, unknown selections, conflicting modes, orphaned or wrong T133 SHA fail before integration. Each mode uses the original concurrency grouping and no diagnostics or special execution emits Full receipts or acceptance. For a PR, record the tested `github.sha` merge commit and its distinct head/base SHAs; never substitute the PR head as the tested commit. Diagnose failed PostgreSQL checks with the smallest reviewed selection before rerunning complete Full Foundation at a corrected final executable SHA.
 

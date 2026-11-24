@@ -257,4 +257,4 @@ def test_denied_routes_preserve_current_persistence_boundary():
         }
         assert connection.execute(
             "SELECT version_num FROM public.alembic_version"
-        ).fetchall() == [("0047_b12_queue_checkin_grants",)]
+        ).fetchall() == [("0048_b12_queue_scope",)]

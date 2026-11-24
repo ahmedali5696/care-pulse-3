@@ -63,12 +63,7 @@ def _operational_controls(
 
     active_in_exam = int(
         connection.scalar(
-            text("""
-                SELECT count(*)
-                FROM public.appointments
-                WHERE organization_id = :tenant
-                  AND status = 'In Examination'
-            """),
+            text("SELECT public.f01_queue_active_exam_count(:tenant)"),
             {"tenant": organization_id},
         )
     )
@@ -166,7 +161,7 @@ def dated_queue_projection(
                     e.id AS queue_entry_id,
                     e.appointment_id,
                     e.patient_id,
-                    p.full_name AS patient_name,
+                    array_to_string(p.name_parts, ' ') AS patient_name,
                     p.archived AS patient_archived,
                     e.service_date,
                     e.lane,

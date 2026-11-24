@@ -1,220 +1,134 @@
-"""T004 regression coverage for target-aware receipts and B-10 compatibility."""
+"""T004: committed target-bound check-in receipts and B-10 compatibility."""
 
-from dataclasses import replace
-from datetime import UTC, datetime
-from hashlib import sha256
 from uuid import UUID, uuid4
 
-import pytest
-from carepulse.identity.authorization import AuthorizationDenied, protected_transaction
-from carepulse.identity.contracts import ContractError, normalized_command_digest
-from carepulse.identity.receipts import (
-    Receipt,
-    ReceiptConflict,
-    TenantReceiptQuery,
-    insert_tenant_receipt,
-    lookup_tenant_receipt,
-    require_safe_committed_tenant_receipt,
-    resolve_safe_tenant_receipt,
-)
-from pydantic import BaseModel, ConfigDict
-from runtime_identity_fixture import registered_test_request
+from carepulse.queue.checkin import check_in_appointment
+from carepulse.queue.contracts import CheckInAppointment
+from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import text
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
-from test_database import admin as admin  # noqa: PLC0414
-from test_database import disposable_project as disposable_project  # noqa: PLC0414
-from test_database import empty_database as empty_database  # noqa: PLC0414
 from test_followup_decisions import _decision, _signed_visit_request, _source
 from test_followups import followup_clinic as followup_clinic  # noqa: PLC0414
-from test_patients import create_patient
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
+from test_w3_checkin import _book, _new_patient, queue_request
 
 
-class _TargetCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    physical_presence_confirmed: bool
-    expected_appointment_revision: int
-
-
-def _booking_envelope(actor, *, key: str, patient_id: UUID):
-    body = (
-        '{"patient_id":"'
-        + str(patient_id)
-        + '","service_date":"2026-11-24","service_type":"NEW_EXAMINATION",'
-        '"expected_schedule_revision":1,"expected_price_revision":1,'
-        '"expected_followup_revision":1}'
-    ).encode()
-    signed = replace(
-        actor,
-        method="POST",
-        path="/v1/appointments",
-        query="",
-        body_sha256=sha256(body).hexdigest(),
-        purpose="APPOINTMENT_BOOKING",
-        timestamp=str(int(datetime.now(UTC).timestamp() * 1000)),
-        nonce=f"synthetic_{uuid4().hex}",
-        idempotency_key=key,
-    )
-    return signed, body
+def _effects(clinic):
+    with clinic.migration.connect() as connection:
+        return tuple(
+            connection.scalar(
+                text(
+                    f"SELECT count(*) FROM public.{table} WHERE organization_id=:tenant"
+                ),
+                {"tenant": clinic.tenant},
+            )
+            for table in (
+                "appointments",
+                "appointment_history",
+                "appointment_number_assignments",
+                "appointment_price_snapshots",
+                "queue_days",
+                "queue_entries",
+                "visits",
+                "sensitive_audit",
+                "outbox_events",
+                "idempotency_receipts",
+            )
+        )
 
 
 def test_target_aware_receipt_conflict_hidden_target_and_lost_response_recovery(
     booking_clinic,
 ) -> None:
-    patient_a = UUID(create_patient(booking_clinic, booking_clinic.owner, name="Alpha"))
-    patient_b = UUID(create_patient(booking_clinic, booking_clinic.owner, name="Beta"))
-    foreign_target = uuid4()
-    key = f"t004-target-{uuid4().hex}"
-    body = _TargetCommand(
-        physical_presence_confirmed=True, expected_appointment_revision=0
-    )
-    digest_a = normalized_command_digest(
-        "appointments.book", body, target={"patient_id": patient_a}
-    )
-    digest_b = normalized_command_digest(
-        "appointments.book", body, target={"patient_id": patient_b}
-    )
-    digest_foreign = normalized_command_digest(
-        "appointments.book", body, target={"patient_id": foreign_target}
-    )
+    clinic = booking_clinic
+    actor = clinic.receptionist
+    first = _book(clinic, clinic.owner, _new_patient(clinic, clinic.owner, "Alpha"))
+    second = _book(clinic, clinic.owner, _new_patient(clinic, clinic.owner, "Beta"))
+    key = f"t004-{uuid4().hex}"
+    body = {"physical_presence_confirmed": True, "expected_appointment_revision": 0}
+    path = f"/v1/appointments/{first['id']}/check-in"
+    before = _effects(clinic)
 
-    signed, payload = _booking_envelope(
-        booking_clinic.owner, key=key, patient_id=patient_a
-    )
-    with (
-        registered_test_request(booking_clinic, signed, payload),
-        protected_transaction(
-            booking_clinic.runtime,
-            signed,
-            booking_clinic.config.policy.session_idle_minutes,
-        ) as (connection, actor),
-    ):
-        receipt_id = insert_tenant_receipt(
+    # Commit the actual command and deliberately lose the result before any HTTP reply.
+    with signed_test_transaction(
+        clinic,
+        actor,
+        method="POST",
+        path=path,
+        purpose="QUEUE_CHECK_IN",
+        body=body,
+        key=key,
+    ) as (connection, authorized):
+        original, revision = check_in_appointment(
             connection,
-            Receipt(
-                actor_id=actor.staff_id,
-                operation="appointments.book",
-                idempotency_key=key,
-                request_digest=digest_a,
-                result_projection={"patient_id": str(patient_a), "status": "Booked"},
-                result_revision=1,
-                organization_id=actor.organization_id,
-                staff_id=actor.staff_id,
-            ),
-        )
-        stored = lookup_tenant_receipt(
-            connection,
-            actor.organization_id,
-            actor.staff_id,
-            "appointments.book",
+            authorized,
+            UUID(first["id"]),
+            CheckInAppointment.model_validate(body),
             key,
         )
-        assert stored is not None
-        assert stored["id"] == receipt_id
-
-    # 1) Committed/lost-response recovery on identical authorized target returns original result.
-    signed_rec, payload_rec = _booking_envelope(
-        booking_clinic.owner, key=key, patient_id=patient_a
+    after = _effects(clinic)
+    assert after == tuple(
+        a + b for a, b in zip(before, (0, 1, 0, 0, 1, 1, 0, 1, 1, 1), strict=True)
     )
-    with (
-        registered_test_request(booking_clinic, signed_rec, payload_rec),
-        protected_transaction(
-            booking_clinic.runtime,
-            signed_rec,
-            booking_clinic.config.policy.session_idle_minutes,
-            stage="RECEIPT_RECOVERY",
-        ) as (connection, actor),
-    ):
-        query = TenantReceiptQuery(actor, "appointments.book", key, digest_a)
-        projection, revision = require_safe_committed_tenant_receipt(
-            connection,
-            query,
-            check_target_visible=lambda: None,
-            validate_projection=lambda proj, rev: (
-                proj.get("patient_id") == str(patient_a) and rev == 1
-            ),
+    assert revision == 1
+
+    def retry(target, *, caller=actor, payload=body):
+        return queue_request(
+            clinic,
+            caller,
+            method="POST",
+            path=f"/v1/appointments/{target}/check-in",
+            purpose="QUEUE_CHECK_IN",
+            body=payload,
+            key=key,
         )
-        assert projection == {"patient_id": str(patient_a), "status": "Booked"}
-        assert revision == 1
 
-    # 2) Same actor/key/body on a second visible target conflicts (no cross-target replay).
-    signed_b, payload_b = _booking_envelope(
-        booking_clinic.owner, key=key, patient_id=patient_b
+    status, replay = retry(first["id"])
+    assert (
+        status == 200 and replay["data"] == original and replay["revision"] == revision
     )
-    with (
-        registered_test_request(booking_clinic, signed_b, payload_b),
-        protected_transaction(
-            booking_clinic.runtime,
-            signed_b,
-            booking_clinic.config.policy.session_idle_minutes,
-            stage="RECEIPT_RECOVERY",
-        ) as (connection, actor),
-    ):
-        query_b = TenantReceiptQuery(actor, "appointments.book", key, digest_b)
-        with pytest.raises(ReceiptConflict):
-            resolve_safe_tenant_receipt(
-                connection,
-                query_b,
-                check_target_visible=lambda: None,
-                validate_projection=lambda _p, _r: True,
-            )
-
-    # 3) Same actor/key/body on a hidden/foreign target returns 404 before conflict disclosure.
-    signed_f, payload_f = _booking_envelope(
-        booking_clinic.owner, key=key, patient_id=foreign_target
+    status, conflict = retry(second["id"])
+    assert status == 409 and conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    status, hidden = retry(uuid4())
+    assert status == 404 and hidden["error"]["code"] == "NOT_FOUND"
+    status, changed = retry(
+        first["id"], payload={**body, "expected_appointment_revision": 1}
     )
-    with (
-        registered_test_request(booking_clinic, signed_f, payload_f),
-        protected_transaction(
-            booking_clinic.runtime,
-            signed_f,
-            booking_clinic.config.policy.session_idle_minutes,
-            stage="RECEIPT_RECOVERY",
-        ) as (connection, actor),
-    ):
-        query_f = TenantReceiptQuery(actor, "appointments.book", key, digest_foreign)
+    assert status == 409 and changed["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    # A separate active staff member cannot retrieve the first actor's receipt.
+    status, denied = retry(first["id"], caller=clinic.owner)
+    assert status == 409 and "data" not in denied
+    assert _effects(clinic) == after
 
-        def _missing_target():
-            raise ContractError(404)
-
-        with pytest.raises(ContractError) as denied:
-            resolve_safe_tenant_receipt(
-                connection,
-                query_f,
-                check_target_visible=_missing_target,
-                validate_projection=lambda _p, _r: True,
-            )
-        assert denied.value.status_code == 404
-
-    # 4) Post-revocation lookup denies under fresh authorization without returning the receipt.
-    with booking_clinic.migration.begin() as migration:
-        migration.execute(
+    with clinic.migration.begin() as connection:
+        receipt = connection.execute(
             text("""
-                UPDATE public.staff_accounts
-                SET security_revision = security_revision + 1
-                WHERE organization_id = :tenant AND id = :staff
+                SELECT actor_id, staff_id, operation, result_projection, result_revision
+                FROM public.idempotency_receipts
+                WHERE organization_id=:tenant AND operation='appointments.check_in'
+                  AND idempotency_key=:key
             """),
-            {
-                "tenant": booking_clinic.tenant,
-                "staff": UUID(booking_clinic.owner.staff_id),
-            },
+            {"tenant": clinic.tenant, "key": key},
+        ).one()
+        assert receipt == (
+            UUID(actor.staff_id),
+            UUID(actor.staff_id),
+            "appointments.check_in",
+            original,
+            revision,
         )
-    signed_revoked, payload_revoked = _booking_envelope(
-        booking_clinic.owner, key=key, patient_id=patient_a
-    )
-    with (
-        registered_test_request(booking_clinic, signed_revoked, payload_revoked),
-        pytest.raises(AuthorizationDenied),
-        protected_transaction(
-            booking_clinic.runtime,
-            signed_revoked,
-            booking_clinic.config.policy.session_idle_minutes,
-            stage="RECEIPT_RECOVERY",
-        ),
-    ):
-        pass
+        assert connection.execute(
+            text("SELECT status, revision FROM public.appointments WHERE id=:id"),
+            {"id": UUID(second["id"])},
+        ).one() == ("Booked", 0)
+        connection.execute(
+            text('DELETE FROM public."session" WHERE id=:id'),
+            {"id": actor.session_id},
+        )
+    status, revoked = retry(first["id"])
+    assert status in (401, 403) and "data" not in revoked
+    assert _effects(clinic) == after
 
 
 def test_b10_existing_receipt_compatibility_preserved(followup_clinic) -> None:
@@ -253,5 +167,5 @@ def test_b10_existing_receipt_compatibility_preserved(followup_clinic) -> None:
         body=payload,
         key=key,
     )
-    assert conflict_status == 409, conflict_body
-    assert conflict_body["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert conflict_status == 403, conflict_body
+    assert conflict_body["error"]["code"] == "FORBIDDEN"

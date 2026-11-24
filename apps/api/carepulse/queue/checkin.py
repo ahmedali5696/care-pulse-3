@@ -17,6 +17,7 @@ from carepulse.identity.contracts import (
 )
 from carepulse.identity.receipts import (
     Receipt,
+    ReceiptConflict,
     TenantReceiptQuery,
     insert_tenant_receipt,
     require_safe_committed_tenant_receipt,
@@ -544,7 +545,8 @@ def check_in_appointment(
         ),
     )
     if cached is not None:
-        return cached
+        # Roll back the provisional QueueDay revision/counter before recovery.
+        raise ReceiptConflict("Idempotency key already committed")
 
     if (
         appt.patient_id != discovered.patient_id

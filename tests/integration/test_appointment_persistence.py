@@ -266,6 +266,7 @@ def _admit_saved(
     actor=None,
     role="DOCTOR_OWNER",
     insert_visit=True,
+    ordinary_routine_head=False,
 ):
     """Construct only genuine, history-backed synthetic admission evidence."""
     appointment = UUID(saved["id"])
@@ -329,7 +330,7 @@ def _admit_saved(
                 SELECT :history, a.organization_id, a.id, :revision, 'STATUS',
                        :old, :status, a.service_date, a.service_date,
                        a.current_number, a.current_number, :actor, :role,
-                       'Synthetic lifecycle', a.id
+                       :reason, a.id
                 FROM public.appointments a WHERE a.organization_id=:tenant AND a.id=:id
             """),
             {
@@ -339,6 +340,9 @@ def _admit_saved(
                 "status": status,
                 "actor": actor,
                 "role": role,
+                "reason": None
+                if ordinary_routine_head and status == "In Examination"
+                else "Synthetic lifecycle",
                 "tenant": tenant,
                 "id": appointment,
             },
@@ -359,12 +363,21 @@ def _admit_saved(
             connection.execute(
                 text("""
                     UPDATE public.queue_days
-                    SET revision = revision + 1
+                    SET revision = revision + 1,
+                        routine_cursor = CASE WHEN :ordinary_head THEN
+                            (SELECT current_number FROM public.appointments
+                             WHERE organization_id = :tenant AND id = :appointment)
+                            ELSE routine_cursor END
                     WHERE organization_id = :tenant
                       AND id = (SELECT queue_day_id FROM public.queue_entries
                                 WHERE organization_id = :tenant AND appointment_id = :id)
                 """),
-                {"tenant": tenant, "id": appointment},
+                {
+                    "tenant": tenant,
+                    "id": appointment,
+                    "appointment": appointment,
+                    "ordinary_head": ordinary_routine_head,
+                },
             )
         if status == "In Examination" and insert_visit:
             connection.execute(
