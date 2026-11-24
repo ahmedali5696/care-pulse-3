@@ -56,6 +56,15 @@ class Diagnostic:
                 r"[A-Z0-9]{5}", error.sqlstate or ""
             ):
                 detail += f" | SQLSTATE {error.sqlstate}"
+                # Publish only identifiers and source line numbers, never SQL, values or error text.
+                constraint = error.diag.constraint_name or ""
+                if re.fullmatch(r"[a-z][a-z0-9_]{0,62}", constraint):
+                    detail += f" | constraint {constraint}"
+                for routine, line_number in re.findall(
+                    r"PL/pgSQL function (?:public\.|f01_private\.)?([a-z][a-z0-9_]{0,62})\([^\n]*?\) line ([0-9]+) at ",
+                    error.diag.context or "",
+                ):
+                    detail += f" | routine {routine}:{line_number}"
             self.details.append(detail)
         return report
 

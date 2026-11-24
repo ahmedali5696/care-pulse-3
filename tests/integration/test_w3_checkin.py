@@ -29,7 +29,7 @@ from test_patients import create_patient, private_request
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
 from test_pricing import _fresh_receptionist_session, _owner_changes_manager
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
-from test_schedule import SERVICE_DAY
+from test_schedule import CAIRO, SERVICE_DAY
 
 NEXT_DAY = SERVICE_DAY + timedelta(days=1)
 PRIOR_DAY = SERVICE_DAY - timedelta(days=1)
@@ -443,7 +443,8 @@ def test_ordering_late_depth_urgent_emergency_and_old_day_isolation(
     a_emg2 = _seed_booked(
         clinic, p_emg2, SERVICE_DAY, classification="EMERGENCY", lane="EMERGENCY"
     )
-    a_prior = _seed_booked(clinic, p_prior, PRIOR_DAY)
+    overdue_day = datetime.now(CAIRO).date() - timedelta(days=1)
+    a_prior = _seed_booked(clinic, p_prior, overdue_day)
 
     # Check in #4 then #2 (cursor=0 -> NOT late -> booked-number order: #2 ahead of #4!).
     assert (
@@ -511,7 +512,7 @@ def test_ordering_late_depth_urgent_emergency_and_old_day_isolation(
             == 200
         )
 
-    # Check in overdue prior-day Booked -> stays on PRIOR_DAY, never enters SERVICE_DAY.
+    # Check in overdue prior-day Booked -> stays on its original day.
     assert (
         queue_request(
             clinic,
@@ -564,16 +565,17 @@ def test_ordering_late_depth_urgent_emergency_and_old_day_isolation(
         a_emg2["id"],
     ]
 
-    # Verify PRIOR_DAY lane has only a_prior.
+    # Verify the overdue day's lane has only a_prior.
     s_pr, pr_q = queue_request(
         clinic,
         clinic.owner,
         method="GET",
         path="/v1/queue",
         purpose="QUEUE_READ",
-        query={"date": PRIOR_DAY.isoformat(), "lane": "MAIN"},
+        query={"date": overdue_day.isoformat(), "lane": "MAIN"},
     )
     assert s_pr == 200
+    assert pr_q["data"]["service_date"] == overdue_day.isoformat()
     assert [e["appointment_id"] for e in pr_q["data"]["entries"]] == [a_prior["id"]]
 
 
