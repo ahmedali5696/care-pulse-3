@@ -1478,6 +1478,12 @@ source_dir="$RUNNER_TEMP/compat-source-0040"
 if [ -e "$source_dir" ] || [ -L "$source_dir" ]; then
   echo 'FAIL existing private compatibility source directory'; exit 1
 fi
+publish_host_diagnostics() {
+  # Publish only the host's structured diagnostic records, never its raw stderr.
+  if [[ -f "$private/ci-host.log" ]]; then
+    grep '^CI_HOST_DIAGNOSTIC {' "$private/ci-host.log" 2>/dev/null || true
+  fi
+}
 cleanup() {
   local code=$? cleanup_failed=0
   trap - EXIT
@@ -1485,6 +1491,9 @@ cleanup() {
     kill -TERM "$host_pid" 2>/dev/null || true
     if ! wait "$host_pid"; then
       echo 'FAIL independent compatibility host supervisor'; cleanup_failed=1
+    fi
+    if [[ "$code" -ne 0 || "$cleanup_failed" -ne 0 ]]; then
+      publish_host_diagnostics
     fi
     host_pid=''
   fi
@@ -1702,7 +1711,8 @@ PY
     chmod 0444 "$private/observed.json"
     mkdir -m 1777 "$private/handshake"
     mkdir -m 0755 "$private/host-replies"
-    python3 -u ops/compat/ci_host.py "$private/handshake" "$private/observed.json" "$private/host-replies" > "$private/ci-host.log" 2>&1 &
+    # Only the supervisor's structured stdout is retained; never publish raw stderr.
+    python3 -u ops/compat/ci_host.py "$private/handshake" "$private/observed.json" "$private/host-replies" > "$private/ci-host.log" 2>/dev/null &
     host_pid=$!
 fi
 if [[ "$mode" = compat-us2 || "$mode" = compat-full ]]; then
@@ -1713,7 +1723,6 @@ if [[ "$mode" = compat-us2 || "$mode" = compat-full ]]; then
       kill -TERM "$host_pid" 2>/dev/null || true
       if ! wait "$host_pid"; then
         echo 'FAIL independent compatibility host supervisor'
-        cat "$private/ci-host.log"
         exit 1
       fi
       host_pid=''
@@ -1737,7 +1746,7 @@ if [[ "$mode" = compat-us3 || "$mode" = compat-full ]]; then
     set -e
     if [[ "$test_code" -ne 0 || "$host_code" -ne 0 ]]; then
       echo 'FAIL real compatibility scenario or bounded host supervisor'
-      test "$host_code" -eq 0 || cat "$private/ci-host.log"
+      publish_host_diagnostics
       exit 1
     fi
     if [[ "$mode" = compat-full ]]; then

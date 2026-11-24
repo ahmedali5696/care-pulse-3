@@ -13,6 +13,8 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 SOURCE_HEAD = "0040_t173_numeric_money"
@@ -29,6 +31,165 @@ IDENT = re.compile(r"[a-z][a-z0-9_]{2,75}\Z")
 TOKEN = re.compile(r"[0-9a-f]{12,32}\Z")
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 RUN_TIMEOUT = 20
+
+
+# Only static supervisor labels, numeric measurements and known exception classes
+# reach the log. Never stringify an exception or a subprocess result.
+_DIAGNOSTIC = ContextVar("ci_host_diagnostic", default=None)
+_EXCEPTION_CLASSES = {
+    cls: cls.__name__
+    for cls in (
+        RuntimeError,
+        OSError,
+        FileNotFoundError,
+        PermissionError,
+        FileExistsError,
+        IsADirectoryError,
+        NotADirectoryError,
+        TimeoutError,
+        BrokenPipeError,
+        ConnectionError,
+        InterruptedError,
+        UnicodeError,
+        ArithmeticError,
+        ValueError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        IndexError,
+        AssertionError,
+        subprocess.SubprocessError,
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+    )
+}
+
+
+def _checkpoint(frame, line: int) -> str:
+    return f"{frame.f_code.co_name}:{line}"
+
+
+def _command_checkpoint() -> str:
+    caller = sys._getframe(2)
+    while caller.f_globals is globals() and caller.f_code.co_name in (
+        "required",
+        "compose",
+    ):
+        caller = caller.f_back
+    return (
+        _checkpoint(caller, caller.f_lineno)
+        if caller.f_globals is globals()
+        else "command"
+    )
+
+
+def _write_diagnostic(payload: dict) -> None:
+    try:
+        print("CI_HOST_DIAGNOSTIC " + json.dumps(payload, sort_keys=True), flush=True)
+    except Exception:  # noqa: BLE001 - diagnostic sink must not mask a failure.
+        # Diagnostic output must not replace a failure or prevent cleanup.
+        return
+
+
+def _record(
+    scope: dict, checkpoint: str, event: str, *, exception_class: str | None = None
+) -> None:
+    payload = {
+        "event": event,
+        "checkpoint": checkpoint,
+        "operation_phase": scope["phase"],
+        "generation": scope["generation"],
+        "timestamp": time.time(),
+        "elapsed_seconds": round(time.monotonic() - scope["started"], 6),
+    }
+    if scope["deadline"] is not None:
+        payload["deadline_seconds"] = scope["deadline"]
+    if type(scope.get("exit_code")) is int:
+        payload["exit_code"] = scope["exit_code"]
+    if scope.get("expected_head") is not None:
+        payload["expected_head"] = scope["expected_head"]
+    if scope.get("response_kind") is not None:
+        payload["response_kind"] = scope["response_kind"]
+    if exception_class is not None:
+        payload["failure_kind"] = scope["category"]
+        payload["exception_class"] = exception_class
+    else:
+        payload["operation_category"] = scope["category"]
+    _write_diagnostic(payload)
+
+
+def _failure(
+    error: Exception, *, checkpoint: str | None = None, exit_code: int | None = None
+) -> None:
+    scope = _DIAGNOSTIC.get()
+    if scope is None or any(error is prior for prior in scope["seen"]):
+        return
+    scope["seen"].append(error)
+    if isinstance(error, subprocess.CalledProcessError):
+        exit_code = error.returncode
+    if type(exit_code) is int:
+        scope = {**scope, "exit_code": exit_code}
+    if checkpoint is None:
+        trace = error.__traceback__
+        checkpoint = "unknown"
+        while trace is not None:
+            if trace.tb_frame.f_globals is globals():
+                checkpoint = _checkpoint(trace.tb_frame, trace.tb_lineno)
+            trace = trace.tb_next
+    _record(
+        scope,
+        checkpoint,
+        "failure",
+        exception_class=next(
+            (
+                _EXCEPTION_CLASSES[cls]
+                for cls in type(error).__mro__
+                if cls in _EXCEPTION_CLASSES
+            ),
+            "OtherException",
+        ),
+    )
+
+
+@contextmanager
+def _diagnostic_scope(
+    phase: str | None = None,
+    *,
+    generation: str | None = None,
+    category: str | None = None,
+    deadline: int | None = None,
+    response_kind: str | None = None,
+):
+    parent = _DIAGNOSTIC.get()
+    scope = {
+        "phase": phase or (parent["phase"] if parent else "supervisor"),
+        "generation": generation or (parent["generation"] if parent else "unknown"),
+        "category": category or (parent["category"] if parent else "primary"),
+        "started": time.monotonic(),
+        "deadline": deadline,
+        "seen": parent["seen"] if parent else [],
+        "expected_head": parent.get("expected_head") if parent else None,
+        "response_kind": response_kind
+        or (parent.get("response_kind") if parent else None),
+    }
+    token = _DIAGNOSTIC.set(scope)
+    try:
+        yield scope
+    except Exception as error:
+        _failure(error)
+        raise
+    finally:
+        _DIAGNOSTIC.reset(token)
+
+
+def _operation(phase: str, generation: str, head=None) -> None:
+    scope = _DIAGNOSTIC.get()
+    if scope is not None:
+        scope.update(phase=phase, generation=generation)
+        if type(head) is str and head in (SOURCE_HEAD, *SUCCESSORS):
+            scope["expected_head"] = head
 
 
 def trusted_foundation_event() -> bool:
@@ -62,16 +223,29 @@ def trusted_foundation_event() -> bool:
 
 
 def command(args: list[str] | tuple[str, ...], *, timeout: int = RUN_TIMEOUT):
-    return subprocess.run(
-        args, capture_output=True, text=True, timeout=timeout, check=False
-    )
+    with _diagnostic_scope(deadline=timeout) as scope:
+        checkpoint = _command_checkpoint()
+        try:
+            result = subprocess.run(
+                args, capture_output=True, text=True, timeout=timeout, check=False
+            )
+        except Exception as error:
+            _failure(error, checkpoint=checkpoint)
+            raise
+        scope["exit_code"] = result.returncode
+        _record(scope, checkpoint, "subprocess_result")
+        return result
 
 
 def required(args: list[str] | tuple[str, ...], *, timeout: int = RUN_TIMEOUT) -> str:
-    result = command(args, timeout=timeout)
-    if result.returncode:
-        raise RuntimeError("CI-host command failed")
-    return result.stdout.strip()
+    with _diagnostic_scope(deadline=timeout) as scope:
+        result = command(args, timeout=timeout)
+        scope["exit_code"] = result.returncode
+        if result.returncode:
+            error = RuntimeError("CI-host command failed")
+            _failure(error, checkpoint=_command_checkpoint())
+            raise error
+        return result.stdout.strip()
 
 
 def compose(*args: str, timeout: int = RUN_TIMEOUT) -> str:
@@ -235,8 +409,11 @@ class Supervisor:
         )
         actual = required(("docker", "inspect", "--format", "{{.Image}}", cid))
         if actual != self.observed["services"][service]["image_id"]:
-            self.remove(cid)
-            raise RuntimeError("CI-host runtime image mismatches observed digest")
+            error = RuntimeError("CI-host runtime image mismatches observed digest")
+            _failure(error, checkpoint="launch:image_mismatch")
+            with _diagnostic_scope(category="cleanup"):
+                self.remove(cid)
+            raise error
         return cid
 
     @staticmethod
@@ -269,35 +446,36 @@ class Supervisor:
             name = f"{os.environ['CP_CI_PROJECT']}-{token[:12]}-{service}-{sequence}"
             cid = self.launch(service, request, name=name)
             try:
-                deadline = time.monotonic() + 10
-                status = None
-                while time.monotonic() < deadline:
-                    observed = command(
-                        (
-                            "docker",
-                            "exec",
-                            cid,
-                            "cat",
-                            "/tmp/carepulse-worker-status.json",
-                        ),
-                        timeout=3,
-                    )
-                    if observed.returncode == 0:
-                        try:
-                            status = json.loads(observed.stdout)
-                        except ValueError:
-                            status = None
-                        if (
-                            status
-                            and status.get("alive") is True
-                            and status.get("ready") is False
-                        ):
-                            break
-                    time.sleep(0.15)
-                if status is None or status.get("ready") is not False:
-                    raise RuntimeError("Worker did not produce fenced heartbeat")
-                if (
-                    command(
+                with _diagnostic_scope(deadline=10):
+                    deadline = time.monotonic() + 10
+                    status = None
+                    while time.monotonic() < deadline:
+                        observed = command(
+                            (
+                                "docker",
+                                "exec",
+                                cid,
+                                "cat",
+                                "/tmp/carepulse-worker-status.json",
+                            ),
+                            timeout=3,
+                        )
+                        if observed.returncode == 0:
+                            try:
+                                status = json.loads(observed.stdout)
+                            except ValueError:
+                                status = None
+                            if (
+                                status
+                                and status.get("alive") is True
+                                and status.get("ready") is False
+                            ):
+                                break
+                        time.sleep(0.15)
+                    if status is None or status.get("ready") is not False:
+                        raise RuntimeError("Worker did not produce fenced heartbeat")
+                with _diagnostic_scope(deadline=RUN_TIMEOUT) as probe:
+                    exit_code = command(
                         (
                             "docker",
                             "exec",
@@ -308,11 +486,11 @@ class Supervisor:
                             "live",
                         )
                     ).returncode
-                    != 0
-                ):
-                    raise RuntimeError("Actual worker not live")
-                if (
-                    command(
+                    probe["exit_code"] = exit_code
+                    if exit_code != 0:
+                        raise RuntimeError("Actual worker not live")
+                with _diagnostic_scope(deadline=RUN_TIMEOUT) as probe:
+                    exit_code = command(
                         (
                             "docker",
                             "exec",
@@ -323,34 +501,39 @@ class Supervisor:
                             "ready",
                         )
                     ).returncode
-                    == 0
-                ):
-                    raise RuntimeError("Fenced worker unexpectedly ready")
+                    probe["exit_code"] = exit_code
+                    if exit_code == 0:
+                        raise RuntimeError("Fenced worker unexpectedly ready")
                 first_beat = status["heartbeat"]
-                updated = False
-                deadline = time.monotonic() + 6
-                while time.monotonic() < deadline:
-                    latest = json.loads(
-                        required(
-                            (
-                                "docker",
-                                "exec",
-                                cid,
-                                "cat",
-                                "/tmp/carepulse-worker-status.json",
-                            ),
-                            timeout=3,
+                with _diagnostic_scope(deadline=6):
+                    updated = False
+                    deadline = time.monotonic() + 6
+                    while time.monotonic() < deadline:
+                        latest = json.loads(
+                            required(
+                                (
+                                    "docker",
+                                    "exec",
+                                    cid,
+                                    "cat",
+                                    "/tmp/carepulse-worker-status.json",
+                                ),
+                                timeout=3,
+                            )
                         )
-                    )
-                    if latest.get("heartbeat", 0) > first_beat:
-                        updated = True
-                        break
-                    time.sleep(0.25)
-                if not updated:
-                    raise RuntimeError("Worker heartbeat did not advance")
+                        if latest.get("heartbeat", 0) > first_beat:
+                            updated = True
+                            break
+                        time.sleep(0.25)
+                    if not updated:
+                        raise RuntimeError("Worker heartbeat did not advance")
                 starts.append((cid, status["started"], first_beat))
+            except Exception as error:
+                _failure(error)
+                raise
             finally:
-                self.remove(cid)
+                with _diagnostic_scope(category="cleanup"):
+                    self.remove(cid)
         if starts[0][0] == starts[1][0] or starts[0][1] == starts[1][1]:
             raise RuntimeError("Worker restart failed to refresh process identity")
         return {
@@ -408,13 +591,23 @@ class Supervisor:
                 or response.stdout.strip() != "Delivery unavailable"
             ):
                 # Do not expose sender output, which could contain sensitive material.
-                raise RuntimeError(
+                error = RuntimeError(
                     f"{service} sender denial mismatch: exit={response.returncode}, "
                     f"expected_output={response.stdout.strip() == 'Delivery unavailable'}, "
                     f"stdout_bytes={len(response.stdout)}, stderr_bytes={len(response.stderr)}"
                 )
+                _failure(
+                    error,
+                    checkpoint="sender:denial_mismatch",
+                    exit_code=response.returncode,
+                )
+                raise error
+        except Exception as error:
+            _failure(error)
+            raise
         finally:
-            self.remove(name)
+            with _diagnostic_scope(category="cleanup"):
+                self.remove(name)
         return {
             "image_id": spec["image_id"],
             "container_id": actual[0],
@@ -430,10 +623,16 @@ class Supervisor:
         workers = {}
         senders = {}
         for generation in ("source", "candidate"):
-            self.validate(request)
-            workers[generation] = self.worker(f"{generation}-worker", request, token)
-            self.validate(request)
-            senders[generation] = self.sender(f"{generation}-sender", request, token)
+            with _diagnostic_scope(generation=generation):
+                self.validate(request)
+                workers[generation] = self.worker(
+                    f"{generation}-worker", request, token
+                )
+            with _diagnostic_scope(generation=generation):
+                self.validate(request)
+                senders[generation] = self.sender(
+                    f"{generation}-sender", request, token
+                )
         self.validate(request)
         after = self.mail_count()
         if before != after:
@@ -455,31 +654,36 @@ class Supervisor:
         name = f"{os.environ['CP_CI_PROJECT']}-{request['id'][:12]}-source-api"
         cid = self.launch("source-api", request, name=name)
         try:
-            deadline = time.monotonic() + 12
-            while time.monotonic() < deadline:
-                check = command(
-                    (
-                        "docker",
-                        "exec",
-                        cid,
-                        "python",
-                        "-c",
-                        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live',timeout=2)",
-                    ),
-                    timeout=4,
-                )
-                if check.returncode == 0:
-                    self.active[request["id"]] = (cid, request)
-                    return {
-                        **request,
-                        "status": "ready",
-                        "endpoint": "http://source-api:8000",
-                    }
-                time.sleep(0.2)
-            raise RuntimeError("Source image did not become live")
+            with _diagnostic_scope(deadline=12):
+                deadline = time.monotonic() + 12
+                while time.monotonic() < deadline:
+                    check = command(
+                        (
+                            "docker",
+                            "exec",
+                            cid,
+                            "python",
+                            "-c",
+                            "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live',timeout=2)",
+                        ),
+                        timeout=4,
+                    )
+                    if check.returncode == 0:
+                        self.active[request["id"]] = (cid, request)
+                        return {
+                            **request,
+                            "status": "ready",
+                            "endpoint": "http://source-api:8000",
+                        }
+                    time.sleep(0.2)
+                raise RuntimeError("Source image did not become live")
+        except Exception as error:
+            _failure(error)
+            raise
         finally:
             if request["id"] not in self.active:
-                self.remove(cid)
+                with _diagnostic_scope(category="cleanup"):
+                    self.remove(cid)
 
     def stop_source(self, request: dict) -> dict:
         item = self.active.get(request["id"])
@@ -550,8 +754,11 @@ class Supervisor:
         ):
             raise RuntimeError("Source stop image/restart policy mismatch")
         self.remove(item[0])
-        if command(("docker", "inspect", identity[0])).returncode == 0:
-            raise RuntimeError("Removed source container still exists")
+        with _diagnostic_scope(deadline=RUN_TIMEOUT) as probe:
+            exit_code = command(("docker", "inspect", identity[0])).returncode
+            probe["exit_code"] = exit_code
+            if exit_code == 0:
+                raise RuntimeError("Removed source container still exists")
         if required(
             ("docker", "ps", "-aq", "--no-trunc", "--filter", f"id={identity[0]}")
         ):
@@ -674,19 +881,25 @@ class Supervisor:
                 raise RuntimeError("Product consumer container is still running")
         previous_id = self.stopped_source_ids.get(target)
         if previous_id is not None:
-            if command(("docker", "inspect", previous_id)).returncode == 0:
-                raise RuntimeError("Previously stopped source container restarted")
-            if required(
-                (
-                    "docker",
-                    "ps",
-                    "-aq",
-                    "--no-trunc",
-                    "--filter",
-                    f"id={previous_id}",
-                )
-            ):
-                raise RuntimeError("Previously stopped source container remains")
+            with _diagnostic_scope(generation="source"):
+                with _diagnostic_scope(deadline=RUN_TIMEOUT) as probe:
+                    exit_code = command(("docker", "inspect", previous_id)).returncode
+                    probe["exit_code"] = exit_code
+                    if exit_code == 0:
+                        raise RuntimeError(
+                            "Previously stopped source container restarted"
+                        )
+                if required(
+                    (
+                        "docker",
+                        "ps",
+                        "-aq",
+                        "--no-trunc",
+                        "--filter",
+                        f"id={previous_id}",
+                    )
+                ):
+                    raise RuntimeError("Previously stopped source container remains")
         self.sealed_source_targets.add(target)
         return {
             **request,
@@ -712,17 +925,27 @@ class Supervisor:
                 raise RuntimeError("Duplicate CI-host request")
             self.processed.add(token)
             if request["kind"] == "drain_proof":
+                _operation("drain_proof", "both", request.get("head"))
                 response = self.drain_proof(request)
             elif request["kind"] == "intermediate":
+                _operation("intermediate", "both", request.get("head"))
                 response = self.intermediate(request)
             elif request["kind"] == "booking_source":
+                _operation("booking_source", "source", SOURCE_HEAD)
                 response = self.book_source(request)
             else:
                 raise RuntimeError("Unknown CI-host kind")
-            emit(self.response_directory / f"{token}.response.json", response)
+            with _diagnostic_scope(
+                category="response_emission", response_kind="normal"
+            ):
+                emit(self.response_directory / f"{token}.response.json", response)
         else:
+            _operation("stop_source", "source")
             response = self.stop_source(request)
-            emit(self.response_directory / f"{token}.stopped.json", response)
+            with _diagnostic_scope(
+                category="response_emission", response_kind="normal"
+            ):
+                emit(self.response_directory / f"{token}.stopped.json", response)
 
     def run(self) -> None:
         while not self.stopped:
@@ -733,21 +956,26 @@ class Supervisor:
                 ):
                     # A separate set covers the stop request for the same token.
                     self.processed.add(file.name)
-                    try:
-                        self.handle(file)
-                    except Exception:
-                        suffix = (
-                            "stopped.json"
-                            if file.name.endswith(".stop.json")
-                            else "response.json"
-                        )
-                        emit(
-                            self.response_directory
-                            / f"{file.name.split('.')[0]}.{suffix}",
-                            {"version": 1, "status": "blocked", "ok": False},
-                        )
-                        self.stopped = True
-                        raise
+                    with _diagnostic_scope("request"):
+                        try:
+                            self.handle(file)
+                        except Exception as error:
+                            _failure(error)
+                            suffix = (
+                                "stopped.json"
+                                if file.name.endswith(".stop.json")
+                                else "response.json"
+                            )
+                            with _diagnostic_scope(
+                                category="response_emission", response_kind="blocked"
+                            ):
+                                emit(
+                                    self.response_directory
+                                    / f"{file.name.split('.')[0]}.{suffix}",
+                                    {"version": 1, "status": "blocked", "ok": False},
+                                )
+                            self.stopped = True
+                            raise
             time.sleep(0.1)
 
     def close(self) -> None:
@@ -759,17 +987,16 @@ class Supervisor:
 def main() -> int:
     if len(sys.argv) != 4:
         return 2
-    supervisor = Supervisor(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
-    signal.signal(signal.SIGTERM, lambda _s, _f: setattr(supervisor, "stopped", True))
-    try:
-        supervisor.run()
-    except RuntimeError as invalid:
-        # Every RuntimeError in this supervisor uses a fixed, sanitized reason.
-        print(
-            f"FAIL bounded CI-host compatibility handshake: {invalid}", file=sys.stderr
+    with _diagnostic_scope("startup"):
+        supervisor = Supervisor(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
+        signal.signal(
+            signal.SIGTERM, lambda _s, _f: setattr(supervisor, "stopped", True)
         )
-        return 1
+    try:
+        with _diagnostic_scope("supervisor"):
+            supervisor.run()
     except (
+        RuntimeError,
         OSError,
         ValueError,
         KeyError,
@@ -779,9 +1006,13 @@ def main() -> int:
         print("FAIL bounded CI-host compatibility handshake", file=sys.stderr)
         return 1
     finally:
-        supervisor.close()
+        with _diagnostic_scope("shutdown", generation="source", category="cleanup"):
+            supervisor.close()
     return 0
 
 
 if __name__ == "__main__":
+    # The structured records above retain the failure; the default traceback
+    # could print exception payloads (including subprocess arguments/output).
+    sys.excepthook = lambda *_: None
     raise SystemExit(main())
