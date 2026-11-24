@@ -94,6 +94,14 @@ def test_request_classifies_full_and_exclusive_modes(env):
         ("b04-spike", {"INPUT_B04_SPIKE": "true"}),
         ("t133", {"INPUT_T133_TERMINAL": "true", "INPUT_T133_SHA": "a" * 40}),
     ):
+        if name == "t133":
+            legacy_ref = "refs/heads/feature/wave-2-booking-and-scheduling"
+            changes.update(
+                GITHUB_REF=legacy_ref,
+                GITHUB_WORKFLOW_REF=(
+                    f"{env['GITHUB_REPOSITORY']}/.github/workflows/foundation.yml@{legacy_ref}"
+                ),
+            )
         result = acceptance.validate_request({**env, **changes})
         assert result["mode"] == name
         assert json.loads(result["matrix"]) == ["standard"]
@@ -125,6 +133,32 @@ def test_request_classifies_full_and_exclusive_modes(env):
 def test_invalid_normalization_fails_closed(env, changes):
     with pytest.raises(ValueError):
         acceptance.validate_request({**env, **changes})
+
+
+@pytest.mark.parametrize(
+    ("repository", "ref"),
+    [
+        (
+            "ahmedali5696/care-pulse-3",
+            "refs/heads/feature/foundation-permanent-acceptance-20261123",
+        ),
+        ("other/care-pulse-3", "refs/heads/feature/wave-2-booking-and-scheduling"),
+    ],
+)
+def test_t133_rejects_unauthorized_context_even_with_exact_sha(env, repository, ref):
+    with pytest.raises(ValueError, match="authorized legacy repository and ref"):
+        acceptance.validate_request(
+            {
+                **env,
+                "GITHUB_REPOSITORY": repository,
+                "GITHUB_REF": ref,
+                "GITHUB_WORKFLOW_REF": (
+                    f"{repository}/.github/workflows/foundation.yml@{ref}"
+                ),
+                "INPUT_T133_TERMINAL": "true",
+                "INPUT_T133_SHA": env["GITHUB_SHA"],
+            }
+        )
 
 
 def test_unapproved_modes_on_push_fail(env):

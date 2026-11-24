@@ -174,6 +174,11 @@ def validate_request(env: dict[str, str]) -> dict[str, str]:
     if terminal:
         if terminal_sha != context["sha"]:
             raise ValueError("T133 must target the exact executing SHA")
+        if (
+            context["repository"] != "ahmedali5696/care-pulse-3"
+            or context["ref"] != "refs/heads/feature/wave-2-booking-and-scheduling"
+        ):
+            raise ValueError("T133 requires the authorized legacy repository and ref")
     elif terminal_sha:
         raise ValueError("T133 SHA without terminal mode")
     if context["event"] != "workflow_dispatch" and (

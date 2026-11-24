@@ -304,6 +304,19 @@ if [[ "${CP_FOUNDATION_MODE:-}" = full ]]; then
 elif [[ "$foundation_lane" != standard ]]; then
   echo 'FAIL Foundation lanes require full acceptance mode'; exit 1
 fi
+if [[ "${CP_T133_MODE:-false}" = true || -n "${CP_T133_SHA:-}" ]]; then
+  if [[ "${CP_T133_MODE:-false}" != true || "${CP_B04_SPIKE:-false}" != false ||
+        "${GITHUB_EVENT_NAME:-}" != workflow_dispatch ||
+        "${GITHUB_REPOSITORY:-}" != ahmedali5696/care-pulse-3 ||
+        "${GITHUB_REF:-}" != refs/heads/feature/wave-2-booking-and-scheduling ||
+        "${CP_ENV:-}" != test || "${CP_SYNTHETIC_TEST_PROFILE:-}" != true ||
+        ! "${CP_T133_SHA:-}" =~ ^[0-9a-f]{40}$ || "$CP_T133_SHA" != "$GITHUB_SHA" ||
+        "$(git rev-parse HEAD)" != "$GITHUB_SHA" ||
+        "$CP_CI_PROJECT" != "carepulse-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ||
+        "$(realpath "$(git rev-parse --show-toplevel)")" != "$(realpath "$GITHUB_WORKSPACE")" ]]; then
+    echo 'T133 DENIED: unauthorized execution context'; exit 1
+  fi
+fi
 if [ "$1" = integration-diagnostic ]; then
   if [[ "${GITHUB_EVENT_NAME:-}" != workflow_dispatch || "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false || -n "${CP_T133_SHA:-}" ]]; then
     echo 'FAIL focused diagnostics require a manual dispatch without experimental modes'; exit 1
@@ -347,7 +360,7 @@ cleanup() {
     if ! rm -rf -- "$private" || test -e "$private"; then
       echo 'FAIL synthetic secret cleanup'; cleanup_failed=1
     fi
-    if [ "$foundation_full" = true ]; then
+    if [ "$foundation_full" = true ] || [ "${CP_B04_SPIKE:-false}" = true ]; then
       local project remaining
       for project in "$CP_CI_PROJECT" "carepulse-ci-${GITHUB_RUN_ID}-0${GITHUB_RUN_ATTEMPT}"; do
         for resource in containers volumes networks; do
@@ -614,6 +627,12 @@ run_historical_migrations() (
   chmod -R a+rX "$historical_root"
   test "$(docker image inspect --format '{{.Id}}' "$test_image")" != ""
   printf 'services:\n  test:\n    image: %s\n' "$test_image" > "$historical_dir/compose-override.yaml"
+  if [ "${CP_B04_SPIKE:-false}" = true ]; then
+    # The feasibility experiment uses the retired 0040 login, never current-head grants.
+    git diff --exit-code "$historical_sha" -- apps/web/auth/b04-spike.test.ts apps/web/auth/schema.ts apps/web/mail/delivery-material.ts tests/integration/b04_spike_seed.py
+    test "$(docker image inspect --format '{{.Id}}' "$COMPOSE_PROJECT_NAME-web")" != ""
+    printf '  web:\n    image: %s\n    secrets: !reset []\n' "$COMPOSE_PROJECT_NAME-web" >> "$historical_dir/compose-override.yaml"
+  fi
   # Never share the active cluster's credentials, volumes or network.
   export CP_DB_PASSWORD_FILE="$historical_dir/postgres-password"
   export CP_RUNTIME_DB_PASSWORD_FILE="$historical_dir/runtime-password"
@@ -637,6 +656,9 @@ run_historical_migrations() (
     .volumes.db_data.name == ($project + "_db_data") and
     .networks.database.name == ($project + "_database") and .networks.database.internal == true
   ' "$historical_dir/compose.json" > /dev/null
+  if [ "${CP_B04_SPIKE:-false}" = true ]; then
+    jq -e '(.services.web.secrets // [] | length) == 0' "$historical_dir/compose.json" > /dev/null
+  fi
   test -z "$(docker ps -aq --filter "label=com.docker.compose.project=$historical_project")"
   test -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$historical_project")"
   test -z "$(docker network ls -q --filter "label=com.docker.compose.project=$historical_project")"
@@ -708,6 +730,29 @@ if stats != {'tests': 163, 'failures': 0, 'errors': 0, 'skipped': 0}:
     raise SystemExit(f'FAIL incomplete historical coverage: {stats}')
 print('PASS 163 required historical tests, zero skips')
 PY
+  if [ "${CP_B04_SPIKE:-false}" = true ]; then
+    historical_compose "${historical_test_args[@]}" \
+      -e CP_B04_SEED_FILE=/tmp/b04-seed.json \
+      -v "$historical_dir/results:/tmp/foundation-results:rw" \
+      test sh -c 'python -m pytest -q -p no:cacheprovider --junitxml=/tmp/foundation-results/b04-seed.xml tests/integration/b04_spike_seed.py >&2 && cat /tmp/b04-seed.json' | \
+    historical_compose run --rm --no-deps -T --entrypoint node \
+      -e CI=true -e CP_CI_PROJECT="$historical_project" \
+      -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+      -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+      web --experimental-strip-types auth/b04-spike.test.ts | tee "$historical_dir/b04-spike.log"
+    python3 - "$historical_dir/results/b04-seed.xml" <<'PY'
+import sys
+from xml.etree import ElementTree
+root = ElementTree.parse(sys.argv[1]).getroot()
+suites = [root] if root.tag == 'testsuite' else list(root)
+if len(suites) != 1 or suites[0].tag != 'testsuite':
+    raise SystemExit('FAIL B-04 seed JUnit missing or ambiguous')
+stats = {field: int(suites[0].attrib[field]) for field in ('tests', 'failures', 'errors', 'skipped')}
+if stats != {'tests': 1, 'failures': 0, 'errors': 0, 'skipped': 0}:
+    raise SystemExit(f'FAIL B-04 seed mandatory test: {stats}')
+PY
+    grep -Fxq 'FEASIBILITY PROOFS PASSED; Issue #7 remains OPEN/BLOCKED pending architecture review' "$historical_dir/b04-spike.log"
+  fi
 )
 if [ "$foundation_lane" = historical ]; then
   run_historical_migrations
@@ -715,8 +760,8 @@ if [ "$foundation_lane" = historical ]; then
   foundation_coverage_verified=true
   exit 0
 fi
-# Keep experimental/protected invocation and its original selection untouched.
-if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ] && [ "${CP_B04_SPIKE:-false}" = false ]; then
+# Current-head B-04 uses the same split as ordinary acceptance; T133 retains its legacy selection.
+if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; then
   for node in "${historical_nodes[@]}"; do
     if [[ "$node" = *::* ]]; then historical_deselect+=("--deselect=$node"); fi
   done
@@ -1275,30 +1320,10 @@ if grep -aF -f "$private/canaries" "$private/runtime-logs" "$private/denials.log
 else
   code=$?; if [ "$code" -ne 1 ]; then echo 'FAIL runtime-log scan error'; exit 1; fi
 fi
-# The spike commits an ACTIVE synthetic Owner; run after empty-baseline assertions.
+# The spike commits an ACTIVE synthetic Owner; run after empty-baseline assertions,
+# using the immutable historical cluster rather than the retired current-head login.
 if [ "${CP_B04_SPIKE:-false}" = true ]; then
-  docker compose --profile test run --rm --no-deps -T \
-    -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
-    -e CP_B04_SEED_FILE=/tmp/b04-seed.json \
-    -v "$private/foundation-results:/tmp/foundation-results:rw" \
-    -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
-    test sh -c 'python -m pytest -q -p no:cacheprovider --junitxml=/tmp/foundation-results/b04-seed.xml tests/integration/b04_spike_seed.py >&2 && cat /tmp/b04-seed.json' | \
-  docker compose run --rm --no-deps -T --entrypoint node \
-    -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" \
-    -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
-    web --experimental-strip-types auth/b04-spike.test.ts | tee "$private/b04-spike.log"
-  python3 - "$private/foundation-results/b04-seed.xml" <<'PY'
-import sys
-from xml.etree import ElementTree
-root = ElementTree.parse(sys.argv[1]).getroot()
-suites = [root] if root.tag == 'testsuite' else list(root)
-if len(suites) != 1 or suites[0].tag != 'testsuite':
-    raise SystemExit('FAIL B-04 seed JUnit missing or ambiguous')
-stats = {field: int(suites[0].attrib[field]) for field in ('tests', 'failures', 'errors', 'skipped')}
-if stats != {'tests': 1, 'failures': 0, 'errors': 0, 'skipped': 0}:
-    raise SystemExit(f'FAIL B-04 seed mandatory test: {stats}')
-PY
-  grep -Fxq 'FEASIBILITY PROOFS PASSED; Issue #7 remains OPEN/BLOCKED pending architecture review' "$private/b04-spike.log"
+  run_historical_migrations
 fi
 if [ "${CP_T133_MODE:-false}" = true ]; then
   bash ops/t133-ci.sh "$private" | tee "$private/t133-run.log"
@@ -1314,7 +1339,7 @@ if not all(marker in text for marker in ('T133 ACL DURING:', 'T133 ACL AFTER:', 
     raise SystemExit('FAIL incomplete protected T133 evidence')
 PY
 fi
-if [ "$foundation_full" = true ]; then
+if [ "$foundation_full" = true ] || [ "${CP_B04_SPIKE:-false}" = true ]; then
   foundation_tests="$(python3 - "$private/foundation-results" "$health_case_count" <<'PY'
 import re
 import sys
