@@ -375,7 +375,7 @@ cleanup() {
     fi
     if [ "$cleanup_failed" = 1 ]; then
       code=1
-    elif [ -n "$focused_target" ]; then
+    elif [ -n "$focused_target" ] || [ "${CP_B04_SPIKE:-false}" = true ]; then
       echo 'PASS scoped PostgreSQL volume and synthetic secret cleanup'
     fi
   else
@@ -603,10 +603,21 @@ run_historical_migrations() (
   set -euo pipefail
   test "${CP_T133_MODE:-false}" = false
   test -z "${CP_T133_SHA:-}"
+  local proof="${1:-migrations}"
   local historical_sha=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
   local historical_head=0040_t173_numeric_money
   local historical_project="carepulse-ci-${GITHUB_RUN_ID}-0${GITHUB_RUN_ATTEMPT}"
   local historical_dir="$private/historical"
+  if [ "$proof" = b04 ]; then
+    test "${CP_B04_SPIKE:-false}" = true
+    test "$foundation_full" = false
+    # Original Issue #7 feasibility evidence, before 0013 revoked native account access.
+    historical_sha=696a5969d12b3e7f3801eb86591fe65113ac9eef
+    historical_head=0008_provisioning_admin
+    historical_dir="$private/historical-b04"
+  else
+    test "$proof" = migrations
+  fi
   local historical_root="$historical_dir/source"
   local test_image="$COMPOSE_PROJECT_NAME-test"
   [[ "$historical_project" =~ ^carepulse-ci-[0-9]+-[0-9]+$ ]]
@@ -620,16 +631,20 @@ run_historical_migrations() (
   test "$(git rev-parse "$historical_sha^{commit}")" = "$historical_sha"
   local -a historical_graph_files
   mapfile -t historical_graph_files < <(git ls-tree -r --name-only "$historical_sha" -- db/migrations)
-  test "${#historical_graph_files[@]}" -gt 40
+  if [ "$proof" = b04 ]; then
+    test "${#historical_graph_files[@]}" -gt 8
+  else
+    test "${#historical_graph_files[@]}" -gt 40
+  fi
   git diff --exit-code "$historical_sha" -- "${historical_graph_files[@]}"
   git archive "$historical_sha" -- alembic.ini pyproject.toml db apps/api/carepulse apps/worker tests/integration tests/fixtures | tar -x -C "$historical_root"
   mkdir "$historical_root/private-files"
   chmod -R a+rX "$historical_root"
   test "$(docker image inspect --format '{{.Id}}' "$test_image")" != ""
   printf 'services:\n  test:\n    image: %s\n' "$test_image" > "$historical_dir/compose-override.yaml"
-  if [ "${CP_B04_SPIKE:-false}" = true ]; then
-    # The feasibility experiment uses the retired 0040 login, never current-head grants.
-    git diff --exit-code "$historical_sha" -- apps/web/auth/b04-spike.test.ts apps/web/auth/schema.ts apps/web/mail/delivery-material.ts tests/integration/b04_spike_seed.py
+  if [ "$proof" = b04 ]; then
+    # Reuse the pinned images only with identical proof sources and dependency locks.
+    git diff --exit-code "$historical_sha" -- apps/web/auth/b04-spike.test.ts apps/web/auth/schema.ts apps/web/mail/delivery-material.ts tests/integration/b04_spike_seed.py apps/web/package.json pnpm-lock.yaml requirements.lock
     test "$(docker image inspect --format '{{.Id}}' "$COMPOSE_PROJECT_NAME-web")" != ""
     printf '  web:\n    image: %s\n    secrets: !reset []\n' "$COMPOSE_PROJECT_NAME-web" >> "$historical_dir/compose-override.yaml"
   fi
@@ -656,7 +671,7 @@ run_historical_migrations() (
     .volumes.db_data.name == ($project + "_db_data") and
     .networks.database.name == ($project + "_database") and .networks.database.internal == true
   ' "$historical_dir/compose.json" > /dev/null
-  if [ "${CP_B04_SPIKE:-false}" = true ]; then
+  if [ "$proof" = b04 ]; then
     jq -e '(.services.web.secrets // [] | length) == 0' "$historical_dir/compose.json" > /dev/null
   fi
   test -z "$(docker ps -aq --filter "label=com.docker.compose.project=$historical_project")"
@@ -714,11 +729,12 @@ run_historical_migrations() (
   test "$(historical_compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = "$historical_head"
   echo "Historical migration evidence: $historical_sha ($historical_head), cluster $historical_project"
   mkdir -m 1777 "$historical_dir/results"
-  historical_compose "${historical_test_args[@]}" -v "$historical_dir/results:/tmp/foundation-results:rw" test python -m pytest -q -ra --tb=short -p no:cacheprovider --junitxml=/tmp/foundation-results/historical.xml "${historical_nodes[@]}" | tee "$historical_dir/tests.log"
-  if grep -Eq '[0-9]+ skipped|no tests ran' "$historical_dir/tests.log"; then
-    echo 'FAIL mandatory historical migration evidence skipped'; exit 1
-  fi
-  python3 - "$historical_dir/results/historical.xml" <<'PY'
+  if [ "$proof" = migrations ]; then
+    historical_compose "${historical_test_args[@]}" -v "$historical_dir/results:/tmp/foundation-results:rw" test python -m pytest -q -ra --tb=short -p no:cacheprovider --junitxml=/tmp/foundation-results/historical.xml "${historical_nodes[@]}" | tee "$historical_dir/tests.log"
+    if grep -Eq '[0-9]+ skipped|no tests ran' "$historical_dir/tests.log"; then
+      echo 'FAIL mandatory historical migration evidence skipped'; exit 1
+    fi
+    python3 - "$historical_dir/results/historical.xml" <<'PY'
 import sys
 from xml.etree import ElementTree
 root = ElementTree.parse(sys.argv[1]).getroot()
@@ -730,7 +746,7 @@ if stats != {'tests': 163, 'failures': 0, 'errors': 0, 'skipped': 0}:
     raise SystemExit(f'FAIL incomplete historical coverage: {stats}')
 print('PASS 163 required historical tests, zero skips')
 PY
-  if [ "${CP_B04_SPIKE:-false}" = true ]; then
+  else
     historical_compose "${historical_test_args[@]}" \
       -e CP_B04_SEED_FILE=/tmp/b04-seed.json \
       -v "$historical_dir/results:/tmp/foundation-results:rw" \
@@ -1321,9 +1337,10 @@ else
   code=$?; if [ "$code" -ne 1 ]; then echo 'FAIL runtime-log scan error'; exit 1; fi
 fi
 # The spike commits an ACTIVE synthetic Owner; run after empty-baseline assertions,
-# using the immutable historical cluster rather than the retired current-head login.
+# using fresh, sequentially isolated historical clusters, never current-head grants.
 if [ "${CP_B04_SPIKE:-false}" = true ]; then
   run_historical_migrations
+  run_historical_migrations b04
 fi
 if [ "${CP_T133_MODE:-false}" = true ]; then
   bash ops/t133-ci.sh "$private" | tee "$private/t133-run.log"
