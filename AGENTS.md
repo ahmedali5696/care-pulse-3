@@ -8,6 +8,14 @@ Before declaring an authorized scope complete, report relevant open Issues and d
 
 Do not implement deferred work, modify approved decisions, or close Issues without verified evidence and appropriate authorization.
 
+## Mandatory Code Quality & Testing
+
+- MUST load and follow `clean-code-guard` and
+  `test-guard` before implementing or modifying code.
+- Apply both skills throughout implementation and perform
+  a final self-check before delivery or any authorized commit/push.
+- Report verification results and unresolved findings.
+
 ## CI workflow selection
 
 - Use Fast Feedback for routine development checkpoints.
