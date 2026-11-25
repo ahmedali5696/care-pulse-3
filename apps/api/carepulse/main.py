@@ -24,6 +24,7 @@ from carepulse.identity.contracts import (
 from carepulse.identity.receipts import ReceiptConflict
 from carepulse.identity.staff_routes import router as staff_router
 from carepulse.patients.routes import router as patient_router
+from carepulse.policies.admission_routes import router as admission_router
 from carepulse.policies.pricing_routes import router as pricing_router
 from carepulse.policies.schedule_routes import router as schedule_router
 from carepulse.policies.slots_routes import router as slots_router
@@ -63,6 +64,7 @@ app.include_router(pricing_router)
 app.include_router(schedule_router)
 app.include_router(slots_router)
 app.include_router(queue_router)
+app.include_router(admission_router)
 app.add_exception_handler(ContractError, contract_exception_handler)
 app.add_exception_handler(
     RequestValidationError, lambda _request, _error: error_response(422)
@@ -116,8 +118,24 @@ app.add_middleware(
         ("POST", "/v1/settings/schedule/activate"): "SETTINGS_SCHEDULE",
         ("GET", "/v1/slots"): "SLOTS",
         ("GET", "/v1/queue"): "QUEUE_READ",
+        ("GET", "/v1/settings/admission"): "ADMISSION_SETTINGS_READ",
+        ("PATCH", "/v1/settings/admission"): "ADMISSION_MODE_UPDATE",
+        ("PATCH", "/v1/queue/capacity"): "QUEUE_CAPACITY_UPDATE",
+        ("POST", "/v1/queue/pause"): "QUEUE_PAUSE",
+        ("POST", "/v1/queue/admission-confirmations"): "QUEUE_CONFIRMATION_ISSUE",
+        (
+            "GET",
+            "/v1/queue/admission-confirmations/usable",
+        ): "QUEUE_CONFIRMATION_USABLE",
     },
     route_patterns=(
+        (
+            "POST",
+            compile(
+                r"/v1/queue/admission-confirmations/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/revoke"
+            ),
+            "QUEUE_CONFIRMATION_REVOKE",
+        ),
         (
             "POST",
             compile(

@@ -40,6 +40,8 @@ on:
           - w3-queue-scope
           - w3-intake
           - w3-intake-races
+          - w3-admission-controls
+          - w3-admission-confirmations
           - w3-migration
           - compat-us1
           - compat-us2

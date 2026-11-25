@@ -1,4 +1,4 @@
-"""B-12 and B-11 authenticated browser-to-BFF-to-API-to-PostgreSQL acceptance."""
+"""B-12, B-11 and B-14 authenticated browser-to-BFF-to-API-to-PostgreSQL acceptance."""
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -48,6 +48,73 @@ def _denied(response, status, code):
     assert actual == status, body
     assert set(body) == {"error"}
     assert body["error"]["code"] == code
+
+
+def test_invited_browser_admission_controls_are_purpose_and_role_bound(
+    invited_patients,
+):
+    sessions = invited_patients
+    owner, receptionist = sessions.owner, sessions.receptionist
+    path = "/api/settings/admission"
+    status, initial = browser_request(owner, path)
+    assert status == 200, initial
+    initial_revision = initial["revision"]
+    command = {"mode": "RECEPTIONIST", "expected_admission_revision": initial_revision}
+    _denied(browser_request(receptionist, path), 403, "FORBIDDEN")
+    _denied(
+        browser_request(
+            receptionist, path, method="PATCH", body=command, key=str(uuid4())
+        ),
+        403,
+        "FORBIDDEN",
+    )
+    key = str(uuid4())
+    status, changed = browser_request(
+        owner, path, method="PATCH", body=command, key=key
+    )
+    assert status == 200, changed
+    assert changed["data"] == {
+        "mode": "RECEPTIONIST",
+        "admission_revision": initial_revision + 1,
+    }
+    assert browser_request(owner, path, method="PATCH", body=command, key=key) == (
+        200,
+        changed,
+    )
+    queue_path = f"/api/queue?date={SERVICE_DAY.isoformat()}&lane=MAIN"
+    status, queue = browser_request(receptionist, queue_path)
+    assert status == 200, queue
+    control = queue["data"]
+    pause = {"paused": True, "expected_control_revision": control["control_revision"]}
+    _denied(
+        browser_request(
+            receptionist,
+            "/api/queue/pause",
+            method="POST",
+            body=pause,
+            key=str(uuid4()),
+        ),
+        403,
+        "FORBIDDEN",
+    )
+    status, paused = browser_request(
+        owner, "/api/queue/pause", method="POST", body=pause, key=str(uuid4())
+    )
+    assert status == 200, paused
+    assert paused["data"]["paused"] is True
+    # B-15 route remains absent at the BFF boundary.
+    _denied(
+        browser_request(
+            owner, "/api/queue/admit", method="POST", body={}, key=str(uuid4())
+        ),
+        403,
+        "FORBIDDEN",
+    )
+    with _database() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM public.idempotency_receipts WHERE organization_id=%s AND operation='settings.admission.update' AND idempotency_key=%s",
+            (sessions.clinic, key),
+        ).fetchone() == (1,)
 
 
 def test_invited_browser_checkin_replay_and_tenant_session_isolation(invited_patients):

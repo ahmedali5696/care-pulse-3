@@ -12,7 +12,7 @@ from pathlib import Path
 HISTORICAL_SHA = "6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7"
 SOURCE_SCHEMA = "0040_t173_numeric_money"
 CANDIDATE_SCHEMA = "0046_f01_audit_integrity"
-ORDINARY_SCHEMA = "0054_b12_receipt_scope"
+ORDINARY_SCHEMA = "0055_b14_admission_control"
 RECEIPT_FILE = "foundation-full-receipt.json"
 EXPECTED_COVERAGE = {
     "ordinary": "current-head-excluding-extracted-historical",
@@ -54,6 +54,8 @@ DIAGNOSTICS = {
     "w3-queue-scope",
     "w3-intake",
     "w3-intake-races",
+    "w3-admission-controls",
+    "w3-admission-confirmations",
     "w3-migration",
     "compat-us1",
     "compat-us2",
@@ -353,7 +355,7 @@ def _publish_acceptance(env: dict[str, str]) -> None:
         f"- Event/ref: `{context['event']}` / `{context['ref']}`",
         f"- Repository/workflow: `{context['repository']}` / `{context['workflow']}`",
         f"- Run/attempt: `{context['run_id']}` / `{context['attempt']}`",
-        f"- Ordinary ({ORDINARY_SCHEMA}, including B-12 and B-11), historical (163 at 0040), compatibility (44 Python + 11 Web, 0040 to 0046): verified",
+        f"- Ordinary ({ORDINARY_SCHEMA}, including B-12, B-11 and B-14), historical (163 at 0040), compatibility (44 Python + 11 Web, 0040 to 0046): verified",
         "- Three current-attempt receipts, zero mandatory skips, scoped cleanup, artifact digests: verified",
     ]
     if context["pr"] is not None:
