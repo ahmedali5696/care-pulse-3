@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -20,7 +20,6 @@ from carepulse.identity.receipts import (
     ReceiptConflict,
     TenantReceiptQuery,
     insert_tenant_receipt,
-    require_safe_committed_tenant_receipt,
     resolve_safe_tenant_receipt,
 )
 from carepulse.notifications.evidence import append_outbox, append_sensitive_audit
@@ -464,12 +463,106 @@ def _check_appointment_visible(
 def _valid_checkin_projection(
     appointment_id: UUID, projection: dict[str, Any], revision: int
 ) -> bool:
-    return (
-        set(projection) == _CHECK_IN_RECEIPT_FIELDS
-        and projection.get("appointment_id") == str(appointment_id)
-        and projection.get("status") == "Waiting"
-        and projection.get("appointment_revision") == revision
+    if set(projection) != _CHECK_IN_RECEIPT_FIELDS or any(
+        type(projection[field]) is not str
+        for field in (
+            "appointment_id",
+            "queue_entry_id",
+            "queue_day_id",
+            "patient_id",
+            "doctor_staff_id",
+            "attested_by_staff_id",
+            "service_date",
+            "attested_at",
+        )
+    ):
+        return False
+    try:
+        if any(
+            str(UUID(projection[field])) != projection[field]
+            for field in (
+                "appointment_id",
+                "queue_entry_id",
+                "queue_day_id",
+                "patient_id",
+                "doctor_staff_id",
+                "attested_by_staff_id",
+            )
+        ):
+            return False
+        attendance = datetime.fromisoformat(projection["attested_at"])
+        if (
+            attendance.utcoffset() is None
+            or attendance.isoformat() != projection["attested_at"]
+        ):
+            return False
+        if (
+            date.fromisoformat(projection["service_date"]).isoformat()
+            != projection["service_date"]
+        ):
+            return False
+    except (ValueError, OverflowError):
+        return False
+    return _valid_checkin_values(appointment_id, projection, revision)
+
+
+def _valid_checkin_values(
+    appointment_id: UUID, projection: dict[str, Any], revision: int
+) -> bool:
+    classification = projection["classification"]
+    rank = projection["routine_rank"]
+    positive_fields = (
+        "booking_number",
+        "arrival_sequence",
+        "position",
+        "appointment_revision",
+        "queue_day_revision",
+        "queue_entry_revision",
+        "queue_policy_version",
     )
+    return (
+        all(
+            type(projection[field]) is int and projection[field] > 0
+            for field in positive_fields
+        )
+        and type(projection["routine_cursor"]) is int
+        and projection["routine_cursor"] >= 0
+        and projection["appointment_id"] == str(appointment_id)
+        and projection["status"] == "Waiting"
+        and projection["appointment_revision"] == revision
+        and projection["queue_entry_revision"] == 1
+        and classification in ("ROUTINE", "URGENT", "EMERGENCY")
+        and projection["lane"]
+        == ("EMERGENCY" if classification == "EMERGENCY" else "MAIN")
+        and (
+            type(rank) is int and rank > 0
+            if classification == "ROUTINE"
+            else rank is None
+        )
+        and (classification != "EMERGENCY" or projection["routine_cursor"] == 0)
+        and projection["position"] <= projection["arrival_sequence"]
+    )
+
+
+def _resolve_checkin_receipt(
+    connection: Connection, query: TenantReceiptQuery, appointment_id: UUID
+) -> tuple[dict[str, Any], int] | None:
+    _check_appointment_visible(connection, query.actor.organization_id, appointment_id)
+    cached = resolve_safe_tenant_receipt(
+        connection,
+        query,
+        check_target_visible=lambda: None,
+        validate_projection=lambda proj, rev: (
+            _valid_checkin_projection(appointment_id, proj, rev)
+            and connection.scalar(text("SELECT public.f01_checkin_receipt_matches()"))
+            is True
+        ),
+    )
+    if cached is None and connection.scalar(
+        text("SELECT public.f01_checkin_key_conflict()")
+    ):
+        raise ContractError(409, "IDEMPOTENCY_CONFLICT")
+    return cached
 
 
 def recover_committed_checkin(
@@ -484,16 +577,10 @@ def recover_committed_checkin(
         CHECK_IN_OPERATION, command, target={"appointment_id": appointment_id}
     )
     query = TenantReceiptQuery(actor, CHECK_IN_OPERATION, idempotency_key, digest)
-    return require_safe_committed_tenant_receipt(
-        connection,
-        query,
-        check_target_visible=lambda: _check_appointment_visible(
-            connection, actor.organization_id, appointment_id
-        ),
-        validate_projection=lambda proj, rev: _valid_checkin_projection(
-            appointment_id, proj, rev
-        ),
-    )
+    cached = _resolve_checkin_receipt(connection, query, appointment_id)
+    if cached is None:
+        raise ContractError(409, "IDEMPOTENCY_CONFLICT")
+    return cached
 
 
 def check_in_appointment(
@@ -514,16 +601,7 @@ def check_in_appointment(
     )
     query = TenantReceiptQuery(actor, CHECK_IN_OPERATION, idempotency_key, digest)
 
-    cached = resolve_safe_tenant_receipt(
-        connection,
-        query,
-        check_target_visible=lambda: _check_appointment_visible(
-            connection, actor.organization_id, appointment_id
-        ),
-        validate_projection=lambda proj, rev: _valid_checkin_projection(
-            appointment_id, proj, rev
-        ),
-    )
+    cached = _resolve_checkin_receipt(connection, query, appointment_id)
     if cached is not None:
         return cached
 
@@ -579,14 +657,7 @@ def check_in_appointment(
         raise ContractError(404)
 
     # Re-verify cached receipt after locks in case a competing same-key winner committed.
-    cached = resolve_safe_tenant_receipt(
-        connection,
-        query,
-        check_target_visible=lambda: None,
-        validate_projection=lambda proj, rev: _valid_checkin_projection(
-            appointment_id, proj, rev
-        ),
-    )
+    cached = _resolve_checkin_receipt(connection, query, appointment_id)
     if cached is not None:
         # Roll back the provisional QueueDay revision/counter before recovery.
         raise ReceiptConflict("Idempotency key already committed")
