@@ -65,6 +65,51 @@ SERVICE = {
 TAP = {"web-ingress", "web-adapter"}
 REPORTS = PRE_SERVICE | SERVICE
 PHASES = ("setup", "call", "teardown")
+PARTITION_KIND = "ORDINARY_COMPARISON_ONLY_NOT_ACCEPTANCE"
+DB_REPORTS = {
+    "f01",
+    "d08",
+    "w3_receipt_boundary",
+    "w3_checkin",
+    "w3_checkin_races",
+    "w3_queue_scope",
+    "w3_intake",
+    "w3_intake_races",
+    "w3_admission_controls",
+    "w3_admission_confirmations",
+}
+PARTITIONS = ("partition-control", "partition-db", "partition-stack")
+
+
+def report_inventory(variant):
+    require(variant in ("control", "instrumented", *PARTITIONS))
+    if variant == "partition-db":
+        return {name: count for name, count in REPORTS.items() if name in DB_REPORTS}
+    if variant == "partition-stack":
+        return {
+            name: count for name, count in REPORTS.items() if name not in DB_REPORTS
+        }
+    return REPORTS
+
+
+def identity_digest(folder, name, count):
+    """Hash complete case identities, retaining parameters but not exporting them."""
+    if name in TAP:
+        tap_count(folder, name, count)
+        identities = re.findall(
+            r"(?m)^([ ]*ok [0-9]+ - .+)$",
+            (folder / f"{name}.tap").read_text(),
+        )
+        require(len(identities) == count)
+    else:
+        identities = [
+            (case.attrib.get("classname", ""), case.attrib["name"])
+            for case in junit_cases(folder, name, count)
+        ]
+    require(len(set(identities)) == count)
+    return hashlib.sha256(
+        json.dumps(sorted(identities), ensure_ascii=True).encode("ascii")
+    ).hexdigest()
 
 
 def require(condition):
@@ -190,9 +235,10 @@ def focus_timings(folder, name, cases):
 
 
 def collect(folder, output, variant, head):
-    require(variant in ("control", "instrumented") and head == HEAD)
-    require({p.stem for p in folder.glob("*.xml")} == set(REPORTS) - TAP)
-    require({p.stem for p in folder.glob("*.tap")} == TAP)
+    require(head == HEAD)
+    reports = report_inventory(variant)
+    require({p.stem for p in folder.glob("*.xml")} == set(reports) - TAP)
+    require({p.stem for p in folder.glob("*.tap")} == set(reports) & TAP)
     expected_profiles = (
         {f"profile-{name}.json" for name in FOCUS}
         if variant == "instrumented"
@@ -200,25 +246,28 @@ def collect(folder, output, variant, head):
     )
     require({p.name for p in folder.glob("profile-*.json")} == expected_profiles)
     focus = {}
-    for name, count in REPORTS.items():
+    for name, count in reports.items():
         if name in TAP:
             tap_count(folder, name, count)
             continue
         cases = junit_cases(folder, name, count)
         if variant == "instrumented" and name in FOCUS:
             focus[name] = focus_timings(folder, name, cases)
-    write_json(
-        output,
-        {
-            "variant": variant,
-            "observed_migration_head": head,
-            "mandatory_report_counts": REPORTS,
-            "focus": focus,
-        },
-    )
+    evidence = {
+        "variant": variant,
+        "observed_migration_head": head,
+        "mandatory_report_counts": reports,
+        "focus": focus,
+    }
+    if variant in PARTITIONS:
+        evidence["report_identity_sha256"] = {
+            name: identity_digest(folder, name, count)
+            for name, count in reports.items()
+        }
+    write_json(output, evidence)
 
 
-def expected_events():
+def expected_events(variant="control"):
     yield "controller:start"
     for name in (
         "pulls",
@@ -230,7 +279,7 @@ def expected_events():
     ):
         yield f"{name}:start"
         yield f"{name}:end"
-    for name in REPORTS:
+    for name in report_inventory(variant):
         if name == "topology-seed":
             yield "service_startup:start"
             yield "service_startup:end"
@@ -242,9 +291,9 @@ def expected_events():
     yield "cleanup:end"
 
 
-def orchestration_timings(path):
+def orchestration_timings(path, variant="control"):
     rows = [line.split("\t") for line in path.read_text().splitlines()]
-    require([label for label, _ in rows] == list(expected_events()))
+    require([label for label, _ in rows] == list(expected_events(variant)))
     ticks = [int(tick) for _, tick in rows]
     require(all(0 <= a <= b for a, b in pairwise(ticks)))
     spans = {}
@@ -269,11 +318,12 @@ def write_json(output, evidence):
 
 def publish(folder, output):
     evidence = json.loads((folder / "report.json").read_text())
+    variant = evidence["variant"]
     require(not (Path(os.environ["RUNNER_TEMP"]) / "foundation-ci-private").exists())
-    evidence.update(orchestration_timings(folder / "timings.tsv"))
+    evidence.update(orchestration_timings(folder / "timings.tsv", variant))
     evidence.update(
         {
-            "kind": KIND,
+            "kind": PARTITION_KIND if variant in PARTITIONS else KIND,
             "baseline_sha": BASELINE,
             "tested_sha": identifier(os.environ["GITHUB_SHA"], r"[0-9a-f]{40}"),
             "profiler_sha256": hashlib.sha256(
@@ -287,7 +337,7 @@ def publish(folder, output):
             "runner_os": identifier(os.environ["ImageOS"], r"ubuntu24"),
             "cleanup": "verified",
             "zero_skips": True,
-            "mandatory_cases": sum(REPORTS.values()),
+            "mandatory_cases": sum(report_inventory(variant).values()),
         }
     )
     write_json(output, evidence)

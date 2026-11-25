@@ -1,5 +1,5 @@
 name: Foundation
-run-name: ${{ inputs.ordinary_profile_sha && 'Ordinary Profiling Experiment (NOT ACCEPTANCE)' || inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && format('Foundation Diagnostic — {0}', inputs.postgres_diagnostic) || '' }}
+run-name: ${{ inputs.ordinary_partition_sha && 'Ordinary Partition Comparison (NOT ACCEPTANCE)' || inputs.ordinary_profile_sha && 'Ordinary Profiling Experiment (NOT ACCEPTANCE)' || inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && format('Foundation Diagnostic — {0}', inputs.postgres_diagnostic) || '' }}
 
 on:
   push:
@@ -21,6 +21,10 @@ on:
         default: ''
       ordinary_profile_sha:
         description: Exact authorized SHA for isolated Ordinary profiling only
+        type: string
+        default: ''
+      ordinary_partition_sha:
+        description: Exact authorized SHA for isolated Ordinary partition comparison only
         type: string
         default: ''
       postgres_diagnostic:
@@ -54,7 +58,7 @@ on:
 # Cancel superseded PR/push checks and duplicate manual runs of the same SHA/mode.
 # Keep manual runs for different commits and spike modes independent.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.sha || 'branch' }}-${{ inputs.b04_spike && 'spike' || 'standard' }}-${{ inputs.t133_terminal && 't133' || 'ordinary' }}-${{ inputs.ordinary_profile_sha && 'ordinary-profile' || inputs.postgres_diagnostic || 'full' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.sha || 'branch' }}-${{ inputs.b04_spike && 'spike' || 'standard' }}-${{ inputs.t133_terminal && 't133' || 'ordinary' }}-${{ inputs.ordinary_partition_sha && 'ordinary-partition' || inputs.ordinary_profile_sha && 'ordinary-profile' || inputs.postgres_diagnostic || 'full' }}
   cancel-in-progress: true
 
 permissions:
@@ -77,7 +81,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: ${{ inputs.ordinary_profile_sha && 3 || 1 }}
+          fetch-depth: ${{ (inputs.ordinary_profile_sha || inputs.ordinary_partition_sha) && 3 || 1 }}
 
       - name: Validate and normalize Foundation request
         id: request
@@ -88,6 +92,7 @@ jobs:
           INPUT_T133_TERMINAL: ${{ inputs.t133_terminal }}
           INPUT_T133_SHA: ${{ inputs.t133_sha }}
           INPUT_ORDINARY_PROFILE_SHA: ${{ inputs.ordinary_profile_sha }}
+          INPUT_ORDINARY_PARTITION_SHA: ${{ inputs.ordinary_partition_sha }}
         run: |
           set -euo pipefail
           python3 -m ops.foundation_acceptance validate-request
@@ -174,7 +179,7 @@ jobs:
           key: foundation-ubuntu24-x64-node24.22.1-pnpm10.34.7-${{ hashFiles('pnpm-lock.yaml') }}
 
       - name: Common pinned inputs, quality, unit, imports and web gates
-        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' && steps.request.outputs.mode != 'ordinary-profile' }}
+        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' && steps.request.outputs.mode != 'ordinary-profile' && steps.request.outputs.mode != 'ordinary-partition' }}
         shell: pwsh
         run: |
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
@@ -183,8 +188,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+      - name: Verify isolated Ordinary partition contract
+        if: ${{ steps.request.outputs.mode == 'ordinary-partition' }}
+        shell: bash
+        run: python -m pytest -q -p no:cacheprovider ops/test_ordinary_partition.py
+
       - name: Check unchanged common gates privately
-        if: ${{ steps.request.outputs.mode == 'ordinary-profile' }}
+        if: ${{ (steps.request.outputs.mode == 'ordinary-profile' || steps.request.outputs.mode == 'ordinary-partition') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -196,7 +206,7 @@ jobs:
           export RUNNER_TEMP="$private"
           for check in inputs python-quality unit imports web; do
             if pwsh -NoProfile -File ops/check.ps1 "$check" > "$private/$check.log" 2>&1; then
-              printf 'Profiling preflight %s passed\n' "$check"
+              printf 'Ordinary experiment preflight %s passed\n' "$check"
             else
               status=$?
               printf 'FAIL profiling preflight %s (exit %s; output withheld)\n' "$check" "$status"
@@ -205,7 +215,7 @@ jobs:
           done
 
   compose-integration:
-    name: ${{ needs.inputs-and-build.outputs.mode == 'ordinary-profile' && format('Ordinary {0} (NOT ACCEPTANCE)', matrix.lane) || matrix.lane == 'standard' && format('{0} integration', needs.inputs-and-build.outputs.mode) || format('Full Foundation {0}', matrix.lane) }}
+    name: ${{ (needs.inputs-and-build.outputs.mode == 'ordinary-profile' || needs.inputs-and-build.outputs.mode == 'ordinary-partition') && format('Ordinary {0} (NOT ACCEPTANCE)', matrix.lane) || matrix.lane == 'standard' && format('{0} integration', needs.inputs-and-build.outputs.mode) || format('Full Foundation {0}', matrix.lane) }}
     needs: inputs-and-build
     if: ${{ needs.inputs-and-build.result == 'success' }}
     strategy:
@@ -220,15 +230,16 @@ jobs:
       CP_T133_SHA: ${{ inputs.t133_sha || '' }}
       CP_FOUNDATION_LANE: ${{ matrix.lane }}
       CP_FOUNDATION_MODE: ${{ needs.inputs-and-build.outputs.mode }}
-      CP_FOUNDATION_RECEIPT_PATH: ${{ needs.inputs-and-build.outputs.mode != 'ordinary-profile' && format('{0}/foundation-full-receipt.json', github.workspace) || '' }}
+      CP_FOUNDATION_RECEIPT_PATH: ${{ needs.inputs-and-build.outputs.mode != 'ordinary-profile' && needs.inputs-and-build.outputs.mode != 'ordinary-partition' && format('{0}/foundation-full-receipt.json', github.workspace) || '' }}
       CP_ORDINARY_PROFILE_SHA: ${{ inputs.ordinary_profile_sha || '' }}
-      COMPOSE_PROJECT_NAME: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.lane == 'ordinary' && '1' || matrix.lane == 'historical' && '2' || matrix.lane == 'profile-control' && '4' || matrix.lane == 'profile-instrumented' && '5' || '3') }}
-      CP_CI_PROJECT: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.lane == 'ordinary' && '1' || matrix.lane == 'historical' && '2' || matrix.lane == 'profile-control' && '4' || matrix.lane == 'profile-instrumented' && '5' || '3') }}
+      CP_ORDINARY_PARTITION_SHA: ${{ inputs.ordinary_partition_sha || '' }}
+      COMPOSE_PROJECT_NAME: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.lane == 'ordinary' && '1' || matrix.lane == 'historical' && '2' || matrix.lane == 'profile-control' && '4' || matrix.lane == 'profile-instrumented' && '5' || matrix.lane == 'partition-control' && '6' || matrix.lane == 'partition-db' && '7' || matrix.lane == 'partition-stack' && '8' || '3') }}
+      CP_CI_PROJECT: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.lane == 'ordinary' && '1' || matrix.lane == 'historical' && '2' || matrix.lane == 'profile-control' && '4' || matrix.lane == 'profile-instrumented' && '5' || matrix.lane == 'partition-control' && '6' || matrix.lane == 'partition-db' && '7' || matrix.lane == 'partition-stack' && '8' || '3') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: ${{ inputs.ordinary_profile_sha && 3 || 1 }}
+          fetch-depth: ${{ (inputs.ordinary_profile_sha || inputs.ordinary_partition_sha) && 3 || 1 }}
 
       - name: Verify normalized lane and exact tested SHA
         shell: bash
@@ -239,7 +250,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$CANDIDATE_SHA" = "$GITHUB_SHA"
           case "$CP_FOUNDATION_MODE:$CP_FOUNDATION_LANE" in
-            full:ordinary|full:historical|full:compat|postgres-diagnostic:standard|compat-diagnostic:standard|b04-spike:standard|t133:standard|ordinary-profile:profile-control|ordinary-profile:profile-instrumented) ;;
+            full:ordinary|full:historical|full:compat|postgres-diagnostic:standard|compat-diagnostic:standard|b04-spike:standard|t133:standard|ordinary-profile:profile-control|ordinary-profile:profile-instrumented|ordinary-partition:partition-control|ordinary-partition:partition-db|ordinary-partition:partition-stack) ;;
             *) echo 'FAIL invalid normalized mode/lane combination'; exit 1 ;;
           esac
           test "$CP_CI_PROJECT" = "$COMPOSE_PROJECT_NAME"
@@ -344,7 +355,7 @@ jobs:
           test "$(dpkg-query -W -f='${Version}' docker-buildx-plugin)" = '0.38.1-1~ubuntu.24.04~noble'
 
       - name: Install pinned Playwright browser on disposable runner
-        if: ${{ needs.inputs-and-build.outputs.mode == 'ordinary-profile' || matrix.lane == 'ordinary' || (matrix.lane == 'standard' && (needs.inputs-and-build.outputs.mode == 'b04-spike' || needs.inputs-and-build.outputs.mode == 't133')) }}
+        if: ${{ needs.inputs-and-build.outputs.mode == 'ordinary-profile' || matrix.lane == 'partition-control' || matrix.lane == 'partition-stack' || matrix.lane == 'ordinary' || (matrix.lane == 'standard' && (needs.inputs-and-build.outputs.mode == 'b04-spike' || needs.inputs-and-build.outputs.mode == 't133')) }}
         shell: bash
         run: |
           set -euo pipefail
@@ -396,8 +407,8 @@ jobs:
           & pwsh -NoProfile -File ops/check.ps1 compat-diagnostic
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run the complete Ordinary sequence with private output
-        if: ${{ needs.inputs-and-build.outputs.mode == 'ordinary-profile' }}
+      - name: Run the selected Ordinary experiment with private output
+        if: ${{ needs.inputs-and-build.outputs.mode == 'ordinary-profile' || needs.inputs-and-build.outputs.mode == 'ordinary-partition' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -434,13 +445,13 @@ jobs:
           fi
           test -f "$output" && test ! -L "$output"
           test ! -e "$RUNNER_TEMP/foundation-ci-private"
-          echo 'Profiling-only evidence validated after scoped cleanup; 1051 mandatory cases, zero skips'
+          echo 'Ordinary experiment evidence validated after scoped cleanup; zero mandatory skips (NOT ACCEPTANCE)'
 
-      - name: Upload sanitized profiling timing only
-        if: ${{ needs.inputs-and-build.outputs.mode == 'ordinary-profile' && success() }}
+      - name: Upload sanitized Ordinary experiment evidence only
+        if: ${{ (needs.inputs-and-build.outputs.mode == 'ordinary-profile' || needs.inputs-and-build.outputs.mode == 'ordinary-partition') && success() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, Node.js 24
         with:
-          name: ordinary-profile-${{ matrix.lane }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          name: ${{ needs.inputs-and-build.outputs.mode }}-${{ matrix.lane }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
           path: ${{ runner.temp }}/ordinary-profile-timing.json
           archive: true
           overwrite: false
@@ -459,7 +470,7 @@ jobs:
           if-no-files-found: error
 
   full-foundation-acceptance:
-    name: ${{ (inputs.ordinary_profile_sha || github.ref == 'refs/heads/feature/ci-scalability' || github.head_ref == 'feature/ci-scalability') && 'Ordinary profiling result (NOT ACCEPTANCE)' || needs.inputs-and-build.outputs.mode != '' && needs.inputs-and-build.outputs.mode != 'full' && format('{0} result (NOT Full Foundation acceptance)', needs.inputs-and-build.outputs.mode) || 'Full Foundation acceptance' }}
+    name: ${{ inputs.ordinary_partition_sha && 'Ordinary partition comparison (NOT ACCEPTANCE)' || (inputs.ordinary_profile_sha || github.ref == 'refs/heads/feature/ci-scalability' || github.head_ref == 'feature/ci-scalability') && 'Ordinary profiling result (NOT ACCEPTANCE)' || needs.inputs-and-build.outputs.mode != '' && needs.inputs-and-build.outputs.mode != 'full' && format('{0} result (NOT Full Foundation acceptance)', needs.inputs-and-build.outputs.mode) || 'Full Foundation acceptance' }}
     if: ${{ always() }}
     needs: [inputs-and-build, compose-integration]
     runs-on: ubuntu-24.04
@@ -492,11 +503,25 @@ jobs:
           test "$COMMON_WORKFLOW" = "$GITHUB_WORKFLOW_REF"
           case "$NORMALIZED_MODE" in
             full) ;;
-            postgres-diagnostic|compat-diagnostic|b04-spike|t133|ordinary-profile)
+            postgres-diagnostic|compat-diagnostic|b04-spike|t133|ordinary-profile|ordinary-partition)
               echo "NON_FULL_RESULT mode=$NORMALIZED_MODE sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT"
               exit 0 ;;
             *) echo 'FAIL invalid or missing normalized mode'; exit 1 ;;
           esac
+
+      - name: Retrieve comparison-only artifacts with strict digest verification
+        if: ${{ env.NORMALIZED_MODE == 'ordinary-partition' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, Node.js 24
+        with:
+          pattern: ordinary-partition-*-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: ordinary-partition-evidence
+          merge-multiple: false
+          digest-mismatch: error
+
+      - name: Compare exact Ordinary scenario inventories (NOT ACCEPTANCE)
+        if: ${{ env.NORMALIZED_MODE == 'ordinary-partition' }}
+        shell: bash
+        run: python3 -m ops.ordinary_partition compare ordinary-partition-evidence
 
       - name: Retrieve this attempt's three mandatory receipts with strict digest verification
         if: ${{ env.NORMALIZED_MODE == 'full' }}

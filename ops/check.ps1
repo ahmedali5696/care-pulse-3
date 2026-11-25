@@ -108,7 +108,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'f7b8ae1500ca320f3c14ede534d4f290146954732c2cf947d0d663a2ddd05204',
+    '.github/workflows/foundation.yml': '3d95f32dfa412910ee8121ed949d28f9ed9d38eb2a6015dbfdfaee719ceaf393',
     '.github/workflows/fast-feedback.yml': '814f40f9f2a09d6337e5d4e14f1d4851e88301e64c1f28d5e538d3549dccce8b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
@@ -321,31 +321,50 @@ focused_target=
 foundation_lane="${CP_FOUNDATION_LANE:-standard}"
 foundation_full=false
 foundation_profile=false
+partition_db=false
+partition_stack=false
+profile_expected_tests=1051
 profile_checkpoint() { :; }
 foundation_coverage_verified=false
 foundation_tests=0
 case "$foundation_lane" in ordinary|historical|standard) ;; *) echo 'FAIL unknown Foundation lane'; exit 1 ;; esac
-if [[ "${CP_FOUNDATION_MODE:-}" = ordinary-profile ]]; then
+if [[ "${CP_FOUNDATION_MODE:-}" = ordinary-profile || "${CP_FOUNDATION_MODE:-}" = ordinary-partition ]]; then
   profile_variant="${CP_ORDINARY_PROFILE_VARIANT:-}"
   profile_dir="$RUNNER_TEMP/ordinary-profile-private"
   if [[ "$1" != integration || "$foundation_lane" != ordinary ||
-        ! "$profile_variant" =~ ^(control|instrumented)$ ||
         "${GITHUB_EVENT_NAME:-}" != workflow_dispatch ||
         "${GITHUB_REPOSITORY:-}" != ahmedali5696/care-pulse-3 ||
         "${GITHUB_REF:-}" != refs/heads/feature/ci-scalability ||
         "${GITHUB_WORKFLOW:-}" != Foundation ||
         "${GITHUB_WORKFLOW_REF:-}" != 'ahmedali5696/care-pulse-3/.github/workflows/foundation.yml@refs/heads/feature/ci-scalability' ||
         "${CP_ENV:-}" != test || "${CP_SYNTHETIC_TEST_PROFILE:-}" != true ||
-        ! "${CP_ORDINARY_PROFILE_SHA:-}" =~ ^[0-9a-f]{40}$ ||
-        "$CP_ORDINARY_PROFILE_SHA" != "$GITHUB_SHA" || "$(git rev-parse HEAD)" != "$GITHUB_SHA" ||
-        "$(git rev-parse HEAD^)" != 276d826fd0d463fbe63de4f9417b22e47b12bf1b ||
-        "$(git rev-parse HEAD~2)" != 0c325ce80a999b79f7e442b39c4b0ecbc55fea9d ||
-        "$CP_CI_PROJECT" != "carepulse-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}$(if [ "$profile_variant" = control ]; then echo 4; else echo 5; fi)" ||
         "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false ||
         -n "${CP_T133_SHA:-}${CP_POSTGRES_DIAGNOSTIC:-}${CP_FOUNDATION_RECEIPT_PATH:-}" ||
         ! -d "$profile_dir" || ! -O "$profile_dir" || -L "$profile_dir" ||
         -e "$profile_dir/timings.tsv" || -e "$profile_dir/report.json" ]]; then
     echo 'FAIL unauthorized profiling-only invocation'; exit 1
+  fi
+  if [[ "$CP_FOUNDATION_MODE" = ordinary-profile ]]; then
+    if [[ ! "$profile_variant" =~ ^(control|instrumented)$ || -n "${CP_ORDINARY_PARTITION_SHA:-}" ||
+        ! "${CP_ORDINARY_PROFILE_SHA:-}" =~ ^[0-9a-f]{40}$ ||
+        "$CP_ORDINARY_PROFILE_SHA" != "$GITHUB_SHA" || "$(git rev-parse HEAD)" != "$GITHUB_SHA" ||
+        "$(git rev-parse HEAD^)" != 276d826fd0d463fbe63de4f9417b22e47b12bf1b ||
+        "$(git rev-parse HEAD~2)" != 0c325ce80a999b79f7e442b39c4b0ecbc55fea9d ||
+        "$CP_CI_PROJECT" != "carepulse-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}$(if [ "$profile_variant" = control ]; then echo 4; else echo 5; fi)" ]]; then
+      echo 'FAIL unauthorized profiling SHA or variant'; exit 1
+    fi
+  else
+    test -z "${CP_ORDINARY_PROFILE_SHA:-}"
+    test "${CP_ORDINARY_PARTITION_SHA:-}" = "$GITHUB_SHA"
+    test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+    python3 -c 'from ops.ordinary_partition import verify_frozen_tree; verify_frozen_tree()'
+    case "$profile_variant" in
+      partition-control) suffix=6 ;;
+      partition-db) suffix=7; partition_db=true; profile_expected_tests=446 ;;
+      partition-stack) suffix=8; partition_stack=true; profile_expected_tests=605 ;;
+      *) echo 'FAIL unknown Ordinary partition'; exit 1 ;;
+    esac
+    test "$CP_CI_PROJECT" = "carepulse-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}$suffix"
   fi
   foundation_profile=true
   source ops/ordinary_profile.sh
@@ -448,7 +467,7 @@ cleanup() {
   profile_checkpoint cleanup:end || cleanup_failed=1
   if [ "$cleanup_failed" = 1 ]; then code=1; fi
   if [ "$code" -eq 0 ] && [ "$foundation_profile" = true ]; then
-    test "$foundation_coverage_verified" = true && test "$foundation_tests" = 1051 && test ! -e "$private" || code=1
+    test "$foundation_coverage_verified" = true && test "$foundation_tests" = "${profile_expected_tests:-1051}" && test ! -e "$private" || code=1
   fi
   if [ "$code" -eq 0 ] && [ "$foundation_full" = true ]; then
     if [[ "$foundation_coverage_verified" != true || "$foundation_tests" -le 0 || -e "$private" ]]; then
@@ -499,7 +518,7 @@ do
 done
 profile_checkpoint pulls:end
 profile_checkpoint build:start
-if [ -n "$focused_target" ] || [ "$foundation_lane" = historical ]; then
+if [ -n "$focused_target" ] || [ "$foundation_lane" = historical ] || [ "$partition_db" = true ]; then
   docker compose --profile test build --pull test
 else
   docker compose --profile test --profile sender --profile operator build --pull
@@ -513,6 +532,13 @@ for attempt in $(seq 1 40); do
   if [ "$attempt" = 40 ]; then echo 'FAIL disposable database startup'; exit 1; fi
   sleep 2
 done
+if [[ "${CP_FOUNDATION_MODE:-}" = ordinary-partition ]]; then
+  db_container="$(docker compose ps -q db)"
+  test -n "$db_container"
+  test "$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$db_container")" = "$CP_CI_PROJECT"
+  test "$(docker inspect --format '{{ len .HostConfig.PortBindings }}' "$db_container")" = 0
+  docker compose exec -T db postgres --version | grep -F '17.11'
+fi
 profile_checkpoint database_ready:end
 profile_checkpoint role_bootstrap:start
 export CP_MIGRATION_PASSWORD="$(cat "$CP_MIGRATION_SECRET_FILE")"
@@ -875,6 +901,7 @@ fi
 profile_checkpoint identity_seed:start
 seed_identity_policy
 profile_checkpoint identity_seed:end
+if [ "$partition_stack" = false ]; then
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/foundation-results:/tmp/foundation-results:rw" \
@@ -907,6 +934,8 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d08-core.log"; then
   echo 'FAIL mandatory D-08 persistence evidence skipped'; exit 1
 fi
+fi
+if [ "$partition_db" = false ]; then
 # Independent D-06 suite must remain executable without D-07/Visit imports.
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
@@ -921,8 +950,9 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d06-queue.log"; then
   echo 'FAIL mandatory D-06 real-PostgreSQL evidence skipped'; exit 1
 fi
+fi
 # Wave 3 suites exercise the current head, never the immutable predecessor or special modes.
-if [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; then
+if [ "$partition_stack" = false ] && [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; then
   for suite in w3_receipt_boundary w3_checkin w3_checkin_races w3_queue_scope w3_intake w3_intake_races w3_admission_controls w3_admission_confirmations; do
     docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
       -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
@@ -937,6 +967,15 @@ if [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] 
       echo "FAIL mandatory Wave 3 evidence skipped: $suite"; exit 1
     fi
   done
+fi
+if [ "$partition_db" = true ]; then
+  python3 -m ops.profile_ordinary_report collect "$private/foundation-results" "$profile_dir/report.json" "$profile_variant" "$profile_head"
+  # DB has no service processes or Web build; check its own synthetic secrets against private published evidence and tracked source.
+  python3 -m ops.ordinary_partition scan "$private" "$profile_dir"
+  foundation_tests=446
+  foundation_coverage_verified=true
+  profile_checkpoint controller:validated
+  exit 0
 fi
 # All B-06 suites run against disposable PostgreSQL; no silent skip counts.
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
@@ -1476,7 +1515,11 @@ if not all(marker in text for marker in ('T133 ACL DURING:', 'T133 ACL AFTER:', 
     raise SystemExit('FAIL incomplete protected T133 evidence')
 PY
 fi
-if [ "$foundation_full" = true ] || [ "$foundation_profile" = true ] || [ "${CP_B04_SPIKE:-false}" = true ]; then
+if [ "$partition_stack" = true ]; then
+  test "$health_case_count" = 8
+  foundation_tests=605
+  foundation_coverage_verified=true
+elif [ "$foundation_full" = true ] || [ "$foundation_profile" = true ] || [ "${CP_B04_SPIKE:-false}" = true ]; then
   foundation_tests="$(python3 - "$private/foundation-results" "$health_case_count" "$foundation_lane" <<'PY'
 import re
 import sys
@@ -1531,7 +1574,7 @@ PY
   foundation_coverage_verified=true
 fi
 if [ "$foundation_profile" = true ]; then
-  test "$foundation_tests" = 1051
+  test "$foundation_tests" = "$profile_expected_tests"
   python3 -m ops.profile_ordinary_report collect "$private/foundation-results" "$profile_dir/report.json" "$profile_variant" "$profile_head"
   profile_checkpoint controller:validated
   if grep -aF -f "$private/canaries" "$profile_dir/report.json" "$profile_dir/timings.tsv" > /dev/null; then

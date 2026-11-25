@@ -140,3 +140,39 @@ Reconciled all five timing rows, all seven focus-suite series and the latest cov
 | Selector or schema drift could leave a green incomplete run. A copied runner could drift from B-04/T133. | CI maintainer and independent reviewer, whenever adding a suite, migration head or execution mode | Reviewed manifest diff, exact inventories, contract/fingerprint and negative gate tests. Retain serial special-mode entry points, original order and scoped credentials. Only sanitized post-cleanup receipts enter the acceptance artifact namespace. |
 
 No open Issue identified in the repository inventory blocks this design review. The next-stage gates are independent review, PO authorization and measured isolation/parity. Open [#28](https://github.com/ahmedali5696/care-pulse-3/issues/28) tracks compatibility evidence, [#26](https://github.com/ahmedali5696/care-pulse-3/issues/26) runtime identity security and [#13](https://github.com/ahmedali5696/care-pulse-3/issues/13) populated migration evidence. Preserve their independent dispositions. [#24](https://github.com/ahmedali5696/care-pulse-3/issues/24) and [#25](https://github.com/ahmedali5696/care-pulse-3/issues/25) concern product behavior. The other open production/release obligations were [#2](https://github.com/ahmedali5696/care-pulse-3/issues/2), [#4](https://github.com/ahmedali5696/care-pulse-3/issues/4), [#5](https://github.com/ahmedali5696/care-pulse-3/issues/5) and [#18](https://github.com/ahmedali5696/care-pulse-3/issues/18).
+
+
+## Hosted profiling results and isolated partition candidate (2026-11-25)
+
+Run [45655182854, attempt 1](https://github.com/ahmedali5696/care-pulse-3/actions/runs/45655182854/attempts/1) succeeded at reviewed SHA `7f54927dbffd9df4f2d6da75fbebb880226cfdb0`. Both downloaded ZIP digests match GitHub metadata: control artifact 15043938101 `8fd6c0842eb1742d606ea98d313b24434b14027b578673e233b3f67b84c0e521`; instrumented artifact 15043542924 `5a48b511d1d3b70627a5267d2b10bbd8555e0e65938c3881e839cb21176657d4`. Both record 1,051 successful mandatory cases, zero skips, verified cleanup, Ubuntu image `20261122.23.1`, head `0056_b14_target_binding` and profiler hash `2e4ffd1725d66dfcb68628b5b1febb7d22315c110eb02e037d49b43be37a40d1`.
+
+| Measured seconds | Control | Instrumented |
+|---|---:|---:|
+| Controller elapsed | 966.979 | 1019.840 |
+| Hosted integration job | 1014 | 1077 |
+| All pytest invocation intervals | 809.360 | 886.763 |
+| Seven focus invocation intervals | 560.409 | 629.234 |
+| Ten proposed DB invocation intervals | 446.832 | 509.780 |
+
+Observed instrumentation comparison: controller +52.861s (5.47%), job +63s, focus intervals +68.825s (12.28%). These are paired observations, not isolated profiler cost: non-focus pytest intervals increased 8.578s while pulls/build became about 22.5s faster. Initial head upgrade was about 1.2s in both. The instrumented focus cases spent 64.243s in setup, 547.032s in call and 1.325s in teardown; fixture times are nested, not additional to phase totals. The largest setup groups are B-10 (32.077s), B-09 (14.431s) and D-08 (11.291s). Heavy individual call times: queue-scope 156.12s, confirmation expiry 60.95s (real configured minute), F-01 resource isolation 47.20s, representative queue plan 39.95s, populated-0040 migration chain 6.56s. The migration-chain case includes its assertions and data operations, not just DDL. Do not optimize away waits, role or evidence checks, representative data, or fixture isolation. No helper-level causal attribution is established by these case timings.
+
+Retain the 446/605 assignment above, with unchanged per-shard order and explicit T145 sequence. The smallest candidate adds one comparison-only manual mode with serial control, DB and stack in the same attempt. Each has its own hosted runner, synthetic secrets, disposable project (suffix 6/7/8), fresh migration and identity seed. DB keeps all pinned image pulls but builds only the test target and omits Playwright/service startup. Stack keeps the original complete service sequence and all probes, scans and health transitions. Each validates PostgreSQL project ownership, no published DB ports, version and observed head. DB also scans its own canaries in tracked source and private evidence. All three require successful scoped cleanup before publishing.
+
+| Projection using profiling control | Job seconds |
+|---|---:|
+| Serial control (observed) | 1014 |
+| Stack (1014 - 446.832) | 567.168 |
+| DB (446.832 + prior diagnostic fixed cost 85.45) | 532.282 |
+| DB with extra 26.34s for retained pulls (sensitivity) | 558.622 |
+
+Using the measured 97s common job, 10s final job and 6s handoffs, serial Ordinary comparison is about 18m47s; a future four-lane Full topology would project about 11m20s (39.6% lower), assuming earlier historical/compatibility job durations 162/256s and immediately available runners. Estimated unrounded Full aggregate runner time increases from 25.65 to 27.07 minutes (+1.42); extra 26.34s increases it to 27.51. The actual three-job comparison intentionally retains serial control on the critical path: about 18m47s plus extra preflight and comparison overhead, around 37.01 runner-minutes before that overhead. No billing or performance guarantee; historical/compatibility and diagnostic fixed costs come from the earlier baseline, not this hosted profiling run. Queueing, cold builds, and changed data accumulation may change estimates. Reapply the prior three-matched-comparison decision threshold before promotion.
+
+Local parity: 18 frozen pre-service commands recorded with complete selectors/flags/exclusions and compared to candidate commands for each variant; all 888 collected pre-service IDs were distinct (446 DB + 442 stack). Service block and historical selector setup are unchanged byte-for-byte. Hosted comparison requires all three same-SHA/current-attempt artifacts with matching runner image, exact report inventory, counts, per-report full JUnit parameter identity/TAP scenario digests, ordered timing markers, and successful cleanup. A hash of case identity is not an acceptance receipt and is not a substitute for the original test assertions. Hosted fresh-cluster behavior and performance remain unverified. New Wave 3 source/tests/migrations are outside this frozen experiment.
+
+After independent review and separate push/dispatch authorization, propose (substitute the reviewed candidate commit SHA):
+
+```sh
+gh workflow run foundation.yml --repo ahmedali5696/care-pulse-3 --ref feature/ci-scalability -f ordinary_partition_sha=<candidate-sha>
+```
+
+The mode is mutually exclusive with Full/diagnostics/profiling/B-04/T133. No Full receipt is sealed or uploaded; the final comparison has a non-acceptance identity. Normal Full's three lanes, Fast Feedback, historical and compatibility coverage, protected B-04/T133 and application/migration files remain unchanged. No promotion, push, dispatch or acceptance authorized here.

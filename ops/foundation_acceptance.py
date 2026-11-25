@@ -175,7 +175,11 @@ def github_context(env: dict[str, str], *, profiling_request: bool = False) -> d
 def validate_request(env: dict[str, str]) -> dict[str, str]:
     """Normalize only approved, mutually exclusive Foundation invocation modes."""
     profile_sha = env.get("INPUT_ORDINARY_PROFILE_SHA", "")
-    context = github_context(env, profiling_request=bool(profile_sha))
+    partition_sha = env.get("INPUT_ORDINARY_PARTITION_SHA", "")
+    if profile_sha and partition_sha:
+        raise ValueError("conflicting Ordinary experiments")
+    experiment_sha = profile_sha or partition_sha
+    context = github_context(env, profiling_request=bool(experiment_sha))
     diagnostic = env.get("INPUT_POSTGRES_DIAGNOSTIC", "") or "full"
     if diagnostic not in DIAGNOSTICS | {"full"}:
         raise ValueError("unknown PostgreSQL diagnostic selection")
@@ -185,11 +189,11 @@ def validate_request(env: dict[str, str]) -> dict[str, str]:
     spike = env.get("INPUT_B04_SPIKE") == "true"
     terminal = env.get("INPUT_T133_TERMINAL") == "true"
     terminal_sha = env.get("INPUT_T133_SHA", "")
-    if profile_sha and (
+    if experiment_sha and (
         context["event"] != "workflow_dispatch"
         or context["repository"] != "ahmedali5696/care-pulse-3"
         or context["ref"] != "refs/heads/feature/ci-scalability"
-        or profile_sha != context["sha"]
+        or experiment_sha != context["sha"]
         or diagnostic != "full"
         or spike
         or terminal
@@ -216,7 +220,9 @@ def validate_request(env: dict[str, str]) -> dict[str, str]:
         raise ValueError("nonstandard Foundation mode requires manual dispatch")
 
     mode = (
-        "ordinary-profile"
+        "ordinary-partition"
+        if partition_sha
+        else "ordinary-profile"
         if profile_sha
         else "b04-spike"
         if spike
@@ -235,6 +241,8 @@ def validate_request(env: dict[str, str]) -> dict[str, str]:
             if mode == "full"
             else ["profile-control", "profile-instrumented"]
             if mode == "ordinary-profile"
+            else ["partition-control", "partition-db", "partition-stack"]
+            if mode == "ordinary-partition"
             else ["standard"],
             separators=(",", ":"),
         ),
@@ -414,6 +422,10 @@ def main(argv: list[str], env: dict[str, str]) -> None:
                 raise ValueError(
                     "profiling candidate does not descend directly from the reviewed experiment"
                 )
+        if result["mode"] == "ordinary-partition":
+            from ops.ordinary_partition import verify_frozen_tree
+
+            verify_frozen_tree()
         output_path = env.get("GITHUB_OUTPUT", "")
         if output_path:
             destination = Path(output_path)
