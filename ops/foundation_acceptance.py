@@ -12,7 +12,7 @@ from pathlib import Path
 HISTORICAL_SHA = "6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7"
 SOURCE_SCHEMA = "0040_t173_numeric_money"
 CANDIDATE_SCHEMA = "0046_f01_audit_integrity"
-ORDINARY_SCHEMA = "0056_b14_target_binding"
+ORDINARY_SCHEMA = "0057_w3_queue_admit"
 RECEIPT_FILE = "foundation-full-receipt.json"
 EXPECTED_COVERAGE = {
     "ordinary": "current-head-excluding-extracted-historical",
@@ -56,6 +56,8 @@ DIAGNOSTICS = {
     "w3-intake-races",
     "w3-admission-controls",
     "w3-admission-confirmations",
+    "w3-admission",
+    "w3-admission-races",
     "w3-migration",
     "compat-us1",
     "compat-us2",

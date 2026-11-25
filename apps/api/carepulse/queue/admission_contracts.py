@@ -81,3 +81,30 @@ class RevokeConfirmationCommand(BaseModel):
         if not value.strip() or any(ord(letter) < 32 for letter in value):
             raise ValueError("Reason required")
         return value.strip()
+
+
+class AdmitCommand(IssueConfirmationCommand):
+    expected_queue_entry_revision: Revision
+    expected_head_appointment_id: UUID
+    non_head_reason: StrictStr | None = None
+    confirmation_id: UUID | None = None
+    physical_presence_confirmed: Literal[True] | None = None
+
+    @field_validator("non_head_reason")
+    @classmethod
+    def nonblank_reason(cls, reason: str | None) -> str | None:
+        if reason is not None and (
+            not reason.strip()
+            or any(
+                ord(letter) < 32 or 0xD800 <= ord(letter) <= 0xDFFF for letter in reason
+            )
+        ):
+            raise ValueError("Reason required")
+        return reason.strip() if reason is not None else None
+
+    @field_validator("physical_presence_confirmed", mode="before")
+    @classmethod
+    def explicit_presence(cls, assertion):
+        if assertion is not True:
+            raise ValueError("Positive physical presence required")
+        return assertion

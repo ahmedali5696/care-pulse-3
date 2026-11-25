@@ -1,4 +1,4 @@
-"""B-12, B-11 and B-14 authenticated browser-to-BFF-to-API-to-PostgreSQL acceptance."""
+"""B-12, B-11, B-14 and B-15 authenticated browser-to-BFF-to-API-to-PostgreSQL acceptance."""
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -12,7 +12,7 @@ from test_booking import booking_body
 from test_patients import PATIENT, browser_request
 from test_patients import invited_patients as invited_patients  # noqa: PLC0414
 from test_pricing import _patch as pricing_patch
-from test_schedule import SERVICE_DAY, _config
+from test_schedule import CAIRO, SERVICE_DAY, _config
 from test_schedule import _patch as schedule_patch
 from test_sessions import _database
 
@@ -28,9 +28,9 @@ def _domain_state(tenant):
         "queue_days": "",
         "queue_entries": "",
         "visits": "",
-        "sensitive_audit": "AND action IN ('appointments.book', 'appointments.check_in', 'appointments.intake_routine', 'appointments.intake_emergency', 'appointments.intake_urgent')",
-        "outbox_events": "AND event_type IN ('APPOINTMENT_BOOKED', 'PATIENT_CHECKED_IN', 'APPOINTMENT_INTAKE')",
-        "idempotency_receipts": "AND operation IN ('appointments.book', 'appointments.check_in', 'appointments.intake_routine', 'appointments.intake_emergency', 'appointments.intake_urgent')",
+        "sensitive_audit": "AND action IN ('appointments.book', 'appointments.check_in', 'appointments.intake_routine', 'appointments.intake_emergency', 'appointments.intake_urgent', 'queue.admit')",
+        "outbox_events": "AND event_type IN ('APPOINTMENT_BOOKED', 'PATIENT_CHECKED_IN', 'APPOINTMENT_INTAKE', 'APPOINTMENT_ADMITTED')",
+        "idempotency_receipts": "AND operation IN ('appointments.book', 'appointments.check_in', 'appointments.intake_routine', 'appointments.intake_emergency', 'appointments.intake_urgent', 'queue.admit')",
     }
     with _database() as connection:
         return {
@@ -54,7 +54,7 @@ def _denied(response, status, code):
 
 
 def _seed_browser_active_exam(tenant, doctor, appointment):
-    # B-15 is deliberately absent; use the existing migration-only lifecycle fixture.
+    # Independent B-14 setup uses the existing migration-only lifecycle fixture.
     def migration_connection():
         connection = _database()
         connection.commit()
@@ -68,7 +68,7 @@ def _seed_browser_active_exam(tenant, doctor, appointment):
         engine.dispose()
 
 
-def _browser_book_new_patient(cookie, name):
+def _browser_book_new_patient(cookie, name, *, day=SERVICE_DAY):
     status, patient = browser_request(
         cookie,
         method="POST",
@@ -80,7 +80,7 @@ def _browser_book_new_patient(cookie, name):
         cookie,
         "/api/appointments",
         method="POST",
-        body=booking_body(patient["data"]["id"]),
+        body=booking_body(patient["data"]["id"], day=day),
         key=str(uuid4()),
     )
     assert status == 201, booked
@@ -151,7 +151,8 @@ def test_independent_browser_sessions_issue_and_retrieve_exact_confirmation(
     )
     assert status == 200, published
 
-    day = SERVICE_DAY.isoformat()
+    today = datetime.now(CAIRO).date()
+    day = today.isoformat()
     queue_path = f"/api/queue?date={day}&lane=MAIN"
     status, queue = browser_request(owner, queue_path)
     assert status == 200, queue
@@ -180,10 +181,10 @@ def test_independent_browser_sessions_issue_and_retrieve_exact_confirmation(
         key=str(uuid4()),
     )
     assert status == 200, mode
-    active = _browser_book_new_patient(receptionist, "Active")
+    active = _browser_book_new_patient(receptionist, "Active", day=today)
     _seed_browser_active_exam(sessions.clinic, doctor["data"]["id"], active)
-    target = _browser_book_new_patient(receptionist, "Target")
-    other = _browser_book_new_patient(receptionist, "Other")
+    target = _browser_book_new_patient(receptionist, "Target", day=today)
+    other = _browser_book_new_patient(receptionist, "Other", day=today)
     status, queue = browser_request(receptionist, queue_path)
     assert status == 200, queue
     assert queue["data"]["active_in_examination_count"] == 1
@@ -294,6 +295,51 @@ def test_independent_browser_sessions_issue_and_retrieve_exact_confirmation(
     )
     assert _confirmation_effects(sessions.clinic) == after
     assert _domain_state(sessions.clinic) == domain
+    status, current_queue = browser_request(receptionist, queue_path)
+    assert status == 200, current_queue
+    (selected,) = current_queue["data"]["entries"]
+    admit_command = {
+        **command,
+        "expected_queue_entry_revision": selected["queue_entry_revision"],
+        "expected_head_appointment_id": target["id"],
+        "confirmation_id": usable["data"]["id"],
+        "physical_presence_confirmed": True,
+    }
+    admit_path, admit_key = "/api/queue/admit", str(uuid4())
+    _denied(
+        browser_request(
+            owner, admit_path, method="POST", body=admit_command, key=admit_key
+        ),
+        403,
+        "FORBIDDEN",
+    )
+    assert _domain_state(sessions.clinic) == domain
+    status, admitted = browser_request(
+        receptionist, admit_path, method="POST", body=admit_command, key=admit_key
+    )
+    assert status == 200, admitted
+    assert admitted["data"]["appointment_id"] == target["id"]
+    assert admitted["data"]["confirmation_id"] == usable["data"]["id"]
+    assert admitted["data"]["status"] == "In Examination"
+    final = _domain_state(sessions.clinic)
+    assert len(final["visits"]) == len(domain["visits"]) + 1
+    assert len(final["appointment_history"]) == len(domain["appointment_history"]) + 1
+    for table in ("sensitive_audit", "outbox_events", "idempotency_receipts"):
+        assert len(final[table]) == len(domain[table]) + 1
+    (new_audit,) = [
+        row for row in final["sensitive_audit"] if row not in domain["sensitive_audit"]
+    ]
+    assert new_audit["actor_staff_id"] == staff["data"]["id"]
+    assert new_audit["actor_role"] == "RECEPTIONIST"
+    (consumed,) = _confirmation_effects(sessions.clinic)[
+        "doctor_admission_confirmations"
+    ]
+    assert consumed[0]["state"] == "CONSUMED"
+    assert browser_request(
+        receptionist, admit_path, method="POST", body=admit_command, key=admit_key
+    ) == (200, admitted)
+    assert _domain_state(sessions.clinic) == final
+    _denied(browser_request(receptionist, usable_path), 404, "NOT_FOUND")
     assert browser_request(receptionist, "/api/auth/logout", method="POST")[0] == 200
     _denied(browser_request(receptionist, usable_path), 401, "UNAUTHENTICATED")
 
@@ -350,13 +396,13 @@ def test_invited_browser_admission_controls_are_purpose_and_role_bound(
     )
     assert status == 200, paused
     assert paused["data"]["paused"] is True
-    # B-15 route remains absent at the BFF boundary.
+    # B-15 route is enabled, but the malformed command must not reach a writer.
     _denied(
         browser_request(
             owner, "/api/queue/admit", method="POST", body={}, key=str(uuid4())
         ),
-        403,
-        "FORBIDDEN",
+        422,
+        "INVALID_INPUT",
     )
     with _database() as connection:
         assert connection.execute(

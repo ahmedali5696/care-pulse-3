@@ -9,8 +9,10 @@ from pydantic import ValidationError
 
 from carepulse.identity.authorization import protected_transaction
 from carepulse.identity.contracts import ContractError, success_response
+from carepulse.identity.receipts import ReceiptConflict
 from carepulse.policies.admission_routes import control_mutation, strict_command
 from carepulse.queue.admission_contracts import (
+    AdmitCommand,
     CapacityCommand,
     IssueConfirmationCommand,
     PauseCommand,
@@ -18,6 +20,7 @@ from carepulse.queue.admission_contracts import (
     UsableConfirmationQuery,
 )
 from carepulse.queue.admission_control import (
+    _require_ttl,
     get_usable_confirmation,
     issue_confirmation,
     set_capacity,
@@ -26,6 +29,7 @@ from carepulse.queue.admission_control import (
 from carepulse.queue.admission_control import (
     revoke_confirmation as revoke_case_confirmation,
 )
+from carepulse.queue.admit import admit_patient, recover_admission
 from carepulse.queue.contracts import QueueQuery
 from carepulse.queue.queries import dated_queue_projection
 
@@ -74,6 +78,33 @@ async def _issue_body(request: Request) -> IssueConfirmationCommand:
 
 async def _revoke_body(request: Request) -> RevokeConfirmationCommand:
     return await strict_command(request, RevokeConfirmationCommand)
+
+
+async def _admit_body(request: Request) -> AdmitCommand:
+    return await strict_command(request, AdmitCommand)
+
+
+@router.post("/admit")
+def admit(request: Request, command: Annotated[AdmitCommand, Depends(_admit_body)]):
+    identity = request.scope["carepulse.identity"]
+    key = identity.idempotency_key
+    if not key:
+        raise ContractError(422)
+    if command.confirmation_id is not None:
+        _require_ttl(
+            request.app.state.service_config.policy.doctor_confirmation_expiry_minutes
+        )
+    try:
+        with _transaction(request, purpose="QUEUE_ADMIT") as (connection, actor):
+            projection, revision, _ = admit_patient(connection, actor, command, key)
+            return success_response(projection, revision)
+    except ReceiptConflict:
+        with _transaction(request, purpose="QUEUE_ADMIT", stage="RECEIPT_RECOVERY") as (
+            connection,
+            actor,
+        ):
+            projection, revision = recover_admission(connection, actor, command, key)
+            return success_response(projection, revision)
 
 
 @router.patch("/capacity")

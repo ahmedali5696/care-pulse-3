@@ -42,6 +42,8 @@ on:
           - w3-intake-races
           - w3-admission-controls
           - w3-admission-confirmations
+          - w3-admission
+          - w3-admission-races
           - w3-migration
           - compat-us1
           - compat-us2

@@ -122,6 +122,7 @@ app.add_middleware(
         ("PATCH", "/v1/settings/admission"): "ADMISSION_MODE_UPDATE",
         ("PATCH", "/v1/queue/capacity"): "QUEUE_CAPACITY_UPDATE",
         ("POST", "/v1/queue/pause"): "QUEUE_PAUSE",
+        ("POST", "/v1/queue/admit"): "QUEUE_ADMIT",
         ("POST", "/v1/queue/admission-confirmations"): "QUEUE_CONFIRMATION_ISSUE",
         (
             "GET",
