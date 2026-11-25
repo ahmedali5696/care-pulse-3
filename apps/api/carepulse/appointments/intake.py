@@ -194,7 +194,7 @@ def recover_committed_intake(connection, actor, command, idempotency_key):
     query, classification = _intake_query(actor, command, idempotency_key)
     cached = _committed_intake(connection, query, command, classification)
     if cached is None:
-        raise ContractError(409, "IDEMPOTENCY_CONFLICT")
+        raise ContractError(404)
     return cached
 
 

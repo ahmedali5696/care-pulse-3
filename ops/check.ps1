@@ -175,6 +175,7 @@ expected_paths = {
     '/v1/settings/schedule/preview', '/v1/settings/schedule/activate',
     '/v1/slots', '/v1/appointments', '/v1/appointments/{appointment_id}',
     '/v1/appointments/{appointment_id}/check-in', '/v1/queue',
+    '/v1/intake/routine', '/v1/intake/emergency', '/v1/intake/urgent',
     '/v1/visits/{visit_id}', '/v1/visits/{visit_id}/extend-followup',
 }
 assert set(app.openapi()['paths']) == expected_paths
@@ -200,6 +201,9 @@ assert boundary.kwargs['routes'] == {
     ('POST', '/v1/settings/schedule/activate'): 'SETTINGS_SCHEDULE',
     ('GET', '/v1/slots'): 'SLOTS',
     ('GET', '/v1/queue'): 'QUEUE_READ',
+    ('POST', '/v1/intake/routine'): 'INTAKE_ROUTINE',
+    ('POST', '/v1/intake/emergency'): 'INTAKE_EMERGENCY',
+    ('POST', '/v1/intake/urgent'): 'INTAKE_URGENT',
 }
 uuid = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
 assert {(method, pattern.pattern, purpose) for method, pattern, purpose in boundary.kwargs['route_patterns']} == {
@@ -405,7 +409,7 @@ cleanup() {
       export CP_FOUNDATION_CLEANUP_VERIFIED=1 CP_FOUNDATION_COVERAGE_VERIFIED=1
       export CP_FOUNDATION_EXECUTION=PASS CP_FOUNDATION_TESTS=PASS CP_FOUNDATION_ZERO_SKIPS=true CP_FOUNDATION_CLEANUP=PASS
       export CP_FOUNDATION_COVERAGE="$(if [ "$foundation_lane" = ordinary ]; then echo current-head-excluding-extracted-historical; else echo immutable-0040-selected-nodes-on-isolated-postgres; fi)"
-      export CP_FOUNDATION_CANDIDATE_SCHEMA=0051_b11_intake
+      export CP_FOUNDATION_CANDIDATE_SCHEMA=0052_b11_routine_scope
       export CP_FOUNDATION_HISTORICAL_SHA=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
       export CP_FOUNDATION_HISTORICAL_SCHEMA=0040_t173_numeric_money
       export CP_FOUNDATION_VERIFIED_TESTS="$foundation_tests" CP_FOUNDATION_LANE="$foundation_lane"

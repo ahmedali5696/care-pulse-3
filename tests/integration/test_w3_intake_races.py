@@ -24,7 +24,7 @@ from test_request_boundary import boundary_data as boundary_data  # noqa: PLC041
 from test_schedule import _activate, _config, _patch, _schedule_request
 from test_w3_checkin import _new_patient, queue_request
 from test_w3_checkin_races import _archive, _ordered_race
-from test_w3_intake import intake_body, intake_request
+from test_w3_intake import intake_body, intake_effects, intake_request
 from test_w3_intake import intake_clinic as intake_clinic  # noqa: PLC0414
 
 
@@ -295,6 +295,35 @@ def test_same_key_recovery_and_wrong_signed_scope(intake_clinic):
         clinic, clinic.receptionist, "emergency", body, key=key
     )
     assert status == 200 and response["data"] == first[0]
+    other_patient = _new_patient(clinic, clinic.owner, "Receipt Scope")
+    other_body = intake_body(clinic, other_patient, "emergency")
+    before = intake_effects(clinic)
+    with _intake(clinic, clinic.receptionist, "emergency", other_body, key) as (
+        connection,
+        _,
+    ):
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.idempotency_receipts WHERE idempotency_key=:key"
+                ),
+                {"key": key},
+            )
+            == 0
+        )
+    status, response = intake_request(
+        clinic, clinic.receptionist, "emergency", other_body, key=key
+    )
+    assert status == 404, response
+    status, response = intake_request(
+        clinic,
+        clinic.receptionist,
+        "emergency",
+        {**body, "expected_net_egp": "99.00"},
+        key=key,
+    )
+    assert status == 409, response
+    assert intake_effects(clinic) == before
     status, response = queue_request(
         clinic,
         clinic.receptionist,
