@@ -15,6 +15,7 @@ from carepulse.policies.pricing_contracts import PricingPatch
 from carepulse.policies.pricing_service import update_pricing
 from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import text
+from test_appointment_persistence import _patient
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_database import admin as admin  # noqa: PLC0414
 from test_database import disposable_project as disposable_project  # noqa: PLC0414
@@ -178,6 +179,59 @@ def test_concurrent_main_and_emergency_share_number_ledger(
     _assert_commits(clinic, 1 if same_patient else 2, 1 if same_patient else 2)
 
 
+@pytest.mark.parametrize("receptionist_first", [True, False])
+def test_two_routine_intakes_same_patient_day_commit_once(
+    intake_clinic, receptionist_first
+):
+    clinic = intake_clinic
+    patient = _new_patient(clinic, clinic.owner, "CON44 Routine")
+    body = intake_body(clinic, patient, "routine")
+    owner_key, receptionist_key = str(uuid4()), str(uuid4())
+    owner = lambda: _intake(clinic, clinic.owner, "routine", body, owner_key)
+    receptionist = lambda: _intake(
+        clinic, clinic.receptionist, "routine", body, receptionist_key
+    )
+    winner_actor = clinic.receptionist if receptionist_first else clinic.owner
+    winner, loser = _ordered_race(
+        clinic,
+        receptionist if receptionist_first else owner,
+        owner if receptionist_first else receptionist,
+        denial="CONFLICT",
+    )
+    assert loser is None
+    projection = winner[0]
+    assert projection["patient_id"] == patient
+    assert projection["service_date"] == body["service_date"]
+    assert projection["classification"] == "ROUTINE"
+    assert projection["lane"] == "MAIN"
+    assert projection["attested_by_staff_id"] == winner_actor.staff_id
+    assert projection["number"] == projection["arrival_sequence"] == 1
+    _assert_commits(clinic, 1, 1)
+    with clinic.migration.connect() as connection:
+        assert connection.execute(
+            text("""
+                SELECT e.patient_id, e.appointment_id, e.lane, e.attested_by_staff_id,
+                       e.disposition, e.routine_rank, e.arrival_sequence,
+                       q.arrival_counter, q.revision, q.routine_cursor
+                FROM public.queue_entries e JOIN public.queue_days q
+                  ON (q.organization_id,q.id)=(e.organization_id,e.queue_day_id)
+                WHERE e.organization_id=:tenant
+            """),
+            {"tenant": clinic.tenant},
+        ).one() == (
+            UUID(patient),
+            UUID(projection["id"]),
+            "MAIN",
+            UUID(winner_actor.staff_id),
+            "ACTIVE",
+            1,
+            1,
+            1,
+            1,
+            0,
+        )
+
+
 @pytest.mark.parametrize("price_first", [True, False])
 def test_price_publication_and_intake_freeze_only_valid_revision(
     intake_clinic, price_first
@@ -228,12 +282,13 @@ def test_price_publication_and_intake_freeze_only_valid_revision(
 
 
 @pytest.mark.parametrize("schedule_first", [True, False])
+@pytest.mark.parametrize("kind", ["routine", "urgent"])
 def test_schedule_publication_and_intake_serialize_both_orders(
-    intake_clinic, schedule_first
+    intake_clinic, schedule_first, kind
 ):
     clinic = intake_clinic
     patient = _new_patient(clinic, clinic.owner, "Intake Schedule")
-    body = intake_body(clinic, patient, "routine")
+    body = intake_body(clinic, patient, kind)
     key, schedule_key = str(uuid4()), str(uuid4())
     status, response = _schedule_request(
         clinic,
@@ -271,15 +326,38 @@ def test_schedule_publication_and_intake_serialize_both_orders(
                 lambda: _activate(connection, actor, preview, schedule_key),
             )
 
-    intake = lambda: _intake(clinic, clinic.receptionist, "routine", body, key)
-    _, second = _ordered_race(
+    intake = lambda: _intake(clinic, clinic.receptionist, kind, body, key)
+    before = intake_effects(clinic)
+    first, second = _ordered_race(
         clinic,
         schedule if schedule_first else intake,
         intake if schedule_first else schedule,
-        denial="CONFLICT",
+        denial="STALE_REVISION",
     )
     assert second is None
     _assert_commits(clinic, 0 if schedule_first else 1, 0 if schedule_first else 1)
+    after = intake_effects(clinic)
+    for table in ("sensitive_audit", "idempotency_receipts"):
+        assert len(after[table]) == len(before[table]) + 1
+        assert set(before[table]) <= set(after[table])
+    if schedule_first:
+        assert all(
+            after[table] == before[table]
+            for table in before
+            if table not in ("sensitive_audit", "idempotency_receipts")
+        )
+    if not schedule_first:
+        assert first[0]["classification"] == kind.upper()
+        assert first[0]["status"] == "Waiting"
+        assert first[0]["base_egp"] == body["expected_base_egp"]
+    with clinic.migration.connect() as connection:
+        assert connection.scalar(
+            text("""
+                SELECT revision FROM public.clinic_policy_heads
+                WHERE organization_id=:tenant AND kind='SCHEDULE'
+            """),
+            {"tenant": clinic.tenant},
+        ) == body["expected_schedule_revision"] + int(schedule_first)
 
 
 def test_same_key_recovery_and_wrong_signed_scope(intake_clinic):
@@ -297,6 +375,8 @@ def test_same_key_recovery_and_wrong_signed_scope(intake_clinic):
     assert status == 200 and response["data"] == first[0]
     other_patient = _new_patient(clinic, clinic.owner, "Receipt Scope")
     other_body = intake_body(clinic, other_patient, "emergency")
+    with clinic.migration.begin() as connection:
+        foreign_patient = _patient(connection, clinic.other)
     before = intake_effects(clinic)
     with _intake(clinic, clinic.receptionist, "emergency", other_body, key) as (
         connection,
@@ -311,10 +391,53 @@ def test_same_key_recovery_and_wrong_signed_scope(intake_clinic):
             )
             == 0
         )
+        assert (
+            connection.scalar(text("SELECT public.f01_intake_key_conflict()")) is True
+        )
+    with clinic.runtime.connect() as connection:
+        assert (
+            connection.scalar(text("SELECT public.f01_intake_key_conflict()")) is False
+        )
+    for caller, kind, payload, scoped_key in (
+        (clinic.owner, "emergency", other_body, key),
+        (
+            clinic.receptionist,
+            "routine",
+            intake_body(clinic, other_patient, "routine"),
+            key,
+        ),
+        (clinic.receptionist, "emergency", other_body, str(uuid4())),
+        (clinic.receptionist, "emergency", body, key),
+    ):
+        with _intake(clinic, caller, kind, payload, scoped_key) as (connection, _):
+            assert (
+                connection.scalar(text("SELECT public.f01_intake_key_conflict()"))
+                is False
+            )
     status, response = intake_request(
         clinic, clinic.receptionist, "emergency", other_body, key=key
     )
-    assert status == 404, response
+    assert status == 409 and response["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert set(response) == {"error"}
+    for hidden_patient in (foreign_patient, uuid4()):
+        hidden_body = {**body, "patient_id": str(hidden_patient)}
+        with _intake(clinic, clinic.receptionist, "emergency", hidden_body, key) as (
+            connection,
+            _,
+        ):
+            assert (
+                connection.scalar(text("SELECT public.f01_intake_key_conflict()"))
+                is False
+            )
+        status, response = intake_request(
+            clinic,
+            clinic.receptionist,
+            "emergency",
+            hidden_body,
+            key=key,
+        )
+        assert status == 404 and response["error"]["code"] == "NOT_FOUND"
+        assert set(response) == {"error"}
     status, response = intake_request(
         clinic,
         clinic.receptionist,
@@ -322,7 +445,8 @@ def test_same_key_recovery_and_wrong_signed_scope(intake_clinic):
         {**body, "expected_net_egp": "99.00"},
         key=key,
     )
-    assert status == 409, response
+    assert status == 409 and response["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert set(response) == {"error"}
     assert intake_effects(clinic) == before
     status, response = queue_request(
         clinic,

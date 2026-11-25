@@ -103,6 +103,8 @@ def _committed_intake(connection, query, command, classification):
         query.idempotency_key,
     )
     if stored is None:
+        if connection.scalar(text("SELECT public.f01_intake_key_conflict()")):
+            raise ContractError(409, "IDEMPOTENCY_CONFLICT")
         return None
     if (
         connection.scalar(

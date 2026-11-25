@@ -944,6 +944,7 @@ def test_fresh_and_failed_following_migration_keep_one_head(
         (scripts / "versions/0048_b12_queue_scope.py").unlink()
         (scripts / "versions/0051_b11_intake.py").unlink()
         (scripts / "versions/0052_b11_routine_scope.py").unlink()
+        (scripts / "versions/0053_b11_receipt_conflict.py").unlink()
         (scripts / "versions/0050_b12_checkin_completeness.py").unlink()
         (scripts / "versions/0049_b12_checkin_provenance.py").unlink()
         (scripts / "versions/0046_f01_audit_integrity.py").unlink()

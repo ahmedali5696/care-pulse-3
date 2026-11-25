@@ -409,7 +409,7 @@ cleanup() {
       export CP_FOUNDATION_CLEANUP_VERIFIED=1 CP_FOUNDATION_COVERAGE_VERIFIED=1
       export CP_FOUNDATION_EXECUTION=PASS CP_FOUNDATION_TESTS=PASS CP_FOUNDATION_ZERO_SKIPS=true CP_FOUNDATION_CLEANUP=PASS
       export CP_FOUNDATION_COVERAGE="$(if [ "$foundation_lane" = ordinary ]; then echo current-head-excluding-extracted-historical; else echo immutable-0040-selected-nodes-on-isolated-postgres; fi)"
-      export CP_FOUNDATION_CANDIDATE_SCHEMA=0052_b11_routine_scope
+      export CP_FOUNDATION_CANDIDATE_SCHEMA=0053_b11_receipt_conflict
       export CP_FOUNDATION_HISTORICAL_SHA=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
       export CP_FOUNDATION_HISTORICAL_SCHEMA=0040_t173_numeric_money
       export CP_FOUNDATION_VERIFIED_TESTS="$foundation_tests" CP_FOUNDATION_LANE="$foundation_lane"
