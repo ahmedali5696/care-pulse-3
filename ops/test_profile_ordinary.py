@@ -232,6 +232,69 @@ def test_acceptance_context_rejects_experiment(override):
         foundation_acceptance.github_context(env | override)
 
 
+@pytest.fixture
+def profiling_env():
+    repo = "ahmedali5696/care-pulse-3"
+    ref = "refs/heads/feature/ci-scalability"
+    return {
+        "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "GITHUB_REF": ref,
+        "GITHUB_SHA": "a" * 40,
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_REPOSITORY": repo,
+        "GITHUB_WORKFLOW": "Foundation",
+        "GITHUB_WORKFLOW_REF": f"{repo}/.github/workflows/foundation.yml@{ref}",
+        "INPUT_ORDINARY_PROFILE_SHA": "a" * 40,
+    }
+
+
+def test_authorized_profile_normalizes_only_two_nonacceptance_lanes(
+    profiling_env, tmp_path
+):
+    request = foundation_acceptance.validate_request(profiling_env)
+    assert request["mode"] == "ordinary-profile"
+    assert json.loads(request["matrix"]) == ["profile-control", "profile-instrumented"]
+    assert request["candidate_sha"] == profiling_env["GITHUB_SHA"]
+    receipt = tmp_path / foundation_acceptance.RECEIPT_FILE
+    with pytest.raises(ValueError, match="profiling-only"):
+        foundation_acceptance.seal(receipt, profiling_env)
+    assert not receipt.exists()
+    with pytest.raises(ValueError, match="profiling-only"):
+        foundation_acceptance.aggregate(tmp_path, profiling_env)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"INPUT_ORDINARY_PROFILE_SHA": ""},
+        {"INPUT_ORDINARY_PROFILE_SHA": "b" * 40},
+        {"INPUT_ORDINARY_PROFILE_SHA": "a" * 7},
+        {"INPUT_B04_SPIKE": "true"},
+        {"INPUT_T133_TERMINAL": "true"},
+        {"INPUT_T133_SHA": "a" * 40},
+        {"INPUT_POSTGRES_DIAGNOSTIC": "compat-us3"},
+        {"INPUT_POSTGRES_DIAGNOSTIC": "w3-checkin"},
+        {"GITHUB_EVENT_NAME": "push"},
+        {"GITHUB_EVENT_NAME": "pull_request"},
+        {
+            "GITHUB_REF": "refs/heads/development",
+            "GITHUB_WORKFLOW_REF": "ahmedali5696/care-pulse-3/.github/workflows/foundation.yml@refs/heads/development",
+        },
+        {
+            "GITHUB_REPOSITORY": "other/repo",
+            "GITHUB_WORKFLOW_REF": "other/repo/.github/workflows/foundation.yml@refs/heads/feature/ci-scalability",
+        },
+        {
+            "GITHUB_WORKFLOW_REF": "ahmedali5696/care-pulse-3/.github/workflows/other.yml@refs/heads/feature/ci-scalability"
+        },
+    ],
+)
+def test_profile_rejects_unapproved_dispatch_context(profiling_env, override):
+    with pytest.raises(ValueError):
+        foundation_acceptance.validate_request(profiling_env | override)
+
+
 def bash_probe(script):
     bash = (
         str(

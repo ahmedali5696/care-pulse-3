@@ -90,7 +90,7 @@ def _read_json(path: Path, max_bytes: int = 8192) -> object:
         raise ValueError("invalid JSON evidence") from error
 
 
-def github_context(env: dict[str, str]) -> dict:
+def github_context(env: dict[str, str], *, profiling_request: bool = False) -> dict:
     """Bind every receipt to the actual checked-out workflow run and PR merge."""
     event = _require(env, "GITHUB_EVENT_NAME", r"(push|pull_request|workflow_dispatch)")
     ref = _require(
@@ -102,9 +102,10 @@ def github_context(env: dict[str, str]) -> dict:
     repository = _require(env, "GITHUB_REPOSITORY", r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
     workflow = env.get("GITHUB_WORKFLOW_REF", "")
     if (
-        ref == "refs/heads/feature/ci-scalability"
+        (ref == "refs/heads/feature/ci-scalability" and not profiling_request)
         or env.get("GITHUB_HEAD_REF") == "feature/ci-scalability"
-        or env.get("GITHUB_WORKFLOW") == "Ordinary Profiling Experiment (NOT ACCEPTANCE)"
+        or env.get("GITHUB_WORKFLOW")
+        == "Ordinary Profiling Experiment (NOT ACCEPTANCE)"
     ):
         raise ValueError("profiling-only experiment cannot issue Foundation acceptance")
     workflow_prefix = f"{repository}/.github/workflows/foundation.yml@"
@@ -173,7 +174,8 @@ def github_context(env: dict[str, str]) -> dict:
 
 def validate_request(env: dict[str, str]) -> dict[str, str]:
     """Normalize only approved, mutually exclusive Foundation invocation modes."""
-    context = github_context(env)
+    profile_sha = env.get("INPUT_ORDINARY_PROFILE_SHA", "")
+    context = github_context(env, profiling_request=bool(profile_sha))
     diagnostic = env.get("INPUT_POSTGRES_DIAGNOSTIC", "") or "full"
     if diagnostic not in DIAGNOSTICS | {"full"}:
         raise ValueError("unknown PostgreSQL diagnostic selection")
@@ -183,6 +185,17 @@ def validate_request(env: dict[str, str]) -> dict[str, str]:
     spike = env.get("INPUT_B04_SPIKE") == "true"
     terminal = env.get("INPUT_T133_TERMINAL") == "true"
     terminal_sha = env.get("INPUT_T133_SHA", "")
+    if profile_sha and (
+        context["event"] != "workflow_dispatch"
+        or context["repository"] != "ahmedali5696/care-pulse-3"
+        or context["ref"] != "refs/heads/feature/ci-scalability"
+        or profile_sha != context["sha"]
+        or diagnostic != "full"
+        or spike
+        or terminal
+        or terminal_sha
+    ):
+        raise ValueError("unauthorized or conflicting Ordinary profiling request")
     if (spike and terminal) or (
         diagnostic != "full" and (spike or terminal or terminal_sha)
     ):
@@ -203,7 +216,9 @@ def validate_request(env: dict[str, str]) -> dict[str, str]:
         raise ValueError("nonstandard Foundation mode requires manual dispatch")
 
     mode = (
-        "b04-spike"
+        "ordinary-profile"
+        if profile_sha
+        else "b04-spike"
         if spike
         else "t133"
         if terminal
@@ -216,7 +231,11 @@ def validate_request(env: dict[str, str]) -> dict[str, str]:
     return {
         "mode": mode,
         "matrix": json.dumps(
-            list(EXPECTED_COVERAGE) if mode == "full" else ["standard"],
+            list(EXPECTED_COVERAGE)
+            if mode == "full"
+            else ["profile-control", "profile-instrumented"]
+            if mode == "ordinary-profile"
+            else ["standard"],
             separators=(",", ":"),
         ),
         "candidate_sha": context["sha"],
@@ -384,6 +403,17 @@ def main(argv: list[str], env: dict[str, str]) -> None:
     if argv == ["validate-request"]:
         result = validate_request(env)
         _assert_checkout_sha(result["candidate_sha"])
+        if result["mode"] == "ordinary-profile":
+            parent_chain = subprocess.check_output(
+                ["git", "rev-parse", "HEAD^", "HEAD~2"], text=True
+            ).splitlines()
+            if parent_chain != [
+                "276d826fd0d463fbe63de4f9417b22e47b12bf1b",
+                "0c325ce80a999b79f7e442b39c4b0ecbc55fea9d",
+            ]:
+                raise ValueError(
+                    "profiling candidate does not descend directly from the reviewed experiment"
+                )
         output_path = env.get("GITHUB_OUTPUT", "")
         if output_path:
             destination = Path(output_path)
