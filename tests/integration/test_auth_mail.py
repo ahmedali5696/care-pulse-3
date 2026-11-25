@@ -257,4 +257,4 @@ def test_denied_routes_preserve_current_persistence_boundary():
         }
         assert connection.execute(
             "SELECT version_num FROM public.alembic_version"
-        ).fetchall() == [("0057_w3_queue_admit",)]
+        ).fetchall() == [("0058_b15_admission_guards",)]

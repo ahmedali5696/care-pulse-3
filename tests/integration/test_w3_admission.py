@@ -537,3 +537,28 @@ def test_database_admission_functions_require_exact_signed_stage(booking_clinic)
                 connection.scalar(text(f"SELECT public.{function}()"))
             assert denied.value.orig.sqlstate == "42501"
     assert admission_effects(clinic) == before
+
+
+def test_signed_database_admission_and_http_replay(booking_clinic):
+    clinic = booking_clinic
+    waiting = waiting_case(clinic)
+    body = admit_body(clinic, waiting, physical_presence_confirmed=True)
+    key = str(uuid4())
+    with signed_test_transaction(
+        clinic,
+        clinic.owner,
+        method="POST",
+        path="/v1/queue/admit",
+        purpose="QUEUE_ADMIT",
+        body=body,
+        key=key,
+    ) as (connection, _):
+        assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+        result = connection.scalar(text("SELECT public.f01_b15_admit()"))
+        assert result["replayed"] is False
+    assert_admitted(clinic, clinic.owner, body, key, result["projection"])
+    after = admission_effects(clinic)
+    status, reply = admit_request(clinic, clinic.owner, body, key)
+    assert status == 200
+    assert reply["data"] == result["projection"]
+    assert admission_effects(clinic) == after
