@@ -3,20 +3,26 @@
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 from carepulse.db import transaction
 from carepulse.identity.contracts import ContractError
 from carepulse.main import app
-from carepulse.queue.admission_contracts import IssueConfirmationCommand
-from carepulse.queue.admission_control import issue_confirmation
+from carepulse.queue.admission_contracts import (
+    IssueConfirmationCommand,
+    RevokeConfirmationCommand,
+)
+from carepulse.queue.admission_control import issue_confirmation, revoke_confirmation
 from runtime_identity_fixture import signed_test_transaction
 from sqlalchemy import text
-from test_appointment_persistence import _admit_saved
+from test_appointment_persistence import _activate_clinic, _admit_saved
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
 from test_patients import patient_backend as patient_backend  # noqa: PLC0414
+from test_pricing import _patch, pricing_request
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
+from test_schedule import _config, publish_signed_schedule
 from test_w3_admission_controls import (
     SERVICE_DAY,
     _capacity_body,
@@ -73,6 +79,190 @@ def _assert_issue_effects(before, after, expected=1):
             assert all(row in new for row in old)
         else:
             assert new == old
+
+
+def _foreign_confirmation(clinic):
+    session = f"synthetic-b14-foreign-{uuid4()}"
+    with clinic.migration.begin() as connection:
+        operator = connection.scalar(
+            text(
+                "SELECT created_by_operator_id FROM public.organizations WHERE id=:tenant"
+            ),
+            {"tenant": clinic.other},
+        )
+        doctor = _activate_clinic(connection, clinic.other, operator)
+        connection.execute(
+            text("""
+            INSERT INTO public."session" (id,"userId",token,"expiresAt","createdAt","updatedAt",
+                "securityRevision","absoluteDeadline","lastActivity")
+            SELECT :session,auth_user_id,:token,now()+interval '1 hour',now(),now(),
+                security_revision,now()+interval '1 hour',now()
+            FROM public.staff_accounts WHERE organization_id=:tenant AND id=:doctor
+        """),
+            {
+                "tenant": clinic.other,
+                "doctor": doctor,
+                "session": session,
+                "token": str(uuid4()),
+            },
+        )
+    foreign = SimpleNamespace(**vars(clinic))
+    foreign.tenant = clinic.other
+    foreign.owner = replace(
+        clinic.owner,
+        organization_id=str(clinic.other),
+        staff_id=str(doctor),
+        session_id=session,
+        security_revision="0",
+    )
+    status, reply = pricing_request(
+        foreign,
+        foreign.owner,
+        method="PATCH",
+        body=_patch(standard_new_exam_egp="100.00"),
+        key=str(uuid4()),
+    )
+    assert status == 200, reply
+    publish_signed_schedule(foreign, _config(mode="OPEN"))
+    waiting = _prepare(foreign)
+    return waiting, _issue(foreign, waiting)
+
+
+def _assert_target_denials(clinic, operation, key, visible, hidden, absent):
+    owner = clinic.owner
+    before = _effects(clinic)
+    foreign_before = _effects(clinic, tenant=clinic.other)
+    status, reply = control_request(clinic, owner, operation, key=key, **visible)
+    assert status == 409 and reply["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert set(reply) == {"error"}
+    for candidate_key in (key, str(uuid4())):
+        hidden_reply = control_request(
+            clinic, owner, operation, key=candidate_key, **hidden
+        )
+        absent_reply = control_request(
+            clinic, owner, operation, key=candidate_key, **absent
+        )
+        # Each response has its own opaque request ID; compare all public error fields except it.
+        for status, response in (hidden_reply, absent_reply):
+            assert status == 404 and set(response) == {"error"}
+            assert set(response["error"]) == {"code", "message", "request_id"}
+            assert response["error"]["code"] == "NOT_FOUND"
+        assert (
+            hidden_reply[1]["error"]["message"] == absent_reply[1]["error"]["message"]
+        )
+    assert _effects(clinic) == before
+    assert _effects(clinic, tenant=clinic.other) == foreign_before
+
+
+def test_confirmation_receipts_bind_issue_and_revoke_targets(booking_clinic):
+    clinic = booking_clinic
+    owner = clinic.owner
+    first = _prepare(clinic)
+    second = seed_waiting(clinic)
+    foreign, hidden_confirmation = _foreign_confirmation(clinic)
+    first_body, second_body = issue_body(clinic, first), issue_body(clinic, second)
+    assert {
+        k: v for k, v in first_body.items() if k not in ("appointment_id", "patient_id")
+    } == {
+        k: v
+        for k, v in second_body.items()
+        if k not in ("appointment_id", "patient_id")
+    }
+    issue_key = str(uuid4())
+    before = _effects(clinic)
+    # Commit the real signed command without returning an HTTP response.
+    with _issue_transaction(clinic, first_body, issue_key) as (_, execute):
+        issued, revision, replayed = execute()
+        assert replayed is False
+    after = _effects(clinic)
+    _assert_issue_effects(before, after)
+    assert control_request(clinic, owner, "issue", body=first_body, key=issue_key) == (
+        200,
+        {"data": issued, "revision": revision},
+    )
+    _assert_target_denials(
+        clinic,
+        "issue",
+        issue_key,
+        {"body": second_body},
+        {
+            "body": {
+                **first_body,
+                "appointment_id": foreign["appointment_id"],
+                "patient_id": foreign["patient_id"],
+            }
+        },
+        {
+            "body": {
+                **first_body,
+                "appointment_id": str(uuid4()),
+                "patient_id": str(uuid4()),
+            }
+        },
+    )
+    assert control_request(clinic, owner, "issue", body=first_body, key=issue_key) == (
+        200,
+        {"data": issued, "revision": revision},
+    )
+    assert _effects(clinic) == after
+
+    other = _issue(clinic, second)
+    revoke_body, revoke_key = _revoke_body(clinic), str(uuid4())
+    before = _effects(clinic)
+    with signed_test_transaction(
+        clinic,
+        owner,
+        method="POST",
+        path=f"/v1/queue/admission-confirmations/{issued['id']}/revoke",
+        purpose="QUEUE_CONFIRMATION_REVOKE",
+        body=revoke_body,
+        key=revoke_key,
+    ) as (connection, actor):
+        revoked, revision, replayed = revoke_confirmation(
+            connection,
+            actor,
+            UUID(issued["id"]),
+            RevokeConfirmationCommand.model_validate(revoke_body),
+            revoke_key,
+        )
+        assert replayed is False
+    after = _effects(clinic)
+    for index, (old, new) in enumerate(zip(before, after, strict=True)):
+        if index in (8, 9, 10):
+            assert len(new) == len(old) + 1 and all(row in new for row in old)
+        elif index != 3:
+            assert new == old
+    assert len(after[3]) == len(before[3])
+    assert {row["id"]: row["state"] for row in after[3]} == {
+        issued["id"]: "REVOKED",
+        other["id"]: "ISSUED",
+    }
+    original = {"body": revoke_body, "confirmation_id": issued["id"]}
+    assert control_request(clinic, owner, "revoke", key=revoke_key, **original) == (
+        200,
+        {"data": revoked, "revision": revision},
+    )
+    _assert_target_denials(
+        clinic,
+        "revoke",
+        revoke_key,
+        {"body": revoke_body, "confirmation_id": other["id"]},
+        {"body": revoke_body, "confirmation_id": hidden_confirmation["id"]},
+        {"body": revoke_body, "confirmation_id": str(uuid4())},
+    )
+    assert control_request(clinic, owner, "revoke", key=revoke_key, **original) == (
+        200,
+        {"data": revoked, "revision": revision},
+    )
+    assert _effects(clinic) == after
+    with clinic.migration.begin() as connection:
+        connection.execute(
+            text('DELETE FROM public."session" WHERE id=:session'),
+            {"session": owner.session_id},
+        )
+    _denied(clinic, owner, "issue", 401, body=first_body, key=issue_key)
+    _denied(clinic, owner, "revoke", 401, key=revoke_key, **original)
+    assert _effects(clinic) == after
 
 
 def test_configured_expiry_and_missing_config(booking_clinic, monkeypatch):

@@ -1,10 +1,13 @@
 """B-12, B-11 and B-14 authenticated browser-to-BFF-to-API-to-PostgreSQL acceptance."""
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from threading import Barrier
 from uuid import UUID, uuid4
 
+from carepulse.db import transaction
+from sqlalchemy import create_engine
+from test_appointment_persistence import _admit_saved
 from test_booking import booking_body
 from test_patients import PATIENT, browser_request
 from test_patients import invited_patients as invited_patients  # noqa: PLC0414
@@ -48,6 +51,251 @@ def _denied(response, status, code):
     assert actual == status, body
     assert set(body) == {"error"}
     assert body["error"]["code"] == code
+
+
+def _seed_browser_active_exam(tenant, doctor, appointment):
+    # B-15 is deliberately absent; use the existing migration-only lifecycle fixture.
+    def migration_connection():
+        connection = _database()
+        connection.commit()
+        return connection
+
+    engine = create_engine("postgresql+psycopg://", creator=migration_connection)
+    try:
+        with transaction(engine, tenant) as connection:
+            _admit_saved(connection, tenant, UUID(doctor), appointment)
+    finally:
+        engine.dispose()
+
+
+def _browser_book_new_patient(cookie, name):
+    status, patient = browser_request(
+        cookie,
+        method="POST",
+        body={**PATIENT, "name_parts": ["Synthetic", "B14", name]},
+        key=str(uuid4()),
+    )
+    assert status == 201, patient
+    status, booked = browser_request(
+        cookie,
+        "/api/appointments",
+        method="POST",
+        body=booking_body(patient["data"]["id"]),
+        key=str(uuid4()),
+    )
+    assert status == 201, booked
+    return booked["data"]
+
+
+def _confirmation_effects(tenant):
+    with _database() as connection:
+        return {
+            table: connection.execute(
+                f"SELECT to_jsonb(r) FROM public.{table} r WHERE organization_id=%s ORDER BY to_jsonb(r)::text",
+                (tenant,),
+            ).fetchall()
+            for table in (
+                "doctor_admission_confirmations",
+                "sensitive_audit",
+                "outbox_events",
+                "idempotency_receipts",
+            )
+        }
+
+
+def test_independent_browser_sessions_issue_and_retrieve_exact_confirmation(
+    invited_patients,
+):
+    sessions = invited_patients
+    owner, receptionist, foreign = sessions.owner, sessions.receptionist, sessions.other
+    assert owner != receptionist
+    status, doctor = browser_request(owner, "/api/session")
+    assert status == 200 and doctor["data"]["role"] == "DOCTOR_OWNER"
+    status, staff = browser_request(receptionist, "/api/session")
+    assert status == 200 and staff["data"]["role"] == "RECEPTIONIST"
+    assert doctor["data"]["id"] != staff["data"]["id"]
+    assert (
+        doctor["data"]["organization_id"]
+        == staff["data"]["organization_id"]
+        == str(sessions.clinic)
+    )
+
+    status, pricing = browser_request(
+        owner,
+        "/api/settings/pricing",
+        method="PATCH",
+        body=pricing_patch(standard_new_exam_egp="100.00"),
+        key=str(uuid4()),
+    )
+    assert status == 200, pricing
+    status, preview = browser_request(
+        owner,
+        "/api/settings/schedule/preview",
+        method="POST",
+        body=schedule_patch(_config(mode="OPEN")).model_dump(mode="json"),
+        key=str(uuid4()),
+    )
+    assert status == 200, preview
+    plan = preview["data"]
+    status, published = browser_request(
+        owner,
+        "/api/settings/schedule/activate",
+        method="POST",
+        body={
+            "preview_id": plan["preview_id"],
+            "expected_schedule_revision": plan["revisions"]["schedule"],
+            "expected_capacity_revision": plan["revisions"]["capacity"],
+            "reason": "Synthetic reviewed calendar",
+        },
+        key=str(uuid4()),
+    )
+    assert status == 200, published
+
+    day = SERVICE_DAY.isoformat()
+    queue_path = f"/api/queue?date={day}&lane=MAIN"
+    status, queue = browser_request(owner, queue_path)
+    assert status == 200, queue
+    status, capacity = browser_request(
+        owner,
+        "/api/queue/capacity",
+        method="PATCH",
+        body={
+            "capacity": 3,
+            "expected_capacity_revision": queue["data"]["capacity_policy_version"],
+            "expected_control_revision": queue["data"]["control_revision"],
+        },
+        key=str(uuid4()),
+    )
+    assert status == 200, capacity
+    status, mode = browser_request(owner, "/api/settings/admission")
+    assert status == 200, mode
+    status, mode = browser_request(
+        owner,
+        "/api/settings/admission",
+        method="PATCH",
+        body={
+            "mode": "RECEPTIONIST",
+            "expected_admission_revision": mode["revision"],
+        },
+        key=str(uuid4()),
+    )
+    assert status == 200, mode
+    active = _browser_book_new_patient(receptionist, "Active")
+    _seed_browser_active_exam(sessions.clinic, doctor["data"]["id"], active)
+    target = _browser_book_new_patient(receptionist, "Target")
+    other = _browser_book_new_patient(receptionist, "Other")
+    status, queue = browser_request(receptionist, queue_path)
+    assert status == 200, queue
+    assert queue["data"]["active_in_examination_count"] == 1
+    status, checked = browser_request(
+        receptionist,
+        f"/api/appointments/{target['id']}/check-in",
+        method="POST",
+        body={
+            "physical_presence_confirmed": True,
+            "expected_appointment_revision": 0,
+            "expected_queue_day_revision": queue["revision"],
+        },
+        key=str(uuid4()),
+    )
+    assert status == 200, checked
+    entry = checked["data"]
+    command = {
+        "appointment_id": target["id"],
+        "patient_id": target["patient_id"],
+        "date": day,
+        "lane": "MAIN",
+        "expected_appointment_revision": entry["appointment_revision"],
+        "expected_queue_day_revision": entry["queue_day_revision"],
+        "expected_control_revision": capacity["data"]["control_revision"],
+        "expected_capacity_revision": capacity["data"]["capacity_revision"],
+        "expected_admission_revision": mode["revision"],
+    }
+    path, key = "/api/queue/admission-confirmations", str(uuid4())
+    before = _confirmation_effects(sessions.clinic)
+    domain = _domain_state(sessions.clinic)
+    _denied(
+        browser_request(receptionist, path, method="POST", body=command, key=key),
+        403,
+        "FORBIDDEN",
+    )
+    assert _confirmation_effects(sessions.clinic) == before
+    status, issued = browser_request(owner, path, method="POST", body=command, key=key)
+    assert status == 201, issued
+    assert issued["data"]["state"] == "ISSUED"
+    after = _confirmation_effects(sessions.clinic)
+    for table in before:
+        assert len(after[table]) == len(before[table]) + 1, table
+        assert all(row in after[table] for row in before[table])
+    (saved,) = after["doctor_admission_confirmations"]
+    assert saved[0]["id"] == issued["data"]["id"]
+    assert saved[0]["appointment_id"] == target["id"]
+    assert saved[0]["patient_id"] == target["patient_id"]
+    assert saved[0]["issuing_doctor_staff_id"] == doctor["data"]["id"]
+    (audit,) = [
+        row[0]
+        for row in after["sensitive_audit"]
+        if row not in before["sensitive_audit"]
+    ]
+    assert (audit["actor_staff_id"], audit["actor_role"], audit["after_state"]) == (
+        doctor["data"]["id"],
+        "DOCTOR_OWNER",
+        issued["data"],
+    )
+    (receipt,) = [
+        row[0]
+        for row in after["idempotency_receipts"]
+        if row not in before["idempotency_receipts"]
+    ]
+    assert (
+        receipt["actor_id"],
+        receipt["idempotency_key"],
+        receipt["result_projection"],
+    ) == (
+        doctor["data"]["id"],
+        key,
+        issued["data"],
+    )
+    assert browser_request(owner, path, method="POST", body=command, key=key) == (
+        200,
+        issued,
+    )
+    usable_path = f"{path}/usable?appointment_id={target['id']}&date={day}&lane=MAIN"
+    status, usable = browser_request(receptionist, usable_path)
+    assert status == 200, usable
+    assert usable["data"] == {
+        k: v for k, v in issued["data"].items() if k not in ("state", "issued_at")
+    }
+    assert usable["revision"] == issued["revision"]
+    for cookie, candidate in (
+        (owner, usable_path),
+        (foreign, usable_path),
+        (receptionist, usable_path.replace(target["id"], other["id"])),
+        (receptionist, usable_path.replace("lane=MAIN", "lane=EMERGENCY")),
+        (
+            receptionist,
+            usable_path.replace(day, (SERVICE_DAY + timedelta(days=1)).isoformat()),
+        ),
+    ):
+        _denied(browser_request(cookie, candidate), 404, "NOT_FOUND")
+    _denied(
+        browser_request(
+            receptionist,
+            f"{path}/{issued['data']['id']}/revoke",
+            method="POST",
+            body={
+                "expected_control_revision": capacity["data"]["control_revision"],
+                "revoke_reason": "Synthetic denial",
+            },
+            key=str(uuid4()),
+        ),
+        403,
+        "FORBIDDEN",
+    )
+    assert _confirmation_effects(sessions.clinic) == after
+    assert _domain_state(sessions.clinic) == domain
+    assert browser_request(receptionist, "/api/auth/logout", method="POST")[0] == 200
+    _denied(browser_request(receptionist, usable_path), 401, "UNAUTHENTICATED")
 
 
 def test_invited_browser_admission_controls_are_purpose_and_role_bound(
