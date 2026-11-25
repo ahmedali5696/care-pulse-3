@@ -1,4 +1,4 @@
-"""B-12 real authenticated browser-to-BFF-to-API-to-PostgreSQL acceptance."""
+"""B-12 and B-11 authenticated browser-to-BFF-to-API-to-PostgreSQL acceptance."""
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -25,9 +25,9 @@ def _domain_state(tenant):
         "queue_days": "",
         "queue_entries": "",
         "visits": "",
-        "sensitive_audit": "AND action IN ('appointments.book', 'appointments.check_in')",
-        "outbox_events": "AND event_type IN ('APPOINTMENT_BOOKED', 'PATIENT_CHECKED_IN')",
-        "idempotency_receipts": "AND operation IN ('appointments.book', 'appointments.check_in')",
+        "sensitive_audit": "AND action IN ('appointments.book', 'appointments.check_in', 'appointments.intake_routine', 'appointments.intake_emergency', 'appointments.intake_urgent')",
+        "outbox_events": "AND event_type IN ('APPOINTMENT_BOOKED', 'PATIENT_CHECKED_IN', 'APPOINTMENT_INTAKE')",
+        "idempotency_receipts": "AND operation IN ('appointments.book', 'appointments.check_in', 'appointments.intake_routine', 'appointments.intake_emergency', 'appointments.intake_urgent')",
     }
     with _database() as connection:
         return {
@@ -422,3 +422,93 @@ def test_invited_browser_checkin_replay_and_tenant_session_isolation(invited_pat
     _denied(browser_request(receptionist, queue_path), 401, "UNAUTHENTICATED")
     assert _domain_state(sessions.clinic) == after_other_booking
     assert _domain_state(foreign_tenant) == foreign_before
+
+
+def test_invited_browser_emergency_intake_is_atomic_and_replay_safe(invited_patients):
+    sessions = invited_patients
+    owner, receptionist, foreign = sessions.owner, sessions.receptionist, sessions.other
+    status, pricing = browser_request(
+        owner,
+        "/api/settings/pricing",
+        method="PATCH",
+        body=pricing_patch(standard_new_exam_egp="100.00"),
+        key=str(uuid4()),
+    )
+    assert status == 200, pricing
+    status, patient = browser_request(
+        receptionist, method="POST", body=PATIENT, key=str(uuid4())
+    )
+    assert status == 201, patient
+    body = {
+        "patient_id": patient["data"]["id"],
+        "physical_presence_confirmed": True,
+        "discount": {
+            "discount_type": "NONE",
+            "discount_value": "0",
+            "discount_reason": None,
+        },
+        "expected_base_egp": "100.00",
+        "expected_net_egp": "100.00",
+        "expected_price_revision": pricing["revision"],
+    }
+    path = "/api/intake/emergency"
+    key = str(uuid4())
+    before = _domain_state(sessions.clinic)
+    _denied(
+        browser_request(None, path, method="POST", body=body, key=key),
+        401,
+        "UNAUTHENTICATED",
+    )
+    _denied(
+        browser_request(foreign, path, method="POST", body=body, key=key),
+        404,
+        "NOT_FOUND",
+    )
+    _denied(
+        browser_request(
+            receptionist,
+            path,
+            method="POST",
+            body={**body, "role": "DOCTOR_OWNER"},
+            key=key,
+        ),
+        422,
+        "INVALID_INPUT",
+    )
+    _denied(
+        browser_request(
+            owner,
+            "/api/intake/urgent",
+            method="POST",
+            body={**body, "expected_schedule_revision": 1},
+            key=key,
+        ),
+        403,
+        "FORBIDDEN",
+    )
+    assert _domain_state(sessions.clinic) == before
+
+    status, created = browser_request(
+        receptionist, path, method="POST", body=body, key=key
+    )
+    assert status == 201, created
+    assert created["revision"] == 0
+    entry = created["data"]
+    assert (
+        entry["status"],
+        entry["classification"],
+        entry["lane"],
+        entry["number"],
+    ) == ("Waiting", "EMERGENCY", "EMERGENCY", 1)
+    after = _domain_state(sessions.clinic)
+    for table in before:
+        assert len(after[table]) == len(before[table]) + (
+            0 if table == "visits" else 1
+        ), table
+    assert after["appointment_history"][-1]["new_status"] == "Waiting"
+    assert after["outbox_events"][-1]["event_type"] == "APPOINTMENT_INTAKE"
+    status, recovered = browser_request(
+        receptionist, path, method="POST", body=body, key=key
+    )
+    assert status == 200 and recovered == created
+    assert _domain_state(sessions.clinic) == after

@@ -38,6 +38,8 @@ on:
           - w3-checkin-races
           - w3-receipt-boundary
           - w3-queue-scope
+          - w3-intake
+          - w3-intake-races
           - w3-migration
           - compat-us1
           - compat-us2

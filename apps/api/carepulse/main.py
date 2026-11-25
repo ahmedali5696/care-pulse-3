@@ -10,6 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 
+from carepulse.appointments.intake_routes import router as intake_router
 from carepulse.appointments.routes import router as appointment_router
 from carepulse.config import load_config
 from carepulse.db import create_db_engine, create_gate_engine
@@ -56,6 +57,7 @@ app.include_router(provisioning_router)
 app.include_router(staff_router)
 app.include_router(patient_router)
 app.include_router(appointment_router)
+app.include_router(intake_router)
 app.include_router(visit_router)
 app.include_router(pricing_router)
 app.include_router(schedule_router)
@@ -103,6 +105,9 @@ app.add_middleware(
         ("POST", "/v1/patients"): "PATIENT_REGISTRY",
         ("GET", "/v1/appointments"): "APPOINTMENT_BOOKING",
         ("POST", "/v1/appointments"): "APPOINTMENT_BOOKING",
+        ("POST", "/v1/intake/routine"): "INTAKE_ROUTINE",
+        ("POST", "/v1/intake/emergency"): "INTAKE_EMERGENCY",
+        ("POST", "/v1/intake/urgent"): "INTAKE_URGENT",
         ("GET", "/v1/settings/pricing"): "SETTINGS_PRICING",
         ("PATCH", "/v1/settings/pricing"): "SETTINGS_PRICING",
         ("GET", "/v1/settings/schedule"): "SETTINGS_SCHEDULE",

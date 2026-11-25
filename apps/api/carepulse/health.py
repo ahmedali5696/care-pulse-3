@@ -13,7 +13,7 @@ from carepulse.config import ConfigError, Consumer, load_config
 from carepulse.db import create_db_engine, transaction
 
 PROBE_DEADLINE_SECONDS = 4
-COMPATIBLE_REVISION = "0050_b12_checkin_completeness"
+COMPATIBLE_REVISION = "0051_b11_intake"
 router = APIRouter()
 
 

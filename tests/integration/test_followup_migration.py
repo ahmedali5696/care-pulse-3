@@ -942,6 +942,7 @@ def test_fresh_and_failed_following_migration_keep_one_head(
         # Isolate D-08 from later M1/B-06 heads for this rollback proof.
         (scripts / "versions/0047_b12_queue_checkin_grants.py").unlink()
         (scripts / "versions/0048_b12_queue_scope.py").unlink()
+        (scripts / "versions/0051_b11_intake.py").unlink()
         (scripts / "versions/0050_b12_checkin_completeness.py").unlink()
         (scripts / "versions/0049_b12_checkin_provenance.py").unlink()
         (scripts / "versions/0046_f01_audit_integrity.py").unlink()

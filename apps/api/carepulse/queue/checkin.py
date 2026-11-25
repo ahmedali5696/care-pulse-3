@@ -328,6 +328,49 @@ def _allocate_routine_rank(
     return target_rank
 
 
+def insert_arrival_entry(
+    connection: Connection,
+    *,
+    actor: AuthorizedStaff,
+    appointment_id: UUID,
+    patient_id: UUID,
+    doctor_staff_id: UUID,
+    service_date: date,
+    lane: str,
+    queue_day: QueueDayState,
+    routine_rank: int | None,
+):
+    """Insert an arrival using the existing database-derived attendance evidence."""
+    entry_id = uuid4()
+    try:
+        inserted_entry = connection.execute(
+            text("""
+                INSERT INTO public.queue_entries
+                    (id, organization_id, queue_day_id, appointment_id,
+                     patient_id, doctor_staff_id, service_date, lane,
+                     routine_rank, disposition)
+                VALUES (:id, :tenant, :queue_day_id, :appointment_id,
+                        :patient_id, :doctor_staff_id, :service_date, :lane,
+                        :routine_rank, 'ACTIVE')
+                RETURNING arrival_sequence, attested_by_staff_id, attested_at, revision
+            """),
+            {
+                "id": entry_id,
+                "tenant": actor.organization_id,
+                "queue_day_id": queue_day.id,
+                "appointment_id": appointment_id,
+                "patient_id": patient_id,
+                "doctor_staff_id": doctor_staff_id,
+                "service_date": service_date,
+                "lane": lane,
+                "routine_rank": routine_rank,
+            },
+        ).one()
+    except IntegrityError as conflict:
+        raise ContractError(409) from conflict
+    return entry_id, inserted_entry
+
+
 def _live_position(
     connection: Connection,
     *,
@@ -582,33 +625,17 @@ def check_in_appointment(
             appointment_number=int(appt.current_number),
         )
 
-    entry_id = uuid4()
-    try:
-        inserted_entry = connection.execute(
-            text("""
-                INSERT INTO public.queue_entries
-                    (id, organization_id, queue_day_id, appointment_id,
-                     patient_id, doctor_staff_id, service_date, lane,
-                     routine_rank, disposition)
-                VALUES (:id, :tenant, :queue_day_id, :appointment_id,
-                        :patient_id, :doctor_staff_id, :service_date, :lane,
-                        :routine_rank, 'ACTIVE')
-                RETURNING arrival_sequence, attested_by_staff_id, attested_at, revision
-            """),
-            {
-                "id": entry_id,
-                "tenant": actor.organization_id,
-                "queue_day_id": queue_day.id,
-                "appointment_id": appointment_id,
-                "patient_id": appt.patient_id,
-                "doctor_staff_id": appt.doctor_staff_id,
-                "service_date": appt.service_date,
-                "lane": appt.lane,
-                "routine_rank": routine_rank,
-            },
-        ).one()
-    except IntegrityError as conflict:
-        raise ContractError(409) from conflict
+    entry_id, inserted_entry = insert_arrival_entry(
+        connection,
+        actor=actor,
+        appointment_id=appointment_id,
+        patient_id=appt.patient_id,
+        doctor_staff_id=appt.doctor_staff_id,
+        service_date=appt.service_date,
+        lane=appt.lane,
+        queue_day=queue_day,
+        routine_rank=routine_rank,
+    )
 
     position = _live_position(
         connection,

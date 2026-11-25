@@ -108,7 +108,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'd859d665e65de2e7fc458ddfd0b3abb051ec1eed40a3d16912b599570b6dac73',
+    '.github/workflows/foundation.yml': '80ebe087f1661cbafb89fefaae13acf16f7d3631c575e7d8f295a0b4164f78fa',
     '.github/workflows/fast-feedback.yml': '814f40f9f2a09d6337e5d4e14f1d4851e88301e64c1f28d5e538d3549dccce8b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
@@ -293,6 +293,9 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             foreach ($suite in @('tests/integration/test_w3_receipt_boundary.py', 'tests/integration/test_w3_checkin.py', 'tests/integration/test_w3_checkin_races.py', 'tests/integration/test_w3_queue_scope.py', 'tests/integration/test_w3_bff.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-12 verification: $suite" }
             }
+            foreach ($suite in @('tests/integration/test_w3_intake.py', 'tests/integration/test_w3_intake_races.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-11 verification: $suite" }
+            }
             # Linux CI retains the accepted Bash probes; PowerShell checks their exit immediately.
             $integration = @'
 set -euo pipefail
@@ -342,6 +345,8 @@ if [ "$1" = integration-diagnostic ]; then
     w3-checkin-races) focused_target='tests/integration/test_w3_checkin_races.py' ;;
     w3-receipt-boundary) focused_target='tests/integration/test_w3_receipt_boundary.py' ;;
     w3-queue-scope) focused_target='tests/integration/test_w3_queue_scope.py' ;;
+    w3-intake) focused_target='tests/integration/test_w3_intake.py' ;;
+    w3-intake-races) focused_target='tests/integration/test_w3_intake_races.py' ;;
     w3-migration) focused_target='tests/integration/test_f01_grants_migration.py' ;;
     *) echo 'FAIL unapproved PostgreSQL diagnostic selection'; exit 1 ;;
   esac
@@ -400,7 +405,7 @@ cleanup() {
       export CP_FOUNDATION_CLEANUP_VERIFIED=1 CP_FOUNDATION_COVERAGE_VERIFIED=1
       export CP_FOUNDATION_EXECUTION=PASS CP_FOUNDATION_TESTS=PASS CP_FOUNDATION_ZERO_SKIPS=true CP_FOUNDATION_CLEANUP=PASS
       export CP_FOUNDATION_COVERAGE="$(if [ "$foundation_lane" = ordinary ]; then echo current-head-excluding-extracted-historical; else echo immutable-0040-selected-nodes-on-isolated-postgres; fi)"
-      export CP_FOUNDATION_CANDIDATE_SCHEMA=0050_b12_checkin_completeness
+      export CP_FOUNDATION_CANDIDATE_SCHEMA=0051_b11_intake
       export CP_FOUNDATION_HISTORICAL_SHA=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
       export CP_FOUNDATION_HISTORICAL_SCHEMA=0040_t173_numeric_money
       export CP_FOUNDATION_VERIFIED_TESTS="$foundation_tests" CP_FOUNDATION_LANE="$foundation_lane"
@@ -850,7 +855,7 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d06-queue.log"; then
 fi
 # Wave 3 suites exercise the current head, never the immutable predecessor or special modes.
 if [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; then
-  for suite in w3_receipt_boundary w3_checkin w3_checkin_races w3_queue_scope; do
+  for suite in w3_receipt_boundary w3_checkin w3_checkin_races w3_queue_scope w3_intake w3_intake_races; do
     docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
       -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
       -v "$private/foundation-results:/tmp/foundation-results:rw" \
@@ -1412,7 +1417,7 @@ expected = {
     'b05-invited', 'sender', 'recovery', 'sender-mail-down', 'owner-invite',
 } | {f'health-{i}' for i in range(1, health_count + 1)}
 if sys.argv[3] == 'ordinary':
-    expected |= {'w3_receipt_boundary', 'w3_checkin', 'w3_checkin_races', 'w3_queue_scope', 'w3_bff'}
+    expected |= {'w3_receipt_boundary', 'w3_checkin', 'w3_checkin_races', 'w3_queue_scope', 'w3_bff', 'w3_intake', 'w3_intake_races'}
 actual = {p.stem for p in folder.glob('*.xml')}
 if actual != expected:
     raise SystemExit(f'FAIL ordinary JUnit inventory: missing={expected - actual}, unexpected={actual - expected}')

@@ -426,7 +426,7 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
     assert f"sha={env['GITHUB_SHA']}" in output
     assert f"Tested github.sha: `{env['GITHUB_SHA']}`" in summary.read_text()
     assert (
-        f"Ordinary ({acceptance.ORDINARY_SCHEMA}, including B-12)"
+        f"Ordinary ({acceptance.ORDINARY_SCHEMA}, including B-12 and B-11)"
         in summary.read_text()
     )
     assert "44 Python + 11 Web" in summary.read_text()
