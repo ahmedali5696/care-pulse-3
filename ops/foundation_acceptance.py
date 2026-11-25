@@ -9,18 +9,22 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ops import foundation_inventory as inventory
+
 HISTORICAL_SHA = "6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7"
 SOURCE_SCHEMA = "0040_t173_numeric_money"
 CANDIDATE_SCHEMA = "0046_f01_audit_integrity"
 ORDINARY_SCHEMA = "0058_b15_admission_guards"
 RECEIPT_FILE = "foundation-full-receipt.json"
 EXPECTED_COVERAGE = {
-    "ordinary": "current-head-excluding-extracted-historical",
+    "ordinary-db": "current-head-db",
+    "ordinary-stack": "current-head-stack",
     "historical": "immutable-0040-selected-nodes-on-isolated-postgres",
     "compat": "full-US1-US2-US3-six-successors-zero-skips",
 }
 PROVENANCE = {
-    "ordinary": {"candidate_schema": ORDINARY_SCHEMA},
+    "ordinary-db": {"candidate_schema": ORDINARY_SCHEMA},
+    "ordinary-stack": {"candidate_schema": ORDINARY_SCHEMA},
     "historical": {
         "historical_sha": HISTORICAL_SHA,
         "historical_schema": SOURCE_SCHEMA,
@@ -169,6 +173,8 @@ def github_context(env: dict[str, str]) -> dict:
 
 def validate_request(env: dict[str, str]) -> dict[str, str]:
     """Normalize only approved, mutually exclusive Foundation invocation modes."""
+    if env.get("INPUT_ORDINARY_PROFILE_SHA") or env.get("INPUT_ORDINARY_PARTITION_SHA"):
+        raise ValueError("experimental Foundation modes are not supported")
     context = github_context(env)
     diagnostic = env.get("INPUT_POSTGRES_DIAGNOSTIC", "") or "full"
     if diagnostic not in DIAGNOSTICS | {"full"}:
@@ -223,9 +229,9 @@ def validate_request(env: dict[str, str]) -> dict[str, str]:
     }
 
 
-def _receipt(context: dict, lane: str) -> dict:
+def _receipt(context: dict, lane: str, report_evidence: dict) -> dict:
     return {
-        "schema": 2,
+        "schema": 3,
         "kind": "FOUNDATION_FULL_LANE",
         "context": context,
         "lane": lane,
@@ -233,6 +239,7 @@ def _receipt(context: dict, lane: str) -> dict:
         "statuses": {"execution": "PASS", "tests": "PASS", "skipped": 0},
         "cleanup": "verified-scoped-teardown",
         "provenance": PROVENANCE[lane],
+        "reports": report_evidence,
     }
 
 
@@ -247,7 +254,11 @@ def seal(path: Path, env: dict[str, str]) -> dict:
     """Seal evidence only from a verified successful lane's terminal cleanup."""
     context = github_context(env)
     lane = env.get("CP_FOUNDATION_LANE", "")
-    if lane not in EXPECTED_COVERAGE or env.get("CP_FOUNDATION_MODE") != "full":
+    if (
+        lane not in EXPECTED_COVERAGE
+        or env.get("CP_FOUNDATION_MODE") != "full"
+        or validate_request(env)["mode"] != "full"
+    ):
         raise ValueError("not a full acceptance lane")
     expected = {
         "CP_FOUNDATION_EXECUTION": "PASS",
@@ -265,7 +276,11 @@ def seal(path: Path, env: dict[str, str]) -> dict:
     if path.name != RECEIPT_FILE or not path.parent.is_dir():
         raise ValueError("invalid receipt destination")
     _safe_path(path)
-    receipt = _receipt(context, lane)
+    report_evidence = json.loads(
+        env.get("CP_FOUNDATION_REPORT_EVIDENCE", ""), object_pairs_hook=_unique_object
+    )
+    inventory.validate_evidence(lane, report_evidence)
+    receipt = _receipt(context, lane, report_evidence)
     with path.open("x", encoding="utf-8") as stream:
         json.dump(receipt, stream, sort_keys=True, separators=(",", ":"))
         stream.write("\n")
@@ -327,7 +342,10 @@ def aggregate(root: Path, env: dict[str, str]) -> None:
             raise ValueError("unexpected or missing lane receipt")
         _safe_path(files[0])
         evidence = _read_json(files[0])
-        if not _identical(evidence, _receipt(context, lane)):
+        if not isinstance(evidence, dict) or "reports" not in evidence:
+            raise ValueError("missing lane report evidence")
+        inventory.validate_evidence(lane, evidence["reports"])
+        if not _identical(evidence, _receipt(context, lane, evidence["reports"])):
             raise ValueError(
                 "incorrect receipt context, coverage, provenance or cleanup"
             )
@@ -357,8 +375,13 @@ def _publish_acceptance(env: dict[str, str]) -> None:
         f"- Event/ref: `{context['event']}` / `{context['ref']}`",
         f"- Repository/workflow: `{context['repository']}` / `{context['workflow']}`",
         f"- Run/attempt: `{context['run_id']}` / `{context['attempt']}`",
-        f"- Ordinary ({ORDINARY_SCHEMA}, including B-12, B-11 and B-14), historical (163 at 0040), compatibility (44 Python + 11 Web, 0040 to 0046): verified",
-        "- Three current-attempt receipts, zero mandatory skips, scoped cleanup, artifact digests: verified",
+        (
+            f"- Ordinary ({ORDINARY_SCHEMA}, including B-12, B-11 and B-14): "
+            f"DB ({sum(inventory.REPORT_COUNTS['ordinary-db'].values())}), "
+            f"stack ({sum(inventory.REPORT_COUNTS['ordinary-stack'].values())}); "
+            "historical (163 at 0040), compatibility (44 Python + 11 Web, 0040 to 0046): verified"
+        ),
+        "- Four current-attempt receipts, exact report inventory, zero mandatory skips, scoped cleanup, artifact digests: verified",
     ]
     if context["pr"] is not None:
         pr = context["pr"]
@@ -400,9 +423,23 @@ def main(argv: list[str], env: dict[str, str]) -> None:
         aggregate(Path(argv[1]), env)
         _assert_checkout_sha(env["GITHUB_SHA"])
         _publish_acceptance(env)
+    elif len(argv) == 3 and argv[0] == "verify-coverage":
+        if (
+            env.get("CP_FOUNDATION_MODE") != "full"
+            or env.get("CP_FOUNDATION_LANE") != argv[1]
+        ):
+            raise ValueError("coverage verification requires its full lane")
+        _assert_checkout_sha(github_context(env)["sha"])
+        print(
+            json.dumps(
+                inventory.collect(argv[1], Path(argv[2])),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
     else:
         raise ValueError(
-            "usage: validate-request | seal <receipt-path> | aggregate <download-root>"
+            "usage: validate-request | verify-coverage <lane> <folder> | seal <receipt-path> | aggregate <download-root>"
         )
 
 

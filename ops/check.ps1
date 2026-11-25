@@ -108,7 +108,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': '01e55faa23c06c96d9a1e8ed70bf5874271651f9b05630961eafe90919ee743a',
+    '.github/workflows/foundation.yml': 'e1ac89772c26b9f10ddbec8853420fd49acf57b95b8336e51195b2feab90b8a0',
     '.github/workflows/fast-feedback.yml': '814f40f9f2a09d6337e5d4e14f1d4851e88301e64c1f28d5e538d3549dccce8b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
@@ -326,7 +326,7 @@ foundation_lane="${CP_FOUNDATION_LANE:-standard}"
 foundation_full=false
 foundation_coverage_verified=false
 foundation_tests=0
-case "$foundation_lane" in ordinary|historical|standard) ;; *) echo 'FAIL unknown Foundation lane'; exit 1 ;; esac
+case "$foundation_lane" in ordinary-db|ordinary-stack|historical|standard) ;; *) echo 'FAIL unknown Foundation lane'; exit 1 ;; esac
 if [[ "${CP_FOUNDATION_MODE:-}" = full ]]; then
   if [[ "$1" != integration || "$foundation_lane" = standard || -z "${CP_FOUNDATION_RECEIPT_PATH:-}" || "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false || -n "${CP_T133_SHA:-}" ]]; then
     echo 'FAIL full Foundation lane invocation'; exit 1
@@ -429,7 +429,11 @@ cleanup() {
     else
       export CP_FOUNDATION_CLEANUP_VERIFIED=1 CP_FOUNDATION_COVERAGE_VERIFIED=1
       export CP_FOUNDATION_EXECUTION=PASS CP_FOUNDATION_TESTS=PASS CP_FOUNDATION_ZERO_SKIPS=true CP_FOUNDATION_CLEANUP=PASS
-      export CP_FOUNDATION_COVERAGE="$(if [ "$foundation_lane" = ordinary ]; then echo current-head-excluding-extracted-historical; else echo immutable-0040-selected-nodes-on-isolated-postgres; fi)"
+      case "$foundation_lane" in
+        ordinary-db) export CP_FOUNDATION_COVERAGE=current-head-db ;;
+        ordinary-stack) export CP_FOUNDATION_COVERAGE=current-head-stack ;;
+        historical) export CP_FOUNDATION_COVERAGE=immutable-0040-selected-nodes-on-isolated-postgres ;;
+      esac
       export CP_FOUNDATION_CANDIDATE_SCHEMA=0058_b15_admission_guards
       export CP_FOUNDATION_HISTORICAL_SHA=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
       export CP_FOUNDATION_HISTORICAL_SCHEMA=0040_t173_numeric_money
@@ -451,6 +455,17 @@ done
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" > /dev/null 2>&1
 openssl pkey -in "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" -pubout -out "$CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE" > /dev/null 2>&1
 chmod 0444 "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" "$CP_DELIVERY_PUBLIC_KEY_SOURCE_FILE"
+scan_tracked_source() {
+  cat "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_API_DB_PASSWORD_SOURCE_FILE" "$CP_WEB_DB_PASSWORD_SOURCE_FILE" "$CP_WORKER_DB_PASSWORD_SOURCE_FILE" "$CP_GATE_DB_PASSWORD_SOURCE_FILE" "$CP_DB_IDENTITY_KEY_SOURCE_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" \
+    "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" > "$private/canaries"
+  chmod 0444 "$private/canaries"
+  awk 'length($0) != 64 || $0 !~ /^[0-9a-f]+$/ || seen[$0]++ { invalid=1 } END { if (NR != 15 || invalid) exit 1 }' "$private/canaries"
+  if git grep -I -q -f "$private/canaries" -- apps tests ops compose.yaml; then
+    echo 'FAIL synthetic key in tracked source'; exit 1
+  else
+    local code=$?; if [ "$code" -ne 1 ]; then echo 'FAIL tracked-source scan error'; exit 1; fi
+  fi
+}
 docker compose --profile mail --profile scan --profile test --profile sender --profile operator config --quiet
 docker compose --profile mail --profile scan --profile test --profile sender --profile operator config --format json > "$private/compose.json"
 chmod 0444 "$private/compose.json"
@@ -469,7 +484,7 @@ do
   test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = linux/amd64
   docker image inspect --format '{{json .RepoDigests}} {{.Id}} {{.Os}}/{{.Architecture}}' "$image"
 done
-if [ -n "$focused_target" ] || [ "$foundation_lane" = historical ]; then
+if [ -n "$focused_target" ] || [ "$foundation_lane" = historical ] || [ "$foundation_lane" = ordinary-db ]; then
   docker compose --profile test build --pull test
 else
   docker compose --profile test --profile sender --profile operator build --pull
@@ -481,6 +496,13 @@ for attempt in $(seq 1 40); do
   if [ "$attempt" = 40 ]; then echo 'FAIL disposable database startup'; exit 1; fi
   sleep 2
 done
+if [ "$foundation_lane" = ordinary-db ] || [ "$foundation_lane" = ordinary-stack ]; then
+  db_container="$(docker compose ps -q db)"
+  test -n "$db_container"
+  test "$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$db_container")" = "$CP_CI_PROJECT"
+  test "$(docker inspect --format '{{ len .HostConfig.PortBindings }}' "$db_container")" = 0
+  docker compose exec -T db postgres --version | grep -F '17.11'
+fi
 export CP_MIGRATION_PASSWORD="$(cat "$CP_MIGRATION_SECRET_FILE")"
 export CP_RUNTIME_PASSWORD="$(cat "$CP_RUNTIME_DB_PASSWORD_FILE")"
 export CP_API_DB_PASSWORD="$(cat "$CP_API_DB_PASSWORD_SOURCE_FILE")"
@@ -814,7 +836,9 @@ PY
 )
 if [ "$foundation_lane" = historical ]; then
   run_historical_migrations
-  foundation_tests=163
+  CP_FOUNDATION_REPORT_EVIDENCE="$(python3 -m ops.foundation_acceptance verify-coverage "$foundation_lane" "$private/historical/results")"
+  export CP_FOUNDATION_REPORT_EVIDENCE
+  foundation_tests="$(jq -er '.total' <<< "$CP_FOUNDATION_REPORT_EVIDENCE")"
   foundation_coverage_verified=true
   exit 0
 fi
@@ -832,6 +856,10 @@ fi
 
 upgrade_head
 seed_identity_policy
+if [ "$foundation_full" = true ]; then
+  test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0058_b15_admission_guards
+fi
+if [ "$foundation_lane" != ordinary-stack ]; then
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/foundation-results:/tmp/foundation-results:rw" \
@@ -848,7 +876,7 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/f01-runtime-identity.log"; then
   echo 'FAIL mandatory F-01 runtime identity evidence skipped'; exit 1
 fi
-if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ] && [ "${CP_B04_SPIKE:-false}" = false ] && [ "$foundation_lane" != ordinary ]; then
+if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ] && [ "${CP_B04_SPIKE:-false}" = false ] && [ "$foundation_lane" = standard ]; then
   run_historical_migrations
 fi
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
@@ -864,22 +892,9 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d08-core.log"; then
   echo 'FAIL mandatory D-08 persistence evidence skipped'; exit 1
 fi
-# Independent D-06 suite must remain executable without D-07/Visit imports.
-docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
-  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
-  -v "$private/foundation-results:/tmp/foundation-results:rw" \
-  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
-  -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
-  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
-  -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
-  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider --junitxml=/tmp/foundation-results/d06.xml "${historical_deselect[@]}" \
-  tests/integration/test_queue_persistence.py tests/integration/test_queue_capacity.py \
-  tests/integration/test_queue_races.py "${ordinary_queue_migration_files[@]}" | tee "$private/d06-queue.log"
-if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d06-queue.log"; then
-  echo 'FAIL mandatory D-06 real-PostgreSQL evidence skipped'; exit 1
 fi
 # Wave 3 suites exercise the current head, never the immutable predecessor or special modes.
-if [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; then
+if [ "$foundation_lane" = ordinary-db ] || { [ "$foundation_lane" = standard ] && [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; }; then
   for suite in w3_receipt_boundary w3_checkin w3_checkin_races w3_queue_scope w3_intake w3_intake_races w3_admission_controls w3_admission_confirmations w3_admission w3_admission_races; do
     docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
       -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
@@ -894,6 +909,34 @@ if [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] 
       echo "FAIL mandatory Wave 3 evidence skipped: $suite"; exit 1
     fi
   done
+fi
+if [ "$foundation_lane" = ordinary-db ]; then
+  CP_FOUNDATION_REPORT_EVIDENCE="$(python3 -m ops.foundation_acceptance verify-coverage "$foundation_lane" "$private/foundation-results")"
+  export CP_FOUNDATION_REPORT_EVIDENCE
+  foundation_tests="$(jq -er '.total' <<< "$CP_FOUNDATION_REPORT_EVIDENCE")"
+  test "$foundation_tests" -gt 0
+  scan_tracked_source
+  if grep -aRF -f "$private/canaries" "$private/foundation-results" > /dev/null; then
+    echo 'FAIL synthetic key in DB lane reports'; exit 1
+  else
+    code=$?; if [ "$code" -ne 1 ]; then echo 'FAIL DB report scan error'; exit 1; fi
+  fi
+  foundation_coverage_verified=true
+  exit 0
+fi
+# Independent D-06 suite must remain executable without D-07/Visit imports.
+docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
+  -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+  -v "$private/foundation-results:/tmp/foundation-results:rw" \
+  -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+  -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+  -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+  -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
+  test python -m pytest -q -s -ra --tb=short -p no:cacheprovider --junitxml=/tmp/foundation-results/d06.xml "${historical_deselect[@]}" \
+  tests/integration/test_queue_persistence.py tests/integration/test_queue_capacity.py \
+  tests/integration/test_queue_races.py "${ordinary_queue_migration_files[@]}" | tee "$private/d06-queue.log"
+if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d06-queue.log"; then
+  echo 'FAIL mandatory D-06 real-PostgreSQL evidence skipped'; exit 1
 fi
 # All B-06 suites run against disposable PostgreSQL; no silent skip counts.
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
@@ -1151,15 +1194,7 @@ for key in CP_POLICY_FILE CP_DB_PASSWORD_FILE CP_FILE_ENCRYPTION_KEY_FILE; do
   fi
   echo "PASS worker protected startup denies missing $key"
 done
-cat "$CP_DB_PASSWORD_FILE" "$CP_RUNTIME_DB_PASSWORD_FILE" "$CP_API_DB_PASSWORD_SOURCE_FILE" "$CP_WEB_DB_PASSWORD_SOURCE_FILE" "$CP_WORKER_DB_PASSWORD_SOURCE_FILE" "$CP_GATE_DB_PASSWORD_SOURCE_FILE" "$CP_DB_IDENTITY_KEY_SOURCE_FILE" "$CP_AUTH_DB_PASSWORD_SOURCE_FILE" "$CP_SERVICE_KEY_SOURCE_FILE" "$CP_AUTH_SECRET_SOURCE_FILE" \
-  "$CP_FILE_ENCRYPTION_KEY_SOURCE_FILE" "$CP_MIGRATION_SECRET_FILE" "$CP_OPERATOR_SECRET_FILE" "$CP_OPERATOR_CREDENTIAL_SOURCE_FILE" "$CP_SENDER_DB_PASSWORD_SOURCE_FILE" > "$private/canaries"
-chmod 0444 "$private/canaries"
-awk 'length($0) != 64 || $0 !~ /^[0-9a-f]+$/ || seen[$0]++ { invalid=1 } END { if (NR != 15 || invalid) exit 1 }' "$private/canaries"
-if git grep -I -q -f "$private/canaries" -- apps tests ops compose.yaml; then
-  echo 'FAIL synthetic key in tracked source'; exit 1
-else
-  code=$?; if [ "$code" -ne 1 ]; then echo 'FAIL tracked-source scan error'; exit 1; fi
-fi
+scan_tracked_source
 docker compose run --rm --no-deps -v "$private/canaries:/tmp/canaries:ro" web sh -c \
   'test -r /tmp/canaries || exit 2
    result=0
@@ -1425,8 +1460,15 @@ if not all(marker in text for marker in ('T133 ACL DURING:', 'T133 ACL AFTER:', 
     raise SystemExit('FAIL incomplete protected T133 evidence')
 PY
 fi
-if [ "$foundation_full" = true ] || [ "${CP_B04_SPIKE:-false}" = true ]; then
-  foundation_tests="$(python3 - "$private/foundation-results" "$health_case_count" "$foundation_lane" <<'PY'
+if [ "$foundation_full" = true ]; then
+  test "$health_case_count" = 8
+  CP_FOUNDATION_REPORT_EVIDENCE="$(python3 -m ops.foundation_acceptance verify-coverage "$foundation_lane" "$private/foundation-results")"
+  export CP_FOUNDATION_REPORT_EVIDENCE
+  foundation_tests="$(jq -er '.total' <<< "$CP_FOUNDATION_REPORT_EVIDENCE")"
+  test "$foundation_tests" -gt 0
+  foundation_coverage_verified=true
+elif [ "${CP_B04_SPIKE:-false}" = true ]; then
+  foundation_tests="$(python3 - "$private/foundation-results" "$health_case_count" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -1441,8 +1483,6 @@ expected = {
     'topology-seed', 'topology-verify', 'secrets', 'auth-mail', 'sessions',
     'b05-invited', 'sender', 'recovery', 'sender-mail-down', 'owner-invite',
 } | {f'health-{i}' for i in range(1, health_count + 1)}
-if sys.argv[3] == 'ordinary':
-    expected |= {'w3_receipt_boundary', 'w3_checkin', 'w3_checkin_races', 'w3_queue_scope', 'w3_bff', 'w3_intake', 'w3_intake_races', 'w3_admission_controls', 'w3_admission_confirmations', 'w3_admission', 'w3_admission_races'}
 actual = {p.stem for p in folder.glob('*.xml')}
 if actual != expected:
     raise SystemExit(f'FAIL ordinary JUnit inventory: missing={expected - actual}, unexpected={actual - expected}')
@@ -1479,6 +1519,9 @@ PY
   test "$foundation_tests" -gt 0
   foundation_coverage_verified=true
 fi
+if [ "$foundation_lane" = ordinary-stack ]; then
+  printf '### Provisional ordinary-stack checks (before scoped cleanup)\n- %s mandatory JUnit/TAP cases, zero skips; service and runtime probes passed.\n' "$foundation_tests" >> "$GITHUB_STEP_SUMMARY"
+else
 {
   echo '### Provisional Wave 0 and Wave 1 D-01/D-02 lane checks (before scoped cleanup)'
   echo "- Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT}, SHA ${GITHUB_SHA})"
@@ -1496,6 +1539,7 @@ fi
   echo '- B-03 restricted operator and owner activation, separate committed sender and real Playwright invite/login: passed'
   echo '- Synthetic development only; production and later Waves remain closed'
 } >> "$GITHUB_STEP_SUMMARY"
+fi
 '@
             & bash -e -c $integration -- $Check
             if ($LASTEXITCODE -ne 0) { throw "Integration failed (exit $LASTEXITCODE)" }
@@ -1726,6 +1770,8 @@ if [[ "$mode" = compat-us1 || "$mode" = compat-full ]]; then
         grep -Fxq "$result" "$private/compat-us1-source-web.log" || { echo "FAIL mandatory source Web test count: $result"; exit 1; }
       done
       echo 'PASS compat-us1-source-web: 2 mandatory source image tests, zero skips'
+      cp "$private/compat-us1-web.log" "$private/compat-results/compat-us1-web.tap"
+      cp "$private/compat-us1-source-web.log" "$private/compat-results/compat-us1-source-web.tap"
     fi
 fi
 # The independent Docker/PG supervisor attests every stopped-consumer proof
@@ -1816,7 +1862,11 @@ if [[ "$mode" = compat-us3 || "$mode" = compat-full ]]; then
 fi
 if [[ "$mode" = compat-full ]]; then
   echo 'PASS mandatory compatibility: 44 Python cases (US1 26, US2 8, US3 10), 11 Web cases, zero skips'
-  if [ "$foundation_full" = true ]; then foundation_coverage_verified=true; fi
+  if [ "$foundation_full" = true ]; then
+    CP_FOUNDATION_REPORT_EVIDENCE="$(python3 -m ops.foundation_acceptance verify-coverage "$foundation_lane" "$private/compat-results")"
+    export CP_FOUNDATION_REPORT_EVIDENCE
+    foundation_coverage_verified=true
+  fi
 fi
 '@
             & bash -e -c $compatScript -- $Check

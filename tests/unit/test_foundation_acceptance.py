@@ -5,6 +5,7 @@ import json
 import pytest
 
 from ops import foundation_acceptance as acceptance
+from ops import foundation_inventory as inventory
 
 
 @pytest.fixture
@@ -27,6 +28,11 @@ def env():
 
 
 def seal_env(env, lane):
+    reports = inventory.expected_evidence(lane)
+    reports["report_identity_sha256"] = {
+        name: inventory.EXPECTED_IDENTITY_DIGESTS[name]
+        for name in reports["report_counts"]
+    }
     return {
         **env,
         "CP_FOUNDATION_MODE": "full",
@@ -38,6 +44,7 @@ def seal_env(env, lane):
         "CP_FOUNDATION_COVERAGE": acceptance.EXPECTED_COVERAGE[lane],
         "CP_FOUNDATION_COVERAGE_VERIFIED": "1",
         "CP_FOUNDATION_CLEANUP_VERIFIED": "1",
+        "CP_FOUNDATION_REPORT_EVIDENCE": json.dumps(reports),
         **{
             acceptance.PROVENANCE_ENV[key]: value
             for key, value in acceptance.PROVENANCE[lane].items()
@@ -81,7 +88,7 @@ def test_request_classifies_full_and_exclusive_modes(env):
     normalized = acceptance.validate_request(env)
     assert normalized == {
         "mode": "full",
-        "matrix": '["ordinary","historical","compat"]',
+        "matrix": '["ordinary-db","ordinary-stack","historical","compat"]',
         "candidate_sha": "a" * 40,
         "run_id": "123456",
         "attempt": "2",
@@ -108,11 +115,37 @@ def test_request_classifies_full_and_exclusive_modes(env):
 
 
 @pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "w3-checkin",
+        "w3-checkin-races",
+        "w3-receipt-boundary",
+        "w3-queue-scope",
+        "w3-intake",
+        "w3-intake-races",
+        "w3-admission-controls",
+        "w3-admission-confirmations",
+        "w3-admission",
+        "w3-admission-races",
+        "w3-migration",
+    ],
+)
+def test_wave3_diagnostic_remains_isolated_from_full_acceptance(env, diagnostic):
+    normalized = acceptance.validate_request(
+        {**env, "INPUT_POSTGRES_DIAGNOSTIC": diagnostic}
+    )
+    assert normalized["mode"] == "postgres-diagnostic"
+    assert json.loads(normalized["matrix"]) == ["standard"]
+
+
+@pytest.mark.parametrize(
     "changes",
     [
         {"INPUT_B04_SPIKE": "TRUE"},
         {"INPUT_T133_TERMINAL": "yes"},
         {"INPUT_POSTGRES_DIAGNOSTIC": "compat-full"},
+        {"INPUT_ORDINARY_PROFILE_SHA": "a" * 40},
+        {"INPUT_ORDINARY_PARTITION_SHA": "a" * 40},
         {
             "INPUT_B04_SPIKE": "true",
             "INPUT_T133_TERMINAL": "true",
@@ -252,8 +285,10 @@ def test_full_aggregate_matches_all_exact_receipts(receipts, env):
 @pytest.mark.parametrize(
     "lane,wrong_head",
     [
-        ("ordinary", "0046_f01_audit_integrity"),
+        ("ordinary-db", "0046_f01_audit_integrity"),
+        ("ordinary-stack", "0046_f01_audit_integrity"),
         ("compat", "0047_b12_queue_checkin_grants"),
+        ("compat", "0058_b15_admission_guards"),
     ],
 )
 def test_lane_schema_provenance_cannot_be_interchanged(tmp_path, env, lane, wrong_head):
@@ -288,6 +323,7 @@ def test_dependency_or_attempt_mismatch_fails(receipts, env, key, value):
     "field,value",
     [
         ("schema", 1),
+        ("schema", 2),
         ("schema", True),
         ("kind", "PROFILING_ONLY_NOT_ACCEPTANCE"),
         ("coverage", "incomplete"),
@@ -295,6 +331,8 @@ def test_dependency_or_attempt_mismatch_fails(receipts, env, key, value):
         ("cleanup", "cleanup attempted"),
         ("provenance", {"source_sha": "b" * 40}),
         ("context", {"sha": "b" * 40}),
+        ("reports", {}),
+        ("lane", "ordinary"),
     ],
 )
 def test_changed_receipt_fails(receipts, env, field, value):
@@ -365,6 +403,9 @@ def test_linked_receipt_fails(receipts, env):
         ("CP_FOUNDATION_SOURCE_SCHEMA", "0041"),
         ("CP_FOUNDATION_CANDIDATE_SCHEMA", "0045"),
         ("CP_FOUNDATION_MODE", "postgres-diagnostic"),
+        ("CP_FOUNDATION_REPORT_EVIDENCE", ""),
+        ("CP_FOUNDATION_REPORT_EVIDENCE", "{}"),
+        ("INPUT_POSTGRES_DIAGNOSTIC", "compat-us3"),
     ],
 )
 def test_seal_requires_positive_terminal_evidence(tmp_path, env, key, value):
@@ -376,10 +417,10 @@ def test_seal_requires_positive_terminal_evidence(tmp_path, env, key, value):
 
 def test_seal_cannot_overwrite_existing_proof(tmp_path, env):
     path = tmp_path / acceptance.RECEIPT_FILE
-    acceptance.seal(path, seal_env(env, "ordinary"))
+    acceptance.seal(path, seal_env(env, "ordinary-db"))
     first = path.read_bytes()
     with pytest.raises(FileExistsError):
-        acceptance.seal(path, seal_env(env, "ordinary"))
+        acceptance.seal(path, seal_env(env, "ordinary-db"))
     assert path.read_bytes() == first
 
 
@@ -394,8 +435,9 @@ def test_validation_does_not_publish_partial_output(tmp_path, env, monkeypatch):
         )
     assert output.read_text(encoding="utf-8") == "existing=retained\n"
     acceptance.main(["validate-request"], {**env, "GITHUB_OUTPUT": str(output)})
-    assert 'matrix=["ordinary","historical","compat"]\n' in output.read_text(
-        encoding="utf-8"
+    assert (
+        'matrix=["ordinary-db","ordinary-stack","historical","compat"]\n'
+        in output.read_text(encoding="utf-8")
     )
 
 
@@ -407,7 +449,7 @@ def test_cli_rejects_checkout_mismatch_before_sealing(tmp_path, env, monkeypatch
     )
     path = tmp_path / acceptance.RECEIPT_FILE
     with pytest.raises(ValueError):
-        acceptance.main(["seal", str(path)], seal_env(env, "ordinary"))
+        acceptance.main(["seal", str(path)], seal_env(env, "ordinary-db"))
     assert not path.exists()
 
 
@@ -430,8 +472,117 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
         in summary.read_text()
     )
     assert "44 Python + 11 Web" in summary.read_text()
+    assert "Four current-attempt receipts" in summary.read_text()
     summary.unlink()
     receipt_file(receipts, env).unlink()
     with pytest.raises(ValueError):
         acceptance.main(["aggregate", str(receipts)], context)
     assert not summary.exists()
+
+
+def test_current_inventory_has_exact_disjoint_ordinary_reports():
+    db = inventory.REPORT_COUNTS["ordinary-db"]
+    stack = inventory.REPORT_COUNTS["ordinary-stack"]
+    assert (sum(db.values()), sum(stack.values())) == (485, 605)
+    assert not db.keys() & stack.keys()
+    assert not (
+        {inventory.EXPECTED_IDENTITY_DIGESTS[name] for name in db}
+        & {inventory.EXPECTED_IDENTITY_DIGESTS[name] for name in stack}
+    )
+    assert set(inventory.EXPECTED_IDENTITY_DIGESTS) == {
+        name for counts in inventory.REPORT_COUNTS.values() for name in counts
+    }
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "manifest_sha256",
+        "total",
+        "report_counts",
+        "report_identity_sha256",
+    ],
+)
+def test_seal_rejects_changed_exact_report_inventory(tmp_path, env, field):
+    lane_env = seal_env(env, "ordinary-db")
+    evidence = json.loads(lane_env["CP_FOUNDATION_REPORT_EVIDENCE"])
+    if field == "manifest_sha256":
+        evidence[field] = "c" * 64
+    elif field == "total":
+        evidence[field] += 1
+    elif field == "report_counts":
+        evidence[field]["f01"] -= 1
+        evidence[field]["d08"] += 1
+    else:
+        evidence[field]["f01"] = "c" * 64
+    lane_env["CP_FOUNDATION_REPORT_EVIDENCE"] = json.dumps(evidence)
+    path = tmp_path / acceptance.RECEIPT_FILE
+    with pytest.raises(ValueError):
+        acceptance.seal(path, lane_env)
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing",
+        "extra",
+        "wrong-name",
+        "wrong-case",
+        "skip",
+        "duplicate",
+        "wrong-tap-case",
+        "tap-skipped",
+        "tap-duplicate-summary",
+        None,
+    ],
+)
+def test_exact_report_collection_rejects_incomplete_or_substituted_cases(
+    tmp_path, monkeypatch, change
+):
+    # Use two actual baseline report identities in a small manifest.
+    monkeypatch.setitem(
+        inventory.REPORT_COUNTS,
+        "ordinary-stack",
+        {
+            "health-2": 1,
+            "web-ingress": 2,
+        },
+    )
+    junit = (
+        '<testsuites><testsuite tests="1" errors="0" failures="0" skipped="0">'
+        '<testcase classname="tests.integration.test_health" name="test_running_service_state"/>'
+        "</testsuite></testsuites>"
+    )
+    tap = (
+        "TAP version 13\n"
+        "ok 1 - real TCP peers have independent login limits despite spoofed forwarding headers\n"
+        "ok 2 - identity limit holds across distinct TCP peers\n"
+        "1..2\n# tests 2\n# pass 2\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n"
+    )
+    if change == "wrong-case":
+        junit = junit.replace("test_running_service_state", "test_other")
+    elif change == "skip":
+        junit = junit.replace("/>", "><skipped/></testcase>")
+    elif change == "duplicate":
+        junit = junit.replace(
+            "</testsuite>",
+            '<testcase classname="tests.integration.test_health" name="test_running_service_state"/></testsuite>',
+        )
+    elif change == "wrong-tap-case":
+        tap = tap.replace("identity limit holds", "identity limit fails")
+    elif change == "tap-skipped":
+        tap = tap.replace("# skipped 0", "# skipped 1")
+    elif change == "tap-duplicate-summary":
+        tap += "# tests 2\n"
+    if change != "missing":
+        filename = "unexpected.xml" if change == "wrong-name" else "health-2.xml"
+        (tmp_path / filename).write_text(junit, encoding="utf-8")
+    if change == "extra":
+        (tmp_path / "extra.xml").write_text(junit, encoding="utf-8")
+    (tmp_path / "web-ingress.tap").write_text(tap, encoding="utf-8")
+    if change is None:
+        assert inventory.collect("ordinary-stack", tmp_path)["total"] == 3
+    else:
+        with pytest.raises(ValueError):
+            inventory.collect("ordinary-stack", tmp_path)
