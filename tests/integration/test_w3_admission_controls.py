@@ -498,15 +498,25 @@ def test_exact_case_confirmation_read_and_write_scope(booking_clinic):
     )
     assert control_request(clinic, manager, "usable", query=query) == (200, usable)
     with clinic.migration.begin() as conn:
+        # An ACTIVE clinic must retain its verified Owner. Suspend before
+        # invalidating the issuer, preserving the inherited database invariant.
+        conn.execute(
+            text("UPDATE public.organizations SET state='SUSPENDED' WHERE id=:tenant"),
+            {"tenant": clinic.tenant},
+        )
         conn.execute(
             text('UPDATE public."user" SET "emailVerified"=false WHERE id=:user'),
             {"user": clinic.native_user},
         )
-    _denied(clinic, manager, "usable", 404, query=query)
+    _denied(clinic, manager, "usable", 403, query=query)
     with clinic.migration.begin() as conn:
         conn.execute(
             text('UPDATE public."user" SET "emailVerified"=true WHERE id=:user'),
             {"user": clinic.native_user},
+        )
+        conn.execute(
+            text("UPDATE public.organizations SET state='ACTIVE' WHERE id=:tenant"),
+            {"tenant": clinic.tenant},
         )
     revoked = _success(
         clinic, owner, "revoke", body=_revoke_body(clinic), confirmation_id=confirmation
