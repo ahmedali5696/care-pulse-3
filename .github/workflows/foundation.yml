@@ -1,5 +1,5 @@
 name: Foundation
-run-name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'Foundation PostgreSQL diagnostic' || '' }}
+run-name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && format('Foundation Diagnostic — {0}', inputs.postgres_diagnostic) || '' }}
 
 on:
   push:
