@@ -185,8 +185,8 @@ jobs:
       CP_FOUNDATION_LANE: ${{ matrix.lane }}
       CP_FOUNDATION_MODE: ${{ needs.inputs-and-build.outputs.mode }}
       CP_FOUNDATION_RECEIPT_PATH: ${{ github.workspace }}/foundation-full-receipt.json
-      COMPOSE_PROJECT_NAME: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.lane == 'ordinary' && '1' || matrix.lane == 'historical' && '2' || '3') }}
-      CP_CI_PROJECT: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.lane == 'ordinary' && '1' || matrix.lane == 'historical' && '2' || '3') }}
+      COMPOSE_PROJECT_NAME: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, fromJSON('{"ordinary-db":"1","historical":"2","compat":"3","ordinary-stack":"4"}')[matrix.lane]) }}
+      CP_CI_PROJECT: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, fromJSON('{"ordinary-db":"1","historical":"2","compat":"3","ordinary-stack":"4"}')[matrix.lane]) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -201,7 +201,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$CANDIDATE_SHA" = "$GITHUB_SHA"
           case "$CP_FOUNDATION_MODE:$CP_FOUNDATION_LANE" in
-            full:ordinary|full:historical|full:compat|postgres-diagnostic:standard|compat-diagnostic:standard|b04-spike:standard|t133:standard) ;;
+            full:ordinary-db|full:ordinary-stack|full:historical|full:compat|postgres-diagnostic:standard|compat-diagnostic:standard|b04-spike:standard|t133:standard) ;;
             *) echo 'FAIL invalid normalized mode/lane combination'; exit 1 ;;
           esac
           test "$CP_CI_PROJECT" = "$COMPOSE_PROJECT_NAME"
@@ -306,7 +306,7 @@ jobs:
           test "$(dpkg-query -W -f='${Version}' docker-buildx-plugin)" = '0.38.1-1~ubuntu.24.04~noble'
 
       - name: Install pinned Playwright browser on disposable runner
-        if: ${{ matrix.lane == 'ordinary' || (matrix.lane == 'standard' && (needs.inputs-and-build.outputs.mode == 'b04-spike' || needs.inputs-and-build.outputs.mode == 't133')) }}
+        if: ${{ matrix.lane == 'ordinary-stack' || (matrix.lane == 'standard' && (needs.inputs-and-build.outputs.mode == 'b04-spike' || needs.inputs-and-build.outputs.mode == 't133')) }}
         shell: bash
         run: |
           set -euo pipefail
@@ -321,7 +321,7 @@ jobs:
           pnpm --filter @carepulse/web exec playwright install --with-deps chromium
 
       - name: Disposable PostgreSQL, signed Patient API, invited-role acceptance and scoped cleanup
-        if: ${{ matrix.lane == 'ordinary' || matrix.lane == 'historical' || (matrix.lane == 'standard' && (needs.inputs-and-build.outputs.mode == 'b04-spike' || needs.inputs-and-build.outputs.mode == 't133')) }}
+        if: ${{ matrix.lane == 'ordinary-db' || matrix.lane == 'ordinary-stack' || matrix.lane == 'historical' || (matrix.lane == 'standard' && (needs.inputs-and-build.outputs.mode == 'b04-spike' || needs.inputs-and-build.outputs.mode == 't133')) }}
         shell: pwsh
         run: |
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
@@ -359,7 +359,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload post-cleanup Full Foundation lane receipt
-        if: ${{ matrix.lane != 'standard' && success() }}
+        if: ${{ needs.inputs-and-build.outputs.mode == 'full' && matrix.lane != 'standard' && success() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, Node.js 24
         with:
           name: foundation-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.lane }}
@@ -409,7 +409,7 @@ jobs:
             *) echo 'FAIL invalid or missing normalized mode'; exit 1 ;;
           esac
 
-      - name: Retrieve this attempt's three mandatory receipts with strict digest verification
+      - name: Retrieve this attempt's four mandatory receipts with strict digest verification
         if: ${{ env.NORMALIZED_MODE == 'full' }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, Node.js 24
         with:
