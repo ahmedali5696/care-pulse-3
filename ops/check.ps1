@@ -108,7 +108,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': '1d9bb12f7e2dbdcb9420b00ca5edb66017893fd23fcdc78bfad812103145a29f',
+    '.github/workflows/foundation.yml': 'a4f940215fd392618e8407253e62140f6a394b7831b0a41c99c545279205608f',
     '.github/workflows/fast-feedback.yml': '814f40f9f2a09d6337e5d4e14f1d4851e88301e64c1f28d5e538d3549dccce8b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
@@ -320,10 +320,36 @@ umask 077
 focused_target=
 foundation_lane="${CP_FOUNDATION_LANE:-standard}"
 foundation_full=false
+foundation_profile=false
+profile_checkpoint() { :; }
 foundation_coverage_verified=false
 foundation_tests=0
 case "$foundation_lane" in ordinary|historical|standard) ;; *) echo 'FAIL unknown Foundation lane'; exit 1 ;; esac
-if [[ "${CP_FOUNDATION_MODE:-}" = full ]]; then
+if [[ "${CP_FOUNDATION_MODE:-}" = ordinary-profile ]]; then
+  profile_variant="${CP_ORDINARY_PROFILE_VARIANT:-}"
+  profile_dir="$RUNNER_TEMP/ordinary-profile-private"
+  if [[ "$1" != integration || "$foundation_lane" != ordinary ||
+        ! "$profile_variant" =~ ^(control|instrumented)$ ||
+        "${GITHUB_EVENT_NAME:-}" != workflow_dispatch ||
+        "${GITHUB_REPOSITORY:-}" != ahmedali5696/care-pulse-3 ||
+        "${GITHUB_REF:-}" != refs/heads/feature/ci-scalability ||
+        "${GITHUB_WORKFLOW:-}" != 'Ordinary Profiling Experiment (NOT ACCEPTANCE)' ||
+        "${GITHUB_WORKFLOW_REF:-}" != 'ahmedali5696/care-pulse-3/.github/workflows/foundation.yml@refs/heads/feature/ci-scalability' ||
+        "${CP_ENV:-}" != test || "${CP_SYNTHETIC_TEST_PROFILE:-}" != true ||
+        ! "${CP_ORDINARY_PROFILE_SHA:-}" =~ ^[0-9a-f]{40}$ ||
+        "$CP_ORDINARY_PROFILE_SHA" != "$GITHUB_SHA" || "$(git rev-parse HEAD)" != "$GITHUB_SHA" ||
+        "$(git rev-parse HEAD^)" != 0c325ce80a999b79f7e442b39c4b0ecbc55fea9d ||
+        "$CP_CI_PROJECT" != "carepulse-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}$(if [ "$profile_variant" = control ]; then echo 4; else echo 5; fi)" ||
+        "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false ||
+        -n "${CP_T133_SHA:-}${CP_POSTGRES_DIAGNOSTIC:-}${CP_FOUNDATION_RECEIPT_PATH:-}" ||
+        ! -d "$profile_dir" || ! -O "$profile_dir" || -L "$profile_dir" ||
+        -e "$profile_dir/timings.tsv" || -e "$profile_dir/report.json" ]]; then
+    echo 'FAIL unauthorized profiling-only invocation'; exit 1
+  fi
+  foundation_profile=true
+  source ops/ordinary_profile.sh
+  profile_checkpoint controller:start
+elif [[ "${CP_FOUNDATION_MODE:-}" = full ]]; then
   if [[ "$1" != integration || "$foundation_lane" = standard || -z "${CP_FOUNDATION_RECEIPT_PATH:-}" || "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false || -n "${CP_T133_SHA:-}" ]]; then
     echo 'FAIL full Foundation lane invocation'; exit 1
   fi
@@ -377,6 +403,7 @@ mkdir -m 0700 "$private"
 cleanup() {
   local code=$? cleanup_failed=0
   trap - EXIT
+  profile_checkpoint cleanup:start || cleanup_failed=1
   if [[ -n "${host_pid:-}" ]]; then
     kill -TERM "$host_pid" 2>/dev/null || true
     if ! wait "$host_pid"; then
@@ -396,7 +423,7 @@ cleanup() {
     if ! rm -rf -- "$private" || test -e "$private"; then
       echo 'FAIL synthetic secret cleanup'; cleanup_failed=1
     fi
-    if [ "$foundation_full" = true ] || [ "${CP_B04_SPIKE:-false}" = true ]; then
+    if [ "$foundation_full" = true ] || [ "$foundation_profile" = true ] || [ "${CP_B04_SPIKE:-false}" = true ]; then
       local project remaining
       for project in "$CP_CI_PROJECT" "carepulse-ci-${GITHUB_RUN_ID}-0${GITHUB_RUN_ATTEMPT}"; do
         for resource in containers volumes networks; do
@@ -416,6 +443,11 @@ cleanup() {
     fi
   else
     echo 'FAIL unsafe cleanup project'; code=1
+  fi
+  profile_checkpoint cleanup:end || cleanup_failed=1
+  if [ "$cleanup_failed" = 1 ]; then code=1; fi
+  if [ "$code" -eq 0 ] && [ "$foundation_profile" = true ]; then
+    test "$foundation_coverage_verified" = true && test "$foundation_tests" = 1051 && test ! -e "$private" || code=1
   fi
   if [ "$code" -eq 0 ] && [ "$foundation_full" = true ]; then
     if [[ "$foundation_coverage_verified" != true || "$foundation_tests" -le 0 || -e "$private" ]]; then
@@ -448,6 +480,7 @@ chmod 0444 "$CP_DELIVERY_PRIVATE_KEY_SOURCE_FILE" "$CP_DELIVERY_PUBLIC_KEY_SOURC
 docker compose --profile mail --profile scan --profile test --profile sender --profile operator config --quiet
 docker compose --profile mail --profile scan --profile test --profile sender --profile operator config --format json > "$private/compose.json"
 chmod 0444 "$private/compose.json"
+profile_checkpoint pulls:start
 for image in \
   'node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205' \
   'python:3.13.16-slim-bookworm@sha256:73aa5faee130c60da030e105ec971ccf57473fbd22ce73bd6fc9ba99a40b838d' \
@@ -463,11 +496,15 @@ do
   test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = linux/amd64
   docker image inspect --format '{{json .RepoDigests}} {{.Id}} {{.Os}}/{{.Architecture}}' "$image"
 done
+profile_checkpoint pulls:end
+profile_checkpoint build:start
 if [ -n "$focused_target" ] || [ "$foundation_lane" = historical ]; then
   docker compose --profile test build --pull test
 else
   docker compose --profile test --profile sender --profile operator build --pull
 fi
+profile_checkpoint build:end
+profile_checkpoint database_ready:start
 docker compose up -d --no-build db
 for attempt in $(seq 1 40); do
   # TCP readiness excludes the temporary Unix-socket-only bootstrap server.
@@ -475,6 +512,8 @@ for attempt in $(seq 1 40); do
   if [ "$attempt" = 40 ]; then echo 'FAIL disposable database startup'; exit 1; fi
   sleep 2
 done
+profile_checkpoint database_ready:end
+profile_checkpoint role_bootstrap:start
 export CP_MIGRATION_PASSWORD="$(cat "$CP_MIGRATION_SECRET_FILE")"
 export CP_RUNTIME_PASSWORD="$(cat "$CP_RUNTIME_DB_PASSWORD_FILE")"
 export CP_API_DB_PASSWORD="$(cat "$CP_API_DB_PASSWORD_SOURCE_FILE")"
@@ -490,6 +529,7 @@ if ! docker compose exec -T -e CP_MIGRATION_PASSWORD -e CP_RUNTIME_PASSWORD -e C
   echo "FAIL controlled roles (${roles_error:-SQLSTATE unavailable}; credential-bearing diagnostics withheld)"; exit 1
 fi
 unset CP_MIGRATION_PASSWORD CP_RUNTIME_PASSWORD CP_AUTH_DB_PASSWORD CP_OPERATOR_PASSWORD CP_SENDER_PASSWORD CP_API_DB_PASSWORD CP_WEB_DB_PASSWORD CP_WORKER_DB_PASSWORD CP_GATE_DB_PASSWORD
+profile_checkpoint role_bootstrap:end
 identity_fixture_args=(
   -e CP_DB_IDENTITY_KEY_ID
   -v "$CP_DB_IDENTITY_KEY_SOURCE_FILE:/run/secrets/db_identity_key:ro"
@@ -824,8 +864,16 @@ if [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; then
   ordinary_day_review_migration_files=()
 fi
 
+profile_checkpoint migration:start
 upgrade_head
+profile_checkpoint migration:end
+if [ "$foundation_profile" = true ]; then
+  profile_head="$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')"
+  test "$profile_head" = 0056_b14_target_binding
+fi
+profile_checkpoint identity_seed:start
 seed_identity_policy
+profile_checkpoint identity_seed:end
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/foundation-results:/tmp/foundation-results:rw" \
@@ -978,6 +1026,7 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b05-backend.log"; then
   echo 'FAIL mandatory B-05 backend evidence skipped'; exit 1
 fi
+profile_checkpoint service_startup:start
 docker compose up -d --no-build db api worker web
 for attempt in $(seq 1 40); do
   if curl --silent --show-error --fail --max-time 2 http://127.0.0.1:3000/ > /dev/null 2>&1; then break; fi
@@ -985,6 +1034,7 @@ for attempt in $(seq 1 40); do
   sleep 2
 done
 echo 'PASS runner-host web http://127.0.0.1:3000/'
+profile_checkpoint service_startup:end
 timeout 60s docker compose exec -T web node --experimental-strip-types --input-type=module <<'NODE'
 import { getSchema } from 'better-auth/db';
 import { getMigrations } from 'better-auth/db/migration';
@@ -1282,7 +1332,9 @@ if [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] 
     echo 'FAIL mandatory Wave 3 authenticated BFF evidence skipped'; exit 1
   fi
 fi
+profile_checkpoint web-ingress:start
 docker compose exec -T web node --no-warnings --experimental-strip-types --test --test-reporter=tap auth/ingress.test.mjs | tee "$private/foundation-results/web-ingress.tap"
+profile_checkpoint web-ingress:end
 echo 'PASS verified source separation, spoof resistance and sole Web listener'
 # The sender target alone has Node, Mailpit access, and the private delivery key.
 # Migration credentials are mounted ONLY into the disposable test invocation.
@@ -1360,13 +1412,17 @@ docker compose --profile test run --rm --no-deps -T \
 if ! grep -Eq '^http://127\.0\.0\.1:3000/auth/invite-accept#' "$private/invite-link"; then
   echo 'FAIL private Mailpit invitation artifact'; exit 1
 fi
+profile_checkpoint owner-invite:start
 CP_INVITE_LINK_FILE="$private/invite-link" CP_INVITE_OWNER_EMAIL=first-owner@example.invalid \
   PLAYWRIGHT_JUNIT_OUTPUT_FILE="$private/foundation-results/owner-invite.xml" \
   pnpm --filter @carepulse/web test:owner-invite --reporter=line,junit
+profile_checkpoint owner-invite:end
 echo 'PASS real restricted operator, post-commit one-shot sender and browser Owner activation/login'
+profile_checkpoint web-adapter:start
 docker compose exec -T -e CI=true -e CP_CI_PROJECT="$CP_CI_PROJECT" \
   -e CP_ADAPTER_TEST_CLINIC="$clinic_id" web \
   node --no-warnings --experimental-strip-types --test --test-reporter=tap auth/postgres-adapter.integration.test.ts | tee "$private/foundation-results/web-adapter.tap"
+profile_checkpoint web-adapter:end
 echo 'PASS real PostgreSQL Stage-1 Better Auth adapter parity and transaction isolation'
 docker compose logs --no-color api > "$private/auth-logs"
 if grep -Fq '__foundation_bff_must_not_forward__' "$private/auth-logs"; then
@@ -1419,7 +1475,7 @@ if not all(marker in text for marker in ('T133 ACL DURING:', 'T133 ACL AFTER:', 
     raise SystemExit('FAIL incomplete protected T133 evidence')
 PY
 fi
-if [ "$foundation_full" = true ] || [ "${CP_B04_SPIKE:-false}" = true ]; then
+if [ "$foundation_full" = true ] || [ "$foundation_profile" = true ] || [ "${CP_B04_SPIKE:-false}" = true ]; then
   foundation_tests="$(python3 - "$private/foundation-results" "$health_case_count" "$foundation_lane" <<'PY'
 import re
 import sys
@@ -1473,6 +1529,16 @@ PY
   test "$foundation_tests" -gt 0
   foundation_coverage_verified=true
 fi
+if [ "$foundation_profile" = true ]; then
+  test "$foundation_tests" = 1051
+  python3 -m ops.profile_ordinary_report collect "$private/foundation-results" "$profile_dir/report.json" "$profile_variant" "$profile_head"
+  profile_checkpoint controller:validated
+  if grep -aF -f "$private/canaries" "$profile_dir/report.json" "$profile_dir/timings.tsv" > /dev/null; then
+    echo 'FAIL synthetic key in profiling evidence'; exit 1
+  else
+    code=$?; if [ "$code" -ne 1 ]; then echo 'FAIL profiling evidence scan error'; exit 1; fi
+  fi
+else
 {
   echo '### Provisional Wave 0 and Wave 1 D-01/D-02 lane checks (before scoped cleanup)'
   echo "- Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT}, SHA ${GITHUB_SHA})"
@@ -1490,6 +1556,7 @@ fi
   echo '- B-03 restricted operator and owner activation, separate committed sender and real Playwright invite/login: passed'
   echo '- Synthetic development only; production and later Waves remain closed'
 } >> "$GITHUB_STEP_SUMMARY"
+fi
 '@
             & bash -e -c $integration -- $Check
             if ($LASTEXITCODE -ne 0) { throw "Integration failed (exit $LASTEXITCODE)" }

@@ -1,93 +1,52 @@
-name: Foundation
-run-name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && format('Foundation Diagnostic — {0}', inputs.postgres_diagnostic) || '' }}
+# Temporary branch-only dispatch entry point. Never merge into development.
+name: Ordinary Profiling Experiment (NOT ACCEPTANCE)
+run-name: Ordinary profiling only — ${{ github.sha }}
 
 on:
-  push:
-    branches: [development]
-  pull_request:
   workflow_dispatch:
     inputs:
-      b04_spike:
-        description: Run the isolated Issue 7 adapter feasibility experiment
-        type: boolean
-        default: false
-      t133_terminal:
-        description: Disposable synthetic T133 PostgreSQL terminal acceptance (SEC-26-CI-01)
-        type: boolean
-        default: false
-      t133_sha:
-        description: Exact 40-character commit SHA authorized for T133
+      expected_sha:
+        description: Exact independently reviewed profiling candidate SHA
         type: string
-        default: ''
-      postgres_diagnostic:
-        description: Focused PostgreSQL diagnostics (full is required for acceptance)
-        type: choice
-        default: full
-        options:
-          - full
-          - authorization-lock
-          - booking-races
-          - followup-races
-          - f01-cleanup
-          - f01-followup-lock
-          - f01-visit-lock
-          - f01-followup-context
-          - f01-pricing
-          - f01-pricing-races
-          - w3-checkin
-          - w3-checkin-races
-          - w3-receipt-boundary
-          - w3-queue-scope
-          - w3-intake
-          - w3-intake-races
-          - w3-admission-controls
-          - w3-admission-confirmations
-          - w3-migration
-          - compat-us1
-          - compat-us2
-          - compat-us3
+        required: true
 
-# Cancel superseded PR/push checks and duplicate manual runs of the same SHA/mode.
-# Keep manual runs for different commits and spike modes independent.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.sha || 'branch' }}-${{ inputs.b04_spike && 'spike' || 'standard' }}-${{ inputs.t133_terminal && 't133' || 'ordinary' }}-${{ inputs.postgres_diagnostic || 'full' }}
-  cancel-in-progress: true
+  group: ordinary-profiling-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  inputs-and-build:
-    name: inputs-and-build
+  profiling-preflight:
+    name: Profiling preflight (NOT ACCEPTANCE)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
-    outputs:
-      mode: ${{ steps.request.outputs.mode }}
-      matrix: ${{ steps.request.outputs.matrix }}
-      candidate_sha: ${{ steps.request.outputs.candidate_sha }}
-      run_id: ${{ steps.request.outputs.run_id }}
-      attempt: ${{ steps.request.outputs.attempt }}
-      repository: ${{ steps.request.outputs.repository }}
-      workflow: ${{ steps.request.outputs.workflow }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
 
-      - name: Validate and normalize Foundation request
-        id: request
+      - name: Require manually authorized profiling SHA and frozen baseline
         shell: bash
         env:
-          INPUT_POSTGRES_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
-          INPUT_B04_SPIKE: ${{ inputs.b04_spike }}
-          INPUT_T133_TERMINAL: ${{ inputs.t133_terminal }}
-          INPUT_T133_SHA: ${{ inputs.t133_sha }}
+          EXPECTED_PROFILE_SHA: ${{ inputs.expected_sha }}
         run: |
           set -euo pipefail
-          python3 -m ops.foundation_acceptance validate-request
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = ahmedali5696/care-pulse-3
+          test "$GITHUB_REF" = refs/heads/feature/ci-scalability
+          test "$GITHUB_WORKFLOW" = 'Ordinary Profiling Experiment (NOT ACCEPTANCE)'
+          test "$GITHUB_WORKFLOW_REF" = 'ahmedali5696/care-pulse-3/.github/workflows/foundation.yml@refs/heads/feature/ci-scalability'
+          [[ "$EXPECTED_PROFILE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_PROFILE_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = 0c325ce80a999b79f7e442b39c4b0ecbc55fea9d
+          test -z "$(git status --porcelain)"
+          echo 'PROFILING ONLY — NOT FULL FOUNDATION ACCEPTANCE'
 
       - name: Verify runner and install pinned PowerShell 7
-        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -105,7 +64,6 @@ jobs:
       # The release archive contains all Python bootstrap bytes, including
       # ensurepip. Do not execute its setup.sh (which upgrades pip unpinned).
       - name: Install SHA-256 verified prebuilt CPython 3.13.16
-        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -134,14 +92,12 @@ jobs:
 
       # Cached wheels still pass pip's required SHA-256 checks on installation.
       - name: Cache pip downloads for exact approved lock
-        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pip
           key: foundation-ubuntu24-x64-python3.13.16-pip26.2.2-${{ hashFiles('requirements.lock') }}
 
       - name: Secure installer bootstrap and frozen dependencies
-        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -161,59 +117,72 @@ jobs:
       # Cache the content-addressed store, never node_modules or an installed environment.
       # Frozen pnpm install and approved-lock fingerprint checks remain mandatory.
       - name: Cache pnpm store for exact approved lock
-        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/pnpm/store
           key: foundation-ubuntu24-x64-node24.22.1-pnpm10.34.7-${{ hashFiles('pnpm-lock.yaml') }}
 
-      - name: Common pinned inputs, quality, unit, imports and web gates
-        if: ${{ steps.request.outputs.mode != 'postgres-diagnostic' }}
-        shell: pwsh
+      - name: Check unchanged common gates privately
+        shell: bash
         run: |
-          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
-          foreach ($check in @('inputs', 'python-quality', 'unit', 'imports', 'web')) {
-            & pwsh -NoProfile -File ops/check.ps1 $check
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          set -euo pipefail
+          umask 077
+          private="$RUNNER_TEMP/ordinary-profile-preflight"
+          test ! -e "$private"
+          mkdir -m 0700 "$private"
+          trap 'status=$?; rm -rf -- "$private" && test ! -e "$private" || status=1; exit "$status"' EXIT
+          export RUNNER_TEMP="$private"
+          for check in inputs python-quality unit imports web; do
+            if pwsh -NoProfile -File ops/check.ps1 "$check" > "$private/$check.log" 2>&1; then
+              printf 'Profiling preflight %s passed\n' "$check"
+            else
+              status=$?
+              printf 'FAIL profiling preflight %s (exit %s; output withheld)\n' "$check" "$status"
+              exit "$status"
+            fi
+          done
 
-  compose-integration:
-    name: ${{ matrix.lane == 'standard' && format('{0} integration', needs.inputs-and-build.outputs.mode) || format('Full Foundation {0}', matrix.lane) }}
-    needs: inputs-and-build
-    if: ${{ needs.inputs-and-build.result == 'success' }}
+  profiling-ordinary:
+    name: Ordinary ${{ matrix.variant }} profiling only (NOT ACCEPTANCE)
+    needs: profiling-preflight
     strategy:
       fail-fast: false
       matrix:
-        lane: ${{ fromJSON(needs.inputs-and-build.outputs.matrix) }}
+        variant: [control, instrumented]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
-      CP_B04_SPIKE: ${{ inputs.b04_spike || false }}
-      CP_T133_MODE: ${{ inputs.t133_terminal || false }}
-      CP_T133_SHA: ${{ inputs.t133_sha || '' }}
-      CP_FOUNDATION_LANE: ${{ matrix.lane }}
-      CP_FOUNDATION_MODE: ${{ needs.inputs-and-build.outputs.mode }}
-      CP_FOUNDATION_RECEIPT_PATH: ${{ github.workspace }}/foundation-full-receipt.json
-      COMPOSE_PROJECT_NAME: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.lane == 'ordinary' && '1' || matrix.lane == 'historical' && '2' || '3') }}
-      CP_CI_PROJECT: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.lane == 'ordinary' && '1' || matrix.lane == 'historical' && '2' || '3') }}
+      CP_B04_SPIKE: 'false'
+      CP_T133_MODE: 'false'
+      CP_FOUNDATION_MODE: ordinary-profile
+      CP_FOUNDATION_LANE: ordinary
+      CP_ORDINARY_PROFILE_VARIANT: ${{ matrix.variant }}
+      CP_ORDINARY_PROFILE_SHA: ${{ inputs.expected_sha }}
+      COMPOSE_PROJECT_NAME: ${{ format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.variant == 'control' && '4' || '5') }}
+      CP_CI_PROJECT: ${{ format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, matrix.variant == 'control' && '4' || '5') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
 
-      - name: Verify normalized lane and exact tested SHA
+      - name: Require manually authorized profiling SHA and frozen baseline
         shell: bash
         env:
-          CANDIDATE_SHA: ${{ needs.inputs-and-build.outputs.candidate_sha }}
+          EXPECTED_PROFILE_SHA: ${{ inputs.expected_sha }}
         run: |
           set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = ahmedali5696/care-pulse-3
+          test "$GITHUB_REF" = refs/heads/feature/ci-scalability
+          test "$GITHUB_WORKFLOW" = 'Ordinary Profiling Experiment (NOT ACCEPTANCE)'
+          test "$GITHUB_WORKFLOW_REF" = 'ahmedali5696/care-pulse-3/.github/workflows/foundation.yml@refs/heads/feature/ci-scalability'
+          [[ "$EXPECTED_PROFILE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_PROFILE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$CANDIDATE_SHA" = "$GITHUB_SHA"
-          case "$CP_FOUNDATION_MODE:$CP_FOUNDATION_LANE" in
-            full:ordinary|full:historical|full:compat|postgres-diagnostic:standard|compat-diagnostic:standard|b04-spike:standard|t133:standard) ;;
-            *) echo 'FAIL invalid normalized mode/lane combination'; exit 1 ;;
-          esac
-          test "$CP_CI_PROJECT" = "$COMPOSE_PROJECT_NAME"
+          test "$(git rev-parse HEAD^)" = 0c325ce80a999b79f7e442b39c4b0ecbc55fea9d
+          test -z "$(git status --porcelain)"
+          echo 'PROFILING ONLY — NOT FULL FOUNDATION ACCEPTANCE'
 
       - name: Set runner-scoped synthetic secret paths and environment
         shell: bash
@@ -315,7 +284,6 @@ jobs:
           test "$(dpkg-query -W -f='${Version}' docker-buildx-plugin)" = '0.38.1-1~ubuntu.24.04~noble'
 
       - name: Install pinned Playwright browser on disposable runner
-        if: ${{ matrix.lane == 'ordinary' || (matrix.lane == 'standard' && (needs.inputs-and-build.outputs.mode == 'b04-spike' || needs.inputs-and-build.outputs.mode == 't133')) }}
         shell: bash
         run: |
           set -euo pipefail
@@ -329,107 +297,49 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --filter @carepulse/web exec playwright install --with-deps chromium
 
-      - name: Disposable PostgreSQL, signed Patient API, invited-role acceptance and scoped cleanup
-        if: ${{ matrix.lane == 'ordinary' || matrix.lane == 'historical' || (matrix.lane == 'standard' && (needs.inputs-and-build.outputs.mode == 'b04-spike' || needs.inputs-and-build.outputs.mode == 't133')) }}
-        shell: pwsh
+      - name: Run the complete Ordinary sequence with private output
+        shell: bash
         run: |
-          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
-          & pwsh -NoProfile -File ops/check.ps1 integration
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          set -euo pipefail
+          umask 077
+          private="$RUNNER_TEMP/ordinary-profile-private"
+          output="$RUNNER_TEMP/ordinary-profile-timing.json"
+          test ! -e "$private" && test ! -e "$output"
+          mkdir -m 0700 "$private"
+          finish() {
+            local status=$?
+            trap - EXIT
+            if [[ -d "$private" && -O "$private" && ! -L "$private" ]]; then
+              rm -rf -- "$private" && test ! -e "$private" || status=1
+            else
+              status=1
+            fi
+            if [ "$status" -ne 0 ]; then
+              rm -f -- "$output"
+              echo 'FAIL profiling-only run or cleanup; raw output withheld'
+            fi
+            exit "$status"
+          }
+          trap finish EXIT
+          export GITHUB_STEP_SUMMARY="$private/step-summary"
+          test "$(pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')" = 7.6.7
+          if pwsh -NoProfile -File ops/check.ps1 integration > "$private/controller.log" 2>&1; then
+            python3 -m ops.profile_ordinary_report publish "$private" "$output" > "$private/publish.log" 2>&1
+          else
+            status=$?
+            printf 'FAIL Ordinary profiling controller (exit %s; private output withheld)\n' "$status"
+            exit "$status"
+          fi
+          test -f "$output" && test ! -L "$output"
+          test ! -e "$RUNNER_TEMP/foundation-ci-private"
+          echo 'Profiling-only evidence validated after scoped cleanup; 1051 mandatory cases, zero skips'
 
-      - name: Mandatory source 0040 to candidate 0046 compatibility, recovery and preserved-data acceptance
-        if: ${{ matrix.lane == 'compat' }}
-        shell: pwsh
-        env:
-          CP_COMPAT_DIAGNOSTIC: compat-full
-        run: |
-          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
-          & pwsh -NoProfile -File ops/check.ps1 compat-full
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Focused disposable PostgreSQL diagnostics and scoped cleanup
-        if: ${{ matrix.lane == 'standard' && needs.inputs-and-build.outputs.mode == 'postgres-diagnostic' }}
-        shell: pwsh
-        env:
-          CP_POSTGRES_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
-        run: |
-          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
-          & pwsh -NoProfile -File ops/check.ps1 integration-diagnostic
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Compatibility diagnostics (PRE-W3-COMPAT) and scoped cleanup
-        if: ${{ matrix.lane == 'standard' && needs.inputs-and-build.outputs.mode == 'compat-diagnostic' }}
-        shell: pwsh
-        env:
-          CP_COMPAT_DIAGNOSTIC: ${{ inputs.postgres_diagnostic }}
-        run: |
-          if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
-          & pwsh -NoProfile -File ops/check.ps1 compat-diagnostic
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Upload post-cleanup Full Foundation lane receipt
-        if: ${{ matrix.lane != 'standard' && success() }}
+      - name: Upload sanitized profiling timing only
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, Node.js 24
         with:
-          name: foundation-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.lane }}
-          path: foundation-full-receipt.json
+          name: ordinary-profile-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: ${{ runner.temp }}/ordinary-profile-timing.json
           archive: true
           overwrite: false
           include-hidden-files: false
           if-no-files-found: error
-
-  full-foundation-acceptance:
-    name: ${{ needs.inputs-and-build.outputs.mode != '' && needs.inputs-and-build.outputs.mode != 'full' && format('{0} result (NOT Full Foundation acceptance)', needs.inputs-and-build.outputs.mode) || 'Full Foundation acceptance' }}
-    if: ${{ always() }}
-    needs: [inputs-and-build, compose-integration]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    env:
-      NORMALIZED_MODE: ${{ needs.inputs-and-build.outputs.mode }}
-      CANDIDATE_SHA: ${{ needs.inputs-and-build.outputs.candidate_sha }}
-      COMMON_RUN_ID: ${{ needs.inputs-and-build.outputs.run_id }}
-      COMMON_ATTEMPT: ${{ needs.inputs-and-build.outputs.attempt }}
-      COMMON_REPOSITORY: ${{ needs.inputs-and-build.outputs.repository }}
-      COMMON_WORKFLOW: ${{ needs.inputs-and-build.outputs.workflow }}
-      INPUT_RESULT: ${{ needs.inputs-and-build.result }}
-      LANES_RESULT: ${{ needs.compose-integration.result }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Reject missing mode, failed dependencies and stale common results
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$INPUT_RESULT" = success
-          test "$LANES_RESULT" = success
-          test "$CANDIDATE_SHA" = "$GITHUB_SHA"
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$COMMON_RUN_ID" = "$GITHUB_RUN_ID"
-          test "$COMMON_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
-          test "$COMMON_REPOSITORY" = "$GITHUB_REPOSITORY"
-          test "$COMMON_WORKFLOW" = "$GITHUB_WORKFLOW_REF"
-          case "$NORMALIZED_MODE" in
-            full) ;;
-            postgres-diagnostic|compat-diagnostic|b04-spike|t133)
-              echo "NON_FULL_RESULT mode=$NORMALIZED_MODE sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT"
-              exit 0 ;;
-            *) echo 'FAIL invalid or missing normalized mode'; exit 1 ;;
-          esac
-
-      - name: Retrieve this attempt's three mandatory receipts with strict digest verification
-        if: ${{ env.NORMALIZED_MODE == 'full' }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, Node.js 24
-        with:
-          pattern: foundation-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-*
-          path: foundation-evidence
-          merge-multiple: false
-          digest-mismatch: error
-
-      - name: Validate all Full Foundation receipts and issue final acceptance
-        if: ${{ env.NORMALIZED_MODE == 'full' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m ops.foundation_acceptance aggregate foundation-evidence

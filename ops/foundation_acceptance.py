@@ -101,6 +101,12 @@ def github_context(env: dict[str, str]) -> dict:
     attempt = _require(env, "GITHUB_RUN_ATTEMPT", r"[1-9][0-9]*")
     repository = _require(env, "GITHUB_REPOSITORY", r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
     workflow = env.get("GITHUB_WORKFLOW_REF", "")
+    if (
+        ref == "refs/heads/feature/ci-scalability"
+        or env.get("GITHUB_HEAD_REF") == "feature/ci-scalability"
+        or env.get("GITHUB_WORKFLOW") == "Ordinary Profiling Experiment (NOT ACCEPTANCE)"
+    ):
+        raise ValueError("profiling-only experiment cannot issue Foundation acceptance")
     workflow_prefix = f"{repository}/.github/workflows/foundation.yml@"
     if not workflow.startswith(workflow_prefix):
         raise ValueError("unverified Foundation workflow identity")
