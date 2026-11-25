@@ -1,12 +1,19 @@
 """T028: actual signed B-15 admission, evidence and authority boundaries."""
 
+import json
+from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from uuid import UUID, uuid4
 
 import pytest
+from carepulse.identity.authorization import protected_transaction
+from carepulse.identity.contracts import ContractError
 from carepulse.main import app
-from runtime_identity_fixture import signed_test_transaction
+from carepulse.queue.admission_contracts import AdmitCommand
+from carepulse.queue.admit import recover_admission
+from runtime_identity_fixture import registered_test_request, signed_test_transaction
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from test_booking import booking_clinic as booking_clinic  # noqa: PLC0414
@@ -562,3 +569,199 @@ def test_signed_database_admission_and_http_replay(booking_clinic):
     assert status == 200
     assert reply["data"] == result["projection"]
     assert admission_effects(clinic) == after
+
+
+@pytest.mark.parametrize("disable_reenable", [False, True])
+def test_admission_rejects_stale_issuer_with_otherwise_current_guards(
+    booking_clinic, disable_reenable
+):
+    clinic = booking_clinic
+    _success(clinic, clinic.owner, "capacity", body=_capacity_body(clinic, 2))
+    first = waiting_case(clinic, lane="EMERGENCY")
+    _admit(clinic, clinic.owner, admit_body(clinic, first))
+    _success(clinic, clinic.owner, "mode", body=_mode_body(clinic, "RECEPTIONIST"))
+    target = waiting_case(clinic)
+    issued = _issue(clinic, target)
+    actor = clinic.receptionist
+    status, usable = control_request(clinic, actor, "usable", query=_query(target))
+    assert status == 200 and usable["data"]["id"] == issued["id"]
+    body = admit_body(clinic, target, confirmation_id=issued["id"])
+    before = admission_effects(clinic)
+    fields = {"tenant": clinic.tenant, "doctor": UUID(clinic.owner.staff_id)}
+    if disable_reenable:
+        with clinic.migration.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE public.organizations SET state='SUSPENDED' WHERE id=:tenant"
+                ),
+                fields,
+            )
+            connection.execute(
+                text(
+                    "UPDATE public.staff_accounts SET enabled=false,security_revision=security_revision+1 WHERE organization_id=:tenant AND id=:doctor"
+                ),
+                fields,
+            )
+    session = f"synthetic-b15-new-owner-{uuid4()}"
+    with clinic.migration.begin() as connection:
+        revision = connection.scalar(
+            text(
+                "UPDATE public.staff_accounts SET enabled=true,security_revision=security_revision+1 WHERE organization_id=:tenant AND id=:doctor RETURNING security_revision"
+            ),
+            fields,
+        )
+        if disable_reenable:
+            connection.execute(
+                text("UPDATE public.organizations SET state='ACTIVE' WHERE id=:tenant"),
+                fields,
+            )
+        connection.execute(
+            text("""
+            INSERT INTO public."session" (id,"userId",token,"expiresAt","createdAt","updatedAt",
+                "securityRevision","absoluteDeadline","lastActivity")
+            SELECT :session,auth_user_id,:token,now()+interval '1 hour',now(),now(),
+                security_revision,now()+interval '1 hour',now()
+            FROM public.staff_accounts WHERE organization_id=:tenant AND id=:doctor
+        """),
+            {**fields, "session": session, "token": str(uuid4())},
+        )
+    assert revision == int(clinic.owner.security_revision) + (
+        2 if disable_reenable else 1
+    )
+    clinic.owner = replace(
+        clinic.owner, session_id=session, security_revision=str(revision)
+    )
+    assert admission_effects(clinic) == before
+    assert admit_body(clinic, target, confirmation_id=issued["id"]) == body
+    with clinic.migration.connect() as connection:
+        assert (
+            connection.scalar(
+                text("""
+                SELECT state='ISSUED' AND expires_at>clock_timestamp()
+                    AND issuer_security_revision<>:revision
+                FROM public.doctor_admission_confirmations
+                WHERE organization_id=:tenant AND id=:id
+            """),
+                {
+                    "tenant": clinic.tenant,
+                    "id": UUID(issued["id"]),
+                    "revision": revision,
+                },
+            )
+            is True
+        )
+    _deny(clinic, actor, body, 409)
+    fresh = _issue(clinic, target)
+    assert fresh["id"] != issued["id"]
+    _admit(clinic, actor, {**body, "confirmation_id": fresh["id"]})
+    confirmations = admission_effects(clinic)["doctor_admission_confirmations"]
+    assert {row["id"]: row["state"] for row in confirmations} == {
+        issued["id"]: "ISSUED",
+        fresh["id"]: "CONSUMED",
+    }
+
+
+@contextmanager
+def _aborted_admission_request(clinic, actor, body, key):
+    raw = json.dumps(body, separators=(",", ":")).encode()
+    identity = replace(
+        actor,
+        method="POST",
+        path="/v1/queue/admit",
+        purpose="QUEUE_ADMIT",
+        query="",
+        body_sha256=sha256(raw).hexdigest(),
+        timestamp=str(int(datetime.now(UTC).timestamp() * 1000)),
+        nonce=f"synthetic_{uuid4().hex}",
+        idempotency_key=key,
+    )
+    with registered_test_request(clinic, identity, raw):
+        with (
+            pytest.raises(RuntimeError, match="synthetic rollback"),
+            protected_transaction(
+                clinic.runtime, identity, clinic.config.policy.session_idle_minutes
+            ),
+        ):
+            raise RuntimeError("synthetic rollback")
+        yield identity
+
+
+def _recover(clinic, identity, body, key):
+    with protected_transaction(
+        clinic.runtime,
+        identity,
+        clinic.config.policy.session_idle_minutes,
+        stage="RECEIPT_RECOVERY",
+    ) as (connection, actor):
+        assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+        return recover_admission(
+            connection, actor, AdmitCommand.model_validate(body), key
+        )
+
+
+def test_admission_receipt_recovery_and_target_authorization(booking_clinic):
+    clinic = booking_clinic
+    actor = clinic.receptionist
+    target, peer = waiting_case(clinic), waiting_case(clinic)
+    foreign, _ = _foreign_confirmation(clinic)
+    body = admit_body(clinic, target)
+    peer_body = admit_body(clinic, peer)
+    key = str(uuid4())
+    original = _admit(clinic, actor, body, key=key)
+    before = admission_effects(clinic)
+    foreign_before = admission_effects(clinic, tenant=clinic.other)
+    with _aborted_admission_request(clinic, actor, body, key) as identity:
+        assert _recover(clinic, identity, body, key) == (
+            original,
+            original["appointment_revision"],
+        )
+    for changed, expected, code in (
+        (peer_body, 409, "IDEMPOTENCY_CONFLICT"),
+        (
+            {
+                **body,
+                "appointment_id": foreign["appointment_id"],
+                "patient_id": foreign["patient_id"],
+                "date": foreign["service_date"],
+                "lane": foreign["lane"],
+            },
+            404,
+            None,
+        ),
+        ({**body, "appointment_id": str(uuid4())}, 404, None),
+    ):
+        _deny(clinic, actor, changed, expected, key=key)
+        with _aborted_admission_request(clinic, actor, changed, key) as identity:
+            with pytest.raises(ContractError) as denied:
+                _recover(clinic, identity, changed, key)
+            assert (denied.value.status_code, denied.value.code) == (expected, code)
+    assert admission_effects(clinic) == before
+    assert admission_effects(clinic, tenant=clinic.other) == foreign_before
+    # Even a registered request must recheck mode after its primary aborts.
+    with _aborted_admission_request(clinic, actor, body, key) as identity:
+        _success(clinic, clinic.owner, "mode", body=_mode_body(clinic, "DOCTOR"))
+        excluded = admission_effects(clinic)
+        with pytest.raises(ContractError) as denied:
+            _recover(clinic, identity, body, key)
+        assert denied.value.status_code == 403
+        _deny(clinic, actor, body, 403, key=key)
+        assert admission_effects(clinic) == excluded
+    _success(clinic, clinic.owner, "mode", body=_mode_body(clinic, "BOTH"))
+    before = admission_effects(clinic)
+    with _aborted_admission_request(clinic, actor, body, key) as identity:
+        assert _recover(clinic, identity, body, key) == (
+            original,
+            original["appointment_revision"],
+        )
+    assert admission_effects(clinic) == before
+    with _aborted_admission_request(clinic, actor, body, key) as identity:
+        with clinic.migration.begin() as connection:
+            connection.execute(
+                text('DELETE FROM public."session" WHERE id=:id'),
+                {"id": actor.session_id},
+            )
+        with pytest.raises(ContractError) as denied:
+            _recover(clinic, identity, body, key)
+        assert denied.value.status_code == 401
+    _deny(clinic, actor, body, 401, key=key)
+    assert admission_effects(clinic) == before
