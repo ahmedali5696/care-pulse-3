@@ -77,6 +77,9 @@ DIAGNOSTICS = {
     "w3-day-review",
     "w3-cutoff-races",
     "w3-migration",
+    "w3-migration-replay",
+    "w3-operation-boundaries",
+    "w3-boundary-security",
     "compat-us1",
     "compat-us2",
     "compat-us3",
@@ -390,7 +393,7 @@ def _publish_acceptance(env: dict[str, str]) -> None:
         f"- Repository/workflow: `{context['repository']}` / `{context['workflow']}`",
         f"- Run/attempt: `{context['run_id']}` / `{context['attempt']}`",
         (
-            f"- Ordinary ({ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15, B-13, B-16, B-17, B-18, B-19 and B-20): "
+            f"- Ordinary ({ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15, B-13, B-16, B-17, B-18, B-19 and B-20; T070-T071 cross-operation verification): "
             f"DB ({sum(inventory.REPORT_COUNTS['ordinary-db'].values())}), "
             f"stack ({sum(inventory.REPORT_COUNTS['ordinary-stack'].values())}); "
             "historical (163 at 0040), compatibility (44 Python + 11 Web, 0040 to 0046): verified"

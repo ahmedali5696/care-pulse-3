@@ -142,6 +142,9 @@ def test_request_classifies_full_and_exclusive_modes(env):
         "w3-day-review",
         "w3-cutoff-races",
         "w3-migration",
+        "w3-migration-replay",
+        "w3-operation-boundaries",
+        "w3-boundary-security",
     ],
 )
 def test_wave3_diagnostic_remains_isolated_from_full_acceptance(env, diagnostic):
@@ -482,7 +485,7 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
     assert f"sha={env['GITHUB_SHA']}" in output
     assert f"Tested github.sha: `{env['GITHUB_SHA']}`" in summary.read_text()
     assert (
-        f"Ordinary ({acceptance.ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15, B-13, B-16, B-17, B-18, B-19 and B-20)"
+        f"Ordinary ({acceptance.ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15, B-13, B-16, B-17, B-18, B-19 and B-20; T070-T071 cross-operation verification)"
         in summary.read_text()
     )
     assert "44 Python + 11 Web" in summary.read_text()
@@ -497,8 +500,8 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
 def test_current_inventory_has_exact_disjoint_ordinary_reports():
     db = inventory.REPORT_COUNTS["ordinary-db"]
     stack = inventory.REPORT_COUNTS["ordinary-stack"]
-    assert (sum(db.values()), sum(stack.values())) == (653, 611)
-    assert (len(db), len(stack)) == (25, 33)
+    assert (sum(db.values()), sum(stack.values())) == (662, 612)
+    assert (len(db), len(stack)) == (28, 33)
     assert (db["w3_queue_policy"], db["w3_placement_races"]) == (11, 4)
     assert (db["w3_visits"], db["w3_visit_races"], stack["w3_visit_bff"]) == (11, 10, 1)
     assert (
@@ -518,9 +521,15 @@ def test_current_inventory_has_exact_disjoint_ordinary_reports():
         db["w3_cutoff_races"],
         stack["w3_reconciliation_bff"],
     ) == (8, 6, 10, 3)
-    assert sum(len(counts) for counts in inventory.REPORT_COUNTS.values()) == 65
     assert (
-        sum(sum(counts.values()) for counts in inventory.REPORT_COUNTS.values()) == 1482
+        db["w3_migration"],
+        db["w3_operation_boundaries"],
+        db["w3_boundary_security"],
+        stack["web-ingress"],
+    ) == (1, 4, 4, 3)
+    assert sum(len(counts) for counts in inventory.REPORT_COUNTS.values()) == 68
+    assert (
+        sum(sum(counts.values()) for counts in inventory.REPORT_COUNTS.values()) == 1492
     )
     assert not db.keys() & stack.keys()
     assert not (
@@ -584,7 +593,7 @@ def test_exact_report_collection_rejects_incomplete_or_substituted_cases(
         "ordinary-stack",
         {
             "health-2": 1,
-            "web-ingress": 2,
+            "web-ingress": 3,
         },
     )
     junit = (
@@ -596,7 +605,8 @@ def test_exact_report_collection_rejects_incomplete_or_substituted_cases(
         "TAP version 13\n"
         "ok 1 - real TCP peers have independent login limits despite spoofed forwarding headers\n"
         "ok 2 - identity limit holds across distinct TCP peers\n"
-        "1..2\n# tests 2\n# pass 2\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n"
+        "ok 3 - Wave 3 ingress rejects forged staff identity across every protected operation\n"
+        "1..3\n# tests 3\n# pass 3\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n"
     )
     if change == "wrong-case":
         junit = junit.replace("test_running_service_state", "test_other")
@@ -612,7 +622,7 @@ def test_exact_report_collection_rejects_incomplete_or_substituted_cases(
     elif change == "tap-skipped":
         tap = tap.replace("# skipped 0", "# skipped 1")
     elif change == "tap-duplicate-summary":
-        tap += "# tests 2\n"
+        tap += "# tests 3\n"
     if change != "missing":
         filename = "unexpected.xml" if change == "wrong-name" else "health-2.xml"
         (tmp_path / filename).write_text(junit, encoding="utf-8")
@@ -620,7 +630,7 @@ def test_exact_report_collection_rejects_incomplete_or_substituted_cases(
         (tmp_path / "extra.xml").write_text(junit, encoding="utf-8")
     (tmp_path / "web-ingress.tap").write_text(tap, encoding="utf-8")
     if change is None:
-        assert inventory.collect("ordinary-stack", tmp_path)["total"] == 3
+        assert inventory.collect("ordinary-stack", tmp_path)["total"] == 4
     else:
         with pytest.raises(ValueError):
             inventory.collect("ordinary-stack", tmp_path)

@@ -59,6 +59,9 @@ on:
           - w3-day-review
           - w3-cutoff-races
           - w3-migration
+          - w3-migration-replay
+          - w3-operation-boundaries
+          - w3-boundary-security
           - compat-us1
           - compat-us2
           - compat-us3
