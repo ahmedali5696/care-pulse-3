@@ -3124,6 +3124,8 @@ def test_d08_adds_no_lifecycle_or_fixture_api_routes():
     }
     authorized_w3_appointment_routes = {
         ("POST", "/v1/appointments/{appointment_id}/check-in"),
+        ("POST", "/v1/appointments/{appointment_id}/cancel"),
+        ("POST", "/v1/appointments/{appointment_id}/replace-urgent"),
     }
     assert ("POST", "/v1/appointments") in route_set
     assert not any(
