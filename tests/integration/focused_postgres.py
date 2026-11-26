@@ -53,9 +53,10 @@ class Diagnostic:
                 and hasattr(item, "callspec")
             ):
                 case = item.callspec.params
-                if case.get("competitor") in ("admit", "reschedule", "archive") and type(
-                    case.get("bulk_first")
-                ) is bool:
+                if (
+                    case.get("competitor") in ("admit", "reschedule", "archive")
+                    and type(case.get("bulk_first")) is bool
+                ):
                     detail += (
                         f" | B19 case {case['competitor']}"
                         f" bulk_first={str(case['bulk_first']).lower()}"

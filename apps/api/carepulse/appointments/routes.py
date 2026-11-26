@@ -342,9 +342,12 @@ def post_bulk_reschedule_preview(
         raise ContractError(422)
     try:
         with _transaction(request, purpose="APPOINTMENT_BULK_PREVIEW") as (
-            connection, actor
+            connection,
+            actor,
         ):
-            projection, revision = preview_bulk_reschedule(connection, actor, command, key)
+            projection, revision = preview_bulk_reschedule(
+                connection, actor, command, key
+            )
             return success_response(projection, revision)
     except ReceiptConflict:
         with _transaction(
@@ -364,13 +367,18 @@ def post_bulk_reschedule_commit(
         raise ContractError(422)
     try:
         with _transaction(request, purpose="APPOINTMENT_BULK_COMMIT") as (
-            connection, actor
+            connection,
+            actor,
         ):
-            projection, revision = commit_bulk_reschedule(connection, actor, command, key)
+            projection, revision = commit_bulk_reschedule(
+                connection, actor, command, key
+            )
             return success_response(projection, revision)
     except ReceiptConflict:
         with _transaction(
             request, purpose="APPOINTMENT_BULK_COMMIT", stage="RECEIPT_RECOVERY"
         ) as (connection, actor):
-            projection, revision = recover_bulk_reschedule(connection, actor, command, key)
+            projection, revision = recover_bulk_reschedule(
+                connection, actor, command, key
+            )
             return success_response(projection, revision)

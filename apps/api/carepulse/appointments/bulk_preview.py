@@ -91,7 +91,9 @@ def joint_capacity_conflicts(
     for identifier, interval in candidates.items():
         candidate_starts[interval.starts_at].add(identifier)
         candidate_ends[interval.ends_at].add(identifier)
-    endpoints = sorted(existing_events.keys() | candidate_starts.keys() | candidate_ends.keys())
+    endpoints = sorted(
+        existing_events.keys() | candidate_starts.keys() | candidate_ends.keys()
+    )
     active: set[str] = set()
     conflicted: set[str] = set()
     existing_load = 0
@@ -128,7 +130,9 @@ def _destination_interval(row: dict, destination: date) -> Interval:
     )
 
 
-def _candidate_exclusion(row: dict, context: dict) -> tuple[str | None, Interval | None]:
+def _candidate_exclusion(
+    row: dict, context: dict
+) -> tuple[str | None, Interval | None]:
     if row["status"] not in ("Booked", "Waiting"):
         return "appointment not eligible", None
     if row["status"] == "Waiting" and not row.get("queue_active"):
@@ -168,7 +172,9 @@ def _candidate_exclusion(row: dict, context: dict) -> tuple[str | None, Interval
     return None, interval
 
 
-def _bound_reschedule_command(row: dict, interval: Interval | None, context: dict) -> dict:
+def _bound_reschedule_command(
+    row: dict, interval: Interval | None, context: dict
+) -> dict:
     command = {
         "service_date": context["destination"].isoformat(),
         "reason": context["reason"],
@@ -190,9 +196,9 @@ def _bound_reschedule_command(row: dict, interval: Interval | None, context: dic
             expected_followup_revision=row["followup_revision"],
             expected_authorization_revision=row["authorization_revision"],
         )
-        if row.get("extension_event_id") and context["destination"] > date.fromisoformat(
-            row["approved_deadline"]
-        ):
+        if row.get("extension_event_id") and context[
+            "destination"
+        ] > date.fromisoformat(row["approved_deadline"]):
             command["extension_event_id"] = row["extension_event_id"]
     return command
 
@@ -208,7 +214,9 @@ def _operational_row(row: dict, interval: Interval | None) -> dict:
     }
 
 
-def _existing_intervals(connection: Connection, tenant: UUID, destination: date) -> list[Interval]:
+def _existing_intervals(
+    connection: Connection, tenant: UUID, destination: date
+) -> list[Interval]:
     registered = current_request.get()
     if registered is None or registered.identity.purpose not in (
         _PREVIEW_PURPOSE,
@@ -216,9 +224,7 @@ def _existing_intervals(connection: Connection, tenant: UUID, destination: date)
     ):
         raise ContractError(403)
     operation = (
-        "preview"
-        if registered.identity.purpose == _PREVIEW_PURPOSE
-        else "commit"
+        "preview" if registered.identity.purpose == _PREVIEW_PURPOSE else "commit"
     )
     from sqlalchemy import text
 
@@ -233,14 +239,18 @@ def _existing_intervals(connection: Connection, tenant: UUID, destination: date)
     ]
 
 
-def evaluate_cohort(connection: Connection, actor: AuthorizedStaff, source: dict) -> dict:
+def evaluate_cohort(
+    connection: Connection, actor: AuthorizedStaff, source: dict
+) -> dict:
     """Derive partitions without reserving numbers or claiming destination capacity."""
     destination = date.fromisoformat(source["destination_date"])
     original = date.fromisoformat(source["original_service_date"])
     if destination == original:
         raise ContractError(409)
     rows = _call(connection, "SELECT public.f01_b19_rows()")
-    if not isinstance(rows, list) or {row["id"] for row in rows} != set(source["appointment_ids"]):
+    if not isinstance(rows, list) or {row["id"] for row in rows} != set(
+        source["appointment_ids"]
+    ):
         raise ContractError(404)
     if any(row["service_date"] != original.isoformat() for row in rows):
         raise ContractError(409)
@@ -260,7 +270,9 @@ def evaluate_cohort(connection: Connection, actor: AuthorizedStaff, source: dict
         },
         "capacity": capacity["capacity"] if schedule.allow_overlap else 1,
         "capacity_revision": capacity["revision"],
-        "schedule_revision": _schedule_head(connection, actor.organization_id)["revision"],
+        "schedule_revision": _schedule_head(connection, actor.organization_id)[
+            "revision"
+        ],
         "existing": _existing_intervals(connection, actor.organization_id, destination),
         "now": now,
     }
@@ -313,7 +325,10 @@ def evaluate_cohort(connection: Connection, actor: AuthorizedStaff, source: dict
 
 
 def preview_bulk_reschedule(
-    connection: Connection, actor: AuthorizedStaff, command: BulkPreviewCommand, key: str
+    connection: Connection,
+    actor: AuthorizedStaff,
+    command: BulkPreviewCommand,
+    key: str,
 ) -> tuple[dict, int]:
     _signed_identity(_PREVIEW_PURPOSE, key)
     if command.original_service_date == command.destination_date:
@@ -339,7 +354,10 @@ def preview_bulk_reschedule(
 
 
 def recover_bulk_preview(
-    connection: Connection, actor: AuthorizedStaff, command: BulkPreviewCommand, key: str
+    connection: Connection,
+    actor: AuthorizedStaff,
+    command: BulkPreviewCommand,
+    key: str,
 ) -> tuple[dict, int]:
     _signed_identity(_PREVIEW_PURPOSE, key)
     preview = _call(connection, "SELECT public.f01_b19_preview_replay()")
