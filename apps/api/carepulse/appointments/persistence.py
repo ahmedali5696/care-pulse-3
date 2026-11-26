@@ -61,7 +61,12 @@ def allocate_day_number(
 
 
 def insert_appointment_records(
-    connection: Connection, actor, draft: AppointmentDraft, number: int
+    connection: Connection,
+    actor,
+    draft: AppointmentDraft,
+    number: int,
+    *,
+    appointment_id: UUID | None = None,
 ) -> tuple[UUID, dict]:
     """Insert the numbered appointment, immutable price and initial history only."""
     frozen = validate_price_snapshot(draft.price_snapshot)
@@ -70,7 +75,7 @@ def insert_appointment_records(
         draft.classification,
     ):
         raise ValueError("Snapshot does not describe the appointment")
-    appointment_id, assignment_id = uuid4(), uuid4()
+    appointment_id, assignment_id = appointment_id or uuid4(), uuid4()
     connection.execute(
         insert(appointments).values(
             id=appointment_id,

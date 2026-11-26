@@ -132,6 +132,8 @@ def test_request_classifies_full_and_exclusive_modes(env):
         "w3-visits",
         "w3-visit-races",
         "w3-legacy-source",
+        "w3-cancel-replace",
+        "w3-cancel-replace-races",
         "w3-migration",
     ],
 )
@@ -473,7 +475,7 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
     assert f"sha={env['GITHUB_SHA']}" in output
     assert f"Tested github.sha: `{env['GITHUB_SHA']}`" in summary.read_text()
     assert (
-        f"Ordinary ({acceptance.ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15, B-13 and B-16)"
+        f"Ordinary ({acceptance.ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15, B-13, B-16 and B-17)"
         in summary.read_text()
     )
     assert "44 Python + 11 Web" in summary.read_text()
@@ -488,11 +490,16 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
 def test_current_inventory_has_exact_disjoint_ordinary_reports():
     db = inventory.REPORT_COUNTS["ordinary-db"]
     stack = inventory.REPORT_COUNTS["ordinary-stack"]
-    assert (sum(db.values()), sum(stack.values())) == (521, 606)
-    assert (len(db), len(stack)) == (16, 30)
+    assert (sum(db.values()), sum(stack.values())) == (541, 607)
+    assert (len(db), len(stack)) == (18, 31)
     assert (db["w3_queue_policy"], db["w3_placement_races"]) == (11, 4)
     assert (db["w3_visits"], db["w3_visit_races"], stack["w3_visit_bff"]) == (11, 10, 1)
-    assert sum(len(counts) for counts in inventory.REPORT_COUNTS.values()) == 53
+    assert (
+        db["w3_cancel_replace"],
+        db["w3_cancel_replace_races"],
+        stack["w3_cancel_replace_bff"],
+    ) == (6, 14, 1)
+    assert sum(len(counts) for counts in inventory.REPORT_COUNTS.values()) == 56
     assert not db.keys() & stack.keys()
     assert not (
         {inventory.EXPECTED_IDENTITY_DIGESTS[name] for name in db}

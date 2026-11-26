@@ -1,4 +1,4 @@
-"""B-09 signed booking and read-only operational appointment surfaces."""
+"""Signed booking, attendance and individual appointment operations."""
 
 import json
 from typing import Annotated
@@ -13,6 +13,12 @@ from carepulse.appointments.booking_contracts import (
     BookAppointment,
     FollowupPreviewQuery,
 )
+from carepulse.appointments.cancel import (
+    cancel_appointment,
+    recover_cancel_replace,
+    replace_urgent,
+)
+from carepulse.appointments.cancel_contracts import CancelAppointment, ReplaceUrgent
 from carepulse.appointments.queries import (
     appointment_detail,
     confirmed_followup_control,
@@ -189,3 +195,76 @@ def post_appointment_checkin(
                 connection, actor, appointment_id, command, key
             )
             return success_response(projection, revision)
+
+
+async def _change_body(
+    request: Request, schema: type[CancelAppointment] | type[ReplaceUrgent]
+):
+    try:
+        body = json.loads(
+            await request.body(),
+            object_pairs_hook=_unique_json_pairs,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+        )
+        return schema.model_validate(body)
+    except (ValueError, UnicodeError, ValidationError, RecursionError) as invalid:
+        raise ContractError(422) from invalid
+
+
+async def _cancel_body(request: Request) -> CancelAppointment:
+    return await _change_body(request, CancelAppointment)
+
+
+async def _replace_body(request: Request) -> ReplaceUrgent:
+    return await _change_body(request, ReplaceUrgent)
+
+
+def _change_appointment(
+    request: Request, appointment_id: UUID, command: CancelAppointment | ReplaceUrgent
+):
+    replacing = isinstance(command, ReplaceUrgent)
+    purpose = "APPOINTMENT_REPLACE_URGENT" if replacing else "APPOINTMENT_CANCEL"
+    execute = replace_urgent if replacing else cancel_appointment
+    identity = request.scope.get("carepulse.identity")
+    if identity is None or identity.purpose != purpose:
+        raise ContractError(403)
+    if replacing and identity.role != "RECEPTIONIST":
+        raise ContractError(403)
+    key = identity.idempotency_key
+    if not key:
+        raise ContractError(422)
+    try:
+        with _transaction(request, purpose=purpose) as (connection, actor):
+            projection, revision, created = execute(
+                connection, actor, appointment_id, command, key
+            )
+            return success_response(
+                projection, revision, status_code=201 if replacing and created else 200
+            )
+    except ReceiptConflict:
+        with _transaction(request, purpose=purpose, stage="RECEIPT_RECOVERY") as (
+            connection,
+            actor,
+        ):
+            projection, revision = recover_cancel_replace(
+                connection, actor, appointment_id, command, key
+            )
+            return success_response(projection, revision)
+
+
+@router.post("/{appointment_id}/cancel")
+def post_appointment_cancel(
+    appointment_id: UUID,
+    request: Request,
+    command: Annotated[CancelAppointment, Depends(_cancel_body)],
+):
+    return _change_appointment(request, appointment_id, command)
+
+
+@router.post("/{appointment_id}/replace-urgent")
+def post_appointment_replace_urgent(
+    appointment_id: UUID,
+    request: Request,
+    command: Annotated[ReplaceUrgent, Depends(_replace_body)],
+):
+    return _change_appointment(request, appointment_id, command)

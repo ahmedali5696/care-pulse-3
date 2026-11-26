@@ -151,6 +151,20 @@ app.add_middleware(
             "QUEUE_CHECK_IN",
         ),
         (
+            "POST",
+            compile(
+                r"/v1/appointments/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/cancel"
+            ),
+            "APPOINTMENT_CANCEL",
+        ),
+        (
+            "POST",
+            compile(
+                r"/v1/appointments/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/replace-urgent"
+            ),
+            "APPOINTMENT_REPLACE_URGENT",
+        ),
+        (
             "PATCH",
             compile(r"/v1/visits/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"),
             signed_visit_patch_purpose,

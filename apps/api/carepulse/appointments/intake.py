@@ -1,8 +1,8 @@
 """Atomic direct Waiting creation for the three distinct physical intake commands."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import IntegrityError
@@ -280,6 +280,101 @@ def _nonroutine_draft(
         ends_at=end,
         price_snapshot=snapshot,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ReplacementArrival:
+    appointment_id: UUID
+    number: int
+    service_date: date
+    doctor_staff_id: UUID
+    command: UrgentIntake
+
+
+def prepare_replacement_urgent(
+    connection, actor, command, target
+) -> ReplacementArrival:
+    """Acquire the existing new-ID locks before the old Appointment is locked."""
+    if (
+        target.status not in ("Booked", "Waiting")
+        or target.classification != "ROUTINE"
+        or target.lane != "MAIN"
+        or target.service_date != datetime.now(UTC).astimezone(CAIRO).date()
+    ):
+        raise ContractError(409)
+    patient = lock_patient_lifecycle(
+        connection, actor.organization_id, target.patient_id
+    )
+    if patient.archived:
+        raise ContractError(409)
+    try:
+        lock_policy_heads(
+            connection,
+            actor.organization_id,
+            {
+                kind: "SHARE"
+                for kind in ("SCHEDULE", "CAPACITY", "FOLLOWUP", "PRICE", "QUEUE")
+            },
+        )
+    except StalePolicyRevision as invalid:
+        raise ContractError(409, "STALE_REVISION") from invalid
+    number = allocate_day_number(connection, actor.organization_id, target.service_date)
+    urgent = UrgentIntake.model_validate(
+        {
+            **command.model_dump(
+                include=set(UrgentIntake.model_fields), exclude_unset=True
+            ),
+            "patient_id": target.patient_id,
+        }
+    )
+    return ReplacementArrival(
+        uuid4(), number, target.service_date, target.doctor_staff_id, urgent
+    )
+
+
+def create_replacement_urgent(connection, actor, arrival: ReplacementArrival) -> dict:
+    """Create a fresh Waiting ID after the old ID is Cancelled in this transaction."""
+    day = lock_or_create_queue_day_for_arrival(
+        connection,
+        organization_id=actor.organization_id,
+        doctor_staff_id=arrival.doctor_staff_id,
+        service_date=arrival.service_date,
+        lane="MAIN",
+        expected_queue_day_revision=None,
+    )
+    draft = _nonroutine_draft(
+        connection,
+        actor,
+        arrival.command,
+        "URGENT",
+        day.service_date,
+        day.doctor_staff_id,
+        datetime.now(UTC),
+    )
+    appointment_id, frozen = insert_appointment_records(
+        connection, actor, draft, arrival.number, appointment_id=arrival.appointment_id
+    )
+    entry_id, _ = insert_arrival_entry(
+        connection,
+        actor=actor,
+        appointment_id=appointment_id,
+        patient_id=draft.patient_id,
+        doctor_staff_id=draft.doctor_staff_id,
+        service_date=draft.service_date,
+        lane="MAIN",
+        queue_day=day,
+        routine_rank=None,
+    )
+    return {
+        "new_appointment_revision": 0,
+        "new_status": "Waiting",
+        "new_number": arrival.number,
+        "new_queue_entry_id": str(entry_id),
+        "new_queue_day_id": str(day.id),
+        "new_queue_day_revision": day.revision,
+        "new_base_egp": format(frozen["base_egp"], ".2f"),
+        "new_net_egp": format(frozen["net_egp"], ".2f"),
+    }
 
 
 def intake_appointment(

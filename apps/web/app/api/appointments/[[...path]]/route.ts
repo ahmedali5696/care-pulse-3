@@ -9,11 +9,14 @@ type RouteContext = { params: Promise<{ path?: string[] }> };
 
 async function delegate(request: Request, context: RouteContext): Promise<Response> {
   const segments = (await context.params).path ?? [];
-  if (segments.length === 2 && UUID.test(segments[0]) && segments[1] === "check-in") {
-    if (request.method !== "POST") return failure(403);
+  if (segments.length === 2 && UUID.test(segments[0])) {
+    const purpose = segments[1] === "check-in" ? "QUEUE_CHECK_IN" :
+      segments[1] === "cancel" ? "APPOINTMENT_CANCEL" :
+      segments[1] === "replace-urgent" ? "APPOINTMENT_REPLACE_URGENT" : null;
+    if (request.method !== "POST" || !purpose) return failure(403);
     return forwardPrivate(request, {
-      path: `/v1/appointments/${segments[0]}/check-in`,
-      purpose: "QUEUE_CHECK_IN",
+      path: `/v1/appointments/${segments[0]}/${segments[1]}`,
+      purpose,
       method: request.method,
     });
   }
