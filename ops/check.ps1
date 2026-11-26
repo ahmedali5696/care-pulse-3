@@ -108,7 +108,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'e0bcfb5d85c500ed0b7126abe5b51db00bcbe2ea8ae2f3f2507dfbdd0fa91578',
+    '.github/workflows/foundation.yml': '5e03cabe192803b9fcba54446a3d0a4cec6fbd7c9d8dfe2d039096f0e03dd527',
     '.github/workflows/fast-feedback.yml': '814f40f9f2a09d6337e5d4e14f1d4851e88301e64c1f28d5e538d3549dccce8b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
@@ -393,6 +393,7 @@ if [ "$1" = integration-diagnostic ]; then
     w3-placement-races) focused_target='tests/integration/test_w3_placement_races.py' ;;
     w3-visits) focused_target='tests/integration/test_w3_visits.py' ;;
     w3-visit-races) focused_target='tests/integration/test_w3_visit_races.py' ;;
+    w3-legacy-source) focused_target='tests/integration/test_followup_persistence.py::test_v2_no_decision_and_actual_staff_events_preserve_clinical_content[doctor]' ;;
     w3-migration) focused_target='tests/integration/test_f01_grants_migration.py' ;;
     *) echo 'FAIL unapproved PostgreSQL diagnostic selection'; exit 1 ;;
   esac

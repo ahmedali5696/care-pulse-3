@@ -66,6 +66,7 @@ DIAGNOSTICS = {
     "w3-placement-races",
     "w3-visits",
     "w3-visit-races",
+    "w3-legacy-source",
     "w3-migration",
     "compat-us1",
     "compat-us2",

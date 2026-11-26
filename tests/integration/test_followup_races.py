@@ -331,6 +331,11 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
         )
 
     def hold_first():
+        decision = (
+            {"kind": "DEFAULT"}
+            if first == "decision"
+            else {"kind": "OPTED_OUT", "reason": "Doctor restriction"}
+        )
         routine = (
             "record_followup_source_decision"
             if first in ("decision", "restriction")
@@ -342,6 +347,9 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
                 routine,
                 source,
                 reference=claim if first == "extension" else None,
+                source_command=decision
+                if first in ("decision", "restriction")
+                else None,
             )
             if clinic
             else transaction(runtime, tenant)
@@ -353,11 +361,7 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
                     connection,
                     "record_followup_source_decision",
                     source,
-                    **(
-                        {"kind": "DEFAULT"}
-                        if first == "decision"
-                        else {"kind": "OPTED_OUT", "reason": "Doctor restriction"}
-                    ),
+                    **decision,
                 )
             elif first == "extension":
                 extension(connection)
@@ -385,6 +389,7 @@ def test_v2_waiting_writer_refreshes_source_claim_and_empty_authorization_ledger
                 routine,
                 source,
                 reference=claim if first != "decision" else None,
+                source_command={"kind": "DEFAULT"} if first == "decision" else None,
             )
             if clinic
             else transaction(runtime, tenant)
@@ -500,8 +505,14 @@ def test_v2_extension_first_remains_historical_after_later_restriction_or_termin
 
     def follow_later():
         assert held.wait(timeout=10)
+        decision = {"kind": "OPTED_OUT", "reason": "Later restriction"}
         context = (
-            _signed_v2_transaction(clinic, "record_followup_source_decision", source)
+            _signed_v2_transaction(
+                clinic,
+                "record_followup_source_decision",
+                source,
+                source_command=decision,
+            )
             if clinic
             else transaction(runtime, tenant)
         )
@@ -521,8 +532,7 @@ def test_v2_extension_first_remains_historical_after_later_restriction_or_termin
                     connection,
                     "record_followup_source_decision",
                     source,
-                    kind="OPTED_OUT",
-                    reason="Later restriction",
+                    **decision,
                 )
             else:
                 _outcome(

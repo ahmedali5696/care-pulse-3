@@ -131,6 +131,7 @@ def test_request_classifies_full_and_exclusive_modes(env):
         "w3-placement-races",
         "w3-visits",
         "w3-visit-races",
+        "w3-legacy-source",
         "w3-migration",
     ],
 )

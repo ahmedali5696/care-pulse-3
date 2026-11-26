@@ -39,6 +39,7 @@ Dispatch **Foundation** on the candidate branch with `postgres_diagnostic` set t
 | `w3-placement-races` | `test_w3_placement_races.py` |
 | `w3-visits` | `test_w3_visits.py` |
 | `w3-visit-races` | `test_w3_visit_races.py` |
+| `w3-legacy-source` | `test_followup_persistence.py::test_v2_no_decision_and_actual_staff_events_preserve_clinical_content[doctor]` |
 | `w3-migration` | `test_f01_grants_migration.py` |
 
 The diagnostic check uses the same pinned PostgreSQL, migrations, disposable Compose project and synthetic secret lifecycle as Foundation. Use a separate dispatch for each independent database. Check the run's SHA and project ID, pytest counts, and volume and secret cleanup. The log reports the failing phase and test location, plus SQLSTATE or expected and observed blocker PIDs when available. It omits exception text, query text, parameters, test output, and parameter IDs.
