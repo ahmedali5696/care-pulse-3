@@ -26,6 +26,11 @@ from carepulse.appointments.queries import (
     list_appointments,
     source_decision_control,
 )
+from carepulse.appointments.reschedule import (
+    RescheduleAppointment,
+    recover_committed_reschedule,
+    reschedule_appointment,
+)
 from carepulse.identity.authorization import protected_transaction
 from carepulse.identity.contracts import (
     ContractError,
@@ -198,7 +203,8 @@ def post_appointment_checkin(
 
 
 async def _change_body(
-    request: Request, schema: type[CancelAppointment] | type[ReplaceUrgent]
+    request: Request,
+    schema: type[CancelAppointment] | type[ReplaceUrgent] | type[RescheduleAppointment],
 ):
     try:
         body = json.loads(
@@ -268,3 +274,35 @@ def post_appointment_replace_urgent(
     command: Annotated[ReplaceUrgent, Depends(_replace_body)],
 ):
     return _change_appointment(request, appointment_id, command)
+
+
+async def _reschedule_body(request: Request) -> RescheduleAppointment:
+    return await _change_body(request, RescheduleAppointment)
+
+
+@router.post("/{appointment_id}/reschedule")
+def post_appointment_reschedule(
+    appointment_id: UUID,
+    request: Request,
+    command: Annotated[RescheduleAppointment, Depends(_reschedule_body)],
+):
+    key = request.scope["carepulse.identity"].idempotency_key
+    if not key:
+        raise ContractError(422)
+    try:
+        with _transaction(request, purpose="APPOINTMENT_RESCHEDULE") as (
+            connection,
+            actor,
+        ):
+            projection, revision = reschedule_appointment(
+                connection, actor, appointment_id, command, key
+            )
+            return success_response(projection, revision)
+    except ReceiptConflict:
+        with _transaction(
+            request, purpose="APPOINTMENT_RESCHEDULE", stage="RECEIPT_RECOVERY"
+        ) as (connection, actor):
+            projection, revision = recover_committed_reschedule(
+                connection, actor, appointment_id, command, key
+            )
+            return success_response(projection, revision)

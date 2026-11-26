@@ -3126,6 +3126,7 @@ def test_d08_adds_no_lifecycle_or_fixture_api_routes():
         ("POST", "/v1/appointments/{appointment_id}/check-in"),
         ("POST", "/v1/appointments/{appointment_id}/cancel"),
         ("POST", "/v1/appointments/{appointment_id}/replace-urgent"),
+        ("POST", "/v1/appointments/{appointment_id}/reschedule"),
     }
     assert ("POST", "/v1/appointments") in route_set
     assert not any(

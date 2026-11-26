@@ -27,7 +27,7 @@ from test_visit_migration import _prepare
 ROOT = Path(__file__).resolve().parents[2]
 BEFORE = "0032_b10_cairo_offset_guard"
 AFTER = "0033_d08_terminal_writer"
-CURRENT_HEAD = "0062_b17_typed_body"
+CURRENT_HEAD = "0063_b18_reschedule"
 TERMINAL = "public.transition_terminal_appointment(uuid,uuid,bigint,jsonb)"
 LEGACY = "public.complete_examined_visit(uuid,uuid,bigint,boolean)"
 PRIVATE = "public.d07_complete_examined_visit_raw(uuid,uuid,bigint,boolean)"

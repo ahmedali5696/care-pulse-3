@@ -954,6 +954,7 @@ def test_fresh_and_failed_following_migration_keep_one_head(
         (scripts / "versions/0060_b16_visits.py").unlink()
         (scripts / "versions/0061_b17_cancel_replace.py").unlink()
         (scripts / "versions/0062_b17_typed_body.py").unlink()
+        (scripts / "versions/0063_b18_reschedule.py").unlink()
         (scripts / "versions/0050_b12_checkin_completeness.py").unlink()
         (scripts / "versions/0049_b12_checkin_provenance.py").unlink()
         (scripts / "versions/0046_f01_audit_integrity.py").unlink()

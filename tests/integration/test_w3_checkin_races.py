@@ -70,7 +70,13 @@ def _archive(clinic, patient_id):
 
 
 def _ordered_race(
-    clinic, holder_transaction, waiter_transaction, denial=None, *, checkpoint=None
+    clinic,
+    holder_transaction,
+    waiter_transaction,
+    denial=None,
+    *,
+    checkpoint=None,
+    denial_status=409,
 ):
     """Hold the first command until PostgreSQL proves the second waits at F-01."""
     ready = Event()
@@ -106,7 +112,7 @@ def _ordered_race(
         if denial is not None:
             with pytest.raises(ContractError) as denied:
                 future.result(timeout=15)
-            assert denied.value.status_code == 409
+            assert denied.value.status_code == denial_status
             if denial == "STALE_REVISION":
                 assert denied.value.code == denial
             return first, None

@@ -12,7 +12,8 @@ async function delegate(request: Request, context: RouteContext): Promise<Respon
   if (segments.length === 2 && UUID.test(segments[0])) {
     const purpose = segments[1] === "check-in" ? "QUEUE_CHECK_IN" :
       segments[1] === "cancel" ? "APPOINTMENT_CANCEL" :
-      segments[1] === "replace-urgent" ? "APPOINTMENT_REPLACE_URGENT" : null;
+      segments[1] === "replace-urgent" ? "APPOINTMENT_REPLACE_URGENT" :
+      segments[1] === "reschedule" ? "APPOINTMENT_RESCHEDULE" : null;
     if (request.method !== "POST" || !purpose) return failure(403);
     return forwardPrivate(request, {
       path: `/v1/appointments/${segments[0]}/${segments[1]}`,
