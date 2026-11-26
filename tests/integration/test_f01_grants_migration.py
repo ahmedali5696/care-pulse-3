@@ -439,7 +439,36 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
                         assert row[:6] in replacements
                         assert "SYSTEM" in replacements[row[:6]]
                         if "OPERATOR_CREATE" in row[6]:
-                            assert row[6][7:-1] in replacements[row[:6]]
+                            # PostgreSQL flattens nested OR expressions during
+                            # parsing. Compare the canonical form of the entire
+                            # original predicate plus precisely the new branch.
+                            with connection.begin_nested() as comparison:
+                                connection.exec_driver_sql(
+                                    f"""ALTER TABLE public.idempotency_receipts
+                                    ADD CONSTRAINT b20_expected_actor_shape CHECK (({row[6][7:-1]}) OR (
+                                        scope_kind='TENANT' AND actor_kind='SYSTEM' AND organization_id IS NOT NULL
+                                        AND scope_id=organization_id AND staff_id IS NULL AND operator_id IS NULL
+                                        AND actor_id='00000000-0000-4000-8000-000000000020'::uuid
+                                        AND operation='appointments.cutoff_no_show' AND result_organization_id IS NULL
+                                        AND result_projection IS NOT NULL AND jsonb_typeof(result_projection)='object'
+                                        AND result_revision IS NOT NULL
+                                        AND result_projection->>'appointment_id'=idempotency_key
+                                        AND result_projection->>'appointment_revision'=result_revision::text
+                                        AND result_projection->>'status'='No-show'
+                                        AND result_projection ?& ARRAY['appointment_id','status','service_date','appointment_revision','claim_revision']
+                                        AND result_projection - ARRAY['appointment_id','status','service_date','appointment_revision','claim_revision']='{{}}'::jsonb
+                                        AND jsonb_typeof(result_projection->'service_date')='string'
+                                        AND jsonb_typeof(result_projection->'appointment_revision')='number'
+                                        AND jsonb_typeof(result_projection->'claim_revision') IN ('number','null')) IS TRUE)""",
+                                    execution_options={"no_parameters": True},
+                                )
+                                expected = connection.scalar(
+                                    text("""SELECT pg_get_constraintdef(oid) FROM pg_constraint
+                                    WHERE conrelid='public.idempotency_receipts'::regclass
+                                    AND conname='b20_expected_actor_shape'""")
+                                )
+                                assert replacements[row[:6]] == expected
+                                comparison.rollback()
                 else:
                     assert set(original_constraints) <= current_constraints
                 after = _snapshot(connection)

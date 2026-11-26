@@ -274,7 +274,8 @@ def test_selected_date_and_invalid_absence_leave_state_unchanged(booking_clinic)
                     "clock_timestamp()",
                     "COALESCE(NULLIF(current_setting('cp.b20_read_asof', true), '')::timestamptz, clock_timestamp())",
                 ),
-            )
+            ),
+            execution_options={"no_parameters": True},
         )
     try:
         midnight = datetime.combine(slot_day + timedelta(days=1), time.min, CAIRO)
@@ -304,7 +305,9 @@ def test_selected_date_and_invalid_absence_leave_state_unchanged(booking_clinic)
                 ) == (timed["id"], overdue, overdue, "Booked")
     finally:
         with clinic.migration.begin() as connection:
-            connection.exec_driver_sql(original)
+            connection.exec_driver_sql(
+                original, execution_options={"no_parameters": True}
+            )
     assert effects(clinic) == before
 
 

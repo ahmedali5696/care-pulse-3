@@ -1,5 +1,6 @@
 """T068: scoped cutoff execution using the actual worker and staff PostgreSQL logins."""
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, time, timedelta
@@ -362,6 +363,31 @@ def test_current_policy_selected_date_token_replay_and_zero_denied_effects(
     with worker.begin() as connection:
         assert _apply(connection, candidate) == result
     assert _selected(worker, scope) == []
+    assert effects(clinic) == after
+    (receipt,) = _added(before, after, "idempotency_receipts")
+    projection = {**receipt["result_projection"], "appointment_id": other["id"]}
+    forged = {
+        **receipt,
+        "id": str(uuid4()),
+        "idempotency_key": other["id"],
+        "result_projection": projection,
+    }
+    # Probe the evolved database CHECK itself using migration-owned fixture writes.
+    # Runtime principals cannot insert such rows directly.
+    for changes in (
+        {"actor_id": str(uuid4())},
+        {"staff_id": clinic.owner.staff_id},
+        {"operation": "appointments.manual_no_show"},
+        {"result_projection": None},
+        {"result_projection": {**projection, "status": "Booked"}},
+        {"result_projection": {**projection, "unexpected": True}},
+    ):
+        _reject(
+            clinic.migration,
+            "INSERT INTO public.idempotency_receipts SELECT * FROM jsonb_populate_record(NULL::public.idempotency_receipts, CAST(:body AS jsonb))",
+            {"body": json.dumps({**forged, **changes})},
+            "23514",
+        )
     assert effects(clinic) == after
 
 
