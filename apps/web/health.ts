@@ -18,7 +18,7 @@ async function databaseReady(config: WebConfig): Promise<boolean> {
       "SELECT version_num FROM public.alembic_version",
     );
     completed = true;
-    return revision.rows.length === 1 && revision.rows[0].version_num === "0063_b18_reschedule";
+    return revision.rows.length === 1 && revision.rows[0].version_num === "0064_b18_source_alias";
   } catch {
     return false;
   } finally {

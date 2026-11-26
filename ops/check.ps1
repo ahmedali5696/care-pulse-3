@@ -472,7 +472,7 @@ cleanup() {
         ordinary-stack) export CP_FOUNDATION_COVERAGE=current-head-stack ;;
         historical) export CP_FOUNDATION_COVERAGE=immutable-0040-selected-nodes-on-isolated-postgres ;;
       esac
-      export CP_FOUNDATION_CANDIDATE_SCHEMA=0063_b18_reschedule
+      export CP_FOUNDATION_CANDIDATE_SCHEMA=0064_b18_source_alias
       export CP_FOUNDATION_HISTORICAL_SHA=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
       export CP_FOUNDATION_HISTORICAL_SCHEMA=0040_t173_numeric_money
       export CP_FOUNDATION_VERIFIED_TESTS="$foundation_tests" CP_FOUNDATION_LANE="$foundation_lane"
@@ -895,7 +895,7 @@ fi
 upgrade_head
 seed_identity_policy
 if [ "$foundation_full" = true ]; then
-  test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0063_b18_reschedule
+  test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0064_b18_source_alias
 fi
 if [ "$foundation_lane" != ordinary-stack ]; then
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \

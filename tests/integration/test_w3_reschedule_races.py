@@ -832,7 +832,7 @@ def test_urgent_reschedule_and_live_staff_withdrawal(
         move if move_first else withdraw,
         withdraw if move_first else move,
         denial=None if move_first else "REVOKED",
-        denial_status=401,
+        denial_status=401 if manager_only else 403,
         checkpoint=_checkpoint(clinic, before),
     )
     after = effects(clinic)
@@ -856,7 +856,7 @@ def test_urgent_reschedule_and_live_staff_withdrawal(
     if move_first:
         assert attestations[0]["actor_staff_id"] == acting.staff_id
         assert attestations[0]["after_state"]["appointment_id"] == target
-    denied(clinic, acting, target, body, 401, key=key)
+    denied(clinic, acting, target, body, 401 if manager_only else 403, key=key)
     fresh_body = move_body(
         clinic,
         target,
@@ -864,7 +864,7 @@ def test_urgent_reschedule_and_live_staff_withdrawal(
         physical_presence_confirmed=True,
         expected_price_revision=_policy_revision(clinic, "PRICE"),
     )
-    denied(clinic, acting, target, fresh_body, 401)
+    denied(clinic, acting, target, fresh_body, 401 if manager_only else 403)
     if manager_only:
         fresh = _fresh_receptionist_session(clinic, 2)
         status, reply = move_request(clinic, fresh, target, fresh_body)
