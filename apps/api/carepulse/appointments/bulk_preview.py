@@ -299,10 +299,24 @@ def evaluate_cohort(
         context["existing"], tentative, context["capacity"]
     ):
         exclusions[identifier] = "destination capacity conflict"
+    # Only commit passes a stored snapshot. Older immutable previews omitted
+    # destination evidence for individually excluded rows.
+    legacy_untimed = {
+        row["appointment_id"]
+        for row in source.get("excluded", [])
+        if row["starts_at"] is None and row["ends_at"] is None
+    }
     included, excluded = [], []
     for identifier in source["appointment_ids"]:
         row = rows_by_id[identifier]
-        evidence = _operational_row(row, carried[identifier])
+        interval = carried[identifier]
+        if (
+            identifier in legacy_untimed
+            and identifier in exclusions
+            and identifier not in tentative
+        ):
+            interval = None
+        evidence = _operational_row(row, interval)
         if identifier in exclusions:
             excluded.append({**evidence, "reason": exclusions[identifier]})
         else:

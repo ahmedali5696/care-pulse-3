@@ -91,6 +91,37 @@ def preview_selection(clinic, actor, body, *, key=None):
     return preview
 
 
+def retained_preview(clinic, preview, key):
+    """Seed the immutable pre-0069 projection as retained migration data."""
+    retained = {
+        **preview,
+        "preview_id": str(uuid4()),
+        "excluded": [
+            {**row, "starts_at": None, "ends_at": None} for row in preview["excluded"]
+        ],
+    }
+    with clinic.migration.begin() as connection:
+        connection.execute(
+            text("""
+                INSERT INTO public.idempotency_receipts
+                    (id,scope_kind,scope_id,actor_kind,actor_id,organization_id,
+                     staff_id,operation,idempotency_key,request_digest,result_projection,
+                     result_revision)
+                SELECT :id,scope_kind,scope_id,actor_kind,actor_id,organization_id,
+                       staff_id,operation,:key,request_digest,CAST(:projection AS jsonb),
+                       result_revision
+                FROM public.idempotency_receipts WHERE id=:source
+            """),
+            {
+                "id": retained["preview_id"],
+                "key": key,
+                "projection": json.dumps(retained),
+                "source": preview["preview_id"],
+            },
+        )
+    return retained
+
+
 def added(before, after, table, count):
     assert all(row in after[table] for row in before[table]), table
     delta = [row for row in after[table] if row not in before[table]]
@@ -863,17 +894,32 @@ def test_individual_destination_guard_excludes_only_invalid_rows(
         denied(clinic, clinic.owner, "commit", commit_body(preview), 409)
     else:
         assert partition(preview) == ({independent}, {target: reason})
+        committed_preview = preview
+        if guard == "existing":
+            retained_key = uuid4().hex
+            committed_preview = retained_preview(clinic, preview, retained_key)
+            before = effects(clinic)
+            status, reply = bulk_request(
+                clinic, clinic.owner, "preview", body, key=retained_key
+            )
+            assert status == 200 and reply["data"] == committed_preview
+            assert effects(clinic) == before
         before = effects(clinic)
         key = uuid4().hex
         status, reply = bulk_request(
-            clinic, clinic.owner, "commit", commit_body(preview), key=key
+            clinic, clinic.owner, "commit", commit_body(committed_preview), key=key
         )
         assert status == 200, reply
         after = effects(clinic)
-        assert_batch(before, after, clinic.owner, preview, reply["data"], key)
+        assert_batch(before, after, clinic.owner, committed_preview, reply["data"], key)
         if guard == "existing":
             assert appointment_row(after, existing) == appointment_row(before, existing)
             assert existing not in json.dumps(preview)
+            status, replay = bulk_request(
+                clinic, clinic.owner, "commit", commit_body(committed_preview), key=key
+            )
+            assert status == 200 and replay == reply
+            assert effects(clinic) == after
     after = effects(clinic)
     status, reply = bulk_request(clinic, clinic.owner, "preview", body, key=preview_key)
     assert status == 200 and reply["data"] == preview
