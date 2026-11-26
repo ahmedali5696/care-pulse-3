@@ -329,8 +329,36 @@ def test_strict_selection_zero_included_and_same_day(intake_clinic):
         clinic, actor, booked, "cancel", cancel_body(clinic, booked)
     )
     assert status == 200, reply
-    preview = preview_selection(clinic, actor, preview_body([booked], day, destination))
+    body = preview_body([booked], day, destination)
+    preview = preview_selection(clinic, actor, body)
     assert partition(preview) == (set(), {booked: "appointment not eligible"})
+    # 0066 accepted any allowlisted reason for an individually excluded row.
+    snapshot = {
+        key: value
+        for key, value in preview.items()
+        if key not in ("preview_id", "revision")
+    }
+    snapshot["excluded"] = [
+        {**preview["excluded"][0], "reason": "follow-up entitlement unavailable"}
+    ]
+    before = effects(clinic)
+    with signed_test_transaction(
+        clinic,
+        actor,
+        method="POST",
+        path="/v1/appointments/bulk-reschedule/preview",
+        purpose="APPOINTMENT_BULK_PREVIEW",
+        body=body,
+        key=uuid4().hex,
+    ) as (connection, _):
+        assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+        assert_sql_denied(
+            connection,
+            "SELECT public.f01_b19_store_preview(CAST(:snapshot AS jsonb))",
+            {"snapshot": json.dumps(snapshot)},
+            "23514",
+        )
+    assert effects(clinic) == before
     denied(clinic, actor, "commit", commit_body(preview), 409)
 
 

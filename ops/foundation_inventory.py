@@ -31,6 +31,8 @@ REPORT_COUNTS = {
         "w3_cancel_replace_races": 14,
         "w3_reschedule": 17,
         "w3_reschedule_races": 30,
+        "w3_bulk": 20,
+        "w3_bulk_races": 21,
     },
     "ordinary-stack": {
         "d06": 19,
@@ -99,6 +101,8 @@ EXPECTED_IDENTITY_DIGESTS = {
     "w3_reschedule": "a30d3eed80eee7a84a556980d5b6a8169c55d2fad44be46c488a1ae42cc73388",
     "w3_reschedule_races": "58e0668e230ee158a6fd15fd26c25c531593c31a0ecd74d12f6a87fcdbff7a6c",
     "w3_reschedule_bff": "c7da0299cff01f24b39de01cb243111efe52cd41ca0419b1a2569267f4cd50a9",
+    "w3_bulk": "082d9f8e1510cdb86d267261dc7fe2715937c6d9d2935ddb2fa6fd6cd473d109",
+    "w3_bulk_races": "aff26bddc084d6adfa259e3fed9d5cd1e0d49a60c21cd881ede9ee4cb46abe91",
     "d06": "67c96d46ec3790d9b4ac545cc5255e9507d0606997e9e4205e501453a493d305",
     "b06": "da894800383bf61c614d56f9bc094e0addb63a607d16856085790732646fe02f",
     "b07": "601e8005ea67693babd6c717ee794fa7ca1d2be08ec7ccac58c2e1355127388c",
