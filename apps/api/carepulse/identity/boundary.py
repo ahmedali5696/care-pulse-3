@@ -1,5 +1,6 @@
 """Signed, replay-resistant private BFF transport boundary."""
 
+from collections.abc import Callable
 from hashlib import sha256
 from hmac import compare_digest, new
 from re import Pattern
@@ -18,7 +19,7 @@ from carepulse.compat.admission import (
     is_compat_enabled,
     release_invocation_permit,
 )
-from carepulse.identity.contracts import error_response
+from carepulse.identity.contracts import ContractError, error_response
 from carepulse.identity.runtime_identity import RegisteredRequest, current_request
 from carepulse.identity.signing import (
     CanonicalEnvelope,
@@ -149,7 +150,9 @@ class ClosedServiceBoundary:
         app: ASGIApp,
         *,
         routes: dict[tuple[str, str], str] | None = None,
-        route_patterns: tuple[tuple[str, Pattern[str], str], ...] = (),
+        route_patterns: tuple[
+            tuple[str, Pattern[str], str | Callable[[bytes], str]], ...
+        ] = (),
     ) -> None:
         self.app = app
         self.routes = routes or {}
@@ -252,6 +255,11 @@ class ClosedServiceBoundary:
                 ),
                 None,
             )
+        if callable(permitted_purpose):
+            try:
+                permitted_purpose = permitted_purpose(payload)
+            except ContractError as invalid:
+                raise BoundaryDenied(invalid.status_code) from invalid
         if permitted_purpose != envelope.purpose:
             raise BoundaryDenied(403)
         try:

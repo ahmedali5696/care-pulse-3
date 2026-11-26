@@ -31,6 +31,7 @@ from carepulse.policies.schedule_routes import router as schedule_router
 from carepulse.policies.slots_routes import router as slots_router
 from carepulse.provisioning.routes import router as provisioning_router
 from carepulse.queue.routes import router as queue_router
+from carepulse.visits.clinical_contracts import signed_visit_patch_purpose
 from carepulse.visits.routes import router as visit_router
 
 
@@ -152,7 +153,26 @@ app.add_middleware(
         (
             "PATCH",
             compile(r"/v1/visits/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"),
-            "VISIT_FOLLOWUP",
+            signed_visit_patch_purpose,
+        ),
+        (
+            "GET",
+            compile(r"/v1/visits/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"),
+            "VISIT_READ",
+        ),
+        (
+            "POST",
+            compile(
+                r"/v1/visits/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/complete"
+            ),
+            "VISIT_COMPLETE",
+        ),
+        (
+            "POST",
+            compile(
+                r"/v1/visits/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/cancel-exceptional"
+            ),
+            "VISIT_CANCEL_EXCEPTIONAL",
         ),
         (
             "POST",
