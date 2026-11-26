@@ -1,6 +1,5 @@
 """B-17 rollback and ordered contention at the real signed PostgreSQL boundary."""
 
-import json
 from contextlib import contextmanager
 from datetime import timedelta
 from uuid import UUID, uuid4
@@ -28,15 +27,9 @@ from test_w3_cancel_replace import cancel_body as _cancel_body
 from test_w3_cancel_replace import replace_body
 from test_w3_checkin import _new_patient
 from test_w3_checkin_races import _archive, _checkin, _ordered_race
-from test_w3_intake import _policy_revision, _today, intake_effects
+from test_w3_intake import _policy_revision, _today, intake_request
 from test_w3_intake import intake_clinic as intake_clinic  # noqa: PLC0414
-
-
-def _state(clinic):
-    return {
-        table: [json.loads(row) for row in rows]
-        for table, rows in intake_effects(clinic).items()
-    }
+from test_w3_visits import effects as _state
 
 
 def _rows(state, table, appointment):
@@ -62,6 +55,14 @@ def _checkpoint(clinic, before):
         assert _state(clinic) == before
 
     return observe
+
+
+@contextmanager
+def _observe_waiter(clinic, transaction, committed):
+    # The waiter holds the F-01 lock only after the winner has committed.
+    with transaction() as (connection, execute):
+        committed.append(_state(clinic))
+        yield connection, execute
 
 
 def _book_today(clinic):
@@ -175,19 +176,26 @@ def _assert_replacement(before, after, original, result, key):
 @pytest.mark.parametrize("stage", ["allocation", "cancellation"])
 def test_replacement_rolls_back_real_partial_writes(intake_clinic, monkeypatch, stage):
     clinic = intake_clinic
-    appointment, _ = _book_today(clinic)
-    with _checkin(
+    source = completed_source(clinic)
+    status, reply = intake_request(
         clinic,
-        clinic.owner,
-        appointment,
-        CheckInAppointment(
-            physical_presence_confirmed=True, expected_appointment_revision=0
+        clinic.receptionist,
+        "routine",
+        followup_body(
+            source,
+            offset=1,
+            expected_price_revision=_policy_revision(clinic, "PRICE"),
+            expected_schedule_revision=_policy_revision(clinic, "SCHEDULE"),
+            physical_presence_confirmed=True,
         ),
-        str(uuid4()),
-    ) as (_, execute):
-        execute()
+    )
+    assert status == 201, reply
+    appointment = UUID(reply["data"]["id"])
     body = replace_body(clinic, appointment)
     before = _state(clinic)
+    (claim,) = _rows(before, "followup_claims", appointment)
+    assert claim["state"] == "ACTIVE"
+    assert claim["revision"] == body["expected_claim_revision"]
     observed = []
 
     class InjectedFailure(Exception):
@@ -211,6 +219,10 @@ def test_replacement_rolls_back_real_partial_writes(intake_clinic, monkeypatch, 
             observed.append(result)
             assert result["status"] == "Cancelled"
             assert result["replacement_appointment_id"] == str(replacement_id)
+            assert result["claim_revision"] == claim["revision"] + 1
+            assert (
+                result["queue_day_revision"] == body["expected_queue_day_revision"] + 1
+            )
             raise InjectedFailure
 
         monkeypatch.setattr(cancel, "_cancel", fail)
@@ -339,16 +351,21 @@ def test_replacement_serializes_with_supported_competitors(
                 yield conn, lambda: _activate(conn, actor, preview, other_key)
 
     before = _state(clinic)
+    committed = []
     first, second = _ordered_race(
         clinic,
         replacement if replacement_first else competing,
-        competing if replacement_first else replacement,
+        lambda: _observe_waiter(
+            clinic, competing if replacement_first else replacement, committed
+        ),
         denial=None
         if replacement_first and competitor in ("archive", "price", "schedule")
         else "CONFLICT",
         checkpoint=_checkpoint(clinic, before),
     )
     after = _state(clinic)
+    if second is None:
+        assert committed == [after]
     if replacement_first:
         _assert_replacement(before, after, appointment, first, key)
         if competitor in ("cancel", "admit"):
@@ -411,15 +428,19 @@ def test_booked_claim_checkin_and_cancellation_in_both_orders(
         return _command(clinic, clinic.owner, appointment, body, cancel_key)
 
     before = _state(clinic)
+    committed = []
     first, second = _ordered_race(
         clinic,
         checking if checkin_first else cancelling,
-        cancelling if checkin_first else checking,
+        lambda: _observe_waiter(
+            clinic, cancelling if checkin_first else checking, committed
+        ),
         denial="CONFLICT",
         checkpoint=_checkpoint(clinic, before),
     )
     assert second is None
     after = _state(clinic)
+    assert committed == [after]
     _assert_unchanged_allocations(before, after)
     assert after["visits"] == before["visits"]
     assert _appointment(after, appointment)["status"] == (
