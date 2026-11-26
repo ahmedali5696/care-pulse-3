@@ -13,6 +13,16 @@ from carepulse.appointments.booking_contracts import (
     BookAppointment,
     FollowupPreviewQuery,
 )
+from carepulse.appointments.bulk_preview import (
+    BulkPreviewCommand,
+    preview_bulk_reschedule,
+    recover_bulk_preview,
+)
+from carepulse.appointments.bulk_reschedule import (
+    BulkCommitCommand,
+    commit_bulk_reschedule,
+    recover_bulk_reschedule,
+)
 from carepulse.appointments.cancel import (
     cancel_appointment,
     recover_cancel_replace,
@@ -204,7 +214,13 @@ def post_appointment_checkin(
 
 async def _change_body(
     request: Request,
-    schema: type[CancelAppointment] | type[ReplaceUrgent] | type[RescheduleAppointment],
+    schema: (
+        type[CancelAppointment]
+        | type[ReplaceUrgent]
+        | type[RescheduleAppointment]
+        | type[BulkPreviewCommand]
+        | type[BulkCommitCommand]
+    ),
 ):
     try:
         body = json.loads(
@@ -305,4 +321,56 @@ def post_appointment_reschedule(
             projection, revision = recover_committed_reschedule(
                 connection, actor, appointment_id, command, key
             )
+            return success_response(projection, revision)
+
+
+async def _bulk_preview_body(request: Request) -> BulkPreviewCommand:
+    return await _change_body(request, BulkPreviewCommand)
+
+
+async def _bulk_commit_body(request: Request) -> BulkCommitCommand:
+    return await _change_body(request, BulkCommitCommand)
+
+
+@router.post("/bulk-reschedule/preview")
+def post_bulk_reschedule_preview(
+    request: Request,
+    command: Annotated[BulkPreviewCommand, Depends(_bulk_preview_body)],
+):
+    key = request.scope["carepulse.identity"].idempotency_key
+    if not key:
+        raise ContractError(422)
+    try:
+        with _transaction(request, purpose="APPOINTMENT_BULK_PREVIEW") as (
+            connection, actor
+        ):
+            projection, revision = preview_bulk_reschedule(connection, actor, command, key)
+            return success_response(projection, revision)
+    except ReceiptConflict:
+        with _transaction(
+            request, purpose="APPOINTMENT_BULK_PREVIEW", stage="RECEIPT_RECOVERY"
+        ) as (connection, actor):
+            projection, revision = recover_bulk_preview(connection, actor, command, key)
+            return success_response(projection, revision)
+
+
+@router.post("/bulk-reschedule/commit")
+def post_bulk_reschedule_commit(
+    request: Request,
+    command: Annotated[BulkCommitCommand, Depends(_bulk_commit_body)],
+):
+    key = request.scope["carepulse.identity"].idempotency_key
+    if not key:
+        raise ContractError(422)
+    try:
+        with _transaction(request, purpose="APPOINTMENT_BULK_COMMIT") as (
+            connection, actor
+        ):
+            projection, revision = commit_bulk_reschedule(connection, actor, command, key)
+            return success_response(projection, revision)
+    except ReceiptConflict:
+        with _transaction(
+            request, purpose="APPOINTMENT_BULK_COMMIT", stage="RECEIPT_RECOVERY"
+        ) as (connection, actor):
+            projection, revision = recover_bulk_reschedule(connection, actor, command, key)
             return success_response(projection, revision)

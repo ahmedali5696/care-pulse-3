@@ -360,6 +360,7 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
             "0063_b18_reschedule",
             "0064_b18_source_alias",
             "0065_b18_followup_fence",
+            "0066_b19_bulk_reschedule",
         ]
         assert any(row["disposition"] == "ACTIVE" for row in retained["queue_entries"])
         for revision in revisions:

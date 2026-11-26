@@ -9,6 +9,15 @@ type RouteContext = { params: Promise<{ path?: string[] }> };
 
 async function delegate(request: Request, context: RouteContext): Promise<Response> {
   const segments = (await context.params).path ?? [];
+  if (segments.length === 2 && segments[0] === "bulk-reschedule" &&
+      (segments[1] === "preview" || segments[1] === "commit")) {
+    if (request.method !== "POST") return failure(403);
+    return forwardPrivate(request, {
+      path: `/v1/appointments/bulk-reschedule/${segments[1]}`,
+      purpose: segments[1] === "preview" ? "APPOINTMENT_BULK_PREVIEW" : "APPOINTMENT_BULK_COMMIT",
+      method: request.method,
+    });
+  }
   if (segments.length === 2 && UUID.test(segments[0])) {
     const purpose = segments[1] === "check-in" ? "QUEUE_CHECK_IN" :
       segments[1] === "cancel" ? "APPOINTMENT_CANCEL" :

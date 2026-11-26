@@ -110,6 +110,8 @@ app.add_middleware(
         ("POST", "/v1/patients"): "PATIENT_REGISTRY",
         ("GET", "/v1/appointments"): "APPOINTMENT_BOOKING",
         ("POST", "/v1/appointments"): "APPOINTMENT_BOOKING",
+        ("POST", "/v1/appointments/bulk-reschedule/preview"): "APPOINTMENT_BULK_PREVIEW",
+        ("POST", "/v1/appointments/bulk-reschedule/commit"): "APPOINTMENT_BULK_COMMIT",
         ("POST", "/v1/intake/routine"): "INTAKE_ROUTINE",
         ("POST", "/v1/intake/emergency"): "INTAKE_EMERGENCY",
         ("POST", "/v1/intake/urgent"): "INTAKE_URGENT",
