@@ -157,6 +157,7 @@ print('PASS approved manifests, complete locks, installed Python closure, privat
             $imports = @'
 from carepulse.main import app
 from carepulse.identity.boundary import ClosedServiceBoundary
+from carepulse.visits.clinical_contracts import signed_visit_patch_purpose
 import apps.worker.main
 
 expected_paths = {
@@ -181,6 +182,7 @@ expected_paths = {
     '/v1/queue/admission-confirmations/{confirmation_id}/revoke',
     '/v1/intake/routine', '/v1/intake/emergency', '/v1/intake/urgent',
     '/v1/visits/{visit_id}', '/v1/visits/{visit_id}/extend-followup',
+    '/v1/visits/{visit_id}/complete', '/v1/visits/{visit_id}/cancel-exceptional',
 }
 assert set(app.openapi()['paths']) == expected_paths
 assert app.openapi_url is None and len(app.user_middleware) == 1
@@ -226,13 +228,18 @@ assert {(method, pattern.pattern, purpose) for method, pattern, purpose in bound
     ('GET', f'/v1/appointments/{uuid}', 'APPOINTMENT_BOOKING'),
     ('POST', f'/v1/appointments/{uuid}/check-in', 'QUEUE_CHECK_IN'),
     ('POST', f'/v1/queue/admission-confirmations/{uuid}/revoke', 'QUEUE_CONFIRMATION_REVOKE'),
-    ('PATCH', f'/v1/visits/{uuid}', 'VISIT_FOLLOWUP'),
+    ('PATCH', f'/v1/visits/{uuid}', signed_visit_patch_purpose),
+    ('GET', f'/v1/visits/{uuid}', 'VISIT_READ'),
+    ('POST', f'/v1/visits/{uuid}/complete', 'VISIT_COMPLETE'),
+    ('POST', f'/v1/visits/{uuid}/cancel-exceptional', 'VISIT_CANCEL_EXCEPTIONAL'),
     ('POST', f'/v1/visits/{uuid}/extend-followup', 'VISIT_FOLLOWUP'),
     ('PATCH', f'/v1/patients/{uuid}', 'PATIENT_REGISTRY'),
     ('POST', f'/v1/patients/{uuid}/(?:archive|unarchive)', 'PATIENT_REGISTRY'),
     ('POST', f'/v1/staff/receptionists/{uuid}/(?:enable|disable|invite|revoke-invite)', 'STAFF_MANAGEMENT'),
     ('PATCH', f'/v1/staff/receptionists/{uuid}/permissions', 'STAFF_MANAGEMENT'),
 }
+assert signed_visit_patch_purpose(b'{"expected_visit_revision":0,"diagnosis":"synthetic"}') == 'VISIT_CLINICAL'
+assert signed_visit_patch_purpose(b'{"expected_visit_revision":0,"followup_decision":{"kind":"DEFAULT"}}') == 'VISIT_FOLLOWUP'
 print('PASS approved signed Owner, Receptionist and recovery routes')
 '@
             $imports | & python -
