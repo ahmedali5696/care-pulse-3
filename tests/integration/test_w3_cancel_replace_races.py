@@ -183,7 +183,7 @@ def test_replacement_rolls_back_real_partial_writes(intake_clinic, monkeypatch, 
         "routine",
         followup_body(
             source,
-            offset=1,
+            offset=0,
             expected_price_revision=_policy_revision(clinic, "PRICE"),
             expected_schedule_revision=_policy_revision(clinic, "SCHEDULE"),
             physical_presence_confirmed=True,
@@ -193,6 +193,11 @@ def test_replacement_rolls_back_real_partial_writes(intake_clinic, monkeypatch, 
     appointment = UUID(reply["data"]["id"])
     body = replace_body(clinic, appointment)
     before = _state(clinic)
+    assert _appointment(before, appointment)["service_date"] == _today().isoformat()
+    assert (
+        _appointment(before, source["appointment"])["service_date"]
+        != _today().isoformat()
+    )
     (claim,) = _rows(before, "followup_claims", appointment)
     assert claim["state"] == "ACTIVE"
     assert claim["revision"] == body["expected_claim_revision"]
