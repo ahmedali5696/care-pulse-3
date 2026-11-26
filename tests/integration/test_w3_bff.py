@@ -1,4 +1,4 @@
-"""B-12, B-11, B-14 and B-15 authenticated browser-to-BFF-to-API-to-PostgreSQL acceptance."""
+"""B-11–B-15 authenticated browser-to-BFF-to-API-to-PostgreSQL acceptance."""
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -15,6 +15,7 @@ from test_pricing import _patch as pricing_patch
 from test_schedule import CAIRO, SERVICE_DAY, _config
 from test_schedule import _patch as schedule_patch
 from test_sessions import _database
+from test_w3_queue_policy import placement_body
 
 
 def _domain_state(tenant):
@@ -101,6 +102,108 @@ def _confirmation_effects(tenant):
                 "idempotency_receipts",
             )
         }
+
+
+def _browser_queue_policy_and_placement(sessions, queue_path):
+    owner, receptionist = sessions.owner, sessions.receptionist
+    policy_path, placement_path = "/api/settings/queue", "/api/queue/placement"
+    status, initial = browser_request(owner, policy_path)
+    assert status == 200, initial
+    status, queue = browser_request(receptionist, queue_path)
+    assert status == 200, queue
+    assert queue["data"]["total_waiting"] == 2
+    publish = {
+        "routine_order": "ARRIVAL_FIFO",
+        "late_depth": 0,
+        "expected_policy_revision": initial["revision"],
+    }
+    place = placement_body(queue["data"])
+    policy_key, placement_key = str(uuid4()), str(uuid4())
+    before = _domain_state(sessions.clinic)
+    evidence = _confirmation_effects(sessions.clinic)
+    _denied(browser_request(receptionist, policy_path), 403, "FORBIDDEN")
+    _denied(
+        browser_request(
+            receptionist, policy_path, method="PATCH", body=publish, key=policy_key
+        ),
+        403,
+        "FORBIDDEN",
+    )
+    _denied(
+        browser_request(
+            owner, placement_path, method="POST", body=place, key=placement_key
+        ),
+        403,
+        "FORBIDDEN",
+    )
+    _denied(browser_request(receptionist, placement_path), 403, "FORBIDDEN")
+    _denied(
+        browser_request(
+            None, placement_path, method="POST", body=place, key=placement_key
+        ),
+        401,
+        "UNAUTHENTICATED",
+    )
+    assert _domain_state(sessions.clinic) == before
+    assert _confirmation_effects(sessions.clinic) == evidence
+    status, published = browser_request(
+        owner, policy_path, method="PATCH", body=publish, key=policy_key
+    )
+    assert status == 200, published
+    assert published["revision"] == initial["revision"] + 1
+    assert published["data"]["routine_order"] == "ARRIVAL_FIFO"
+    assert published["data"]["late_depth"] == 0
+    assert browser_request(owner, policy_path) == (200, published)
+    assert browser_request(receptionist, queue_path) == (200, queue)
+    status, placed = browser_request(
+        receptionist, placement_path, method="POST", body=place, key=placement_key
+    )
+    assert status == 200, placed
+    assert placed["revision"] == queue["revision"] + 1
+    status, current = browser_request(receptionist, queue_path)
+    assert status == 200, current
+    assert [row["queue_entry_id"] for row in current["data"]["entries"]] == [
+        row["queue_entry_id"] for row in place["entries"]
+    ]
+    assert current["data"]["routine_cursor"] == queue["data"]["routine_cursor"]
+    assert (
+        current["data"]["queue_policy_version"] == queue["data"]["queue_policy_version"]
+    )
+    committed = _confirmation_effects(sessions.clinic)
+    assert browser_request(
+        owner, policy_path, method="PATCH", body=publish, key=policy_key
+    ) == (200, published)
+    assert browser_request(
+        receptionist, placement_path, method="POST", body=place, key=placement_key
+    ) == (200, placed)
+    _denied(
+        browser_request(
+            receptionist,
+            placement_path,
+            method="POST",
+            body={**place, "entries": list(reversed(place["entries"]))},
+            key=placement_key,
+        ),
+        409,
+        "IDEMPOTENCY_CONFLICT",
+    )
+    assert _confirmation_effects(sessions.clinic) == committed
+    for operation, key, result, cookie in (
+        ("settings.queue.update", policy_key, published, owner),
+        ("queue.placement", placement_key, placed, receptionist),
+    ):
+        status, identity = browser_request(cookie, "/api/session")
+        assert status == 200, identity
+        actor_id = identity["data"]["id"]
+        with _database() as connection:
+            assert connection.execute(
+                "SELECT actor_id::text, result_projection, result_revision FROM public.idempotency_receipts WHERE organization_id=%s AND operation=%s AND idempotency_key=%s",
+                (sessions.clinic, operation, key),
+            ).fetchall() == [(actor_id, result["data"], result["revision"])]
+            assert connection.execute(
+                "SELECT actor_staff_id::text, after_state FROM public.sensitive_audit WHERE organization_id=%s AND action=%s",
+                (sessions.clinic, operation),
+            ).fetchall() == [(actor_id, result["data"])]
 
 
 def test_independent_browser_sessions_issue_and_retrieve_exact_confirmation(
@@ -773,6 +876,17 @@ def test_invited_browser_checkin_replay_and_tenant_session_isolation(invited_pat
         "IDEMPOTENCY_CONFLICT",
     )
     assert _domain_state(sessions.clinic) == after_other_booking
+
+    status, checked_other = browser_request(
+        receptionist,
+        other_path,
+        method="POST",
+        body={**command, "expected_queue_day_revision": 1},
+        key=str(uuid4()),
+    )
+    assert status == 200, checked_other
+    _browser_queue_policy_and_placement(sessions, queue_path)
+    after_other_booking = _domain_state(sessions.clinic)
 
     assert browser_request(receptionist, "/api/auth/logout", method="POST")[0] == 200
     _denied(

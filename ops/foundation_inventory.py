@@ -23,6 +23,8 @@ REPORT_COUNTS = {
         "w3_admission_confirmations": 8,
         "w3_admission": 19,
         "w3_admission_races": 20,
+        "w3_queue_policy": 11,
+        "w3_placement_races": 4,
     },
     "ordinary-stack": {
         "d06": 19,
@@ -76,6 +78,8 @@ EXPECTED_IDENTITY_DIGESTS = {
     "w3_admission_confirmations": "8e553e52d606c59a21a08a1c38967ce736496d440cc80cf975cafa6ff3220285",
     "w3_admission": "17eab73e26716f671fdc13597ddf0eb92427307f1f7fb24e9e8254bf4acb9604",
     "w3_admission_races": "09ef4bfb2e5ab3dfced0431da6ca23a3f6ee85808a20dd895ee746d107af8c73",
+    "w3_queue_policy": "fcbc287905c6452d4274d070005936d4c0aa25ef710159e98651ea38d6b89cc8",
+    "w3_placement_races": "71f9757994c5f8808a2eac03fe2da6379db27056a6fb37c23caea82e03bc00c7",
     "w3_bff": "0ea0322495a3166b71ef64b2cc230f1122029b5e6e202a6d031050aebc10ff99",
     "d06": "67c96d46ec3790d9b4ac545cc5255e9507d0606997e9e4205e501453a493d305",
     "b06": "da894800383bf61c614d56f9bc094e0addb63a607d16856085790732646fe02f",

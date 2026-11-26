@@ -14,7 +14,7 @@ from ops import foundation_inventory as inventory
 HISTORICAL_SHA = "6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7"
 SOURCE_SCHEMA = "0040_t173_numeric_money"
 CANDIDATE_SCHEMA = "0046_f01_audit_integrity"
-ORDINARY_SCHEMA = "0058_b15_admission_guards"
+ORDINARY_SCHEMA = "0059_b13_queue_policy_placement"
 RECEIPT_FILE = "foundation-full-receipt.json"
 EXPECTED_COVERAGE = {
     "ordinary-db": "current-head-db",
@@ -62,6 +62,8 @@ DIAGNOSTICS = {
     "w3-admission-confirmations",
     "w3-admission",
     "w3-admission-races",
+    "w3-queue-policy",
+    "w3-placement-races",
     "w3-migration",
     "compat-us1",
     "compat-us2",
@@ -376,7 +378,7 @@ def _publish_acceptance(env: dict[str, str]) -> None:
         f"- Repository/workflow: `{context['repository']}` / `{context['workflow']}`",
         f"- Run/attempt: `{context['run_id']}` / `{context['attempt']}`",
         (
-            f"- Ordinary ({ORDINARY_SCHEMA}, including B-12, B-11 and B-14): "
+            f"- Ordinary ({ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15 and B-13): "
             f"DB ({sum(inventory.REPORT_COUNTS['ordinary-db'].values())}), "
             f"stack ({sum(inventory.REPORT_COUNTS['ordinary-stack'].values())}); "
             "historical (163 at 0040), compatibility (44 Python + 11 Web, 0040 to 0046): verified"

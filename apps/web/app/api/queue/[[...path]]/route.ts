@@ -13,6 +13,7 @@ function queuePurpose(segments: string[], method: string): string | null {
   if (segments.length === 1 && segments[0] === "capacity" && method === "PATCH") return "QUEUE_CAPACITY_UPDATE";
   if (segments.length === 1 && segments[0] === "pause" && method === "POST") return "QUEUE_PAUSE";
   if (segments.length === 1 && segments[0] === "admit" && method === "POST") return "QUEUE_ADMIT";
+  if (segments.length === 1 && segments[0] === "placement" && method === "POST") return "QUEUE_PLACEMENT";
   if (segments[0] !== "admission-confirmations") return null;
   if (segments.length === 1 && method === "POST") return "QUEUE_CONFIRMATION_ISSUE";
   if (segments.length === 2 && segments[1] === "usable" && method === "GET") return "QUEUE_CONFIRMATION_USABLE";

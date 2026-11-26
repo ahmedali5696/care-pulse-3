@@ -26,6 +26,7 @@ from carepulse.identity.staff_routes import router as staff_router
 from carepulse.patients.routes import router as patient_router
 from carepulse.policies.admission_routes import router as admission_router
 from carepulse.policies.pricing_routes import router as pricing_router
+from carepulse.policies.queue_routes import router as queue_policy_router
 from carepulse.policies.schedule_routes import router as schedule_router
 from carepulse.policies.slots_routes import router as slots_router
 from carepulse.provisioning.routes import router as provisioning_router
@@ -65,6 +66,7 @@ app.include_router(schedule_router)
 app.include_router(slots_router)
 app.include_router(queue_router)
 app.include_router(admission_router)
+app.include_router(queue_policy_router)
 app.add_exception_handler(ContractError, contract_exception_handler)
 app.add_exception_handler(
     RequestValidationError, lambda _request, _error: error_response(422)
@@ -123,6 +125,9 @@ app.add_middleware(
         ("PATCH", "/v1/queue/capacity"): "QUEUE_CAPACITY_UPDATE",
         ("POST", "/v1/queue/pause"): "QUEUE_PAUSE",
         ("POST", "/v1/queue/admit"): "QUEUE_ADMIT",
+        ("GET", "/v1/settings/queue"): "SETTINGS_QUEUE_READ",
+        ("PATCH", "/v1/settings/queue"): "SETTINGS_QUEUE_UPDATE",
+        ("POST", "/v1/queue/placement"): "QUEUE_PLACEMENT",
         ("POST", "/v1/queue/admission-confirmations"): "QUEUE_CONFIRMATION_ISSUE",
         (
             "GET",

@@ -950,6 +950,7 @@ def test_fresh_and_failed_following_migration_keep_one_head(
         (scripts / "versions/0056_b14_target_binding.py").unlink()
         (scripts / "versions/0057_w3_queue_admit.py").unlink()
         (scripts / "versions/0058_b15_admission_guards.py").unlink()
+        (scripts / "versions/0059_b13_queue_policy_placement.py").unlink()
         (scripts / "versions/0050_b12_checkin_completeness.py").unlink()
         (scripts / "versions/0049_b12_checkin_provenance.py").unlink()
         (scripts / "versions/0046_f01_audit_integrity.py").unlink()

@@ -127,6 +127,8 @@ def test_request_classifies_full_and_exclusive_modes(env):
         "w3-admission-confirmations",
         "w3-admission",
         "w3-admission-races",
+        "w3-queue-policy",
+        "w3-placement-races",
         "w3-migration",
     ],
 )
@@ -468,7 +470,7 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
     assert f"sha={env['GITHUB_SHA']}" in output
     assert f"Tested github.sha: `{env['GITHUB_SHA']}`" in summary.read_text()
     assert (
-        f"Ordinary ({acceptance.ORDINARY_SCHEMA}, including B-12, B-11 and B-14)"
+        f"Ordinary ({acceptance.ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15 and B-13)"
         in summary.read_text()
     )
     assert "44 Python + 11 Web" in summary.read_text()
@@ -483,7 +485,8 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
 def test_current_inventory_has_exact_disjoint_ordinary_reports():
     db = inventory.REPORT_COUNTS["ordinary-db"]
     stack = inventory.REPORT_COUNTS["ordinary-stack"]
-    assert (sum(db.values()), sum(stack.values())) == (485, 605)
+    assert (sum(db.values()), sum(stack.values())) == (500, 605)
+    assert (db["w3_queue_policy"], db["w3_placement_races"]) == (11, 4)
     assert not db.keys() & stack.keys()
     assert not (
         {inventory.EXPECTED_IDENTITY_DIGESTS[name] for name in db}

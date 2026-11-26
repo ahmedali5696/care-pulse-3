@@ -108,7 +108,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'e1ac89772c26b9f10ddbec8853420fd49acf57b95b8336e51195b2feab90b8a0',
+    '.github/workflows/foundation.yml': 'a0b0f9a7430b15ea0c5eea3905757bd0c02bfeb3aae2999c562d518ef3de8d76',
     '.github/workflows/fast-feedback.yml': '814f40f9f2a09d6337e5d4e14f1d4851e88301e64c1f28d5e538d3549dccce8b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
@@ -176,6 +176,7 @@ expected_paths = {
     '/v1/slots', '/v1/appointments', '/v1/appointments/{appointment_id}',
     '/v1/appointments/{appointment_id}/check-in', '/v1/queue',
     '/v1/settings/admission', '/v1/queue/capacity', '/v1/queue/pause', '/v1/queue/admit',
+    '/v1/settings/queue', '/v1/queue/placement',
     '/v1/queue/admission-confirmations', '/v1/queue/admission-confirmations/usable',
     '/v1/queue/admission-confirmations/{confirmation_id}/revoke',
     '/v1/intake/routine', '/v1/intake/emergency', '/v1/intake/urgent',
@@ -209,6 +210,9 @@ assert boundary.kwargs['routes'] == {
     ('PATCH', '/v1/queue/capacity'): 'QUEUE_CAPACITY_UPDATE',
     ('POST', '/v1/queue/pause'): 'QUEUE_PAUSE',
     ('POST', '/v1/queue/admit'): 'QUEUE_ADMIT',
+    ('GET', '/v1/settings/queue'): 'SETTINGS_QUEUE_READ',
+    ('PATCH', '/v1/settings/queue'): 'SETTINGS_QUEUE_UPDATE',
+    ('POST', '/v1/queue/placement'): 'QUEUE_PLACEMENT',
     ('POST', '/v1/queue/admission-confirmations'): 'QUEUE_CONFIRMATION_ISSUE',
     ('GET', '/v1/queue/admission-confirmations/usable'): 'QUEUE_CONFIRMATION_USABLE',
     ('POST', '/v1/intake/routine'): 'INTAKE_ROUTINE',
@@ -317,6 +321,9 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             foreach ($suite in @('tests/integration/test_w3_admission.py', 'tests/integration/test_w3_admission_races.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-15 verification: $suite" }
             }
+            foreach ($suite in @('tests/integration/test_w3_queue_policy.py', 'tests/integration/test_w3_placement_races.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-13 verification: $suite" }
+            }
             # Linux CI retains the accepted Bash probes; PowerShell checks their exit immediately.
             $integration = @'
 set -euo pipefail
@@ -372,6 +379,8 @@ if [ "$1" = integration-diagnostic ]; then
     w3-admission-confirmations) focused_target='tests/integration/test_w3_admission_confirmations.py' ;;
     w3-admission) focused_target='tests/integration/test_w3_admission.py' ;;
     w3-admission-races) focused_target='tests/integration/test_w3_admission_races.py' ;;
+    w3-queue-policy) focused_target='tests/integration/test_w3_queue_policy.py' ;;
+    w3-placement-races) focused_target='tests/integration/test_w3_placement_races.py' ;;
     w3-migration) focused_target='tests/integration/test_f01_grants_migration.py' ;;
     *) echo 'FAIL unapproved PostgreSQL diagnostic selection'; exit 1 ;;
   esac
@@ -434,7 +443,7 @@ cleanup() {
         ordinary-stack) export CP_FOUNDATION_COVERAGE=current-head-stack ;;
         historical) export CP_FOUNDATION_COVERAGE=immutable-0040-selected-nodes-on-isolated-postgres ;;
       esac
-      export CP_FOUNDATION_CANDIDATE_SCHEMA=0058_b15_admission_guards
+      export CP_FOUNDATION_CANDIDATE_SCHEMA=0059_b13_queue_policy_placement
       export CP_FOUNDATION_HISTORICAL_SHA=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
       export CP_FOUNDATION_HISTORICAL_SCHEMA=0040_t173_numeric_money
       export CP_FOUNDATION_VERIFIED_TESTS="$foundation_tests" CP_FOUNDATION_LANE="$foundation_lane"
@@ -857,7 +866,7 @@ fi
 upgrade_head
 seed_identity_policy
 if [ "$foundation_full" = true ]; then
-  test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0058_b15_admission_guards
+  test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0059_b13_queue_policy_placement
 fi
 if [ "$foundation_lane" != ordinary-stack ]; then
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
@@ -895,7 +904,7 @@ fi
 fi
 # Wave 3 suites exercise the current head, never the immutable predecessor or special modes.
 if [ "$foundation_lane" = ordinary-db ] || { [ "$foundation_lane" = standard ] && [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; }; then
-  for suite in w3_receipt_boundary w3_checkin w3_checkin_races w3_queue_scope w3_intake w3_intake_races w3_admission_controls w3_admission_confirmations w3_admission w3_admission_races; do
+  for suite in w3_receipt_boundary w3_checkin w3_checkin_races w3_queue_scope w3_intake w3_intake_races w3_admission_controls w3_admission_confirmations w3_admission w3_admission_races w3_queue_policy w3_placement_races; do
     docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
       -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
       -v "$private/foundation-results:/tmp/foundation-results:rw" \

@@ -31,6 +31,7 @@ from carepulse.queue.admission_control import (
 )
 from carepulse.queue.admit import admit_patient, recover_admission
 from carepulse.queue.contracts import QueueQuery
+from carepulse.queue.placement import PlacementCommand, place_routine, recover_placement
 from carepulse.queue.queries import dated_queue_projection
 
 router = APIRouter(prefix="/v1/queue")
@@ -82,6 +83,32 @@ async def _revoke_body(request: Request) -> RevokeConfirmationCommand:
 
 async def _admit_body(request: Request) -> AdmitCommand:
     return await strict_command(request, AdmitCommand)
+
+
+async def _placement_body(request: Request) -> PlacementCommand:
+    return await strict_command(request, PlacementCommand)
+
+
+@router.post("/placement")
+def place(
+    request: Request, command: Annotated[PlacementCommand, Depends(_placement_body)]
+):
+    key = request.scope["carepulse.identity"].idempotency_key
+    if not key:
+        raise ContractError(422)
+    try:
+        with _transaction(request, purpose="QUEUE_PLACEMENT") as (connection, actor):
+            projection, revision, _ = place_routine(connection, actor, command, key)
+            return success_response(projection, revision)
+    except ReceiptConflict:
+        with _transaction(
+            request, purpose="QUEUE_PLACEMENT", stage="RECEIPT_RECOVERY"
+        ) as (
+            connection,
+            actor,
+        ):
+            projection, revision = recover_placement(connection, actor, command, key)
+            return success_response(projection, revision)
 
 
 @router.post("/admit")

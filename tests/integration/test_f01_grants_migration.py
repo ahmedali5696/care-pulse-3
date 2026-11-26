@@ -339,7 +339,7 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
         assert revisions[-1].revision == head
         revision_order = [revision.revision for revision in revisions]
         queue_grants_index = revision_order.index("0047_b12_queue_checkin_grants")
-        assert revision_order[queue_grants_index - 1 : queue_grants_index + 12] == [
+        assert revision_order[queue_grants_index - 1 : queue_grants_index + 13] == [
             "0046_f01_audit_integrity",
             "0047_b12_queue_checkin_grants",
             "0048_b12_queue_scope",
@@ -353,6 +353,7 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
             "0056_b14_target_binding",
             "0057_w3_queue_admit",
             "0058_b15_admission_guards",
+            "0059_b13_queue_policy_placement",
         ]
         assert any(row["disposition"] == "ACTIVE" for row in retained["queue_entries"])
         for revision in revisions:
