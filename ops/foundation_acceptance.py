@@ -14,7 +14,7 @@ from ops import foundation_inventory as inventory
 HISTORICAL_SHA = "6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7"
 SOURCE_SCHEMA = "0040_t173_numeric_money"
 CANDIDATE_SCHEMA = "0046_f01_audit_integrity"
-ORDINARY_SCHEMA = "0070_b19_legacy_evidence"
+ORDINARY_SCHEMA = "0072_b20_worker"
 RECEIPT_FILE = "foundation-full-receipt.json"
 EXPECTED_COVERAGE = {
     "ordinary-db": "current-head-db",
@@ -73,6 +73,9 @@ DIAGNOSTICS = {
     "w3-reschedule-races",
     "w3-bulk",
     "w3-bulk-races",
+    "w3-reconciliation",
+    "w3-day-review",
+    "w3-cutoff-races",
     "w3-migration",
     "compat-us1",
     "compat-us2",
@@ -387,7 +390,7 @@ def _publish_acceptance(env: dict[str, str]) -> None:
         f"- Repository/workflow: `{context['repository']}` / `{context['workflow']}`",
         f"- Run/attempt: `{context['run_id']}` / `{context['attempt']}`",
         (
-            f"- Ordinary ({ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15, B-13, B-16, B-17, B-18 and B-19): "
+            f"- Ordinary ({ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15, B-13, B-16, B-17, B-18, B-19 and B-20): "
             f"DB ({sum(inventory.REPORT_COUNTS['ordinary-db'].values())}), "
             f"stack ({sum(inventory.REPORT_COUNTS['ordinary-stack'].values())}); "
             "historical (163 at 0040), compatibility (44 Python + 11 Web, 0040 to 0046): verified"

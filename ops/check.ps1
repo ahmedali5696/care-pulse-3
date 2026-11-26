@@ -108,7 +108,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'e70ffc5d0fcbcdddb3c7ed6f9244831021b9cfe9a3e65ba033a4fa91406bad23',
+    '.github/workflows/foundation.yml': '934a589b71447c74c56c266a216e229ccdf43a0328ae284572a08d962255f115',
     '.github/workflows/fast-feedback.yml': '814f40f9f2a09d6337e5d4e14f1d4851e88301e64c1f28d5e538d3549dccce8b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
@@ -179,6 +179,8 @@ expected_paths = {
     '/v1/appointments/{appointment_id}/cancel',
     '/v1/appointments/{appointment_id}/replace-urgent',
     '/v1/appointments/{appointment_id}/reschedule',
+    '/v1/reconciliation', '/v1/appointments/{appointment_id}/manual-no-show',
+    '/v1/days/{raw_date}/review', '/v1/days/{raw_date}/close',
     '/v1/appointments/bulk-reschedule/preview', '/v1/appointments/bulk-reschedule/commit',
     '/v1/settings/admission', '/v1/queue/capacity', '/v1/queue/pause', '/v1/queue/admit',
     '/v1/settings/queue', '/v1/queue/placement',
@@ -202,6 +204,7 @@ assert boundary.kwargs['routes'] == {
     ('GET', '/v1/patients'): 'PATIENT_REGISTRY',
     ('POST', '/v1/patients'): 'PATIENT_REGISTRY',
     ('GET', '/v1/appointments'): 'APPOINTMENT_BOOKING',
+    ('GET', '/v1/reconciliation'): 'RECONCILIATION_READ',
     ('POST', '/v1/appointments'): 'APPOINTMENT_BOOKING',
     ('POST', '/v1/appointments/bulk-reschedule/preview'): 'APPOINTMENT_BULK_PREVIEW',
     ('POST', '/v1/appointments/bulk-reschedule/commit'): 'APPOINTMENT_BULK_COMMIT',
@@ -236,6 +239,9 @@ assert {(method, pattern.pattern, purpose) for method, pattern, purpose in bound
     ('POST', f'/v1/appointments/{uuid}/cancel', 'APPOINTMENT_CANCEL'),
     ('POST', f'/v1/appointments/{uuid}/replace-urgent', 'APPOINTMENT_REPLACE_URGENT'),
     ('POST', f'/v1/appointments/{uuid}/reschedule', 'APPOINTMENT_RESCHEDULE'),
+    ('POST', f'/v1/appointments/{uuid}/manual-no-show', 'APPOINTMENT_MANUAL_NO_SHOW'),
+    ('POST', r'/v1/days/[0-9]{4}-[0-9]{2}-[0-9]{2}/review', 'DAY_REVIEW'),
+    ('POST', r'/v1/days/[0-9]{4}-[0-9]{2}-[0-9]{2}/close', 'DAY_CLOSE'),
     ('POST', f'/v1/queue/admission-confirmations/{uuid}/revoke', 'QUEUE_CONFIRMATION_REVOKE'),
     ('PATCH', f'/v1/visits/{uuid}', signed_visit_patch_purpose),
     ('GET', f'/v1/visits/{uuid}', 'VISIT_READ'),
@@ -352,6 +358,9 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             foreach ($suite in @('tests/integration/test_w3_bulk.py', 'tests/integration/test_w3_bulk_races.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-19 verification: $suite" }
             }
+            foreach ($suite in @('tests/integration/test_w3_reconciliation.py', 'tests/integration/test_w3_day_review.py', 'tests/integration/test_w3_cutoff_races.py', 'tests/integration/test_w3_reconciliation_bff.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-20 verification: $suite" }
+            }
             # Linux CI retains the accepted Bash probes; PowerShell checks their exit immediately.
             $integration = @'
 set -euo pipefail
@@ -418,6 +427,9 @@ if [ "$1" = integration-diagnostic ]; then
     w3-reschedule-races) focused_target='tests/integration/test_w3_reschedule_races.py' ;;
     w3-bulk) focused_target='tests/integration/test_w3_bulk.py' ;;
     w3-bulk-races) focused_target='tests/integration/test_w3_bulk_races.py' ;;
+    w3-reconciliation) focused_target='tests/integration/test_w3_reconciliation.py' ;;
+    w3-day-review) focused_target='tests/integration/test_w3_day_review.py' ;;
+    w3-cutoff-races) focused_target='tests/integration/test_w3_cutoff_races.py' ;;
     w3-migration) focused_target='tests/integration/test_f01_grants_migration.py' ;;
     *) echo 'FAIL unapproved PostgreSQL diagnostic selection'; exit 1 ;;
   esac
@@ -480,7 +492,7 @@ cleanup() {
         ordinary-stack) export CP_FOUNDATION_COVERAGE=current-head-stack ;;
         historical) export CP_FOUNDATION_COVERAGE=immutable-0040-selected-nodes-on-isolated-postgres ;;
       esac
-      export CP_FOUNDATION_CANDIDATE_SCHEMA=0070_b19_legacy_evidence
+      export CP_FOUNDATION_CANDIDATE_SCHEMA=0072_b20_worker
       export CP_FOUNDATION_HISTORICAL_SHA=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
       export CP_FOUNDATION_HISTORICAL_SCHEMA=0040_t173_numeric_money
       export CP_FOUNDATION_VERIFIED_TESTS="$foundation_tests" CP_FOUNDATION_LANE="$foundation_lane"
@@ -606,11 +618,16 @@ if [ -n "$focused_target" ]; then
   echo 'PASS focused PostgreSQL Alembic upgrade to head'
   seed_identity_policy
   docker compose exec -T db postgres --version | grep -F '17.11'
+  worker_fixture_args=()
+  if [ "$focused_target" = 'tests/integration/test_w3_cutoff_races.py' ]; then
+    worker_fixture_args=(-v "$CP_WORKER_DB_PASSWORD_SOURCE_FILE:/run/secrets/worker_db_password:ro" -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro")
+  fi
   docker compose --profile test run --rm --no-deps -T "${identity_fixture_args[@]}" \
     -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
     -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
     -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
     -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+    "${worker_fixture_args[@]}" \
     test python tests/integration/focused_postgres.py "$focused_target"
   exit 0
 fi
@@ -908,7 +925,7 @@ fi
 upgrade_head
 seed_identity_policy
 if [ "$foundation_full" = true ]; then
-  if ! test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0070_b19_legacy_evidence; then
+  if ! test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0072_b20_worker; then
     echo 'FAIL ordinary current schema verification'; exit 1
   fi
   echo 'PASS ordinary current schema verification'
@@ -949,7 +966,11 @@ fi
 fi
 # Wave 3 suites exercise the current head, never the immutable predecessor or special modes.
 if [ "$foundation_lane" = ordinary-db ] || { [ "$foundation_lane" = standard ] && [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; }; then
-  for suite in w3_receipt_boundary w3_checkin w3_checkin_races w3_queue_scope w3_intake w3_intake_races w3_admission_controls w3_admission_confirmations w3_admission w3_admission_races w3_queue_policy w3_placement_races w3_visits w3_visit_races w3_cancel_replace w3_cancel_replace_races w3_reschedule w3_reschedule_races w3_bulk w3_bulk_races; do
+  for suite in w3_receipt_boundary w3_checkin w3_checkin_races w3_queue_scope w3_intake w3_intake_races w3_admission_controls w3_admission_confirmations w3_admission w3_admission_races w3_queue_policy w3_placement_races w3_visits w3_visit_races w3_cancel_replace w3_cancel_replace_races w3_reschedule w3_reschedule_races w3_bulk w3_bulk_races w3_reconciliation w3_day_review w3_cutoff_races; do
+    worker_fixture_args=()
+    if [ "$suite" = w3_cutoff_races ]; then
+      worker_fixture_args=(-v "$CP_WORKER_DB_PASSWORD_SOURCE_FILE:/run/secrets/worker_db_password:ro")
+    fi
     docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
       -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
       -v "$private/foundation-results:/tmp/foundation-results:rw" \
@@ -958,6 +979,7 @@ if [ "$foundation_lane" = ordinary-db ] || { [ "$foundation_lane" = standard ] &
       -v "$CP_AUTH_DB_PASSWORD_SOURCE_FILE:/run/secrets/auth_db_password:ro" \
       -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
       -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
+      "${worker_fixture_args[@]}" \
       test python -m pytest -q -s -ra --tb=short -p no:cacheprovider "--junitxml=/tmp/foundation-results/$suite.xml" "tests/integration/test_$suite.py" | tee "$private/$suite.log"
     if grep -Eq '[0-9]+ skipped|no tests ran' "$private/$suite.log"; then
       echo "FAIL mandatory Wave 3 evidence skipped: $suite"; exit 1
@@ -1368,7 +1390,7 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b05-invited.log"; then
   echo 'FAIL mandatory B-05 invited-session evidence skipped'; exit 1
 fi
 if [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; then
-  for suite in w3_bff w3_visit_bff w3_cancel_replace_bff w3_reschedule_bff; do
+  for suite in w3_bff w3_visit_bff w3_cancel_replace_bff w3_reschedule_bff w3_reconciliation_bff; do
     docker compose --profile test run --rm --no-deps \
       -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
       -v "$private/foundation-results:/tmp/foundation-results:rw" \

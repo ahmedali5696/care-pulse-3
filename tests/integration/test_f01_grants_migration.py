@@ -365,6 +365,8 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
             "0068_b19_capacity_numeric",
             "0069_b19_interval_evidence",
             "0070_b19_legacy_evidence",
+            "0071_b20_staff",
+            "0072_b20_worker",
         ]
         assert any(row["disposition"] == "ACTIVE" for row in retained["queue_entries"])
         for revision in revisions:
@@ -407,9 +409,39 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
                 assert _private_nonces(connection) == [
                     ("legacy-http-key", "synthetic-f01-retained-nonce")
                 ]
-                assert set(original_constraints) <= set(
-                    _constraints(connection, ("public",))
-                )
+                current_constraints = set(_constraints(connection, ("public",)))
+                if target == "0072_b20_worker":
+                    # Only the three explicitly evolved actor checks may change.
+                    evolved = {
+                        row
+                        for row in original_constraints
+                        if (row[1], row[2])
+                        in {
+                            (
+                                "appointment_history",
+                                "appointment_history_actor_role_check",
+                            ),
+                            (
+                                "idempotency_receipts",
+                                "idempotency_receipts_actor_kind_check",
+                            ),
+                        }
+                        or (
+                            row[1] == "idempotency_receipts"
+                            and "OPERATOR_CREATE" in row[6]
+                            and "actor_id" in row[6]
+                        )
+                    }
+                    assert len(evolved) == 3
+                    assert set(original_constraints) - evolved <= current_constraints
+                    replacements = {row[:6]: row[6] for row in current_constraints}
+                    for row in evolved:
+                        assert row[:6] in replacements
+                        assert "SYSTEM" in replacements[row[:6]]
+                        if "OPERATOR_CREATE" in row[6]:
+                            assert row[6][7:-1] in replacements[row[:6]]
+                else:
+                    assert set(original_constraints) <= current_constraints
                 after = _snapshot(connection)
                 assert after[0] == target
             _upgrade(migration, target)

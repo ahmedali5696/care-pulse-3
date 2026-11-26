@@ -138,6 +138,9 @@ def test_request_classifies_full_and_exclusive_modes(env):
         "w3-reschedule-races",
         "w3-bulk",
         "w3-bulk-races",
+        "w3-reconciliation",
+        "w3-day-review",
+        "w3-cutoff-races",
         "w3-migration",
     ],
 )
@@ -479,7 +482,7 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
     assert f"sha={env['GITHUB_SHA']}" in output
     assert f"Tested github.sha: `{env['GITHUB_SHA']}`" in summary.read_text()
     assert (
-        f"Ordinary ({acceptance.ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15, B-13, B-16, B-17, B-18 and B-19)"
+        f"Ordinary ({acceptance.ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15, B-13, B-16, B-17, B-18, B-19 and B-20)"
         in summary.read_text()
     )
     assert "44 Python + 11 Web" in summary.read_text()
@@ -494,8 +497,8 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
 def test_current_inventory_has_exact_disjoint_ordinary_reports():
     db = inventory.REPORT_COUNTS["ordinary-db"]
     stack = inventory.REPORT_COUNTS["ordinary-stack"]
-    assert (sum(db.values()), sum(stack.values())) == (629, 608)
-    assert (len(db), len(stack)) == (22, 32)
+    assert (sum(db.values()), sum(stack.values())) == (653, 611)
+    assert (len(db), len(stack)) == (25, 33)
     assert (db["w3_queue_policy"], db["w3_placement_races"]) == (11, 4)
     assert (db["w3_visits"], db["w3_visit_races"], stack["w3_visit_bff"]) == (11, 10, 1)
     assert (
@@ -509,9 +512,15 @@ def test_current_inventory_has_exact_disjoint_ordinary_reports():
         stack["w3_reschedule_bff"],
     ) == (17, 30, 1)
     assert (db["w3_bulk"], db["w3_bulk_races"]) == (20, 21)
-    assert sum(len(counts) for counts in inventory.REPORT_COUNTS.values()) == 61
     assert (
-        sum(sum(counts.values()) for counts in inventory.REPORT_COUNTS.values()) == 1455
+        db["w3_reconciliation"],
+        db["w3_day_review"],
+        db["w3_cutoff_races"],
+        stack["w3_reconciliation_bff"],
+    ) == (8, 6, 10, 3)
+    assert sum(len(counts) for counts in inventory.REPORT_COUNTS.values()) == 65
+    assert (
+        sum(sum(counts.values()) for counts in inventory.REPORT_COUNTS.values()) == 1482
     )
     assert not db.keys() & stack.keys()
     assert not (

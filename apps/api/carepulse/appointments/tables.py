@@ -191,7 +191,7 @@ appointment_history = Table(
     Column("new_service_date", Date, nullable=False),
     Column("old_number", BigInteger),
     Column("new_number", BigInteger, nullable=False),
-    Column("actor_staff_id", UUID(as_uuid=True), nullable=False),
+    Column("actor_staff_id", UUID(as_uuid=True)),
     Column("actor_role", Text, nullable=False),
     Column(
         "occurred_at",

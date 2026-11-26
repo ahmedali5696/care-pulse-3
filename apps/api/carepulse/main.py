@@ -2,7 +2,9 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import date
 from re import compile
+from uuid import UUID
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -10,7 +12,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 
+from carepulse.appointments.cutoff import apply_selected_cutoff
 from carepulse.appointments.intake_routes import router as intake_router
+from carepulse.appointments.reconciliation_routes import router as reconciliation_router
 from carepulse.appointments.routes import router as appointment_router
 from carepulse.config import load_config
 from carepulse.db import create_db_engine, create_gate_engine
@@ -33,6 +37,19 @@ from carepulse.provisioning.routes import router as provisioning_router
 from carepulse.queue.routes import router as queue_router
 from carepulse.visits.clinical_contracts import signed_visit_patch_purpose
 from carepulse.visits.routes import router as visit_router
+
+
+def run_selected_day_cutoff(
+    organization_id: UUID, service_date: date, policy_version: int
+) -> int:
+    """Internal worker entry only; no HTTP route or scheduling responsibility."""
+    engine = create_db_engine(load_config("worker"))
+    try:
+        return apply_selected_cutoff(
+            engine, organization_id, service_date, policy_version
+        )
+    finally:
+        engine.dispose()
 
 
 @asynccontextmanager
@@ -60,6 +77,7 @@ app.include_router(provisioning_router)
 app.include_router(staff_router)
 app.include_router(patient_router)
 app.include_router(appointment_router)
+app.include_router(reconciliation_router)
 app.include_router(intake_router)
 app.include_router(visit_router)
 app.include_router(pricing_router)
@@ -109,6 +127,7 @@ app.add_middleware(
         ("GET", "/v1/patients"): "PATIENT_REGISTRY",
         ("POST", "/v1/patients"): "PATIENT_REGISTRY",
         ("GET", "/v1/appointments"): "APPOINTMENT_BOOKING",
+        ("GET", "/v1/reconciliation"): "RECONCILIATION_READ",
         ("POST", "/v1/appointments"): "APPOINTMENT_BOOKING",
         (
             "POST",
@@ -141,6 +160,15 @@ app.add_middleware(
         ): "QUEUE_CONFIRMATION_USABLE",
     },
     route_patterns=(
+        (
+            "POST",
+            compile(
+                r"/v1/appointments/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/manual-no-show"
+            ),
+            "APPOINTMENT_MANUAL_NO_SHOW",
+        ),
+        ("POST", compile(r"/v1/days/[0-9]{4}-[0-9]{2}-[0-9]{2}/review"), "DAY_REVIEW"),
+        ("POST", compile(r"/v1/days/[0-9]{4}-[0-9]{2}-[0-9]{2}/close"), "DAY_CLOSE"),
         (
             "POST",
             compile(

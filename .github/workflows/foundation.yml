@@ -55,6 +55,9 @@ on:
           - w3-reschedule-races
           - w3-bulk
           - w3-bulk-races
+          - w3-reconciliation
+          - w3-day-review
+          - w3-cutoff-races
           - w3-migration
           - compat-us1
           - compat-us2

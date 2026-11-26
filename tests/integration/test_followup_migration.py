@@ -962,6 +962,8 @@ def test_fresh_and_failed_following_migration_keep_one_head(
         (scripts / "versions/0068_b19_capacity_numeric.py").unlink()
         (scripts / "versions/0069_b19_interval_evidence.py").unlink()
         (scripts / "versions/0070_b19_legacy_evidence.py").unlink()
+        (scripts / "versions/0071_b20_staff.py").unlink()
+        (scripts / "versions/0072_b20_worker.py").unlink()
         (scripts / "versions/0050_b12_checkin_completeness.py").unlink()
         (scripts / "versions/0049_b12_checkin_provenance.py").unlink()
         (scripts / "versions/0046_f01_audit_integrity.py").unlink()
