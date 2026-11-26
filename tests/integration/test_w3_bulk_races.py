@@ -77,7 +77,7 @@ def bulk_transaction(clinic, actor, kind, body, key):
         )
 
 
-def batch_race(clinic, bulk, competitor, bulk_first, *, losing=True):
+def batch_race(clinic, bulk, competitor, bulk_first, *, losing=True, denial_status=409):
     before = effects(clinic)
     observed = []
     winner, waiter = (bulk, competitor) if bulk_first else (competitor, bulk)
@@ -87,6 +87,7 @@ def batch_race(clinic, bulk, competitor, bulk_first, *, losing=True):
         lambda: _observe_waiter(clinic, waiter, observed),
         denial="CONFLICT" if losing else None,
         checkpoint=_checkpoint(clinic, before),
+        denial_status=denial_status,
     )
     after = effects(clinic)
     assert len(observed) == 1
@@ -165,7 +166,12 @@ def test_bulk_commit_serializes_with_included_row_changes(
 
     both_succeed = bulk_first and competitor == "archive"
     first, _, before, after, winner = batch_race(
-        clinic, bulk, compete, bulk_first, losing=not both_succeed
+        clinic,
+        bulk,
+        compete,
+        bulk_first,
+        losing=not both_succeed,
+        denial_status=404 if bulk_first and competitor == "admit" else 409,
     )
     assert appointment_row(after, excluded) == appointment_row(before, excluded)
     if bulk_first:
