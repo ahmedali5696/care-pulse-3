@@ -176,6 +176,8 @@ expected_paths = {
     '/v1/settings/schedule/preview', '/v1/settings/schedule/activate',
     '/v1/slots', '/v1/appointments', '/v1/appointments/{appointment_id}',
     '/v1/appointments/{appointment_id}/check-in', '/v1/queue',
+    '/v1/appointments/{appointment_id}/cancel',
+    '/v1/appointments/{appointment_id}/replace-urgent',
     '/v1/settings/admission', '/v1/queue/capacity', '/v1/queue/pause', '/v1/queue/admit',
     '/v1/settings/queue', '/v1/queue/placement',
     '/v1/queue/admission-confirmations', '/v1/queue/admission-confirmations/usable',
@@ -227,6 +229,8 @@ assert {(method, pattern.pattern, purpose) for method, pattern, purpose in bound
     ('GET', f'/v1/patients/{uuid}', 'PATIENT_REGISTRY'),
     ('GET', f'/v1/appointments/{uuid}', 'APPOINTMENT_BOOKING'),
     ('POST', f'/v1/appointments/{uuid}/check-in', 'QUEUE_CHECK_IN'),
+    ('POST', f'/v1/appointments/{uuid}/cancel', 'APPOINTMENT_CANCEL'),
+    ('POST', f'/v1/appointments/{uuid}/replace-urgent', 'APPOINTMENT_REPLACE_URGENT'),
     ('POST', f'/v1/queue/admission-confirmations/{uuid}/revoke', 'QUEUE_CONFIRMATION_REVOKE'),
     ('PATCH', f'/v1/visits/{uuid}', signed_visit_patch_purpose),
     ('GET', f'/v1/visits/{uuid}', 'VISIT_READ'),
@@ -461,7 +465,7 @@ cleanup() {
         ordinary-stack) export CP_FOUNDATION_COVERAGE=current-head-stack ;;
         historical) export CP_FOUNDATION_COVERAGE=immutable-0040-selected-nodes-on-isolated-postgres ;;
       esac
-      export CP_FOUNDATION_CANDIDATE_SCHEMA=0061_b17_cancel_replace
+      export CP_FOUNDATION_CANDIDATE_SCHEMA=0062_b17_typed_body
       export CP_FOUNDATION_HISTORICAL_SHA=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
       export CP_FOUNDATION_HISTORICAL_SCHEMA=0040_t173_numeric_money
       export CP_FOUNDATION_VERIFIED_TESTS="$foundation_tests" CP_FOUNDATION_LANE="$foundation_lane"
@@ -884,7 +888,7 @@ fi
 upgrade_head
 seed_identity_policy
 if [ "$foundation_full" = true ]; then
-  test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0061_b17_cancel_replace
+  test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0062_b17_typed_body
 fi
 if [ "$foundation_lane" != ordinary-stack ]; then
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \

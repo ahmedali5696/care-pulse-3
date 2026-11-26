@@ -8,7 +8,7 @@ from hashlib import sha256
 from uuid import UUID, uuid4
 
 import pytest
-from carepulse.appointments.cancel import recover_cancel_replace
+from carepulse.appointments.cancel import recover_cancel_replace, replace_urgent
 from carepulse.appointments.cancel_contracts import ReplaceUrgent
 from carepulse.identity.authorization import protected_transaction
 from runtime_identity_fixture import registered_test_request, signed_test_transaction
@@ -54,7 +54,7 @@ def _appointment(clinic, appointment_id):
         return (
             connection.execute(
                 text("""
-            SELECT a.*, p.base_egp, p.net_egp, p.pricing_version
+            SELECT a.*, p.base_egp, p.net_egp, p.pricing_version, p.discount_reason
             FROM public.appointments a JOIN public.appointment_price_snapshots p
               ON p.organization_id=a.organization_id AND p.appointment_id=a.id
             WHERE a.organization_id=:tenant AND a.id=:id
@@ -147,6 +147,7 @@ def _denied(clinic, actor, appointment_id, operation, body, expected, *, key=Non
     assert status == expected, reply
     assert set(reply) == {"error"}
     assert intake_effects(clinic) == before
+    return reply
 
 
 def _assert_recovery_stage(clinic, target, body, key, reply):
@@ -351,9 +352,10 @@ def test_replacement_preserves_old_number_price_history_and_recovers_exact_resul
         discount={
             "discount_type": "FIXED",
             "discount_value": "49.99",
-            "discount_reason": "Synthetic premium",
+            "discount_reason": "Synthetic premium\nApproved onsite",
         },
         expected_net_egp="100.01",
+        expected_capacity_revision=None,
     )
     old = _appointment(clinic, target)
     key = uuid4().hex
@@ -387,6 +389,28 @@ def test_replacement_preserves_old_number_price_history_and_recovers_exact_resul
                 connection.execute(text(statement))
             assert denied.value.orig.sqlstate == "42501"
     assert intake_effects(clinic) == before
+    # Force deferred DB checks while still inside the signed request, then roll back.
+    with (
+        pytest.raises(RuntimeError, match="synthetic replacement rollback"),
+        signed_test_transaction(
+            clinic,
+            clinic.receptionist,
+            method="POST",
+            path=f"/v1/appointments/{target}/replace-urgent",
+            purpose="APPOINTMENT_REPLACE_URGENT",
+            body=body,
+            key=key,
+        ) as (connection, actor),
+    ):
+        assert connection.scalar(text("SELECT session_user")) == "carepulse_api"
+        projection, revision, created = replace_urgent(
+            connection, actor, UUID(target), ReplaceUrgent.model_validate(body), key
+        )
+        assert created and revision == body["expected_appointment_revision"] + 1
+        assert projection["new_status"] == "Waiting"
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+        raise RuntimeError("synthetic replacement rollback")
+    assert intake_effects(clinic) == before
     status, reply = change_request(
         clinic, clinic.receptionist, target, "replace-urgent", body, key=key
     )
@@ -415,6 +439,7 @@ def test_replacement_preserves_old_number_price_history_and_recovers_exact_resul
     )
     assert new["current_number"] > old["current_number"] and new["revision"] == 0
     assert (new["base_egp"], new["net_egp"]) == (Decimal("150.00"), Decimal("100.01"))
+    assert new["discount_reason"] == body["discount"]["discount_reason"]
     _terminal_evidence(clinic, target, clinic.receptionist, body, replacement=new_id)
     after = intake_effects(clinic)
     for table in (
@@ -431,6 +456,11 @@ def test_replacement_preserves_old_number_price_history_and_recovers_exact_resul
     ) == (200, reply)
     _assert_recovery_stage(clinic, target, body, key, reply)
     assert intake_effects(clinic) == after
+    omitted = {k: v for k, v in body.items() if k != "expected_capacity_revision"}
+    conflict = _denied(
+        clinic, clinic.receptionist, target, "replace-urgent", omitted, 409, key=key
+    )
+    assert conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
     _denied(
         clinic,
         clinic.receptionist,
@@ -451,15 +481,43 @@ def test_replacement_preserves_old_number_price_history_and_recovers_exact_resul
     )
     foreign = _foreign_appointment(clinic)
     _denied(clinic, clinic.receptionist, foreign, "replace-urgent", body, 404, key=key)
+    second_body, second_key = replace_body(clinic, other), uuid4().hex
     status, second = change_request(
         clinic,
         clinic.receptionist,
         other,
         "replace-urgent",
-        replace_body(clinic, other),
+        second_body,
+        key=second_key,
     )
     assert status == 201, second
     assert second["data"]["replacement_appointment_id"] not in (new_id, other, target)
+    committed = intake_effects(clinic)
+    assert change_request(
+        clinic,
+        clinic.receptionist,
+        other,
+        "replace-urgent",
+        second_body,
+        key=second_key,
+    ) == (200, second)
+    omitted_discount = {
+        **second_body,
+        "discount": {
+            k: v for k, v in second_body["discount"].items() if k != "discount_reason"
+        },
+    }
+    conflict = _denied(
+        clinic,
+        clinic.receptionist,
+        other,
+        "replace-urgent",
+        omitted_discount,
+        409,
+        key=second_key,
+    )
+    assert conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert intake_effects(clinic) == committed
 
 
 def test_replacement_rejects_invalid_actor_onsite_premium_holiday_and_archived_patient(
