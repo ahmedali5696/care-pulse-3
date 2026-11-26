@@ -480,7 +480,7 @@ cleanup() {
         ordinary-stack) export CP_FOUNDATION_COVERAGE=current-head-stack ;;
         historical) export CP_FOUNDATION_COVERAGE=immutable-0040-selected-nodes-on-isolated-postgres ;;
       esac
-      export CP_FOUNDATION_CANDIDATE_SCHEMA=0066_b19_bulk_reschedule
+      export CP_FOUNDATION_CANDIDATE_SCHEMA=0067_b19_exclusion_reason
       export CP_FOUNDATION_HISTORICAL_SHA=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
       export CP_FOUNDATION_HISTORICAL_SCHEMA=0040_t173_numeric_money
       export CP_FOUNDATION_VERIFIED_TESTS="$foundation_tests" CP_FOUNDATION_LANE="$foundation_lane"
@@ -571,16 +571,22 @@ identity_fixture_args=(
   -v "$CP_GATE_DB_PASSWORD_SOURCE_FILE:/run/secrets/gate_db_password:ro"
 )
 upgrade_head() {
-  docker compose --profile test run --rm --no-deps \
+  echo 'START PostgreSQL Alembic upgrade to head'
+  if ! docker compose --profile test run --rm --no-deps -T \
     -e CP_DB_HOST=db -e CP_DB_PORT=5432 -e CP_DB_NAME=carepulse \
     -e CP_MIGRATION_PASSWORD_FILE=/run/secrets/migration_password \
     -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
-    test python -m alembic -c alembic.ini upgrade head
+    test python -m ops.migration_startup > "$private/migration-startup.log" 2>&1; then
+    grep -E '^MIGRATION_STARTUP FAIL category=(database|runtime|other) sqlstate=([A-Z0-9]{5}|unavailable) location=([0-9]{4}_[a-z0-9_]+\.py:[0-9]+|unavailable)$' "$private/migration-startup.log" || true
+    echo 'FAIL PostgreSQL Alembic upgrade to head'; return 1
+  fi
+  grep -Fx 'MIGRATION_STARTUP PASS' "$private/migration-startup.log"
 }
 
 # Synthetic-only custody setup. The ordinary runtime roles have no key-table
 # access. Provisioning is performed outside all application containers.
 seed_identity_policy() {
+  echo 'START F-01 synthetic identity provisioning'
   set +x
   export CP_F01_SYNTHETIC_KEY="$(cat "$CP_DB_IDENTITY_KEY_SOURCE_FILE")"
   export CP_F01_FRESHNESS="$(jq -er 'select(.profile == "synthetic") | .signed_request_freshness_seconds' tests/fixtures/foundation-policy.json)"
@@ -592,12 +598,11 @@ seed_identity_policy() {
       echo 'FAIL F-01 synthetic identity provisioning'; return 1;
     }
   unset CP_F01_SYNTHETIC_KEY CP_F01_FRESHNESS CP_F01_SKEW CP_F01_IDLE
+  echo 'PASS F-01 synthetic identity provisioning'
 }
 
 if [ -n "$focused_target" ]; then
-  if ! upgrade_head > "$private/focused-migration.log" 2>&1; then
-    echo 'FAIL focused PostgreSQL Alembic upgrade to head'; exit 1
-  fi
+  upgrade_head
   echo 'PASS focused PostgreSQL Alembic upgrade to head'
   seed_identity_policy
   docker compose exec -T db postgres --version | grep -F '17.11'
@@ -903,7 +908,10 @@ fi
 upgrade_head
 seed_identity_policy
 if [ "$foundation_full" = true ]; then
-  test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0066_b19_bulk_reschedule
+  if ! test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0067_b19_exclusion_reason; then
+    echo 'FAIL ordinary current schema verification'; exit 1
+  fi
+  echo 'PASS ordinary current schema verification'
 fi
 if [ "$foundation_lane" != ordinary-stack ]; then
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
