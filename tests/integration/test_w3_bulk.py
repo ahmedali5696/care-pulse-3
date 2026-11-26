@@ -267,7 +267,7 @@ def mixed_cohort(clinic):
     booked, waiting = book_case(clinic), book_case(clinic, waiting=True)
     status, reply = intake_request(
         clinic,
-        clinic.owner,
+        clinic.receptionist,
         "urgent",
         intake_body(clinic, new_patient(clinic), "urgent"),
     )
