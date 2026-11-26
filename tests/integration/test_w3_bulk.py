@@ -562,9 +562,20 @@ def test_joint_capacity_is_order_independent(
                 connection,
                 str(clinic.tenant),
                 "CAPACITY",
-                {"capacity": 2, "paused": False},
+                {"capacity": 2.0, "paused": False},
                 _policy_revision(clinic, "CAPACITY"),
                 actor_staff_id=clinic.owner.staff_id,
+            )
+            # Regression for 0066: valid retained integral JSON numeric 2.0.
+            assert (
+                connection.scalar(
+                    text("""
+                    SELECT payload->>'capacity' FROM public.clinic_policy_versions
+                    WHERE organization_id=:tenant AND kind='CAPACITY' AND version=:version
+                """),
+                    {"tenant": clinic.tenant, "version": version},
+                )
+                == "2.0"
             )
             connection.execute(
                 text("""
