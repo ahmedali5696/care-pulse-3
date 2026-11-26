@@ -292,6 +292,16 @@ def test_mixed_selection_moves_only_exact_included_subset(intake_clinic, role):
     preview_key, commit_key = uuid4().hex, uuid4().hex
     preview = preview_selection(clinic, actor, body, key=preview_key)
     assert partition(preview) == (set(included), excluded)
+    for row in preview["included"] + preview["excluded"]:
+        assert all(
+            row[field] is None
+            for field in (
+                "source_local_start",
+                "source_local_end",
+                "starts_at",
+                "ends_at",
+            )
+        )
     assert "Synthetic B19 confidential diagnosis" not in json.dumps(preview)
     assert '"diagnosis"' not in json.dumps(preview)
     before = effects(clinic)
@@ -598,7 +608,7 @@ def test_joint_capacity_is_order_independent(
     ]
     for preview in previews:
         assert partition(preview) == expected
-        for row in preview["included"]:
+        for row in preview["included"] + preview["excluded"]:
             clocks = (
                 ("09:15", "09:30")
                 if row["appointment_id"] == touching
@@ -682,10 +692,21 @@ def test_cairo_clock_carriage_across_offset_change(intake_clinic):
         clinic, mode="EXACT_TIME", periods=(("09:00", "10:00"),), duration=15
     )
     target = timed_book(clinic, original, "09:00", "09:15", overlap=False)
-    preview = preview_selection(
-        clinic, clinic.owner, preview_body([target], original, destination)
+    terminal = timed_book(clinic, original, "09:15", "09:30", overlap=False)
+    status, reply = change_request(
+        clinic, clinic.owner, terminal, "cancel", cancel_body(clinic, terminal)
     )
-    assert partition(preview) == ({target}, {})
+    assert status == 200, reply
+    preview = preview_selection(
+        clinic, clinic.owner, preview_body([target, terminal], original, destination)
+    )
+    assert partition(preview) == ({target}, {terminal: "appointment not eligible"})
+    (excluded,) = preview["excluded"]
+    assert excluded["source_local_start"] == "09:15:00"
+    assert excluded["source_local_end"] == "09:30:00"
+    assert {key: excluded[key] for key in ("starts_at", "ends_at")} == interval(
+        destination, "09:15", "09:30"
+    )
     (row,) = preview["included"]
     assert row["source_local_start"] == "09:00:00"
     assert row["source_local_end"] == "09:15:00"
@@ -794,9 +815,49 @@ def test_individual_destination_guard_excludes_only_invalid_rows(
             holidays=(destination,) if guard == "holiday" else (),
             duration=30 if guard == "duration" else 15,
         )
-    preview = preview_selection(
-        clinic, clinic.owner, preview_body([target, independent], original, destination)
-    )
+    body = preview_body([target, independent], original, destination)
+    preview_key = uuid4().hex
+    preview = preview_selection(clinic, clinic.owner, body, key=preview_key)
+    expected_clocks = {target: ("09:00", "09:15"), independent: ("09:30", "09:45")}
+    for row in preview["included"] + preview["excluded"]:
+        start, end = expected_clocks[row["appointment_id"]]
+        assert row["source_local_start"] == start + ":00"
+        assert row["source_local_end"] == end + ":00"
+        for field, clock in (("starts_at", start), ("ends_at", end)):
+            expected = datetime.combine(destination, time.fromisoformat(clock), CAIRO)
+            observed = datetime.fromisoformat(row[field])
+            assert observed.utcoffset() == timedelta(0)
+            assert observed == expected.astimezone(UTC)
+    assert all("command" not in row for row in preview["excluded"])
+    before = effects(clinic)
+    snapshot = {k: v for k, v in preview.items() if k not in ("preview_id", "revision")}
+    for forged in (
+        {"starts_at": None, "ends_at": None},
+        {"starts_at": preview["excluded"][0]["ends_at"]},
+    ):
+        invalid = {
+            **snapshot,
+            "excluded": [
+                {**preview["excluded"][0], **forged},
+                *preview["excluded"][1:],
+            ],
+        }
+        with signed_test_transaction(
+            clinic,
+            clinic.owner,
+            method="POST",
+            path="/v1/appointments/bulk-reschedule/preview",
+            purpose="APPOINTMENT_BULK_PREVIEW",
+            body=body,
+            key=uuid4().hex,
+        ) as (connection, _):
+            assert_sql_denied(
+                connection,
+                "SELECT public.f01_b19_store_preview(CAST(:snapshot AS jsonb))",
+                {"snapshot": json.dumps(invalid)},
+                "40001",
+            )
+    assert effects(clinic) == before
     if guard in ("holiday", "duration"):
         assert partition(preview) == (set(), {target: reason, independent: reason})
         denied(clinic, clinic.owner, "commit", commit_body(preview), 409)
@@ -813,6 +874,10 @@ def test_individual_destination_guard_excludes_only_invalid_rows(
         if guard == "existing":
             assert appointment_row(after, existing) == appointment_row(before, existing)
             assert existing not in json.dumps(preview)
+    after = effects(clinic)
+    status, reply = bulk_request(clinic, clinic.owner, "preview", body, key=preview_key)
+    assert status == 200 and reply["data"] == preview
+    assert effects(clinic) == after
 
 
 def assert_sql_denied(connection, sql, params, state):

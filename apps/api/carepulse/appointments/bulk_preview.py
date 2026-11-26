@@ -121,55 +121,59 @@ def _source_clocks(row: dict) -> dict:
     }
 
 
-def _destination_interval(row: dict, destination: date) -> Interval:
-    start = datetime.fromisoformat(row["starts_at"]).astimezone(CAIRO).time()
-    end = datetime.fromisoformat(row["ends_at"]).astimezone(CAIRO).time()
-    return Interval(
-        resolve_cairo_local_time(destination, start),
-        resolve_cairo_local_time(destination, end),
-    )
+def _destination_interval(row: dict, destination: date) -> Interval | None:
+    """Resolve evidence independently of eligibility; Open and unresolved clocks stay untimed."""
+    if row["booking_mode"] != "EXACT_TIME":
+        return None
+    try:
+        start = datetime.fromisoformat(row["starts_at"]).astimezone(CAIRO).time()
+        end = datetime.fromisoformat(row["ends_at"]).astimezone(CAIRO).time()
+        return Interval(
+            resolve_cairo_local_time(destination, start),
+            resolve_cairo_local_time(destination, end),
+        )
+    except (ValueError, OverflowError, TypeError):
+        return None
 
 
 def _candidate_exclusion(
-    row: dict, context: dict
-) -> tuple[str | None, Interval | None]:
+    row: dict, context: dict, interval: Interval | None
+) -> str | None:
     if row["status"] not in ("Booked", "Waiting"):
-        return "appointment not eligible", None
+        return "appointment not eligible"
     if row["status"] == "Waiting" and not row.get("queue_active"):
-        return "waiting queue evidence unavailable", None
+        return "waiting queue evidence unavailable"
     if row["classification"] != "ROUTINE" or row["lane"] != "MAIN":
-        return "service not eligible", None
+        return "service not eligible"
     if row.get("destination_patient_conflict"):
-        return "patient already booked on destination day", None
+        return "patient already booked on destination day"
     if row["service_type"] == "FOLLOW_UP":
         if row.get("claim_state") != "ACTIVE" or not row.get("source_eligible"):
-            return "follow-up entitlement unavailable", None
+            return "follow-up entitlement unavailable"
         frozen_deadline = row.get("approved_deadline")
         if (
             frozen_deadline is None
             or context["destination"] > date.fromisoformat(frozen_deadline)
             and not row.get("extension_event_id")
         ):
-            return "confirmed follow-up extension required", None
+            return "confirmed follow-up extension required"
     if not context["destination_eligible"]:
-        return "destination schedule unavailable", None
+        return "destination schedule unavailable"
     if row["booking_mode"] != context["booking_mode"]:
-        return "booking mode changed", None
+        return "booking mode changed"
     if row["booking_mode"] == "OPEN":
-        return None, None
-    try:
-        interval = _destination_interval(row, context["destination"])
-    except (ValueError, OverflowError, TypeError):
-        return "destination local time unavailable", None
+        return None
+    if interval is None:
+        return "destination local time unavailable"
     if (interval.starts_at, interval.ends_at) not in context["slots"]:
-        return "destination slot unavailable", None
+        return "destination slot unavailable"
     if interval.starts_at <= context["now"]:
-        return "destination time elapsed", None
+        return "destination time elapsed"
     if joint_capacity_conflicts(
         context["existing"], {row["id"]: interval}, context["capacity"]
     ):
-        return "destination capacity conflict", None
-    return None, interval
+        return "destination capacity conflict"
+    return None
 
 
 def _bound_reschedule_command(
@@ -277,11 +281,16 @@ def evaluate_cohort(
         "now": now,
     }
     rows_by_id = {row["id"]: row for row in rows}
+    carried = {
+        identifier: _destination_interval(row, destination)
+        for identifier, row in rows_by_id.items()
+    }
     tentative: dict[str, Interval] = {}
     exclusions: dict[str, str] = {}
     for identifier in source["appointment_ids"]:
         row = rows_by_id[identifier]
-        denial, interval = _candidate_exclusion(row, context)
+        interval = carried[identifier]
+        denial = _candidate_exclusion(row, context, interval)
         if denial:
             exclusions[identifier] = denial
         elif interval is not None:
@@ -293,7 +302,7 @@ def evaluate_cohort(
     included, excluded = [], []
     for identifier in source["appointment_ids"]:
         row = rows_by_id[identifier]
-        evidence = _operational_row(row, tentative.get(identifier))
+        evidence = _operational_row(row, carried[identifier])
         if identifier in exclusions:
             excluded.append({**evidence, "reason": exclusions[identifier]})
         else:

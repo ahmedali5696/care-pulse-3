@@ -14,7 +14,7 @@ from ops import foundation_inventory as inventory
 HISTORICAL_SHA = "6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7"
 SOURCE_SCHEMA = "0040_t173_numeric_money"
 CANDIDATE_SCHEMA = "0046_f01_audit_integrity"
-ORDINARY_SCHEMA = "0068_b19_capacity_numeric"
+ORDINARY_SCHEMA = "0069_b19_interval_evidence"
 RECEIPT_FILE = "foundation-full-receipt.json"
 EXPECTED_COVERAGE = {
     "ordinary-db": "current-head-db",

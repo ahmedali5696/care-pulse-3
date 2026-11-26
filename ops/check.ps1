@@ -480,7 +480,7 @@ cleanup() {
         ordinary-stack) export CP_FOUNDATION_COVERAGE=current-head-stack ;;
         historical) export CP_FOUNDATION_COVERAGE=immutable-0040-selected-nodes-on-isolated-postgres ;;
       esac
-      export CP_FOUNDATION_CANDIDATE_SCHEMA=0068_b19_capacity_numeric
+      export CP_FOUNDATION_CANDIDATE_SCHEMA=0069_b19_interval_evidence
       export CP_FOUNDATION_HISTORICAL_SHA=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
       export CP_FOUNDATION_HISTORICAL_SCHEMA=0040_t173_numeric_money
       export CP_FOUNDATION_VERIFIED_TESTS="$foundation_tests" CP_FOUNDATION_LANE="$foundation_lane"
@@ -908,7 +908,7 @@ fi
 upgrade_head
 seed_identity_policy
 if [ "$foundation_full" = true ]; then
-  if ! test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0068_b19_capacity_numeric; then
+  if ! test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0069_b19_interval_evidence; then
     echo 'FAIL ordinary current schema verification'; exit 1
   fi
   echo 'PASS ordinary current schema verification'
