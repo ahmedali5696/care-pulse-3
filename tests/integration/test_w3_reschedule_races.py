@@ -28,7 +28,9 @@ from test_pricing import (
     _manager_change,
     _manager_transaction,
     _owner_changes_manager,
+    pricing_request,
 )
+from test_pricing import _patch as pricing_patch
 from test_queue_capacity import _policy_capacity
 from test_request_boundary import boundary_data as boundary_data  # noqa: PLC0414
 from test_schedule import _activate, _config, _patch, _schedule_request
@@ -36,8 +38,19 @@ from test_slots import _slots_request
 from test_w3_admission import _admit, admit_body
 from test_w3_admission_controls import _capacity_body
 from test_w3_admission_races import _policy
-from test_w3_cancel_replace import _appointment, book_case, cancel_body, replace_body
-from test_w3_cancel_replace_races import _checkpoint, _command, _observe_waiter
+from test_w3_cancel_replace import (
+    _appointment,
+    book_case,
+    cancel_body,
+    change_request,
+    replace_body,
+)
+from test_w3_cancel_replace_races import (
+    _assert_replacement,
+    _checkpoint,
+    _command,
+    _observe_waiter,
+)
 from test_w3_checkin_races import _archive, _ordered_race
 from test_w3_intake import (
     _policy_revision,
@@ -47,7 +60,7 @@ from test_w3_intake import (
     set_intake_schedule,
 )
 from test_w3_intake import intake_clinic as intake_clinic  # noqa: PLC0414
-from test_w3_reschedule import denied, move_body, move_request, rows
+from test_w3_reschedule import assert_move, denied, move_body, move_request, rows
 from test_w3_visit_races import _claimed_visit, _denied_holder, _visit_command
 from test_w3_visits import detail, effects, terminal_body, visit_request
 
@@ -328,7 +341,7 @@ def test_reschedule_replacement_order(intake_clinic, move_first):
             replacement=True,
         )
 
-    _ordered_race(
+    result, _ = _ordered_race(
         clinic,
         move if move_first else replace,
         lambda: _observe_waiter(clinic, replace if move_first else move, committed),
@@ -345,6 +358,34 @@ def test_reschedule_replacement_order(intake_clinic, move_first):
         "Booked" if move_first else "Cancelled"
     )
     assert len(after["appointments"]) == len(before["appointments"]) + (not move_first)
+    if move_first:
+        projection, revision = result
+        assert_move(
+            clinic,
+            clinic.owner,
+            target,
+            body,
+            before,
+            {"data": projection, "revision": revision},
+            move_key,
+        )
+        # Return the Routine to an independently eligible current-day booking.
+        status, reply = move_request(
+            clinic, clinic.owner, target, move_body(clinic, target, _today())
+        )
+        assert status == 200, reply
+        status, reply = change_request(
+            clinic,
+            clinic.receptionist,
+            target,
+            "replace-urgent",
+            replace_body(clinic, target),
+        )
+        assert status == 201, reply
+        assert _appointment(clinic, target)["status"] == "Cancelled"
+        assert reply["data"]["replacement_appointment_id"] != str(target)
+    else:
+        _assert_replacement(before, after, target, result, replace_key)
 
 
 @pytest.mark.parametrize("move_first", [True, False])
@@ -508,7 +549,7 @@ def test_new_booking_and_reschedule_count_destination_once(
     def book():
         return booking_transaction(clinic, booking, book_key)
 
-    _ordered_race(
+    result, _ = _ordered_race(
         clinic,
         move if move_first else book,
         lambda: _observe_waiter(clinic, book if move_first else move, committed),
@@ -528,6 +569,41 @@ def test_new_booking_and_reschedule_count_destination_once(
         r["idempotency_key"] == (book_key if move_first else move_key)
         for r in after["idempotency_receipts"]
     )
+    if move_first:
+        projection, revision = result
+        assert_move(
+            clinic,
+            clinic.owner,
+            target,
+            body,
+            before,
+            {"data": projection, "revision": revision},
+            move_key,
+        )
+        assert (
+            len(after["appointment_number_assignments"])
+            == len(before["appointment_number_assignments"]) + 1
+        )
+    else:
+        new_id = result["id"]
+        assert next(r for r in after["appointments"] if r["id"] == target) == next(
+            r for r in before["appointments"] if r["id"] == target
+        )
+        assert len(after["appointments"]) == len(before["appointments"]) + 1
+        assert len(rows(after, "appointment_number_assignments", new_id)) == 1
+        assert len(rows(after, "appointment_price_snapshots", new_id)) == 1
+        assert len(rows(after, "appointment_history", new_id)) == 1
+        assert after["queue_entries"] == before["queue_entries"]
+        assert after["followup_claims"] == before["followup_claims"]
+        (receipt,) = [
+            r for r in after["idempotency_receipts"] if r["idempotency_key"] == book_key
+        ]
+        assert receipt["result_projection"] == result
+        (event,) = [
+            r for r in after["outbox_events"] if r not in before["outbox_events"]
+        ]
+        assert event["event_type"] == "APPOINTMENT_BOOKED"
+        assert event["aggregate_id"] == new_id
 
 
 @pytest.mark.parametrize("claimed", [False, True])
@@ -869,3 +945,16 @@ def test_urgent_reschedule_and_live_staff_withdrawal(
         fresh = _fresh_receptionist_session(clinic, 2)
         status, reply = move_request(clinic, fresh, target, fresh_body)
         assert status == 200, reply
+        before_settings = effects(clinic)
+        status, reply = pricing_request(
+            clinic,
+            fresh,
+            method="PATCH",
+            body=pricing_patch(
+                expected_price_revision=_policy_revision(clinic, "PRICE"),
+                standard_new_exam_egp="100.00",
+            ),
+            key=uuid4().hex,
+        )
+        assert status == 403, reply
+        assert effects(clinic) == before_settings

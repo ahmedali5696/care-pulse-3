@@ -110,8 +110,11 @@ def assert_move(clinic, actor, target, body, before, reply, key):
     for table in (
         "appointment_price_snapshots",
         "followup_claims",
+        "followup_source_state",
+        "followup_source_decision_events",
         "followup_authorization_events",
         "visits",
+        "clinical_audit",
     ):
         assert after[table] == before[table], table
     assert (
@@ -119,11 +122,13 @@ def assert_move(clinic, actor, target, body, before, reply, key):
         saved["doctor_staff_id"],
         saved["classification"],
         saved["lane"],
+        saved["service_type"],
     ) == (
         original["patient_id"],
         original["doctor_staff_id"],
         original["classification"],
         original["lane"],
+        original["service_type"],
     )
     (history,) = [
         row
@@ -149,6 +154,8 @@ def assert_move(clinic, actor, target, body, before, reply, key):
         audit["actor_staff_id"] == actor.staff_id and audit["actor_role"] == actor.role
     )
     assert audit["organization_id"] == str(clinic.tenant)
+    assert audit["action"] == "APPOINTMENT_RESCHEDULED"
+    assert audit["correlation_id"] == history["id"]
     assert audit["occurred_at"] == history["occurred_at"]
     assert audit["after_state"]["appointment_id"] == str(target)
     assert audit["after_state"].get("physical_presence_confirmed") is (
@@ -160,6 +167,24 @@ def assert_move(clinic, actor, target, body, before, reply, key):
     assert sum(
         row["event_type"] == "DOCTOR_RESCHEDULED_APPOINTMENT" for row in events
     ) == (actor.role == "DOCTOR_OWNER")
+    payload = {
+        "appointment_id": str(target),
+        "status": saved["status"],
+        "service_date": saved["service_date"],
+        "appointment_revision": saved["revision"],
+    }
+    assert len(events) == 1 + (actor.role == "DOCTOR_OWNER")
+    for event in events:
+        assert event["aggregate_id"] == str(target)
+        if event["event_type"] == "DOCTOR_RESCHEDULED_APPOINTMENT":
+            assert event["payload"] == payload
+        else:
+            assert event["event_type"] == "APPOINTMENT_RESCHEDULED"
+            assert event["payload"] == {
+                **payload,
+                "actor_staff_id": actor.staff_id,
+                "actor_role": actor.role,
+            }
     (receipt,) = [
         row
         for row in after["idempotency_receipts"]
@@ -587,6 +612,20 @@ def test_signed_destination_scope_and_third_party_occupancy(intake_clinic, overl
         )
         assert status == 201, reply
     same = move_body(clinic, target, day, **interval)
+    with signed_test_transaction(
+        clinic,
+        clinic.owner,
+        method="POST",
+        path=f"/v1/appointments/{target}/reschedule",
+        purpose="APPOINTMENT_RESCHEDULE",
+        body=same,
+        key=uuid4().hex,
+    ) as (connection, _):
+        counted = connection.execute(
+            text("SELECT * FROM public.f01_counted_appointment_intervals(:t,:d)"),
+            {"t": clinic.tenant, "d": day},
+        ).all()
+        assert len(counted) == int(overlap)
     status, reply = move_request(clinic, clinic.owner, target, same)
     assert status == 200, reply
     denied(clinic, clinic.owner, other, move_body(clinic, other, day, **interval), 409)
@@ -659,6 +698,31 @@ def test_confirmed_extension_preserves_frozen_claim_and_doctor_precedence(
         )
     body = move_body(clinic, target, destination, extension_event_id=str(extension_id))
     before = effects(clinic)
+    # Exercise the actual ordered SQL writer without HTTP error translation;
+    # rollback must preserve the claim, evidence and all tentative effects.
+    with (
+        pytest.raises(RuntimeError, match="synthetic rollback"),
+        signed_test_transaction(
+            clinic,
+            clinic.receptionist,
+            method="POST",
+            path=f"/v1/appointments/{target}/reschedule",
+            purpose="APPOINTMENT_RESCHEDULE",
+            body=body,
+            key=uuid4().hex,
+        ) as (connection, _),
+    ):
+        connection.execute(text("SELECT public.f01_b18_prepare()"))
+        with pytest.raises(DBAPIError) as error, connection.begin_nested():
+            connection.execute(
+                text("UPDATE public.appointments SET service_date=:d WHERE id=:id"),
+                {"d": destination, "id": target},
+            )
+        assert error.value.orig.sqlstate == "42501"
+        connection.execute(text("SELECT public.f01_b18_apply()"))
+        connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+        raise RuntimeError("synthetic rollback")
+    assert effects(clinic) == before
     key = uuid4().hex
     status, reply = move_request(clinic, clinic.receptionist, target, body, key=key)
     assert status == 200, reply
