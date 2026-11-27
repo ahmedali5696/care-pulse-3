@@ -187,3 +187,37 @@ Total: 1,492 mandatory integration cases, 68 reports, zero failures/mandatory sk
 ### Independent handoff boundary
 
 Read-only Issue verification found #24/#25/#26/#28 and #2/#4/#5/#13/#18 still OPEN, without individual GitHub assignees; the responsible functions/closure criteria remain those in master §12/14. Engineering evidence for the consumed November contracts must be reviewed by independent Security/Clinical reviewers and the PO (#24/#25/#26), not inferred to close the Issues. #28 remains the compatibility engineering/Security/Operations disposition of historical findings; current compatibility stays bounded to immutable source 0040 → candidate 0046, not 0047–0072 operational cutover. Security/Operations, legal/privacy, Clinical and PO retain the production-only ingress, advisory, custody, applicable populated upgrades, policy numerics and OPEN-OPS-01/02/03 / OPEN-FILES-01 obligations. Synthetic confirmation TTL is not a production default. Neither acceptance nor this handoff authorizes next-Wave work, convergence, Issue changes, merge, deployment or release.
+
+## T074–T075 acceptance handoff
+
+**2026-11-27 — INTEGRATION VERIFIED / engineering accepted.** Tested executable SHA `d76b5bc144db046e9f8fb7f13da396be3f24d72c`, branch `feature/wave-3-queue-and-clinical-operations`, repository `ahmedali5696/care-pulse-3`, manual `workflow_dispatch`, [Full Foundation #45921986616, attempt 1](https://github.com/ahmedali5696/care-pulse-3/actions/runs/45921986616/attempts/1). Local and remote HEAD matched the tested SHA before this documentation-only closure. The migration tree remains `1e723e1c4cd69dcb3a6df6eb2a2d571f3e992fc2` / head `0072_b20_worker`.
+
+- T074: `tests/integration/test_w3_intake.py:740–825` controls only the disposable business clock in Python and the relevant PostgreSQL functions, restoring original definitions afterward. The existing overlap-off/on identities and two additive late-day identities use 12:00 and 23:56 Cairo times, preserving signed intake, capacity, manual precedence, rollback, replay and committed evidence assertions. Authentication freshness, session expiry and audit time remain real. [Focused diagnostic #45921823030, job 140254143396](https://github.com/ahmedali5696/care-pulse-3/actions/runs/45921823030/job/140254143396): 10 passed, zero failures/skips, scoped cleanup passed.
+- T075: `apps/api/carepulse/queue/contracts.py:18–24` reuses `CanonicalServiceDate` and bounds offset to PostgreSQL signed bigint maximum (9223372036854775807). `tests/integration/test_w3_boundary_security.py:255–290` asserts signed timestamp-form date and out-of-range offset return sanitized 422, retains canonical dated reads and zero denied effects. `tests/integration/test_w3_checkin.py:856–858` uses the canonical wire date for the existing query-plan case. [Focused diagnostic #45921826225, job 140254163892](https://github.com/ahmedali5696/care-pulse-3/actions/runs/45921826225/job/140254163892): 4 passed, zero failures/skips, scoped cleanup passed.
+- [Fast Feedback #45921811110](https://github.com/ahmedali5696/care-pulse-3/actions/runs/45921811110) succeeded at the same SHA. Local unit verification was 1,008 passed, four Windows-specific skips; hosted common executed all 1,012 Python and 11 Web cases without skips.
+
+| Full job | Job ID | Mandatory cases / reports | Result / duration |
+| --- | --- | --- | --- |
+| Common | 140254611603 | 1,012 Python + 11 Web (separate from integration total) | PASS / 1m40s |
+| Ordinary DB | 140255144574 | 664 / 28 (intake 10, boundary 4) | PASS / 35m18s |
+| Ordinary Stack | 140255144630 | 612 / 33 | PASS / 10m32s |
+| Historical | 140255144624 | 163 / 1 | PASS / 2m21s |
+| Compatibility | 140255144611 | 55 / 6 | PASS / 4m47s |
+| Aggregate | 140265715001 | Four same-attempt receipts | PASS / 6s |
+
+Reviewed manifest `a259416a804bf447ed39ee4288d62b183874235797349bfae4fa31cdbeaee999`: 1,276 Ordinary cases / 61 reports; 1,494 mandatory integration cases / 68 reports overall, zero failures and mandatory skips. Compared with accepted T070–T073 inventory: all 67 other report counts and identity digests unchanged; intake increases from 8 to 10, with all original eight identities retained by locked collection.
+
+| Lane | Artifact ID | Independently verified ZIP SHA-256 |
+| --- | --- | --- |
+| ordinary-db | 15166246908 | `bb7cfeebf4e44fb7e14aa57f3f0ea4154c941166bd88f7b19f98d10748c4c03a` |
+| ordinary-stack | 15165252418 | `47c101c08842307d752fcd4f341fc0a1137acdfa6dce812b615f6ea7bb6ba217` |
+| historical | 15165076339 | `8ca106c3da1aba0e0ed980856027d01f333199a2466bc079daae60121f3ffd43` |
+| compat | 15165051201 | `cfd96536900848a5ae94fd5497bfb3037df09517636b16a4c4dec7e9269f99d2` |
+
+Independently retrieved all four ZIPs from GitHub; verified digest, exact receipt entry, duplicate-key rejection, schema, context, provenance, report counts/identity digests, zero skips and scoped cleanup. Local `ops.foundation_acceptance.aggregate` passed with actual successful dependencies. Hosted [aggregate job #140265715001](https://github.com/ahmedali5696/care-pulse-3/actions/runs/45921986616/job/140265715001) enforced digest mismatch as error and emitted at 2026-11-27 01:57:28 UTC:
+
+```text
+FOUNDATION_FULL_ACCEPTED sha=d76b5bc144db046e9f8fb7f13da396be3f24d72c run=45921986616 attempt=1
+```
+
+T074 and T075 are complete. The DB lane completed within its existing 40-minute job limit; this is an observed duration, not a new performance guarantee. The later documentation-only closure does not substitute its commit SHA for the tested executable SHA. No new CI dispatch, executable changes, convergence, subsequent tasks, Issue changes, merge, deployment or release. Read-only verification confirmed #24/#25/#26/#28 and production-only #2/#4/#5/#13/#18 remain open under the existing owners and closure criteria; none is an immediate blocker to these two synthetic engineering tasks. Independent Security/Clinical/PO and production obligations remain unchanged.
