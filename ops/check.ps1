@@ -108,7 +108,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'b468e25f7f80cbb3e528e68c1e9f9e2514b86bc68daff1e5b375cb0e781706c9',
+    '.github/workflows/foundation.yml': 'f45c359c7e97cc9893bdbd0fbc2ca0f3a6d50680ebcd72f088c26781eb1538b7',
     '.github/workflows/fast-feedback.yml': '814f40f9f2a09d6337e5d4e14f1d4851e88301e64c1f28d5e538d3549dccce8b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
@@ -371,9 +371,10 @@ umask 077
 focused_target=
 foundation_lane="${CP_FOUNDATION_LANE:-standard}"
 foundation_full=false
+foundation_db_lane=false
 foundation_coverage_verified=false
 foundation_tests=0
-case "$foundation_lane" in ordinary-db|ordinary-stack|historical|standard) ;; *) echo 'FAIL unknown Foundation lane'; exit 1 ;; esac
+case "$foundation_lane" in ordinary-db-core|ordinary-db-clinical) foundation_db_lane=true ;; ordinary-stack|historical|standard) ;; *) echo 'FAIL unknown Foundation lane'; exit 1 ;; esac
 if [[ "${CP_FOUNDATION_MODE:-}" = full ]]; then
   if [[ "$1" != integration || "$foundation_lane" = standard || -z "${CP_FOUNDATION_RECEIPT_PATH:-}" || "${CP_B04_SPIKE:-false}" != false || "${CP_T133_MODE:-false}" != false || -n "${CP_T133_SHA:-}" ]]; then
     echo 'FAIL full Foundation lane invocation'; exit 1
@@ -494,7 +495,8 @@ cleanup() {
       export CP_FOUNDATION_CLEANUP_VERIFIED=1 CP_FOUNDATION_COVERAGE_VERIFIED=1
       export CP_FOUNDATION_EXECUTION=PASS CP_FOUNDATION_TESTS=PASS CP_FOUNDATION_ZERO_SKIPS=true CP_FOUNDATION_CLEANUP=PASS
       case "$foundation_lane" in
-        ordinary-db) export CP_FOUNDATION_COVERAGE=current-head-db ;;
+        ordinary-db-core) export CP_FOUNDATION_COVERAGE=current-head-db-core ;;
+        ordinary-db-clinical) export CP_FOUNDATION_COVERAGE=current-head-db-clinical ;;
         ordinary-stack) export CP_FOUNDATION_COVERAGE=current-head-stack ;;
         historical) export CP_FOUNDATION_COVERAGE=immutable-0040-selected-nodes-on-isolated-postgres ;;
       esac
@@ -548,7 +550,7 @@ do
   test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = linux/amd64
   docker image inspect --format '{{json .RepoDigests}} {{.Id}} {{.Os}}/{{.Architecture}}' "$image"
 done
-if [ -n "$focused_target" ] || [ "$foundation_lane" = historical ] || [ "$foundation_lane" = ordinary-db ]; then
+if [ -n "$focused_target" ] || [ "$foundation_lane" = historical ] || [ "$foundation_db_lane" = true ]; then
   docker compose --profile test build --pull test
 else
   docker compose --profile test --profile sender --profile operator build --pull
@@ -560,7 +562,7 @@ for attempt in $(seq 1 40); do
   if [ "$attempt" = 40 ]; then echo 'FAIL disposable database startup'; exit 1; fi
   sleep 2
 done
-if [ "$foundation_lane" = ordinary-db ] || [ "$foundation_lane" = ordinary-stack ]; then
+if [ "$foundation_db_lane" = true ] || [ "$foundation_lane" = ordinary-stack ]; then
   db_container="$(docker compose ps -q db)"
   test -n "$db_container"
   test "$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$db_container")" = "$CP_CI_PROJECT"
@@ -953,7 +955,7 @@ if [ "$foundation_full" = true ]; then
   fi
   echo 'PASS ordinary current schema verification'
 fi
-if [ "$foundation_lane" != ordinary-stack ]; then
+if [ "$foundation_lane" = ordinary-db-core ] || [ "$foundation_lane" = standard ]; then
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
   -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
   -v "$private/foundation-results:/tmp/foundation-results:rw" \
@@ -988,8 +990,13 @@ if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d08-core.log"; then
 fi
 fi
 # Wave 3 suites exercise the current head, never the immutable predecessor or special modes.
-if [ "$foundation_lane" = ordinary-db ] || { [ "$foundation_lane" = standard ] && [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; }; then
-  for suite in w3_receipt_boundary w3_checkin w3_checkin_races w3_queue_scope w3_intake w3_intake_races w3_admission_controls w3_admission_confirmations w3_admission w3_admission_races w3_queue_policy w3_placement_races w3_visits w3_visit_races w3_cancel_replace w3_cancel_replace_races w3_reschedule w3_reschedule_races w3_bulk w3_bulk_races w3_reconciliation w3_day_review w3_cutoff_races w3_migration w3_operation_boundaries w3_boundary_security; do
+if [ "$foundation_db_lane" = true ] || { [ "$foundation_lane" = standard ] && [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; }; then
+  if [ "$foundation_db_lane" = true ]; then
+    w3_suites="$(python3 -c 'from ops.foundation_inventory import REPORT_COUNTS; import sys; print(" ".join(name for name in REPORT_COUNTS[sys.argv[1]] if name.startswith("w3_")))' "$foundation_lane")"
+  else
+    w3_suites='w3_receipt_boundary w3_checkin w3_checkin_races w3_queue_scope w3_intake w3_intake_races w3_admission_controls w3_admission_confirmations w3_admission w3_admission_races w3_queue_policy w3_placement_races w3_visits w3_visit_races w3_cancel_replace w3_cancel_replace_races w3_reschedule w3_reschedule_races w3_bulk w3_bulk_races w3_reconciliation w3_day_review w3_cutoff_races w3_migration w3_operation_boundaries w3_boundary_security'
+  fi
+  for suite in $w3_suites; do
     worker_fixture_args=()
     if [ "$suite" = w3_boundary_security ]; then
       profile_boundary_population
@@ -1013,7 +1020,7 @@ if [ "$foundation_lane" = ordinary-db ] || { [ "$foundation_lane" = standard ] &
     fi
   done
 fi
-if [ "$foundation_lane" = ordinary-db ]; then
+if [ "$foundation_db_lane" = true ]; then
   CP_FOUNDATION_REPORT_EVIDENCE="$(python3 -m ops.foundation_acceptance verify-coverage "$foundation_lane" "$private/foundation-results")"
   export CP_FOUNDATION_REPORT_EVIDENCE
   foundation_tests="$(jq -er '.total' <<< "$CP_FOUNDATION_REPORT_EVIDENCE")"

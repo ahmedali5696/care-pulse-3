@@ -10,13 +10,12 @@ from xml.etree import ElementTree
 
 # Preserve the complete 0ae625c inventory and add cad3d91 Wave 3 coverage.
 REPORT_COUNTS = {
-    "ordinary-db": {
+    "ordinary-db-core": {
         "f01": 68,
         "d08": 322,
         "w3_receipt_boundary": 4,
         "w3_checkin": 8,
         "w3_checkin_races": 8,
-        "w3_queue_scope": 3,
         "w3_intake": 10,
         "w3_intake_races": 15,
         "w3_admission_controls": 2,
@@ -25,6 +24,10 @@ REPORT_COUNTS = {
         "w3_admission_races": 20,
         "w3_queue_policy": 11,
         "w3_placement_races": 4,
+    },
+    "ordinary-db-clinical": {
+        "w3_boundary_security": 4,
+        "w3_queue_scope": 3,
         "w3_visits": 11,
         "w3_visit_races": 10,
         "w3_cancel_replace": 6,
@@ -38,7 +41,6 @@ REPORT_COUNTS = {
         "w3_cutoff_races": 10,
         "w3_migration": 1,
         "w3_operation_boundaries": 4,
-        "w3_boundary_security": 4,
     },
     "ordinary-stack": {
         "d06": 19,

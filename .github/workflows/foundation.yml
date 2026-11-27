@@ -213,8 +213,8 @@ jobs:
       CP_FOUNDATION_LANE: ${{ matrix.lane }}
       CP_FOUNDATION_MODE: ${{ needs.inputs-and-build.outputs.mode }}
       CP_FOUNDATION_RECEIPT_PATH: ${{ github.workspace }}/foundation-full-receipt.json
-      COMPOSE_PROJECT_NAME: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, fromJSON('{"ordinary-db":"1","historical":"2","compat":"3","ordinary-stack":"4"}')[matrix.lane]) }}
-      CP_CI_PROJECT: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, fromJSON('{"ordinary-db":"1","historical":"2","compat":"3","ordinary-stack":"4"}')[matrix.lane]) }}
+      COMPOSE_PROJECT_NAME: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, fromJSON('{"ordinary-db-core":"1","ordinary-db-clinical":"5","historical":"2","compat":"3","ordinary-stack":"4"}')[matrix.lane]) }}
+      CP_CI_PROJECT: ${{ matrix.lane == 'standard' && format('carepulse-ci-{0}-{1}', github.run_id, github.run_attempt) || format('carepulse-ci-{0}-{1}{2}', github.run_id, github.run_attempt, fromJSON('{"ordinary-db-core":"1","ordinary-db-clinical":"5","historical":"2","compat":"3","ordinary-stack":"4"}')[matrix.lane]) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -229,7 +229,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$CANDIDATE_SHA" = "$GITHUB_SHA"
           case "$CP_FOUNDATION_MODE:$CP_FOUNDATION_LANE" in
-            full:ordinary-db|full:ordinary-stack|full:historical|full:compat|postgres-diagnostic:standard|compat-diagnostic:standard|b04-spike:standard|t133:standard) ;;
+            full:ordinary-db-core|full:ordinary-db-clinical|full:ordinary-stack|full:historical|full:compat|postgres-diagnostic:standard|compat-diagnostic:standard|b04-spike:standard|t133:standard) ;;
             *) echo 'FAIL invalid normalized mode/lane combination'; exit 1 ;;
           esac
           test "$CP_CI_PROJECT" = "$COMPOSE_PROJECT_NAME"
@@ -349,7 +349,7 @@ jobs:
           pnpm --filter @carepulse/web exec playwright install --with-deps chromium
 
       - name: Disposable PostgreSQL, signed Patient API, invited-role acceptance and scoped cleanup
-        if: ${{ matrix.lane == 'ordinary-db' || matrix.lane == 'ordinary-stack' || matrix.lane == 'historical' || (matrix.lane == 'standard' && (needs.inputs-and-build.outputs.mode == 'b04-spike' || needs.inputs-and-build.outputs.mode == 't133')) }}
+        if: ${{ matrix.lane == 'ordinary-db-core' || matrix.lane == 'ordinary-db-clinical' || matrix.lane == 'ordinary-stack' || matrix.lane == 'historical' || (matrix.lane == 'standard' && (needs.inputs-and-build.outputs.mode == 'b04-spike' || needs.inputs-and-build.outputs.mode == 't133')) }}
         shell: pwsh
         run: |
           if ($PSVersionTable.PSVersion.ToString() -ne '7.6.7') { exit 1 }
@@ -437,7 +437,7 @@ jobs:
             *) echo 'FAIL invalid or missing normalized mode'; exit 1 ;;
           esac
 
-      - name: Retrieve this attempt's four mandatory receipts with strict digest verification
+      - name: Retrieve this attempt's five mandatory receipts with strict digest verification
         if: ${{ env.NORMALIZED_MODE == 'full' }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, Node.js 24
         with:

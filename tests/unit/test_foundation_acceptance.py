@@ -88,7 +88,7 @@ def test_request_classifies_full_and_exclusive_modes(env):
     normalized = acceptance.validate_request(env)
     assert normalized == {
         "mode": "full",
-        "matrix": '["ordinary-db","ordinary-stack","historical","compat"]',
+        "matrix": '["ordinary-db-core","ordinary-db-clinical","ordinary-stack","historical","compat"]',
         "candidate_sha": "a" * 40,
         "run_id": "123456",
         "attempt": "2",
@@ -302,7 +302,8 @@ def test_full_aggregate_matches_all_exact_receipts(receipts, env):
 @pytest.mark.parametrize(
     "lane,wrong_head",
     [
-        ("ordinary-db", "0046_f01_audit_integrity"),
+        ("ordinary-db-core", "0046_f01_audit_integrity"),
+        ("ordinary-db-clinical", "0046_f01_audit_integrity"),
         ("ordinary-stack", "0046_f01_audit_integrity"),
         ("compat", "0047_b12_queue_checkin_grants"),
         ("compat", "0058_b15_admission_guards"),
@@ -384,6 +385,21 @@ def test_missing_extra_and_wrong_named_artifacts_fail(receipts, env):
         acceptance.aggregate(receipts, aggregate_env(env))
 
 
+@pytest.mark.parametrize("lane", ["ordinary-db-core", "ordinary-db-clinical"])
+def test_each_db_lane_receipt_is_mandatory(receipts, env, lane):
+    receipt_file(receipts, env, lane).unlink()
+    with pytest.raises(ValueError):
+        acceptance.aggregate(receipts, aggregate_env(env))
+
+
+def test_db_lane_receipts_cannot_be_substituted(receipts, env):
+    core = receipt_file(receipts, env, "ordinary-db-core")
+    clinical = receipt_file(receipts, env, "ordinary-db-clinical")
+    clinical.write_bytes(core.read_bytes())
+    with pytest.raises(ValueError):
+        acceptance.aggregate(receipts, aggregate_env(env))
+
+
 def test_extra_file_in_artifact_fails(receipts, env):
     (receipt_file(receipts, env).parent / "extra.txt").write_text(
         "unexpected", encoding="utf-8"
@@ -434,10 +450,10 @@ def test_seal_requires_positive_terminal_evidence(tmp_path, env, key, value):
 
 def test_seal_cannot_overwrite_existing_proof(tmp_path, env):
     path = tmp_path / acceptance.RECEIPT_FILE
-    acceptance.seal(path, seal_env(env, "ordinary-db"))
+    acceptance.seal(path, seal_env(env, "ordinary-db-core"))
     first = path.read_bytes()
     with pytest.raises(FileExistsError):
-        acceptance.seal(path, seal_env(env, "ordinary-db"))
+        acceptance.seal(path, seal_env(env, "ordinary-db-core"))
     assert path.read_bytes() == first
 
 
@@ -453,7 +469,7 @@ def test_validation_does_not_publish_partial_output(tmp_path, env, monkeypatch):
     assert output.read_text(encoding="utf-8") == "existing=retained\n"
     acceptance.main(["validate-request"], {**env, "GITHUB_OUTPUT": str(output)})
     assert (
-        'matrix=["ordinary-db","ordinary-stack","historical","compat"]\n'
+        'matrix=["ordinary-db-core","ordinary-db-clinical","ordinary-stack","historical","compat"]\n'
         in output.read_text(encoding="utf-8")
     )
 
@@ -466,7 +482,7 @@ def test_cli_rejects_checkout_mismatch_before_sealing(tmp_path, env, monkeypatch
     )
     path = tmp_path / acceptance.RECEIPT_FILE
     with pytest.raises(ValueError):
-        acceptance.main(["seal", str(path)], seal_env(env, "ordinary-db"))
+        acceptance.main(["seal", str(path)], seal_env(env, "ordinary-db-core"))
     assert not path.exists()
 
 
@@ -489,7 +505,7 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
         in summary.read_text()
     )
     assert "44 Python + 11 Web" in summary.read_text()
-    assert "Four current-attempt receipts" in summary.read_text()
+    assert "Five current-attempt receipts" in summary.read_text()
     summary.unlink()
     receipt_file(receipts, env).unlink()
     with pytest.raises(ValueError):
@@ -498,7 +514,13 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
 
 
 def test_current_inventory_has_exact_disjoint_ordinary_reports():
-    db = inventory.REPORT_COUNTS["ordinary-db"]
+    core = inventory.REPORT_COUNTS["ordinary-db-core"]
+    clinical = inventory.REPORT_COUNTS["ordinary-db-clinical"]
+    assert not core.keys() & clinical.keys()
+    assert (sum(core.values()), sum(clinical.values())) == (499, 165)
+    assert (len(core), len(clinical)) == (13, 15)
+    assert list(clinical)[:2] == ["w3_boundary_security", "w3_queue_scope"]
+    db = core | clinical
     stack = inventory.REPORT_COUNTS["ordinary-stack"]
     assert (sum(db.values()), sum(stack.values())) == (664, 612)
     assert (len(db), len(stack)) == (28, 33)
@@ -552,7 +574,7 @@ def test_current_inventory_has_exact_disjoint_ordinary_reports():
     ],
 )
 def test_seal_rejects_changed_exact_report_inventory(tmp_path, env, field):
-    lane_env = seal_env(env, "ordinary-db")
+    lane_env = seal_env(env, "ordinary-db-core")
     evidence = json.loads(lane_env["CP_FOUNDATION_REPORT_EVIDENCE"])
     if field == "manifest_sha256":
         evidence[field] = "c" * 64

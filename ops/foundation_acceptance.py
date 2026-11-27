@@ -17,13 +17,15 @@ CANDIDATE_SCHEMA = "0046_f01_audit_integrity"
 ORDINARY_SCHEMA = "0072_b20_worker"
 RECEIPT_FILE = "foundation-full-receipt.json"
 EXPECTED_COVERAGE = {
-    "ordinary-db": "current-head-db",
+    "ordinary-db-core": "current-head-db-core",
+    "ordinary-db-clinical": "current-head-db-clinical",
     "ordinary-stack": "current-head-stack",
     "historical": "immutable-0040-selected-nodes-on-isolated-postgres",
     "compat": "full-US1-US2-US3-six-successors-zero-skips",
 }
 PROVENANCE = {
-    "ordinary-db": {"candidate_schema": ORDINARY_SCHEMA},
+    "ordinary-db-core": {"candidate_schema": ORDINARY_SCHEMA},
+    "ordinary-db-clinical": {"candidate_schema": ORDINARY_SCHEMA},
     "ordinary-stack": {"candidate_schema": ORDINARY_SCHEMA},
     "historical": {
         "historical_sha": HISTORICAL_SHA,
@@ -394,11 +396,12 @@ def _publish_acceptance(env: dict[str, str]) -> None:
         f"- Run/attempt: `{context['run_id']}` / `{context['attempt']}`",
         (
             f"- Ordinary ({ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15, B-13, B-16, B-17, B-18, B-19 and B-20; T070-T071 cross-operation verification): "
-            f"DB ({sum(inventory.REPORT_COUNTS['ordinary-db'].values())}), "
+            f"DB core ({sum(inventory.REPORT_COUNTS['ordinary-db-core'].values())}), "
+            f"DB clinical ({sum(inventory.REPORT_COUNTS['ordinary-db-clinical'].values())}), "
             f"stack ({sum(inventory.REPORT_COUNTS['ordinary-stack'].values())}); "
             "historical (163 at 0040), compatibility (44 Python + 11 Web, 0040 to 0046): verified"
         ),
-        "- Four current-attempt receipts, exact report inventory, zero mandatory skips, scoped cleanup, artifact digests: verified",
+        "- Five current-attempt receipts, exact report inventory, zero mandatory skips, scoped cleanup, artifact digests: verified",
     ]
     if context["pr"] is not None:
         pr = context["pr"]
