@@ -24,6 +24,7 @@ Do not implement deferred work, modify approved decisions, or close Issues witho
 - Rerun all Full Foundation jobs when required; never combine evidence from different attempts.
 - Verify mandatory tests actually execute with zero skips.
 - Follow docs/postgresql-ci.md for workflow selection, acceptance evidence, and diagnostic procedures.
+- MUST read and follow the permanent scalability rules in `docs/full-foundation-scalability.md` when planning, implementing, assigning, or reviewing integration tests and CI evidence for every Master.
 
 ## CI failure triage
 
