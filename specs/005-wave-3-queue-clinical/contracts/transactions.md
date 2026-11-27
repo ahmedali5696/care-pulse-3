@@ -2,6 +2,8 @@
 
 Proposed Phase 1 design, 2026-11-22. Sources: master §§2/8/11.4/12 and Domain §§4/6–11. Reuse [Wave 2 ordered transactions](../../003-wave-2-booking-scheduling/contracts/transactions.md), with current F-01 authority superseding historical shared-runtime assumptions. This document selects no migration implementation and claims no deadlock/runtime proof. [HTTP](http.md) defines strict operation families; [model](../data-model.md) defines evidence.
 
+Current verification (2026-11-27): the approved contract's synthetic engineering evidence is recorded in [T070-T073 integration evidence](../quickstart.md#t070t073-integration-evidence), at executable SHA `e10ff59a67a23483e94fa7b964af775422392835` in [Full Foundation #45912610996, attempt 1](https://github.com/ahmedali5696/care-pulse-3/actions/runs/45912610996/attempts/1). This does not change the operation/actor/transaction requirements or authorize production.
+
 ## Shared command boundary and lock order
 
 1. Validate exact signed request and database-verified operation/resource. Bind the real service login/backend/xid, recheck live tenant/staff/session/security revision and relevant Manager capability under the existing authorization barrier. Resolve permitted resource IDs, never caller actor/role. Reauthorize receipt reads as well as mutations. F-01 activation may serialize same-clinic requests before inner domain locks; retain that boundary and demonstrate the actual blocker in tests.

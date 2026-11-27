@@ -2,6 +2,8 @@
 
 Phase 1 proposed contract, 2026-11-22; routes are design, not a claim of current support. Master §§2/8/11.1 and the approved field matrix govern. Reuse [Wave 1 protocol](../../002-wave-1-security-core/contracts/http-and-operator.md), [Wave 2 HTTP](../../003-wave-2-booking-scheduling/contracts/http.md), [F-01](../../../docs/f01-runtime-identity.md) and [transactions](transactions.md).
 
+Current verification (2026-11-27): the approved contract's synthetic engineering evidence is recorded in [T070-T073 integration evidence](../quickstart.md#t070t073-integration-evidence), at executable SHA `e10ff59a67a23483e94fa7b964af775422392835` in [Full Foundation #45912610996, attempt 1](https://github.com/ahmedali5696/care-pulse-3/actions/runs/45912610996/attempts/1). This does not change the operation/actor/transaction requirements or authorize production.
+
 ## Common boundary and wire behavior
 
 Browser calls same-origin BFF `/api/*`; authenticated BFF validates live Better Auth session and Origin/CSRF, strips supplied identity headers and signs private `/v1/*`. Table paths omit these prefixes. API validates exact method/path/query/body and independently database-verified scope bound to actual tenant/staff/session/security revision, service login/backend/transaction and operation/resource. No direct browser/private-API privilege, caller actor/role/tenant override or shared-runtime fallback.
