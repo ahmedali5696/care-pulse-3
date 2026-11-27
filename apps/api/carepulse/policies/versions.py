@@ -9,7 +9,7 @@ from sqlalchemy.engine import Connection
 
 CAIRO = ZoneInfo("Africa/Cairo")
 KINDS = frozenset({"PRICE", "SCHEDULE", "QUEUE", "ADMISSION", "CAPACITY", "FOLLOWUP"})
-POLICY_LOCK_ORDER = ("SCHEDULE", "CAPACITY", "FOLLOWUP", "PRICE")
+POLICY_LOCK_ORDER = ("SCHEDULE", "CAPACITY", "FOLLOWUP", "PRICE", "QUEUE", "ADMISSION")
 
 
 class StalePolicyRevision(ValueError):

@@ -805,7 +805,7 @@ def test_operation_resource_read_isolation_across_signed_purposes(followup_clini
         method="PATCH",
         path=f"/v1/visits/{source_a['visit']}",
         purpose="VISIT_FOLLOWUP",
-        body={"followup_decision": {"kind": "DEFAULT"}},
+        body={"followup_decision": {"kind": "DEFAULT"}, "expected_visit_revision": 0},
         key=str(uuid4()),
     ) as (connection, _):
         assert connection.scalars(text("SELECT id FROM public.visits")).all() == [

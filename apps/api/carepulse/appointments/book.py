@@ -187,26 +187,27 @@ def _doctor_id(connection: Connection, tenant):
 def _snapshot(
     connection: Connection,
     actor: AuthorizedStaff,
-    command: BookAppointment,
+    command,
     service_type: str,
     provenance: dict | None,
+    *,
+    classification: str = "ROUTINE",
 ):
     state = current_price_state(connection, actor.organization_id)
     require_matching_revision(
         command.expected_price_revision, state["PRICE"]["revision"]
     )
-    if command.expected_followup_revision is not None:
+    if classification == "ROUTINE" and command.expected_followup_revision is not None:
         require_matching_revision(
             command.expected_followup_revision, state["FOLLOWUP"]["revision"]
         )
     standard_base = _money_output(state["PRICE"]["payload"]["standard_new_exam_egp"])
-    base = _money_output(
-        state["PRICE"]["payload"][
-            "preferential_followup_egp"
-            if service_type == "FOLLOW_UP"
-            else "standard_new_exam_egp"
-        ]
-    )
+    base_key = "standard_new_exam_egp"
+    if classification == "URGENT":
+        base_key = "urgent_base_egp"
+    elif service_type == "FOLLOW_UP":
+        base_key = "preferential_followup_egp"
+    base = _money_output(state["PRICE"]["payload"][base_key])
     if base is None or standard_base is None:
         raise ContractError(409)
     discount = command.discount
@@ -216,7 +217,7 @@ def _snapshot(
             base,
             standard_base,
             service_type,
-            "ROUTINE",
+            classification,
             discount.discount_type,
             discount.discount_value,
         )
@@ -228,7 +229,7 @@ def _snapshot(
         raise ContractError(409, "STALE_REVISION")
     return {
         "service_type": service_type,
-        "classification": "ROUTINE",
+        "classification": classification,
         "base_egp": quote.base_egp,
         "discount_type": quote.discount_type,
         "discount_value": quote.discount_value,
@@ -241,7 +242,7 @@ def _snapshot(
     }
 
 
-def _timed_interval(connection: Connection, actor, command, booking_mode, now):
+def _parse_interval(command, booking_mode, service_date):
     if booking_mode == "OPEN":
         if command.starts_at is not None or command.ends_at is not None:
             raise ContractError(422)
@@ -249,14 +250,23 @@ def _timed_interval(connection: Connection, actor, command, booking_mode, now):
     if command.starts_at is None or command.ends_at is None:
         raise ContractError(422)
     try:
-        start = parse_timed_endpoint(command.starts_at, command.service_date)
-        end = parse_timed_endpoint(command.ends_at, command.service_date)
+        start = parse_timed_endpoint(command.starts_at, service_date)
+        end = parse_timed_endpoint(command.ends_at, service_date)
     except ValueError as invalid:
         raise ContractError(422) from invalid
+    return start, end
+
+
+def _timed_interval(
+    connection: Connection, actor, command, booking_mode, now, service_date
+):
+    start, end = _parse_interval(command, booking_mode, service_date)
+    if start is None:
+        return start, end
     validate_timed_booking(
         connection,
         actor.organization_id,
-        command.service_date,
+        service_date,
         start,
         end,
         now,
@@ -279,7 +289,9 @@ def _booking_plan(connection: Connection, actor, command, now):
     validate_booking_date(command.service_date, now)
     if not date_rules(schedule, command.service_date).eligible:
         raise ContractError(409)
-    start, end = _timed_interval(connection, actor, command, schedule.booking_mode, now)
+    start, end = _timed_interval(
+        connection, actor, command, schedule.booking_mode, now, command.service_date
+    )
     doctor_id = _doctor_id(connection, actor.organization_id)
     claim = None
     service_type = "NEW_EXAMINATION"
@@ -358,6 +370,81 @@ def _booking_plan(connection: Connection, actor, command, now):
     )
 
 
+def insert_followup_appointment(connection, actor, command, plan, number):
+    """Use the existing ordered source/claim writer for a new appointment."""
+    claim = plan.claim
+    snapshot = plan.draft.price_snapshot
+    booking = {
+        "service_date": command.service_date.isoformat(),
+        "booking_mode": plan.draft.booking_mode,
+        "starts_at": plan.draft.starts_at.isoformat() if plan.draft.starts_at else None,
+        "ends_at": plan.draft.ends_at.isoformat() if plan.draft.ends_at else None,
+        "allocated_number": number,
+        "price_snapshot": {
+            field: (
+                format(snapshot[field], "f")
+                if field == "discount_value" and snapshot["discount_type"] == "PERCENT"
+                else str(snapshot[field])
+                if snapshot[field] is not None
+                else None
+            )
+            for field in (
+                "base_egp",
+                "discount_type",
+                "discount_value",
+                "discount_reason",
+                "is_free",
+                "net_egp",
+                "pricing_version",
+                "creation_standard_base_egp",
+            )
+        },
+    }
+    if command.new_booking_date_exception is not None:
+        booking["new_booking_date_exception"] = (
+            command.new_booking_date_exception.model_dump(
+                mode="json", exclude_unset=True
+            )
+        )
+    expected = {
+        "source_revision": claim["policy_snapshot"]["source_decision_revision"],
+        "clinical_revision": claim["policy_snapshot"]["visit_revision"],
+        "policy_version": claim["policy_snapshot"]["policy_revision"],
+    }
+    try:
+        claim_id = connection.scalar(
+            text("""
+            SELECT public.create_followup_claim_ordered(
+                :tenant, :visit, CAST(:expected AS jsonb), CAST(:booking AS jsonb))
+        """),
+            {
+                "tenant": actor.organization_id,
+                "visit": claim["source_visit_id"],
+                "expected": json.dumps(expected),
+                "booking": json.dumps(booking),
+            },
+        )
+    except DBAPIError as invalid:
+        sqlstate = getattr(invalid.orig, "sqlstate", None)
+        if sqlstate in ("40001", "23505"):
+            raise ContractError(409, "STALE_REVISION") from invalid
+        if sqlstate == "23514":
+            raise ContractError(409) from invalid
+        if sqlstate == "42501":
+            raise ContractError(403) from invalid
+        raise
+    appointment_id = connection.scalar(
+        text("""
+            SELECT appointment_id FROM public.followup_claims
+            WHERE organization_id=:tenant AND id=:claim
+        """),
+        {"tenant": actor.organization_id, "claim": claim_id},
+    )
+    if appointment_id is None:
+        raise ContractError(409)
+    return appointment_id
+
+
 def book_appointment(
     connection: Connection,
     actor: AuthorizedStaff,
@@ -404,79 +491,9 @@ def book_appointment(
     )
     plan = _booking_plan(connection, actor, command, datetime.now(UTC))
     if plan.claim is not None:
-        claim = plan.claim
-        snapshot = plan.draft.price_snapshot
-        booking = {
-            "service_date": command.service_date.isoformat(),
-            "booking_mode": plan.draft.booking_mode,
-            "starts_at": plan.draft.starts_at.isoformat()
-            if plan.draft.starts_at
-            else None,
-            "ends_at": plan.draft.ends_at.isoformat() if plan.draft.ends_at else None,
-            "allocated_number": number,
-            "price_snapshot": {
-                field: (
-                    format(snapshot[field], "f")
-                    if field == "discount_value"
-                    and snapshot["discount_type"] == "PERCENT"
-                    else str(snapshot[field])
-                    if snapshot[field] is not None
-                    else None
-                )
-                for field in (
-                    "base_egp",
-                    "discount_type",
-                    "discount_value",
-                    "discount_reason",
-                    "is_free",
-                    "net_egp",
-                    "pricing_version",
-                    "creation_standard_base_egp",
-                )
-            },
-        }
-        if command.new_booking_date_exception is not None:
-            booking["new_booking_date_exception"] = (
-                command.new_booking_date_exception.model_dump(
-                    mode="json", exclude_unset=True
-                )
-            )
-        expected = {
-            "source_revision": claim["policy_snapshot"]["source_decision_revision"],
-            "clinical_revision": claim["policy_snapshot"]["visit_revision"],
-            "policy_version": claim["policy_snapshot"]["policy_revision"],
-        }
-        try:
-            claim_id = connection.scalar(
-                text("""
-                SELECT public.create_followup_claim_ordered(
-                    :tenant, :visit, CAST(:expected AS jsonb), CAST(:booking AS jsonb))
-            """),
-                {
-                    "tenant": actor.organization_id,
-                    "visit": claim["source_visit_id"],
-                    "expected": json.dumps(expected),
-                    "booking": json.dumps(booking),
-                },
-            )
-        except DBAPIError as invalid:
-            sqlstate = getattr(invalid.orig, "sqlstate", None)
-            if sqlstate in ("40001", "23505"):
-                raise ContractError(409, "STALE_REVISION") from invalid
-            if sqlstate == "23514":
-                raise ContractError(409) from invalid
-            if sqlstate == "42501":
-                raise ContractError(403) from invalid
-            raise
-        appointment_id = connection.scalar(
-            text("""
-                SELECT appointment_id FROM public.followup_claims
-                WHERE organization_id=:tenant AND id=:claim
-            """),
-            {"tenant": actor.organization_id, "claim": claim_id},
+        appointment_id = insert_followup_appointment(
+            connection, actor, command, plan, number
         )
-        if appointment_id is None:
-            raise ContractError(409)
     else:
         try:
             appointment_id, _ = insert_appointment_records(

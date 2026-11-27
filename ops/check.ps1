@@ -108,7 +108,7 @@ images = re.findall(r'^\s*(?:FROM|image:)\s+(\S+)', Path('compose.yaml').read_te
 require(images == ['postgres:17.11-bookworm@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27','axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387','clamav/clamav:1.5.4-debian13-slim@sha256:d7ede3cefeaf3b8a72ebcdee849d13f504bbca3f3b3cfade5bc7b6ee06a4f62c'], 'compose.yaml approved image references')
 # Fingerprint whole files so added commands cannot evade line-prefix checks.
 approved_bootstrap_files = {
-    '.github/workflows/foundation.yml': 'c14787dd9191d284544fa996841a8d19024d92ecb402e81f9baf26105723e196',
+    '.github/workflows/foundation.yml': 'b468e25f7f80cbb3e528e68c1e9f9e2514b86bc68daff1e5b375cb0e781706c9',
     '.github/workflows/fast-feedback.yml': '814f40f9f2a09d6337e5d4e14f1d4851e88301e64c1f28d5e538d3549dccce8b',
     'compose.yaml': '7e23f17480731ba1544db9943c9a2e9b8d34942df04ba2f3663d9948a57b363e',
     'compose.compat.yaml': 'e88fe73556a5ff585a08f84f459ba3cd1fd56b5b28dd2fb75ebbc7d932efa0e0',
@@ -157,6 +157,7 @@ print('PASS approved manifests, complete locks, installed Python closure, privat
             $imports = @'
 from carepulse.main import app
 from carepulse.identity.boundary import ClosedServiceBoundary
+from carepulse.visits.clinical_contracts import signed_visit_patch_purpose
 import apps.worker.main
 
 expected_paths = {
@@ -174,7 +175,20 @@ expected_paths = {
     '/v1/settings/pricing', '/v1/settings/schedule',
     '/v1/settings/schedule/preview', '/v1/settings/schedule/activate',
     '/v1/slots', '/v1/appointments', '/v1/appointments/{appointment_id}',
+    '/v1/appointments/{appointment_id}/check-in', '/v1/queue',
+    '/v1/appointments/{appointment_id}/cancel',
+    '/v1/appointments/{appointment_id}/replace-urgent',
+    '/v1/appointments/{appointment_id}/reschedule',
+    '/v1/reconciliation', '/v1/appointments/{appointment_id}/manual-no-show',
+    '/v1/days/{raw_date}/review', '/v1/days/{raw_date}/close',
+    '/v1/appointments/bulk-reschedule/preview', '/v1/appointments/bulk-reschedule/commit',
+    '/v1/settings/admission', '/v1/queue/capacity', '/v1/queue/pause', '/v1/queue/admit',
+    '/v1/settings/queue', '/v1/queue/placement',
+    '/v1/queue/admission-confirmations', '/v1/queue/admission-confirmations/usable',
+    '/v1/queue/admission-confirmations/{confirmation_id}/revoke',
+    '/v1/intake/routine', '/v1/intake/emergency', '/v1/intake/urgent',
     '/v1/visits/{visit_id}', '/v1/visits/{visit_id}/extend-followup',
+    '/v1/visits/{visit_id}/complete', '/v1/visits/{visit_id}/cancel-exceptional',
 }
 assert set(app.openapi()['paths']) == expected_paths
 assert app.openapi_url is None and len(app.user_middleware) == 1
@@ -190,7 +204,10 @@ assert boundary.kwargs['routes'] == {
     ('GET', '/v1/patients'): 'PATIENT_REGISTRY',
     ('POST', '/v1/patients'): 'PATIENT_REGISTRY',
     ('GET', '/v1/appointments'): 'APPOINTMENT_BOOKING',
+    ('GET', '/v1/reconciliation'): 'RECONCILIATION_READ',
     ('POST', '/v1/appointments'): 'APPOINTMENT_BOOKING',
+    ('POST', '/v1/appointments/bulk-reschedule/preview'): 'APPOINTMENT_BULK_PREVIEW',
+    ('POST', '/v1/appointments/bulk-reschedule/commit'): 'APPOINTMENT_BULK_COMMIT',
     ('GET', '/v1/settings/pricing'): 'SETTINGS_PRICING',
     ('PATCH', '/v1/settings/pricing'): 'SETTINGS_PRICING',
     ('GET', '/v1/settings/schedule'): 'SETTINGS_SCHEDULE',
@@ -198,19 +215,46 @@ assert boundary.kwargs['routes'] == {
     ('POST', '/v1/settings/schedule/preview'): 'SETTINGS_SCHEDULE',
     ('POST', '/v1/settings/schedule/activate'): 'SETTINGS_SCHEDULE',
     ('GET', '/v1/slots'): 'SLOTS',
+    ('GET', '/v1/queue'): 'QUEUE_READ',
+    ('GET', '/v1/settings/admission'): 'ADMISSION_SETTINGS_READ',
+    ('PATCH', '/v1/settings/admission'): 'ADMISSION_MODE_UPDATE',
+    ('PATCH', '/v1/queue/capacity'): 'QUEUE_CAPACITY_UPDATE',
+    ('POST', '/v1/queue/pause'): 'QUEUE_PAUSE',
+    ('POST', '/v1/queue/admit'): 'QUEUE_ADMIT',
+    ('GET', '/v1/settings/queue'): 'SETTINGS_QUEUE_READ',
+    ('PATCH', '/v1/settings/queue'): 'SETTINGS_QUEUE_UPDATE',
+    ('POST', '/v1/queue/placement'): 'QUEUE_PLACEMENT',
+    ('POST', '/v1/queue/admission-confirmations'): 'QUEUE_CONFIRMATION_ISSUE',
+    ('GET', '/v1/queue/admission-confirmations/usable'): 'QUEUE_CONFIRMATION_USABLE',
+    ('POST', '/v1/intake/routine'): 'INTAKE_ROUTINE',
+    ('POST', '/v1/intake/emergency'): 'INTAKE_EMERGENCY',
+    ('POST', '/v1/intake/urgent'): 'INTAKE_URGENT',
 }
 uuid = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
 assert {(method, pattern.pattern, purpose) for method, pattern, purpose in boundary.kwargs['route_patterns']} == {
     ('GET', f'/v1/staff/receptionists/{uuid}', 'STAFF_MANAGEMENT'),
     ('GET', f'/v1/patients/{uuid}', 'PATIENT_REGISTRY'),
     ('GET', f'/v1/appointments/{uuid}', 'APPOINTMENT_BOOKING'),
-    ('PATCH', f'/v1/visits/{uuid}', 'VISIT_FOLLOWUP'),
+    ('POST', f'/v1/appointments/{uuid}/check-in', 'QUEUE_CHECK_IN'),
+    ('POST', f'/v1/appointments/{uuid}/cancel', 'APPOINTMENT_CANCEL'),
+    ('POST', f'/v1/appointments/{uuid}/replace-urgent', 'APPOINTMENT_REPLACE_URGENT'),
+    ('POST', f'/v1/appointments/{uuid}/reschedule', 'APPOINTMENT_RESCHEDULE'),
+    ('POST', f'/v1/appointments/{uuid}/manual-no-show', 'APPOINTMENT_MANUAL_NO_SHOW'),
+    ('POST', r'/v1/days/[0-9]{4}-[0-9]{2}-[0-9]{2}/review', 'DAY_REVIEW'),
+    ('POST', r'/v1/days/[0-9]{4}-[0-9]{2}-[0-9]{2}/close', 'DAY_CLOSE'),
+    ('POST', f'/v1/queue/admission-confirmations/{uuid}/revoke', 'QUEUE_CONFIRMATION_REVOKE'),
+    ('PATCH', f'/v1/visits/{uuid}', signed_visit_patch_purpose),
+    ('GET', f'/v1/visits/{uuid}', 'VISIT_READ'),
+    ('POST', f'/v1/visits/{uuid}/complete', 'VISIT_COMPLETE'),
+    ('POST', f'/v1/visits/{uuid}/cancel-exceptional', 'VISIT_CANCEL_EXCEPTIONAL'),
     ('POST', f'/v1/visits/{uuid}/extend-followup', 'VISIT_FOLLOWUP'),
     ('PATCH', f'/v1/patients/{uuid}', 'PATIENT_REGISTRY'),
     ('POST', f'/v1/patients/{uuid}/(?:archive|unarchive)', 'PATIENT_REGISTRY'),
     ('POST', f'/v1/staff/receptionists/{uuid}/(?:enable|disable|invite|revoke-invite)', 'STAFF_MANAGEMENT'),
     ('PATCH', f'/v1/staff/receptionists/{uuid}/permissions', 'STAFF_MANAGEMENT'),
 }
+assert signed_visit_patch_purpose(b'{"expected_visit_revision":0,"diagnosis":"synthetic"}') == 'VISIT_CLINICAL'
+assert signed_visit_patch_purpose(b'{"expected_visit_revision":0,"followup_decision":{"kind":"DEFAULT"}}') == 'VISIT_FOLLOWUP'
 print('PASS approved signed Owner, Receptionist and recovery routes')
 '@
             $imports | & python -
@@ -287,6 +331,39 @@ print('PASS approved signed Owner, Receptionist and recovery routes')
             foreach ($suite in @('tests/integration/test_day_review_persistence.py', 'tests/integration/test_report_query_plans.py', 'tests/integration/test_day_review_races.py', 'tests/integration/test_day_review_migration.py')) {
                 if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required D-11 verification: $suite" }
             }
+            foreach ($suite in @('tests/integration/test_w3_receipt_boundary.py', 'tests/integration/test_w3_checkin.py', 'tests/integration/test_w3_checkin_races.py', 'tests/integration/test_w3_queue_scope.py', 'tests/integration/test_w3_bff.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-12 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_w3_intake.py', 'tests/integration/test_w3_intake_races.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-11 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_w3_admission_controls.py', 'tests/integration/test_w3_admission_confirmations.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-14 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_w3_admission.py', 'tests/integration/test_w3_admission_races.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-15 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_w3_queue_policy.py', 'tests/integration/test_w3_placement_races.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-13 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_w3_visits.py', 'tests/integration/test_w3_visit_races.py', 'tests/integration/test_w3_visit_bff.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-16 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_w3_cancel_replace.py', 'tests/integration/test_w3_cancel_replace_races.py', 'tests/integration/test_w3_cancel_replace_bff.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-17 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_w3_reschedule.py', 'tests/integration/test_w3_reschedule_races.py', 'tests/integration/test_w3_reschedule_bff.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-18 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_w3_bulk.py', 'tests/integration/test_w3_bulk_races.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-19 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_w3_reconciliation.py', 'tests/integration/test_w3_day_review.py', 'tests/integration/test_w3_cutoff_races.py', 'tests/integration/test_w3_reconciliation_bff.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 B-20 verification: $suite" }
+            }
+            foreach ($suite in @('tests/integration/test_w3_migration.py', 'tests/integration/test_w3_operation_boundaries.py', 'tests/integration/test_w3_boundary_security.py')) {
+                if (-not (Test-Path -LiteralPath $suite -PathType Leaf)) { throw "Missing required Wave 3 T070-T071 verification: $suite" }
+            }
             # Linux CI retains the accepted Bash probes; PowerShell checks their exit immediately.
             $integration = @'
 set -euo pipefail
@@ -332,6 +409,34 @@ if [ "$1" = integration-diagnostic ]; then
     f01-followup-context) focused_target='tests/integration/test_followup_persistence.py::test_v2_writer_rejects_invalid_context_without_evidence[missing]' ;;
     f01-pricing) focused_target='tests/integration/test_pricing.py' ;;
     f01-pricing-races) focused_target='tests/integration/test_pricing_races.py' ;;
+    w3-checkin) focused_target='tests/integration/test_w3_checkin.py' ;;
+    w3-checkin-races) focused_target='tests/integration/test_w3_checkin_races.py' ;;
+    w3-receipt-boundary) focused_target='tests/integration/test_w3_receipt_boundary.py' ;;
+    w3-queue-scope) focused_target='tests/integration/test_w3_queue_scope.py' ;;
+    w3-intake) focused_target='tests/integration/test_w3_intake.py' ;;
+    w3-intake-races) focused_target='tests/integration/test_w3_intake_races.py' ;;
+    w3-admission-controls) focused_target='tests/integration/test_w3_admission_controls.py' ;;
+    w3-admission-confirmations) focused_target='tests/integration/test_w3_admission_confirmations.py' ;;
+    w3-admission) focused_target='tests/integration/test_w3_admission.py' ;;
+    w3-admission-races) focused_target='tests/integration/test_w3_admission_races.py' ;;
+    w3-queue-policy) focused_target='tests/integration/test_w3_queue_policy.py' ;;
+    w3-placement-races) focused_target='tests/integration/test_w3_placement_races.py' ;;
+    w3-visits) focused_target='tests/integration/test_w3_visits.py' ;;
+    w3-visit-races) focused_target='tests/integration/test_w3_visit_races.py' ;;
+    w3-legacy-source) focused_target='tests/integration/test_followup_persistence.py::test_v2_no_decision_and_actual_staff_events_preserve_clinical_content[doctor]' ;;
+    w3-cancel-replace) focused_target='tests/integration/test_w3_cancel_replace.py' ;;
+    w3-cancel-replace-races) focused_target='tests/integration/test_w3_cancel_replace_races.py' ;;
+    w3-reschedule) focused_target='tests/integration/test_w3_reschedule.py' ;;
+    w3-reschedule-races) focused_target='tests/integration/test_w3_reschedule_races.py' ;;
+    w3-bulk) focused_target='tests/integration/test_w3_bulk.py' ;;
+    w3-bulk-races) focused_target='tests/integration/test_w3_bulk_races.py' ;;
+    w3-reconciliation) focused_target='tests/integration/test_w3_reconciliation.py' ;;
+    w3-day-review) focused_target='tests/integration/test_w3_day_review.py' ;;
+    w3-cutoff-races) focused_target='tests/integration/test_w3_cutoff_races.py' ;;
+    w3-migration) focused_target='tests/integration/test_f01_grants_migration.py' ;;
+    w3-migration-replay) focused_target='tests/integration/test_w3_migration.py' ;;
+    w3-operation-boundaries) focused_target='tests/integration/test_w3_operation_boundaries.py' ;;
+    w3-boundary-security) focused_target='tests/integration/test_w3_boundary_security.py' ;;
     *) echo 'FAIL unapproved PostgreSQL diagnostic selection'; exit 1 ;;
   esac
   printf 'Focused PostgreSQL diagnostic only: %s (SHA %s, project %s)\n' "$focused_target" "$GITHUB_SHA" "$CP_CI_PROJECT"
@@ -393,7 +498,7 @@ cleanup() {
         ordinary-stack) export CP_FOUNDATION_COVERAGE=current-head-stack ;;
         historical) export CP_FOUNDATION_COVERAGE=immutable-0040-selected-nodes-on-isolated-postgres ;;
       esac
-      export CP_FOUNDATION_CANDIDATE_SCHEMA=0046_f01_audit_integrity
+      export CP_FOUNDATION_CANDIDATE_SCHEMA=0072_b20_worker
       export CP_FOUNDATION_HISTORICAL_SHA=6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7
       export CP_FOUNDATION_HISTORICAL_SCHEMA=0040_t173_numeric_money
       export CP_FOUNDATION_VERIFIED_TESTS="$foundation_tests" CP_FOUNDATION_LANE="$foundation_lane"
@@ -484,16 +589,22 @@ identity_fixture_args=(
   -v "$CP_GATE_DB_PASSWORD_SOURCE_FILE:/run/secrets/gate_db_password:ro"
 )
 upgrade_head() {
-  docker compose --profile test run --rm --no-deps \
+  echo 'START PostgreSQL Alembic upgrade to head'
+  if ! docker compose --profile test run --rm --no-deps -T \
     -e CP_DB_HOST=db -e CP_DB_PORT=5432 -e CP_DB_NAME=carepulse \
     -e CP_MIGRATION_PASSWORD_FILE=/run/secrets/migration_password \
     -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
-    test python -m alembic -c alembic.ini upgrade head
+    test python -m ops.migration_startup > "$private/migration-startup.log" 2>&1; then
+    grep -E '^MIGRATION_STARTUP FAIL category=(database|runtime|other) sqlstate=([A-Z0-9]{5}|unavailable) location=([0-9]{4}_[a-z0-9_]+\.py:[0-9]+|unavailable)$' "$private/migration-startup.log" || true
+    echo 'FAIL PostgreSQL Alembic upgrade to head'; return 1
+  fi
+  grep -Fx 'MIGRATION_STARTUP PASS' "$private/migration-startup.log"
 }
 
 # Synthetic-only custody setup. The ordinary runtime roles have no key-table
 # access. Provisioning is performed outside all application containers.
 seed_identity_policy() {
+  echo 'START F-01 synthetic identity provisioning'
   set +x
   export CP_F01_SYNTHETIC_KEY="$(cat "$CP_DB_IDENTITY_KEY_SOURCE_FILE")"
   export CP_F01_FRESHNESS="$(jq -er 'select(.profile == "synthetic") | .signed_request_freshness_seconds' tests/fixtures/foundation-policy.json)"
@@ -505,20 +616,25 @@ seed_identity_policy() {
       echo 'FAIL F-01 synthetic identity provisioning'; return 1;
     }
   unset CP_F01_SYNTHETIC_KEY CP_F01_FRESHNESS CP_F01_SKEW CP_F01_IDLE
+  echo 'PASS F-01 synthetic identity provisioning'
 }
 
 if [ -n "$focused_target" ]; then
-  if ! upgrade_head > "$private/focused-migration.log" 2>&1; then
-    echo 'FAIL focused PostgreSQL Alembic upgrade to head'; exit 1
-  fi
+  upgrade_head
   echo 'PASS focused PostgreSQL Alembic upgrade to head'
   seed_identity_policy
   docker compose exec -T db postgres --version | grep -F '17.11'
+  worker_fixture_args=()
+  case "$focused_target" in
+    tests/integration/test_w3_cutoff_races.py) worker_fixture_args=(-v "$CP_WORKER_DB_PASSWORD_SOURCE_FILE:/run/secrets/worker_db_password:ro" -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro") ;;
+    tests/integration/test_w3_migration.py) worker_fixture_args=(-v "$CP_DB_PASSWORD_FILE:/run/secrets/postgres_password:ro") ;;
+  esac
   docker compose --profile test run --rm --no-deps -T "${identity_fixture_args[@]}" \
     -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
     -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
     -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
     -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+    "${worker_fixture_args[@]}" \
     test python tests/integration/focused_postgres.py "$focused_target"
   exit 0
 fi
@@ -816,7 +932,10 @@ fi
 upgrade_head
 seed_identity_policy
 if [ "$foundation_full" = true ]; then
-  test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0046_f01_audit_integrity
+  if ! test "$(docker compose exec -T db psql --no-psqlrc -At -U carepulse_bootstrap -d carepulse -c 'SELECT version_num FROM public.alembic_version')" = 0072_b20_worker; then
+    echo 'FAIL ordinary current schema verification'; exit 1
+  fi
+  echo 'PASS ordinary current schema verification'
 fi
 if [ "$foundation_lane" != ordinary-stack ]; then
 docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
@@ -851,6 +970,29 @@ docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/d08-core.log"; then
   echo 'FAIL mandatory D-08 persistence evidence skipped'; exit 1
 fi
+fi
+# Wave 3 suites exercise the current head, never the immutable predecessor or special modes.
+if [ "$foundation_lane" = ordinary-db ] || { [ "$foundation_lane" = standard ] && [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; }; then
+  for suite in w3_receipt_boundary w3_checkin w3_checkin_races w3_queue_scope w3_intake w3_intake_races w3_admission_controls w3_admission_confirmations w3_admission w3_admission_races w3_queue_policy w3_placement_races w3_visits w3_visit_races w3_cancel_replace w3_cancel_replace_races w3_reschedule w3_reschedule_races w3_bulk w3_bulk_races w3_reconciliation w3_day_review w3_cutoff_races w3_migration w3_operation_boundaries w3_boundary_security; do
+    worker_fixture_args=()
+    case "$suite" in
+      w3_cutoff_races) worker_fixture_args=(-v "$CP_WORKER_DB_PASSWORD_SOURCE_FILE:/run/secrets/worker_db_password:ro") ;;
+      w3_migration) worker_fixture_args=(-v "$CP_DB_PASSWORD_FILE:/run/secrets/postgres_password:ro") ;;
+    esac
+    docker compose --profile test run --rm --no-deps "${identity_fixture_args[@]}" \
+      -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+      -v "$private/foundation-results:/tmp/foundation-results:rw" \
+      -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+      -v "$CP_RUNTIME_DB_PASSWORD_FILE:/run/secrets/runtime_db_password:ro" \
+      -v "$CP_AUTH_DB_PASSWORD_SOURCE_FILE:/run/secrets/auth_db_password:ro" \
+      -v "$CP_MIGRATION_SECRET_FILE:/run/secrets/migration_password:ro" \
+      -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro" \
+      "${worker_fixture_args[@]}" \
+      test python -m pytest -q -s -ra --tb=short -p no:cacheprovider "--junitxml=/tmp/foundation-results/$suite.xml" "tests/integration/test_$suite.py" | tee "$private/$suite.log"
+    if grep -Eq '[0-9]+ skipped|no tests ran' "$private/$suite.log"; then
+      echo "FAIL mandatory Wave 3 evidence skipped: $suite"; exit 1
+    fi
+  done
 fi
 if [ "$foundation_lane" = ordinary-db ]; then
   CP_FOUNDATION_REPORT_EVIDENCE="$(python3 -m ops.foundation_acceptance verify-coverage "$foundation_lane" "$private/foundation-results")"
@@ -1254,6 +1396,18 @@ docker compose --profile test run --rm --no-deps \
   tests/integration/test_patients.py | tee "$private/b05-invited.log"
 if grep -Eq '[0-9]+ skipped|no tests ran' "$private/b05-invited.log"; then
   echo 'FAIL mandatory B-05 invited-session evidence skipped'; exit 1
+fi
+if [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; then
+  for suite in w3_bff w3_visit_bff w3_cancel_replace_bff w3_reschedule_bff w3_reconciliation_bff; do
+    docker compose --profile test run --rm --no-deps \
+      -e CP_CI_PROJECT="$CP_CI_PROJECT" -e CP_COMPOSE_CONFIG_PATH=/tmp/foundation-compose.json \
+      -v "$private/foundation-results:/tmp/foundation-results:rw" \
+      -v "$private/compose.json:/tmp/foundation-compose.json:ro" \
+      test python -m pytest -q -ra --tb=short -p no:cacheprovider --junitxml="/tmp/foundation-results/$suite.xml" "tests/integration/test_$suite.py" | tee "$private/$suite.log"
+    if grep -Eq '[0-9]+ skipped|no tests ran' "$private/$suite.log"; then
+      echo 'FAIL mandatory Wave 3 authenticated BFF evidence skipped'; exit 1
+    fi
+  done
 fi
 docker compose exec -T web node --no-warnings --experimental-strip-types --test --test-reporter=tap auth/ingress.test.mjs | tee "$private/foundation-results/web-ingress.tap"
 echo 'PASS verified source separation, spoof resistance and sole Web listener'

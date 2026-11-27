@@ -47,6 +47,20 @@ class Diagnostic:
             ):
                 location = f"{path}:{line + 1} {name}"
             detail = f"{report.outcome.upper()} {report.when} {location}"
+            if (
+                name == "test_bulk_commit_serializes_with_included_row_changes"
+                and path == "tests/integration/test_w3_bulk_races.py"
+                and hasattr(item, "callspec")
+            ):
+                case = item.callspec.params
+                if (
+                    case.get("competitor") in ("admit", "reschedule", "archive")
+                    and type(case.get("bulk_first")) is bool
+                ):
+                    detail += (
+                        f" | B19 case {case['competitor']}"
+                        f" bulk_first={str(case['bulk_first']).lower()}"
+                    )
             error = call.excinfo.value if call.excinfo else None
             if isinstance(error, PostgresLockNotObserved):
                 detail += f" | {error}"
@@ -56,6 +70,15 @@ class Diagnostic:
                 r"[A-Z0-9]{5}", error.sqlstate or ""
             ):
                 detail += f" | SQLSTATE {error.sqlstate}"
+                # Publish only identifiers and source line numbers, never SQL, values or error text.
+                constraint = error.diag.constraint_name or ""
+                if re.fullmatch(r"[a-z][a-z0-9_]{0,62}", constraint):
+                    detail += f" | constraint {constraint}"
+                for routine, line_number in re.findall(
+                    r"PL/pgSQL function (?:public\.|f01_private\.)?([a-z][a-z0-9_]{0,62})\([^\n]*?\) line ([0-9]+) at ",
+                    error.diag.context or "",
+                ):
+                    detail += f" | routine {routine}:{line_number}"
             self.details.append(detail)
         return report
 

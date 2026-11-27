@@ -2,7 +2,9 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import date
 from re import compile
+from uuid import UUID
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -10,6 +12,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 
+from carepulse.appointments.cutoff import apply_selected_cutoff
+from carepulse.appointments.intake_routes import router as intake_router
+from carepulse.appointments.reconciliation_routes import router as reconciliation_router
 from carepulse.appointments.routes import router as appointment_router
 from carepulse.config import load_config
 from carepulse.db import create_db_engine, create_gate_engine
@@ -23,11 +28,28 @@ from carepulse.identity.contracts import (
 from carepulse.identity.receipts import ReceiptConflict
 from carepulse.identity.staff_routes import router as staff_router
 from carepulse.patients.routes import router as patient_router
+from carepulse.policies.admission_routes import router as admission_router
 from carepulse.policies.pricing_routes import router as pricing_router
+from carepulse.policies.queue_routes import router as queue_policy_router
 from carepulse.policies.schedule_routes import router as schedule_router
 from carepulse.policies.slots_routes import router as slots_router
 from carepulse.provisioning.routes import router as provisioning_router
+from carepulse.queue.routes import router as queue_router
+from carepulse.visits.clinical_contracts import signed_visit_patch_purpose
 from carepulse.visits.routes import router as visit_router
+
+
+def run_selected_day_cutoff(
+    organization_id: UUID, service_date: date, policy_version: int
+) -> int:
+    """Internal worker entry only; no HTTP route or scheduling responsibility."""
+    engine = create_db_engine(load_config("worker"))
+    try:
+        return apply_selected_cutoff(
+            engine, organization_id, service_date, policy_version
+        )
+    finally:
+        engine.dispose()
 
 
 @asynccontextmanager
@@ -55,10 +77,15 @@ app.include_router(provisioning_router)
 app.include_router(staff_router)
 app.include_router(patient_router)
 app.include_router(appointment_router)
+app.include_router(reconciliation_router)
+app.include_router(intake_router)
 app.include_router(visit_router)
 app.include_router(pricing_router)
 app.include_router(schedule_router)
 app.include_router(slots_router)
+app.include_router(queue_router)
+app.include_router(admission_router)
+app.include_router(queue_policy_router)
 app.add_exception_handler(ContractError, contract_exception_handler)
 app.add_exception_handler(
     RequestValidationError, lambda _request, _error: error_response(422)
@@ -100,7 +127,16 @@ app.add_middleware(
         ("GET", "/v1/patients"): "PATIENT_REGISTRY",
         ("POST", "/v1/patients"): "PATIENT_REGISTRY",
         ("GET", "/v1/appointments"): "APPOINTMENT_BOOKING",
+        ("GET", "/v1/reconciliation"): "RECONCILIATION_READ",
         ("POST", "/v1/appointments"): "APPOINTMENT_BOOKING",
+        (
+            "POST",
+            "/v1/appointments/bulk-reschedule/preview",
+        ): "APPOINTMENT_BULK_PREVIEW",
+        ("POST", "/v1/appointments/bulk-reschedule/commit"): "APPOINTMENT_BULK_COMMIT",
+        ("POST", "/v1/intake/routine"): "INTAKE_ROUTINE",
+        ("POST", "/v1/intake/emergency"): "INTAKE_EMERGENCY",
+        ("POST", "/v1/intake/urgent"): "INTAKE_URGENT",
         ("GET", "/v1/settings/pricing"): "SETTINGS_PRICING",
         ("PATCH", "/v1/settings/pricing"): "SETTINGS_PRICING",
         ("GET", "/v1/settings/schedule"): "SETTINGS_SCHEDULE",
@@ -108,12 +144,89 @@ app.add_middleware(
         ("POST", "/v1/settings/schedule/preview"): "SETTINGS_SCHEDULE",
         ("POST", "/v1/settings/schedule/activate"): "SETTINGS_SCHEDULE",
         ("GET", "/v1/slots"): "SLOTS",
+        ("GET", "/v1/queue"): "QUEUE_READ",
+        ("GET", "/v1/settings/admission"): "ADMISSION_SETTINGS_READ",
+        ("PATCH", "/v1/settings/admission"): "ADMISSION_MODE_UPDATE",
+        ("PATCH", "/v1/queue/capacity"): "QUEUE_CAPACITY_UPDATE",
+        ("POST", "/v1/queue/pause"): "QUEUE_PAUSE",
+        ("POST", "/v1/queue/admit"): "QUEUE_ADMIT",
+        ("GET", "/v1/settings/queue"): "SETTINGS_QUEUE_READ",
+        ("PATCH", "/v1/settings/queue"): "SETTINGS_QUEUE_UPDATE",
+        ("POST", "/v1/queue/placement"): "QUEUE_PLACEMENT",
+        ("POST", "/v1/queue/admission-confirmations"): "QUEUE_CONFIRMATION_ISSUE",
+        (
+            "GET",
+            "/v1/queue/admission-confirmations/usable",
+        ): "QUEUE_CONFIRMATION_USABLE",
     },
     route_patterns=(
         (
+            "POST",
+            compile(
+                r"/v1/appointments/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/manual-no-show"
+            ),
+            "APPOINTMENT_MANUAL_NO_SHOW",
+        ),
+        ("POST", compile(r"/v1/days/[0-9]{4}-[0-9]{2}-[0-9]{2}/review"), "DAY_REVIEW"),
+        ("POST", compile(r"/v1/days/[0-9]{4}-[0-9]{2}-[0-9]{2}/close"), "DAY_CLOSE"),
+        (
+            "POST",
+            compile(
+                r"/v1/queue/admission-confirmations/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/revoke"
+            ),
+            "QUEUE_CONFIRMATION_REVOKE",
+        ),
+        (
+            "POST",
+            compile(
+                r"/v1/appointments/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/check-in"
+            ),
+            "QUEUE_CHECK_IN",
+        ),
+        (
+            "POST",
+            compile(
+                r"/v1/appointments/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/cancel"
+            ),
+            "APPOINTMENT_CANCEL",
+        ),
+        (
+            "POST",
+            compile(
+                r"/v1/appointments/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/replace-urgent"
+            ),
+            "APPOINTMENT_REPLACE_URGENT",
+        ),
+        (
+            "POST",
+            compile(
+                r"/v1/appointments/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/reschedule"
+            ),
+            "APPOINTMENT_RESCHEDULE",
+        ),
+        (
             "PATCH",
             compile(r"/v1/visits/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"),
-            "VISIT_FOLLOWUP",
+            signed_visit_patch_purpose,
+        ),
+        (
+            "GET",
+            compile(r"/v1/visits/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"),
+            "VISIT_READ",
+        ),
+        (
+            "POST",
+            compile(
+                r"/v1/visits/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/complete"
+            ),
+            "VISIT_COMPLETE",
+        ),
+        (
+            "POST",
+            compile(
+                r"/v1/visits/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/cancel-exceptional"
+            ),
+            "VISIT_CANCEL_EXCEPTIONAL",
         ),
         (
             "POST",

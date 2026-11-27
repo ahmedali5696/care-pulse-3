@@ -4,7 +4,7 @@ import { currentActor } from "./session.ts";
 import { failure, validMutation } from "./http.ts";
 import { canonicalPath, signRequest } from "./signing.ts";
 
-type ApprovedRoute = { path: string; purpose: string; method: string };
+type ApprovedRoute = { path: string; purpose: string | ((body: Uint8Array) => string | null); method: string };
 const MAX_MUTATION_BODY_BYTES = 1_048_576;
 
 export async function boundedBody(request: Request): Promise<Uint8Array | null> {
@@ -61,13 +61,15 @@ export async function forwardPrivate(request: Request, route: ApprovedRoute): Pr
     const rawQuery = new URL(request.url).search.slice(1);
     const body = await boundedBody(request);
     if (body === null) return failure(422);
+    const purpose = typeof route.purpose === "function" ? route.purpose(body) : route.purpose;
+    if (!purpose) return failure(422);
     const idempotencyKey = request.headers.get("idempotency-key") ?? "";
     if (idempotencyKey.length > 128 || /[\x00-\x1f\x7f-\x9f]/.test(idempotencyKey)) return failure(422);
     const signed = signRequest({
       method: request.method, rawPath: path, rawQuery, body,
       organizationId: actor.organizationId, staffId: actor.staffId,
       sessionId: actor.sessionId, role: actor.role,
-      securityRevision: actor.securityRevision, purpose: route.purpose,
+      securityRevision: actor.securityRevision, purpose,
       idempotencyKey, keyId: config.signingKeyId, serviceKey: config.serviceKey,
       dbIdentityKeyId: config.dbIdentityKeyId, dbIdentityKey: config.dbIdentityKey,
     });

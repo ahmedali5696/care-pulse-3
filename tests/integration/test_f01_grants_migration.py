@@ -27,6 +27,7 @@ from test_database import disposable_project as disposable_project  # noqa: PLC0
 from test_database import empty_database as empty_database  # noqa: PLC0414
 from test_evidence_persistence import _new_delivery
 from test_followup_persistence import _claim, _source
+from test_queue_persistence import _arrive
 
 PREVIOUS = "0041_f01_runtime_identity"
 REVISION = "0042_f01_effective_grants"
@@ -290,6 +291,12 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
                 """)
             )
             _new_delivery(connection, operator)
+            waiting = persist_appointment(
+                connection,
+                _draft(_patient(connection, tenant), doctor, status="Waiting"),
+                _query(tenant, doctor),
+            )
+            _arrive(connection, tenant, doctor, waiting)
         with migration.connect() as connection:
             retained = _historic_rows(connection)
             original_constraints = _constraints(connection, ("public",))
@@ -330,6 +337,38 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
         revisions = list(reversed(list(graph.iterate_revisions(head, baseline))))
         assert revisions[0].revision == PREVIOUS
         assert revisions[-1].revision == head
+        revision_order = [revision.revision for revision in revisions]
+        queue_grants_index = revision_order.index("0047_b12_queue_checkin_grants")
+        assert revision_order[queue_grants_index - 1 :] == [
+            "0046_f01_audit_integrity",
+            "0047_b12_queue_checkin_grants",
+            "0048_b12_queue_scope",
+            "0049_b12_checkin_provenance",
+            "0050_b12_checkin_completeness",
+            "0051_b11_intake",
+            "0052_b11_routine_scope",
+            "0053_b11_receipt_conflict",
+            "0054_b12_receipt_scope",
+            "0055_b14_admission_control",
+            "0056_b14_target_binding",
+            "0057_w3_queue_admit",
+            "0058_b15_admission_guards",
+            "0059_b13_queue_policy_placement",
+            "0060_b16_visits",
+            "0061_b17_cancel_replace",
+            "0062_b17_typed_body",
+            "0063_b18_reschedule",
+            "0064_b18_source_alias",
+            "0065_b18_followup_fence",
+            "0066_b19_bulk_reschedule",
+            "0067_b19_exclusion_reason",
+            "0068_b19_capacity_numeric",
+            "0069_b19_interval_evidence",
+            "0070_b19_legacy_evidence",
+            "0071_b20_staff",
+            "0072_b20_worker",
+        ]
+        assert any(row["disposition"] == "ACTIVE" for row in retained["queue_entries"])
         for revision in revisions:
             target = revision.revision
             with migration.connect() as connection:
@@ -361,14 +400,77 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
                 ) == before
 
             _upgrade(migration, target)
+            if target == "0060_b16_visits":
+                retained["visits"] = [
+                    row | {"recommendation": None} for row in retained["visits"]
+                ]
             with migration.connect() as connection:
                 assert _historic_rows(connection) == retained
                 assert _private_nonces(connection) == [
                     ("legacy-http-key", "synthetic-f01-retained-nonce")
                 ]
-                assert set(original_constraints) <= set(
-                    _constraints(connection, ("public",))
-                )
+                current_constraints = set(_constraints(connection, ("public",)))
+                if target == "0072_b20_worker":
+                    # Only the three explicitly evolved actor checks may change.
+                    evolved = {
+                        row
+                        for row in original_constraints
+                        if (row[1], row[2])
+                        in {
+                            (
+                                "appointment_history",
+                                "appointment_history_actor_role_check",
+                            ),
+                            (
+                                "idempotency_receipts",
+                                "idempotency_receipts_actor_kind_check",
+                            ),
+                        }
+                        or (
+                            row[1] == "idempotency_receipts"
+                            and "OPERATOR_CREATE" in row[6]
+                            and "actor_id" in row[6]
+                        )
+                    }
+                    assert len(evolved) == 3
+                    assert set(original_constraints) - evolved <= current_constraints
+                    replacements = {row[:6]: row[6] for row in current_constraints}
+                    for row in evolved:
+                        assert row[:6] in replacements
+                        assert "SYSTEM" in replacements[row[:6]]
+                        if "OPERATOR_CREATE" in row[6]:
+                            # PostgreSQL flattens nested OR expressions during
+                            # parsing. Compare the canonical form of the entire
+                            # original predicate plus precisely the new branch.
+                            with connection.begin_nested() as comparison:
+                                connection.exec_driver_sql(
+                                    f"""ALTER TABLE public.idempotency_receipts
+                                    ADD CONSTRAINT b20_expected_actor_shape CHECK (({row[6][7:-1]}) OR (
+                                        scope_kind='TENANT' AND actor_kind='SYSTEM' AND organization_id IS NOT NULL
+                                        AND scope_id=organization_id AND staff_id IS NULL AND operator_id IS NULL
+                                        AND actor_id='00000000-0000-4000-8000-000000000020'::uuid
+                                        AND operation='appointments.cutoff_no_show' AND result_organization_id IS NULL
+                                        AND result_projection IS NOT NULL AND jsonb_typeof(result_projection)='object'
+                                        AND result_revision IS NOT NULL
+                                        AND result_projection->>'appointment_id'=idempotency_key
+                                        AND result_projection->>'appointment_revision'=result_revision::text
+                                        AND result_projection->>'status'='No-show'
+                                        AND result_projection ?& ARRAY['appointment_id','status','service_date','appointment_revision','claim_revision']
+                                        AND result_projection - ARRAY['appointment_id','status','service_date','appointment_revision','claim_revision']='{{}}'::jsonb
+                                        AND jsonb_typeof(result_projection->'service_date')='string'
+                                        AND jsonb_typeof(result_projection->'appointment_revision')='number'
+                                        AND jsonb_typeof(result_projection->'claim_revision') IN ('number','null')) IS TRUE)""",
+                                    execution_options={"no_parameters": True},
+                                )
+                                expected = connection.scalar(
+                                    text("""SELECT pg_get_constraintdef(oid) FROM pg_constraint
+                                    WHERE conrelid='public.idempotency_receipts'::regclass
+                                    AND conname='b20_expected_actor_shape'""")
+                                )
+                                assert replacements[row[:6]] == expected
+                                comparison.rollback()
+                else:
+                    assert set(original_constraints) <= current_constraints
                 after = _snapshot(connection)
                 assert after[0] == target
             _upgrade(migration, target)
@@ -401,6 +503,15 @@ def test_f01_populated_0040_cutover_preserves_history_and_rolls_back_each_correc
                    AND NOT has_table_privilege('carepulse_runtime','public.idempotency_receipts','INSERT')
                    AND NOT has_column_privilege('carepulse_api','public.delivery_jobs','claim_owner','SELECT')
                    AND has_column_privilege('carepulse_sender','public.delivery_jobs','claim_owner','SELECT')
+                   AND (SELECT prosecdef AND proowner = 'carepulse_migration'::regrole
+                        FROM pg_proc WHERE oid = 'public.f01_intake_key_conflict()'::regprocedure)
+                   AND has_function_privilege('carepulse_api','public.f01_intake_key_conflict()','EXECUTE')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM unnest(ARRAY['public','carepulse_runtime','carepulse_gate',
+                           'carepulse_web','carepulse_worker','carepulse_operator','carepulse_sender',
+                           'carepulse_auth','carepulse_identity_owner']) AS role_name
+                       WHERE has_function_privilege(role_name,'public.f01_intake_key_conflict()','EXECUTE')
+                   )
             """)
                 )
                 is True

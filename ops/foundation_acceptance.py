@@ -14,6 +14,7 @@ from ops import foundation_inventory as inventory
 HISTORICAL_SHA = "6cf2973c07f6e0ef2d8040d1eb3c235fd1598df7"
 SOURCE_SCHEMA = "0040_t173_numeric_money"
 CANDIDATE_SCHEMA = "0046_f01_audit_integrity"
+ORDINARY_SCHEMA = "0072_b20_worker"
 RECEIPT_FILE = "foundation-full-receipt.json"
 EXPECTED_COVERAGE = {
     "ordinary-db": "current-head-db",
@@ -22,8 +23,8 @@ EXPECTED_COVERAGE = {
     "compat": "full-US1-US2-US3-six-successors-zero-skips",
 }
 PROVENANCE = {
-    "ordinary-db": {"candidate_schema": CANDIDATE_SCHEMA},
-    "ordinary-stack": {"candidate_schema": CANDIDATE_SCHEMA},
+    "ordinary-db": {"candidate_schema": ORDINARY_SCHEMA},
+    "ordinary-stack": {"candidate_schema": ORDINARY_SCHEMA},
     "historical": {
         "historical_sha": HISTORICAL_SHA,
         "historical_schema": SOURCE_SCHEMA,
@@ -51,6 +52,34 @@ DIAGNOSTICS = {
     "f01-followup-context",
     "f01-pricing",
     "f01-pricing-races",
+    "w3-checkin",
+    "w3-checkin-races",
+    "w3-receipt-boundary",
+    "w3-queue-scope",
+    "w3-intake",
+    "w3-intake-races",
+    "w3-admission-controls",
+    "w3-admission-confirmations",
+    "w3-admission",
+    "w3-admission-races",
+    "w3-queue-policy",
+    "w3-placement-races",
+    "w3-visits",
+    "w3-visit-races",
+    "w3-legacy-source",
+    "w3-cancel-replace",
+    "w3-cancel-replace-races",
+    "w3-reschedule",
+    "w3-reschedule-races",
+    "w3-bulk",
+    "w3-bulk-races",
+    "w3-reconciliation",
+    "w3-day-review",
+    "w3-cutoff-races",
+    "w3-migration",
+    "w3-migration-replay",
+    "w3-operation-boundaries",
+    "w3-boundary-security",
     "compat-us1",
     "compat-us2",
     "compat-us3",
@@ -364,9 +393,10 @@ def _publish_acceptance(env: dict[str, str]) -> None:
         f"- Repository/workflow: `{context['repository']}` / `{context['workflow']}`",
         f"- Run/attempt: `{context['run_id']}` / `{context['attempt']}`",
         (
-            f"- Ordinary DB ({sum(inventory.REPORT_COUNTS['ordinary-db'].values())}), "
-            f"Ordinary stack ({sum(inventory.REPORT_COUNTS['ordinary-stack'].values())}), "
-            "historical (163), compatibility (44 Python + 11 Web): verified"
+            f"- Ordinary ({ORDINARY_SCHEMA}, including B-12, B-11, B-14, B-15, B-13, B-16, B-17, B-18, B-19 and B-20; T070-T071 cross-operation verification): "
+            f"DB ({sum(inventory.REPORT_COUNTS['ordinary-db'].values())}), "
+            f"stack ({sum(inventory.REPORT_COUNTS['ordinary-stack'].values())}); "
+            "historical (163 at 0040), compatibility (44 Python + 11 Web, 0040 to 0046): verified"
         ),
         "- Four current-attempt receipts, exact report inventory, zero mandatory skips, scoped cleanup, artifact digests: verified",
     ]

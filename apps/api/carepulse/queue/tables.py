@@ -98,6 +98,7 @@ doctor_admission_confirmations = Table(
     Column("id", UUID(as_uuid=True), primary_key=True),
     Column("organization_id", UUID(as_uuid=True), nullable=False),
     Column("issuing_doctor_staff_id", UUID(as_uuid=True), nullable=False),
+    Column("issuer_security_revision", BigInteger),
     Column("doctor_staff_id", UUID(as_uuid=True), nullable=False),
     Column("patient_id", UUID(as_uuid=True), nullable=False),
     Column("appointment_id", UUID(as_uuid=True), nullable=False),

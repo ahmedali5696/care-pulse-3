@@ -273,7 +273,9 @@ def _followup_actor(connection, clinic, staff):
 
 
 @contextmanager
-def _signed_v2_transaction(clinic, routine, source, *, actor=None, reference=None):
+def _signed_v2_transaction(
+    clinic, routine, source, *, actor=None, reference=None, source_command=None
+):
     """One real gate proof/transaction, scoped to the SQL command's resource."""
     reference = source["visit"] if reference is None else reference
     if routine == "create_followup_claim":
@@ -303,7 +305,21 @@ def _signed_v2_transaction(clinic, routine, source, *, actor=None, reference=Non
             f"/v1/visits/{source['visit']}",
             "VISIT_FOLLOWUP",
         )
-        body = {}
+        assert source_command is not None
+        expected = source_command.get(
+            "expected",
+            {"source_revision": 0, "clinical_revision": 0, "policy_version": 1},
+        )
+        body = {
+            "followup_decision": {
+                field: source_command[field]
+                for field in ("kind", "deadline_date", "reason")
+                if field in source_command
+            },
+            "expected_source_decision_revision": expected["source_revision"],
+            "expected_visit_revision": expected["clinical_revision"],
+            "expected_followup_revision": expected["policy_version"],
+        }
     payload = json.dumps(body, separators=(",", ":")).encode()
     identity = replace(
         actor or clinic.owner,
@@ -328,7 +344,14 @@ def _signed_v2_transaction(clinic, routine, source, *, actor=None, reference=Non
 def _signed_v2_command(clinic, routine, source, *, actor=None, **command):
     """Commit one signed command; callers commit maintenance setup separately first."""
     with _signed_v2_transaction(
-        clinic, routine, source, actor=actor, reference=command.get("reference")
+        clinic,
+        routine,
+        source,
+        actor=actor,
+        reference=command.get("reference"),
+        source_command=command
+        if routine == "record_followup_source_decision"
+        else None,
     ) as connection:
         return _current_v2_command(connection, routine, source, **command)
 
@@ -1351,7 +1374,17 @@ def test_v2_effective_privileges_rls_reserved_audit_and_legacy_fences(
         appointment_api, "record_followup_source_decision", source, kind="DEFAULT"
     )
     with _signed_v2_transaction(
-        appointment_api, "record_followup_source_decision", source
+        appointment_api,
+        "record_followup_source_decision",
+        source,
+        source_command={
+            "kind": "DEFAULT",
+            "expected": {
+                "source_revision": 1,
+                "clinical_revision": 0,
+                "policy_version": 1,
+            },
+        },
     ) as connection:
         for sql in (
             "UPDATE public.visits SET followup_decision='{}'::jsonb WHERE id=:visit",
@@ -3089,12 +3122,23 @@ def test_d08_adds_no_lifecycle_or_fixture_api_routes():
         if hasattr(route, "path")
         for method in getattr(route, "methods", set())
     }
+    authorized_w3_appointment_routes = {
+        ("POST", "/v1/appointments/{appointment_id}/check-in"),
+        ("POST", "/v1/appointments/{appointment_id}/cancel"),
+        ("POST", "/v1/appointments/{appointment_id}/replace-urgent"),
+        ("POST", "/v1/appointments/{appointment_id}/reschedule"),
+        ("POST", "/v1/appointments/bulk-reschedule/preview"),
+        ("POST", "/v1/appointments/bulk-reschedule/commit"),
+        ("POST", "/v1/appointments/{appointment_id}/manual-no-show"),
+    }
     assert ("POST", "/v1/appointments") in route_set
+    assert authorized_w3_appointment_routes <= route_set
     assert not any(
         path.startswith(("/v1/followups", "/v1/followup-claims", "/v1/fixtures"))
         or (
             path.startswith("/v1/appointments/")
             and method in ("PATCH", "POST", "DELETE")
+            and (method, path) not in authorized_w3_appointment_routes
         )
         for method, path in route_set
     )

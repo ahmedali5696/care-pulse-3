@@ -97,7 +97,7 @@ def list_slots(
     }
 
 
-def validate_timed_booking(
+def validate_timed_candidate(
     connection: Connection,
     tenant,
     service_date: date,
@@ -105,8 +105,8 @@ def validate_timed_booking(
     ends_at: datetime,
     now: datetime,
     expected_capacity_revision: int | None,
-) -> None:
-    """Caller holds schedule/policy locks and the clinic/day number-counter lock."""
+) -> int | None:
+    """Validate the selected candidate and locked policy; return overlap capacity, if enabled."""
     if any(
         endpoint.tzinfo is None or endpoint.utcoffset() is None
         for endpoint in (starts_at, ends_at, now)
@@ -128,11 +128,47 @@ def validate_timed_booking(
     capacity = _capacity_state(connection, tenant) if schedule.allow_overlap else None
     if capacity:
         require_matching_revision(expected_capacity_revision, capacity["revision"])
+    return capacity["capacity"] if capacity else None
+
+
+def validate_new_timed_capacity(
+    connection: Connection,
+    tenant,
+    service_date: date,
+    starts_at: datetime,
+    ends_at: datetime,
+    capacity: int | None,
+) -> None:
+    """New-ID scan under the clinic/day number-counter lock."""
     booked = _counted_intervals(connection, tenant, service_date)
     if not _available(
         booked,
         Candidate(starts_at.astimezone(UTC), ends_at.astimezone(UTC), "VALIDATION"),
-        schedule.allow_overlap,
-        capacity["capacity"] if capacity else 1,
+        capacity is not None,
+        capacity if capacity is not None else 1,
     ):
         raise ContractError(409)
+
+
+def validate_timed_booking(
+    connection: Connection,
+    tenant,
+    service_date: date,
+    starts_at: datetime,
+    ends_at: datetime,
+    now: datetime,
+    expected_capacity_revision: int | None,
+) -> None:
+    """Caller holds schedule/policy locks and the clinic/day number-counter lock."""
+    capacity = validate_timed_candidate(
+        connection,
+        tenant,
+        service_date,
+        starts_at,
+        ends_at,
+        now,
+        expected_capacity_revision,
+    )
+    validate_new_timed_capacity(
+        connection, tenant, service_date, starts_at, ends_at, capacity
+    )

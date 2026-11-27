@@ -1,4 +1,4 @@
-"""B-09 signed booking and read-only operational appointment surfaces."""
+"""Signed booking, attendance and individual appointment operations."""
 
 import json
 from typing import Annotated
@@ -13,12 +13,33 @@ from carepulse.appointments.booking_contracts import (
     BookAppointment,
     FollowupPreviewQuery,
 )
+from carepulse.appointments.bulk_preview import (
+    BulkPreviewCommand,
+    preview_bulk_reschedule,
+    recover_bulk_preview,
+)
+from carepulse.appointments.bulk_reschedule import (
+    BulkCommitCommand,
+    commit_bulk_reschedule,
+    recover_bulk_reschedule,
+)
+from carepulse.appointments.cancel import (
+    cancel_appointment,
+    recover_cancel_replace,
+    replace_urgent,
+)
+from carepulse.appointments.cancel_contracts import CancelAppointment, ReplaceUrgent
 from carepulse.appointments.queries import (
     appointment_detail,
     confirmed_followup_control,
     followup_qualification,
     list_appointments,
     source_decision_control,
+)
+from carepulse.appointments.reschedule import (
+    RescheduleAppointment,
+    recover_committed_reschedule,
+    reschedule_appointment,
 )
 from carepulse.identity.authorization import protected_transaction
 from carepulse.identity.contracts import (
@@ -31,15 +52,19 @@ from carepulse.identity.receipts import (
     TenantReceiptQuery,
     lookup_tenant_receipt,
 )
+from carepulse.queue.checkin import check_in_appointment, recover_committed_checkin
+from carepulse.queue.contracts import CheckInAppointment
 
 router = APIRouter(prefix="/v1/appointments")
 
 
-def _transaction(request: Request, *, stage: str = "PRIMARY"):
+def _transaction(
+    request: Request, *, purpose: str = "APPOINTMENT_BOOKING", stage: str = "PRIMARY"
+):
     if request.method != "GET" and request.query_params:
         raise ContractError(422)
     identity = request.scope.get("carepulse.identity")
-    if identity is None or identity.purpose != "APPOINTMENT_BOOKING":
+    if identity is None or identity.purpose != purpose:
         raise ContractError(403)
     return protected_transaction(
         request.app.state.db_engine,
@@ -148,3 +173,212 @@ def get_appointment(appointment_id: UUID, request: Request):
         if control is not None:
             projection["decision_control"] = control
         return success_response(projection, projection["revision"])
+
+
+async def _checkin_body(request: Request) -> CheckInAppointment:
+    try:
+        body = json.loads(
+            await request.body(),
+            object_pairs_hook=_unique_json_pairs,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+        )
+        return CheckInAppointment.model_validate(body)
+    except (ValueError, UnicodeError, ValidationError, RecursionError) as invalid:
+        raise ContractError(422) from invalid
+
+
+@router.post("/{appointment_id}/check-in")
+def post_appointment_checkin(
+    appointment_id: UUID,
+    request: Request,
+    command: Annotated[CheckInAppointment, Depends(_checkin_body)],
+):
+    key = request.scope["carepulse.identity"].idempotency_key
+    if not key:
+        raise ContractError(422)
+    try:
+        with _transaction(request, purpose="QUEUE_CHECK_IN") as (connection, actor):
+            projection, revision = check_in_appointment(
+                connection, actor, appointment_id, command, key
+            )
+            return success_response(projection, revision)
+    except ReceiptConflict:
+        with _transaction(
+            request, purpose="QUEUE_CHECK_IN", stage="RECEIPT_RECOVERY"
+        ) as (connection, actor):
+            projection, revision = recover_committed_checkin(
+                connection, actor, appointment_id, command, key
+            )
+            return success_response(projection, revision)
+
+
+async def _change_body(
+    request: Request,
+    schema: (
+        type[CancelAppointment]
+        | type[ReplaceUrgent]
+        | type[RescheduleAppointment]
+        | type[BulkPreviewCommand]
+        | type[BulkCommitCommand]
+    ),
+):
+    try:
+        body = json.loads(
+            await request.body(),
+            object_pairs_hook=_unique_json_pairs,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+        )
+        return schema.model_validate(body)
+    except (ValueError, UnicodeError, ValidationError, RecursionError) as invalid:
+        raise ContractError(422) from invalid
+
+
+async def _cancel_body(request: Request) -> CancelAppointment:
+    return await _change_body(request, CancelAppointment)
+
+
+async def _replace_body(request: Request) -> ReplaceUrgent:
+    return await _change_body(request, ReplaceUrgent)
+
+
+def _change_appointment(
+    request: Request, appointment_id: UUID, command: CancelAppointment | ReplaceUrgent
+):
+    replacing = isinstance(command, ReplaceUrgent)
+    purpose = "APPOINTMENT_REPLACE_URGENT" if replacing else "APPOINTMENT_CANCEL"
+    execute = replace_urgent if replacing else cancel_appointment
+    identity = request.scope.get("carepulse.identity")
+    if identity is None or identity.purpose != purpose:
+        raise ContractError(403)
+    if replacing and identity.role != "RECEPTIONIST":
+        raise ContractError(403)
+    key = identity.idempotency_key
+    if not key:
+        raise ContractError(422)
+    try:
+        with _transaction(request, purpose=purpose) as (connection, actor):
+            projection, revision, created = execute(
+                connection, actor, appointment_id, command, key
+            )
+            return success_response(
+                projection, revision, status_code=201 if replacing and created else 200
+            )
+    except ReceiptConflict:
+        with _transaction(request, purpose=purpose, stage="RECEIPT_RECOVERY") as (
+            connection,
+            actor,
+        ):
+            projection, revision = recover_cancel_replace(
+                connection, actor, appointment_id, command, key
+            )
+            return success_response(projection, revision)
+
+
+@router.post("/{appointment_id}/cancel")
+def post_appointment_cancel(
+    appointment_id: UUID,
+    request: Request,
+    command: Annotated[CancelAppointment, Depends(_cancel_body)],
+):
+    return _change_appointment(request, appointment_id, command)
+
+
+@router.post("/{appointment_id}/replace-urgent")
+def post_appointment_replace_urgent(
+    appointment_id: UUID,
+    request: Request,
+    command: Annotated[ReplaceUrgent, Depends(_replace_body)],
+):
+    return _change_appointment(request, appointment_id, command)
+
+
+async def _reschedule_body(request: Request) -> RescheduleAppointment:
+    return await _change_body(request, RescheduleAppointment)
+
+
+@router.post("/{appointment_id}/reschedule")
+def post_appointment_reschedule(
+    appointment_id: UUID,
+    request: Request,
+    command: Annotated[RescheduleAppointment, Depends(_reschedule_body)],
+):
+    key = request.scope["carepulse.identity"].idempotency_key
+    if not key:
+        raise ContractError(422)
+    try:
+        with _transaction(request, purpose="APPOINTMENT_RESCHEDULE") as (
+            connection,
+            actor,
+        ):
+            projection, revision = reschedule_appointment(
+                connection, actor, appointment_id, command, key
+            )
+            return success_response(projection, revision)
+    except ReceiptConflict:
+        with _transaction(
+            request, purpose="APPOINTMENT_RESCHEDULE", stage="RECEIPT_RECOVERY"
+        ) as (connection, actor):
+            projection, revision = recover_committed_reschedule(
+                connection, actor, appointment_id, command, key
+            )
+            return success_response(projection, revision)
+
+
+async def _bulk_preview_body(request: Request) -> BulkPreviewCommand:
+    return await _change_body(request, BulkPreviewCommand)
+
+
+async def _bulk_commit_body(request: Request) -> BulkCommitCommand:
+    return await _change_body(request, BulkCommitCommand)
+
+
+@router.post("/bulk-reschedule/preview")
+def post_bulk_reschedule_preview(
+    request: Request,
+    command: Annotated[BulkPreviewCommand, Depends(_bulk_preview_body)],
+):
+    key = request.scope["carepulse.identity"].idempotency_key
+    if not key:
+        raise ContractError(422)
+    try:
+        with _transaction(request, purpose="APPOINTMENT_BULK_PREVIEW") as (
+            connection,
+            actor,
+        ):
+            projection, revision = preview_bulk_reschedule(
+                connection, actor, command, key
+            )
+            return success_response(projection, revision)
+    except ReceiptConflict:
+        with _transaction(
+            request, purpose="APPOINTMENT_BULK_PREVIEW", stage="RECEIPT_RECOVERY"
+        ) as (connection, actor):
+            projection, revision = recover_bulk_preview(connection, actor, command, key)
+            return success_response(projection, revision)
+
+
+@router.post("/bulk-reschedule/commit")
+def post_bulk_reschedule_commit(
+    request: Request,
+    command: Annotated[BulkCommitCommand, Depends(_bulk_commit_body)],
+):
+    key = request.scope["carepulse.identity"].idempotency_key
+    if not key:
+        raise ContractError(422)
+    try:
+        with _transaction(request, purpose="APPOINTMENT_BULK_COMMIT") as (
+            connection,
+            actor,
+        ):
+            projection, revision = commit_bulk_reschedule(
+                connection, actor, command, key
+            )
+            return success_response(projection, revision)
+    except ReceiptConflict:
+        with _transaction(
+            request, purpose="APPOINTMENT_BULK_COMMIT", stage="RECEIPT_RECOVERY"
+        ) as (connection, actor):
+            projection, revision = recover_bulk_reschedule(
+                connection, actor, command, key
+            )
+            return success_response(projection, revision)

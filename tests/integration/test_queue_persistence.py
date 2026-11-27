@@ -834,7 +834,8 @@ def test_queue_rls_tenant_isolation_no_context_and_operator_grants(
                     )
                     == 1
                 )
-        # Wave 3 queue access is unsupported, even for a genuinely bound Owner.
+        # Under Wave 3 B-12, queue tables are RLS-isolated to QUEUE_CHECK_IN/QUEUE_READ:
+        # unrelated APPOINTMENT_BOOKING purpose sees zero rows, and B-14 confirmations remain 42501.
         with signed_test_transaction(
             appointment_api,
             appointment_api.actors[organization],
@@ -843,14 +844,26 @@ def test_queue_rls_tenant_isolation_no_context_and_operator_grants(
             purpose="APPOINTMENT_BOOKING",
         ) as (connection, _):
             for table in ("queue_days", "queue_entries", "doctor_controls"):
-                with pytest.raises(DBAPIError) as denied, connection.begin_nested():
-                    connection.execute(text(f"SELECT * FROM public.{table}"))
-                assert denied.value.orig.sqlstate == "42501"
+                assert (
+                    connection.execute(text(f"SELECT * FROM public.{table}")).fetchall()
+                    == []
+                )
+            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+                connection.execute(
+                    text("SELECT * FROM public.doctor_admission_confirmations")
+                )
+            assert denied.value.orig.sqlstate == "42501"
     with transaction(appointment_api.runtime) as connection:
         for table in ("queue_days", "queue_entries", "doctor_controls"):
-            with pytest.raises(DBAPIError) as denied, connection.begin_nested():
-                connection.execute(text(f"SELECT * FROM public.{table}"))
-            assert denied.value.orig.sqlstate == "42501"
+            assert (
+                connection.execute(text(f"SELECT * FROM public.{table}")).fetchall()
+                == []
+            )
+        with pytest.raises(DBAPIError) as denied, connection.begin_nested():
+            connection.execute(
+                text("SELECT * FROM public.doctor_admission_confirmations")
+            )
+        assert denied.value.orig.sqlstate == "42501"
     operator = role_engine("carepulse_operator")
     try:
         with pytest.raises(DBAPIError) as denied, operator.connect() as connection:

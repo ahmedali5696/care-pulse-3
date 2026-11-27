@@ -35,6 +35,7 @@ visits = Table(
     Column("medical_notes", Text),
     Column("treatment", Text),
     Column("tests", Text),
+    Column("recommendation", Text),
     Column("followup_decision", JSONB(none_as_null=True)),
     UniqueConstraint("organization_id", "id"),
     UniqueConstraint("organization_id", "appointment_id"),

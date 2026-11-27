@@ -1,5 +1,5 @@
 name: Foundation
-run-name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && 'Foundation PostgreSQL diagnostic' || '' }}
+run-name: ${{ inputs.postgres_diagnostic && inputs.postgres_diagnostic != 'full' && format('Foundation Diagnostic — {0}', inputs.postgres_diagnostic) || '' }}
 
 on:
   push:
@@ -34,6 +34,34 @@ on:
           - f01-followup-context
           - f01-pricing
           - f01-pricing-races
+          - w3-checkin
+          - w3-checkin-races
+          - w3-receipt-boundary
+          - w3-queue-scope
+          - w3-intake
+          - w3-intake-races
+          - w3-admission-controls
+          - w3-admission-confirmations
+          - w3-admission
+          - w3-admission-races
+          - w3-queue-policy
+          - w3-placement-races
+          - w3-visits
+          - w3-visit-races
+          - w3-legacy-source
+          - w3-cancel-replace
+          - w3-cancel-replace-races
+          - w3-reschedule
+          - w3-reschedule-races
+          - w3-bulk
+          - w3-bulk-races
+          - w3-reconciliation
+          - w3-day-review
+          - w3-cutoff-races
+          - w3-migration
+          - w3-migration-replay
+          - w3-operation-boundaries
+          - w3-boundary-security
           - compat-us1
           - compat-us2
           - compat-us3
