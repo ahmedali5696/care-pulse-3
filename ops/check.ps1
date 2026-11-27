@@ -619,11 +619,27 @@ seed_identity_policy() {
   echo 'PASS F-01 synthetic identity provisioning'
 }
 
+profile_boundary_population() {
+  # Read-only aggregate observer on the disposable synthetic database.
+  docker compose exec -T db psql --no-psqlrc -v ON_ERROR_STOP=1 -U carepulse_bootstrap -d carepulse -At <<'SQL'
+SELECT 'BOUNDARY_POPULATION patients=' || (SELECT count(*) FROM public.patients)
+    || ' appointments=' || (SELECT count(*) FROM public.appointments)
+    || ' queue_days=' || (SELECT count(*) FROM public.queue_days)
+    || ' queue_entries=' || (SELECT count(*) FROM public.queue_entries)
+    || ' requests=' || (SELECT count(*) FROM f01_private.requests)
+    || ' bindings=' || (SELECT count(*) FROM f01_private.bindings)
+    || ' activations=' || (SELECT count(*) FROM f01_private.activations);
+SQL
+}
+
 if [ -n "$focused_target" ]; then
   upgrade_head
   echo 'PASS focused PostgreSQL Alembic upgrade to head'
   seed_identity_policy
   docker compose exec -T db postgres --version | grep -F '17.11'
+  if [ "$focused_target" = tests/integration/test_w3_boundary_security.py ]; then
+    profile_boundary_population
+  fi
   worker_fixture_args=()
   case "$focused_target" in
     tests/integration/test_w3_cutoff_races.py) worker_fixture_args=(-v "$CP_WORKER_DB_PASSWORD_SOURCE_FILE:/run/secrets/worker_db_password:ro" -v "$CP_OPERATOR_SECRET_FILE:/run/secrets/operator_password:ro") ;;
@@ -975,6 +991,9 @@ fi
 if [ "$foundation_lane" = ordinary-db ] || { [ "$foundation_lane" = standard ] && [ "${CP_B04_SPIKE:-false}" = false ] && [ "${CP_T133_MODE:-false}" = false ] && [ -z "${CP_T133_SHA:-}" ]; }; then
   for suite in w3_receipt_boundary w3_checkin w3_checkin_races w3_queue_scope w3_intake w3_intake_races w3_admission_controls w3_admission_confirmations w3_admission w3_admission_races w3_queue_policy w3_placement_races w3_visits w3_visit_races w3_cancel_replace w3_cancel_replace_races w3_reschedule w3_reschedule_races w3_bulk w3_bulk_races w3_reconciliation w3_day_review w3_cutoff_races w3_migration w3_operation_boundaries w3_boundary_security; do
     worker_fixture_args=()
+    if [ "$suite" = w3_boundary_security ]; then
+      profile_boundary_population
+    fi
     case "$suite" in
       w3_cutoff_races) worker_fixture_args=(-v "$CP_WORKER_DB_PASSWORD_SOURCE_FILE:/run/secrets/worker_db_password:ro") ;;
       w3_migration) worker_fixture_args=(-v "$CP_DB_PASSWORD_FILE:/run/secrets/postgres_password:ro") ;;
