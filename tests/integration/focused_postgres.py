@@ -16,6 +16,11 @@ class Diagnostic:
         self.passed = self.failed = self.skipped = 0
         self.details = []
 
+    def pytest_runtest_logreport(self, report):
+        for name, detail in report.user_properties:
+            if name == "boundary_profile":
+                self.details.append(detail)
+
     def pytest_collectreport(self, report):
         if report.failed:
             path = Path(report.nodeid).as_posix()

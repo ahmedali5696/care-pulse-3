@@ -3,14 +3,92 @@
 import json
 import os
 import re
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Barrier
+from time import perf_counter
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import URL, create_engine, text
+from sqlalchemy import URL, create_engine, event, text
+from sqlalchemy.engine import Engine
+
+_BOUNDARY_PROFILE = pytest.StashKey[tuple[Counter, Counter]]()
+
+
+def _boundary_statement_group(statement):
+    # Only fixed labels leave this process; never emit SQL or parameters.
+    for table in ("patients", "appointments", "queue_days", "queue_entries"):
+        if statement == f"SELECT id::text FROM public.{table}":
+            return f"unfiltered-{table}"
+    for function in (
+        "f01_context",
+        "f01_register_proof",
+        "f01_bind",
+        "f01_activate",
+        "f01_cleanup",
+    ):
+        if f"public.{function}(" in statement:
+            return function
+    if "SELECT to_jsonb(r)" in statement:
+        return "snapshot"
+    return "other"
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    if item.path.name != "test_w3_boundary_security.py":
+        return (yield)
+    counts, seconds = Counter(), Counter()
+    item.stash[_BOUNDARY_PROFILE] = counts, seconds
+
+    def start(conn, cursor, statement, parameters, context, executemany):
+        context.boundary_profile = _boundary_statement_group(statement), perf_counter()
+
+    def finish(context):
+        if context is not None and hasattr(context, "boundary_profile"):
+            group, started = context.boundary_profile
+            counts[group] += 1
+            seconds[group] += perf_counter() - started
+            del context.boundary_profile
+
+    def complete(conn, cursor, statement, parameters, context, executemany):
+        finish(context)
+
+    def failed(context):
+        finish(context.execution_context)
+
+    listeners = (
+        ("before_cursor_execute", start),
+        ("after_cursor_execute", complete),
+        ("handle_error", failed),
+    )
+    for name, listener in listeners:
+        event.listen(Engine, name, listener)
+    try:
+        return (yield)
+    finally:
+        for name, listener in listeners:
+            event.remove(Engine, name, listener)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    profile = item.stash.get(_BOUNDARY_PROFILE, None)
+    if profile is not None:
+        counts, seconds = profile
+        groups = " ".join(
+            f"{group}={counts[group]}/{seconds[group]:.6f}s" for group in sorted(counts)
+        )
+        detail = f"BOUNDARY_PROFILE {item.originalname} {report.when} {report.duration:.6f}s {groups}"
+        report.user_properties.append(("boundary_profile", detail))
+        print(detail)
+        counts.clear()
+        seconds.clear()
+    return report
 
 
 @pytest.fixture(scope="module")
