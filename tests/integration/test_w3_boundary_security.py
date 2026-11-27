@@ -256,6 +256,8 @@ def test_signed_boundary_rejects_excessive_and_malformed_requests(booking_clinic
         ("/v1/reconciliation", "RECONCILIATION_READ", {"date": date}),
     ):
         for invalid in (
+            {"date": f"{date}T00:00:00"},
+            {"offset": 9223372036854775808},
             {"limit": 101},
             {"limit": 0},
             {"offset": -1},

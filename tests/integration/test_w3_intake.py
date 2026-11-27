@@ -6,6 +6,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
+from carepulse.appointments import intake
 from carepulse.appointments.intake_contracts import (
     EmergencyIntake,
     RoutineIntake,
@@ -13,6 +14,7 @@ from carepulse.appointments.intake_contracts import (
 )
 from carepulse.db import transaction
 from carepulse.identity.contracts import normalized_request_digest
+from carepulse.policies import slots_service
 from carepulse.policies.versions import append_version
 from sqlalchemy import text
 from test_booking import booking_body, booking_request, new_patient
@@ -736,29 +738,108 @@ def test_active_patient_counted_conflict_and_strict_operation_payload(intake_cli
         )
 
 
-@pytest.mark.parametrize("overlap", [False, True])
-def test_urgent_exact_time_selected_slot_and_counted_capacity(intake_clinic, overlap):
+def _set_intake_business_clock(connection, instant, originals):
+    # Only the business-clock reads change; proof freshness, session expiry and audit time stay real.
+    definitions = (
+        ("public.f01_register_proof_before_b14(bytea,text,bytea,bytea)", 1, True),
+        ("f01_private.capture_audit_appointment()", 1, True),
+        ("public.f01_guard_intake_appointment()", 1, False),
+        ("public.b10_schedule_without_offset_guard(uuid,jsonb)", 2, False),
+    )
+    connection.exec_driver_sql(
+        "GRANT CREATE ON SCHEMA public TO carepulse_identity_owner"
+    )
+    for signature, count, identity_owned in definitions:
+        if identity_owned:
+            connection.exec_driver_sql("SET LOCAL ROLE carepulse_identity_owner")
+        original = connection.scalar(
+            text("SELECT pg_get_functiondef(CAST(:signature AS regprocedure))"),
+            {"signature": signature},
+        )
+        assert original.count("clock_timestamp()") == count, signature
+        originals.append((original, identity_owned))
+        connection.exec_driver_sql(
+            original.replace(
+                "clock_timestamp()", f"TIMESTAMPTZ '{instant.isoformat()}'"
+            ),
+            execution_options={"no_parameters": True},
+        )
+        if identity_owned:
+            connection.exec_driver_sql("RESET ROLE")
+    connection.exec_driver_sql(
+        "REVOKE CREATE ON SCHEMA public FROM carepulse_identity_owner"
+    )
+
+
+@pytest.fixture
+def urgent_business_clock(intake_clinic, monkeypatch, wall_time):
+    instant = datetime.combine(
+        datetime(2030, 2, 15).date(), time.fromisoformat(wall_time), CAIRO
+    )
+
+    class FixedBusinessClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return (
+                instant.astimezone(tz)
+                if tz is not None
+                else instant.replace(tzinfo=None)
+            )
+
+    monkeypatch.setattr(intake, "datetime", FixedBusinessClock)
+    monkeypatch.setattr(slots_service, "datetime", FixedBusinessClock)
+    originals = []
+    with intake_clinic.migration.begin() as connection:
+        _set_intake_business_clock(connection, instant, originals)
+    try:
+        yield instant
+    finally:
+        with intake_clinic.migration.begin() as connection:
+            connection.exec_driver_sql(
+                "GRANT CREATE ON SCHEMA public TO carepulse_identity_owner"
+            )
+            for original, identity_owned in originals:
+                if identity_owned:
+                    connection.exec_driver_sql(
+                        "SET LOCAL ROLE carepulse_identity_owner"
+                    )
+                connection.exec_driver_sql(
+                    original, execution_options={"no_parameters": True}
+                )
+                if identity_owned:
+                    connection.exec_driver_sql("RESET ROLE")
+            connection.exec_driver_sql(
+                "REVOKE CREATE ON SCHEMA public FROM carepulse_identity_owner"
+            )
+
+
+@pytest.mark.parametrize(
+    ("overlap", "wall_time"),
+    [(False, "12:00"), (True, "12:00"), (False, "23:56"), (True, "23:56")],
+    ids=["False", "True", "False-late", "True-late"],
+)
+def test_urgent_exact_time_selected_slot_and_counted_capacity(
+    intake_clinic, overlap, urgent_business_clock
+):
     clinic = intake_clinic
+    now = urgent_business_clock
     if overlap:
         with transaction(clinic.migration, clinic.tenant) as conn:
             _policy_capacity(conn, clinic.tenant, capacity=2)
-    # Real Cairo clock and candidate membership; overlap mode also tests manual precedence.
-    future = datetime.now(CAIRO).replace(second=0, microsecond=0) + timedelta(minutes=8)
+    # A one-minute lead fits even near midnight because the business clock is fixed.
+    future = now + timedelta(minutes=1)
     manual_end = future + timedelta(minutes=2)
     manual = ()
     if overlap:
-        assert manual_end.date() == _today(), (
-            "Real Cairo day has no remaining test interval"
-        )
+        assert manual_end.date() == now.date()
         manual = ((future.strftime("%H:%M"), manual_end.strftime("%H:%M")),)
     set_intake_schedule(
         clinic, mode="EXACT_TIME", overlap=overlap, duration=1, manual=manual
     )
-    status, result = _slots_request(clinic, clinic.receptionist, _today())
+    status, result = _slots_request(clinic, clinic.receptionist, now.date())
     assert status == 200, result
     slots = result["data"]
-    # Leave time for the focused assertions and avoid selecting a slot about to start.
-    earliest = datetime.now(UTC) + timedelta(minutes=3)
+    earliest = now.astimezone(UTC)
     offered = next(
         (
             s
@@ -769,8 +850,10 @@ def test_urgent_exact_time_selected_slot_and_counted_capacity(intake_clinic, ove
         ),
         None,
     )
-    assert offered is not None, (
-        "Real Cairo operating day has no future selected candidate"
+    assert offered is not None, "Controlled Cairo day has no future selected candidate"
+    assert (
+        datetime.fromisoformat(offered["ends_at"]).astimezone(CAIRO).date()
+        == now.date()
     )
     interval = {k: offered[k] for k in ("starts_at", "ends_at")}
     if overlap:
@@ -835,6 +918,7 @@ def test_urgent_exact_time_selected_slot_and_counted_capacity(intake_clinic, ove
         )
     saved = _created(clinic, clinic.receptionist, "urgent", body)
     assert saved["booking_mode"] == "EXACT_TIME"
+    assert saved["service_date"] == now.date().isoformat()
     assert datetime.fromisoformat(saved["starts_at"]) == datetime.fromisoformat(
         offered["starts_at"]
     )

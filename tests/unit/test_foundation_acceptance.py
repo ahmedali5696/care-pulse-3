@@ -500,8 +500,9 @@ def test_cli_emits_final_acceptance_only_after_complete_evidence(
 def test_current_inventory_has_exact_disjoint_ordinary_reports():
     db = inventory.REPORT_COUNTS["ordinary-db"]
     stack = inventory.REPORT_COUNTS["ordinary-stack"]
-    assert (sum(db.values()), sum(stack.values())) == (662, 612)
+    assert (sum(db.values()), sum(stack.values())) == (664, 612)
     assert (len(db), len(stack)) == (28, 33)
+    assert db["w3_intake"] == 10
     assert (db["w3_queue_policy"], db["w3_placement_races"]) == (11, 4)
     assert (db["w3_visits"], db["w3_visit_races"], stack["w3_visit_bff"]) == (11, 10, 1)
     assert (
@@ -529,7 +530,7 @@ def test_current_inventory_has_exact_disjoint_ordinary_reports():
     ) == (1, 4, 4, 3)
     assert sum(len(counts) for counts in inventory.REPORT_COUNTS.values()) == 68
     assert (
-        sum(sum(counts.values()) for counts in inventory.REPORT_COUNTS.values()) == 1492
+        sum(sum(counts.values()) for counts in inventory.REPORT_COUNTS.values()) == 1494
     )
     assert not db.keys() & stack.keys()
     assert not (

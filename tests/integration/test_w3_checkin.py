@@ -853,7 +853,9 @@ def test_representative_production_queue_query_plan(booking_clinic):
             elif "FROM public.queue_days q" in sql:
                 statements["day"] = (sql, params)
 
-        query = QueueQuery(date=SERVICE_DAY, lane="MAIN", limit=10, offset=5)
+        query = QueueQuery(
+            date=SERVICE_DAY.isoformat(), lane="MAIN", limit=10, offset=5
+        )
         with signed_test_transaction(
             clinic,
             clinic.receptionist,
