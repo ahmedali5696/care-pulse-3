@@ -60,7 +60,7 @@ For **Full Foundation acceptance**, dispatch with the default `full` selection a
 
 | Lane | Reviewed Wave 3 coverage |
 | --- | --- |
-| `ordinary-db` | F-01, D-08 and twenty-six Wave 3 database suites; 662 cases in 28 JUnit reports, including B-20 staff reconciliation, review and worker cutoff plus T070-T071 migration, arrival races and cross-operation security; fresh current-head PostgreSQL, pinned images and database/toolchain checks |
+| `ordinary-db` | F-01, D-08 and twenty-six Wave 3 database suites; 664 cases in 28 JUnit reports, including B-20 staff reconciliation, review and worker cutoff plus T070-T071 migration, arrival races and cross-operation security; fresh current-head PostgreSQL, pinned images and database/toolchain checks |
 | `ordinary-stack` | D-06, B-06–10, D-11, B-05 backend and all service/browser scenarios including authenticated Wave 3, Visit, cancellation/replacement and reschedule and reconciliation BFF, 612 cases in 31 JUnit and 2 TAP reports; original stack probes and lifecycle checks |
 | `historical` | Immutable 0040 selection, 163 cases in its separate database |
 | `compat` | 44 mandatory Python and 11 Web cases, source 0040 and the reviewed six-successor candidate chain |
